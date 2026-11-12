@@ -6,8 +6,9 @@
 //! [`App`], and keeps what the reader sees in [`Updates`]. It does no networking of its own: the
 //! caller hands in a [`Fetch`] (`mdshared_fetch::fetch_file` in the applications).
 //!
-//! [`check`] and [`install`] block, so the shell calls them from a thread of its own and posts
-//! the [`Event`] back to its event loop. The binaries are not code-signed, so the hash in the
+//! [`check`] and [`install`] block, so they run on a thread of their own: [`spawn_at_launch`],
+//! [`spawn_check`] and [`spawn_install`] start one and hand the [`Event`] to the shell's `post`,
+//! which sends it to its event loop. The binaries are not code-signed, so the hash in the
 //! manifest, fetched over TLS, is the only integrity check there is.
 
 use crate::selfupdate;
@@ -249,6 +250,73 @@ pub fn check_due(enabled: bool, remembers: bool, last: u64, now: u64) -> bool {
     enabled && remembers && now.saturating_sub(last) >= CHECK_EVERY
 }
 
+// ---- threads -----------------------------------------------------------------------------------
+
+/// A [`Fetch`] a thread can take with it.
+pub type FetchFn = fn(&str, usize, Duration) -> Result<Vec<u8>, String>;
+
+/// Seconds since the Unix epoch, for [`check_due`] and the time of the last look.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Runs `work` on a thread named for the application's updater (`mdview-update`); if the thread
+/// cannot start, nothing happens.
+fn spawn(app: &App, work: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new()
+        .name(format!("{}-update", app.name))
+        .spawn(work);
+}
+
+/// At launch, for a copy that can update itself (`files`): clears what an earlier update left
+/// behind and, when `due`, looks for a newer version and posts the answer as an automatic look.
+pub fn spawn_at_launch(
+    app: App,
+    files: Files,
+    due: bool,
+    fetch: FetchFn,
+    post: impl Fn(Event) + Send + 'static,
+) {
+    spawn(&app, move || {
+        clean_up(&files);
+        if due {
+            let result = check(&app, &fetch);
+            post(Event::Checked {
+                manual: false,
+                result,
+            });
+        }
+    });
+}
+
+/// Looks for a newer version now and posts the answer.
+pub fn spawn_check(app: App, manual: bool, fetch: FetchFn, post: impl Fn(Event) + Send + 'static) {
+    spawn(&app, move || {
+        let result = check(&app, &fetch);
+        post(Event::Checked { manual, result });
+    });
+}
+
+/// Downloads and swaps in `offer`, records the version with the system on success, and posts
+/// how it went.
+pub fn spawn_install(
+    app: App,
+    offer: Offer,
+    files: Files,
+    fetch: FetchFn,
+    post: impl Fn(Event) + Send + 'static,
+) {
+    spawn(&app, move || {
+        let result = install(&offer, &files, &fetch);
+        if result.is_ok() {
+            record_version(&app, &offer.version);
+        }
+        post(Event::Installed(result));
+    });
+}
+
 // ---- what the reader sees ----------------------------------------------------------------------
 
 /// The label of the bar's button.
@@ -461,6 +529,56 @@ mod tests {
 
     fn read(p: &std::path::Path) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    /// A release of `ALONE` whose executable reads "app 2", for the threads (a `FetchFn` cannot
+    /// capture anything).
+    fn release_fetch(url: &str, _: usize, _: Duration) -> Result<Vec<u8>, String> {
+        if url.ends_with("update.txt") {
+            Ok(manifest("0.3.0", b"app 2", None).into_bytes())
+        } else {
+            Ok(b"app 2".to_vec())
+        }
+    }
+
+    #[test]
+    fn the_threads_post_what_happened() {
+        use std::sync::mpsc::channel;
+        let wait = Duration::from_secs(20);
+        let files = files("threads", false);
+        let (tx, rx) = channel();
+        let post = move |e: Event| _ = tx.send(e);
+
+        // A launch with no look due only cleans up; one that is due answers as automatic.
+        spawn_at_launch(ALONE, files.clone(), false, release_fetch, post.clone());
+        spawn_at_launch(ALONE, files.clone(), true, release_fetch, post.clone());
+        let Ok(Event::Checked {
+            manual: false,
+            result: Ok(Some(found)),
+        }) = rx.recv_timeout(wait)
+        else {
+            panic!("the look at launch did not post an offer");
+        };
+        assert_eq!(found.version.to_string(), "0.3.0");
+
+        spawn_check(ALONE, true, release_fetch, post.clone());
+        assert!(matches!(
+            rx.recv_timeout(wait),
+            Ok(Event::Checked {
+                manual: true,
+                result: Ok(Some(_))
+            })
+        ));
+
+        spawn_install(ALONE, found, files.clone(), release_fetch, post);
+        assert!(matches!(
+            rx.recv_timeout(wait),
+            Ok(Event::Installed(Ok(())))
+        ));
+        assert_eq!(read(&files.app), "app 2");
+        // Nothing else was posted: the launch that was not due said nothing.
+        assert!(rx.try_recv().is_err());
+        _ = std::fs::remove_dir_all(files.app.parent().unwrap());
     }
 
     #[test]
