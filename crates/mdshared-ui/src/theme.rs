@@ -1,6 +1,6 @@
-//! Chrome colours, one set per page theme. The page itself is coloured by `mdview_render::Theme`;
-//! the accent is the page theme's (Windows 11's default blue) rather than the desktop's, so links,
-//! checkboxes and the chrome agree.
+//! Chrome colours, one set per page theme. The page itself is coloured by the application's own
+//! page theme; the accent is that theme's (Windows 11's default blue) rather than the desktop's, so
+//! links, checkboxes and the chrome agree.
 
 use crate::gfx::{Rgb, rgb};
 

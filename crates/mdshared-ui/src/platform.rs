@@ -420,7 +420,7 @@ pub fn system_scale() -> f32 {
 pub fn subpixel_order() -> Subpixel {
     imp::subpixel_order()
 }
-/// Window, client and work-area rectangles, for the frameless-window checks under `MDVIEW_TRACE`.
+/// Window, client and work-area rectangles, for checking the frameless-window geometry.
 pub fn frame_report(hwnd: isize) -> String {
     imp::frame_report(hwnd)
 }

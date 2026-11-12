@@ -3,6 +3,7 @@
 //! Only expanded folders are read from disk. Collapsing a folder keeps the expansion state of its
 //! nested folders, so expanding it again restores them.
 
+use mdshared_app::paths::strip_verbatim;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,12 +21,10 @@ pub struct Row {
     pub expanded: bool,
 }
 
-/// What the tree needs from the application: which files to list, and how to spell a path
-/// without its Windows verbatim prefix (see `mdview_core::files::strip_verbatim`).
-#[derive(Clone, Copy)]
+/// What the tree needs from the application: which files to list. A closure, so the application
+/// can capture state such as a set of extensions.
 pub struct Rules {
-    pub shows_file: fn(&Path) -> bool,
-    pub strip_verbatim: fn(&str) -> Option<String>,
+    pub shows_file: Box<dyn Fn(&Path) -> bool>,
 }
 
 pub struct FileTree {
@@ -36,9 +35,9 @@ pub struct FileTree {
 }
 
 /// A comparison key: no verbatim prefix, no trailing separator, case-folded with `\` on Windows.
-fn key(rules: Rules, path: &Path) -> String {
+fn key(path: &Path) -> String {
     let s = path.to_string_lossy();
-    let mut s = (rules.strip_verbatim)(&s).unwrap_or_else(|| s.into_owned());
+    let mut s = strip_verbatim(&s).unwrap_or_else(|| s.into_owned());
     if cfg!(windows) {
         s = s.replace('/', "\\").to_lowercase();
     }
@@ -63,7 +62,7 @@ fn is_hidden(_meta: &fs::Metadata) -> bool {
 }
 
 /// Sorted visible children of `dir`: (path, name, is_dir). Unreadable folders give nothing.
-fn read_children(rules: Rules, dir: &Path) -> Vec<(PathBuf, String, bool)> {
+fn read_children(rules: &Rules, dir: &Path) -> Vec<(PathBuf, String, bool)> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -150,8 +149,8 @@ impl FileTree {
 
     /// Expands the ancestors of `path` (if under the root) and returns its row index.
     pub fn reveal(&mut self, path: &Path) -> Option<usize> {
-        let root_key = key(self.rules, self.root.as_deref()?);
-        let target = key(self.rules, path);
+        let root_key = key(self.root.as_deref()?);
+        let target = key(path);
         let rest = target.strip_prefix(&root_key)?;
         let rest = if root_key.ends_with(is_sep) {
             rest
@@ -182,7 +181,7 @@ impl FileTree {
     /// The row index of `path` if it is currently visible.
     #[cfg(test)]
     pub fn index_of(&self, path: &Path) -> Option<usize> {
-        self.index_of_key(&key(self.rules, path))
+        self.index_of_key(&key(path))
     }
 
     /// The root and every visible expanded folder.
@@ -199,7 +198,7 @@ impl FileTree {
     }
 
     fn index_of_key(&self, k: &str) -> Option<usize> {
-        self.rows.iter().position(|r| key(self.rules, &r.path) == k)
+        self.rows.iter().position(|r| key(&r.path) == k)
     }
 
     fn rebuild_changed(&mut self) -> bool {
@@ -220,7 +219,7 @@ impl FileTree {
         if depth > MAX_DEPTH {
             return;
         }
-        for (path, name, is_dir) in read_children(self.rules, dir) {
+        for (path, name, is_dir) in read_children(&self.rules, dir) {
             if rows.len() >= MAX_ROWS {
                 return;
             }
@@ -250,7 +249,7 @@ mod tests {
     impl Tmp {
         fn new() -> Tmp {
             let p = std::env::temp_dir().join(format!(
-                "mdview-tree-test-{}-{}",
+                "mdshared-tree-test-{}-{}",
                 std::process::id(),
                 N.fetch_add(1, Ordering::SeqCst)
             ));
@@ -282,8 +281,7 @@ mod tests {
 
     fn rules() -> Rules {
         Rules {
-            shows_file: |p| p.extension().is_some_and(|e| e == "md" || e == "markdown"),
-            strip_verbatim: |s| s.strip_prefix("\\\\?\\").map(str::to_string),
+            shows_file: Box::new(|p| p.extension().is_some_and(|e| e == "md" || e == "markdown")),
         }
     }
 

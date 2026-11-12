@@ -104,6 +104,9 @@ roughly a thousand lines but keeps both applications independent.
    editor depends on the viewer's `mdview-core` directly. Moving them is cleaner; depending on
    `mdview-core` is less work and drags the Markdown parser into the editor's build (not into its
    exe if unused). Recommendation: move them, after step 3.
+   Decided as recommended and done on 2026-11-12: `mdshared-app` holds path helpers, file reading,
+   recents, the settings file layer, single-instance hand-over and file watching. The viewer's
+   `Session` struct stays in `mdview-core`.
 2. **One repository or three.** The alternative to all of this is one workspace holding the
    viewer, the editor and the shared crates. It removes the pinning and the cross-repository
    steps. The user asked for separate repositories on 2026-11-12, so this plan follows that; it is

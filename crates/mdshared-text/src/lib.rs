@@ -1,4 +1,4 @@
-//! Bitmap, text shaping and rasterisation shared by the mdview applications. No window system.
+//! Bitmap, text shaping and rasterisation for applications that draw their own UI. No window system.
 
 pub mod bitmap;
 mod fonts;

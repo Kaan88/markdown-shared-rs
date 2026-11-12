@@ -628,7 +628,7 @@ mod tests {
         assert!(fb.pixels == bgr.pixels);
     }
 
-    /// Not a correctness test: `cargo test --release -p mdview-render text_draw_speed -- --ignored
+    /// Not a correctness test: `cargo test --release -p mdshared-text text_draw_speed -- --ignored
     /// --nocapture` prints the time per glyph of a warm-cache draw.
     #[test]
     #[ignore]
