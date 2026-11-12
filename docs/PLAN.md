@@ -1,7 +1,12 @@
 # Plan: the shared code of mdview and mdedit
 
-Written 2026-11-12. Nothing here is built. This is the plan the user asked for before any work
-starts; the decisions marked **Open** are theirs to make.
+Written 2026-11-12. Steps 0 to 3 were done the same day, with a fourth crate (`mdshared-app`, open
+decision 1). Step 4 (the window frame) is put off: the editor was given its own window loop, so
+the frame can be designed from two real users. Step 5 (a tag) waits for that. After each step the
+viewer's 43 `--shot` renders were compared byte for byte with renders taken before the move, and
+the four goldens still match; `mdview.exe` grew from 7,439,872 to 7,457,280 bytes. Not measured
+after the move: the viewer's first-frame time and memory. All three repositories are public and
+MIT, so the notes below about private repositories no longer apply.
 
 ## Why this repository exists
 
