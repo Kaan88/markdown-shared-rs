@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mdshared-app", "crates/mdshared-ui", "crates/mdshared-text", "crates/mdshared-highlight"]
+members = ["crates/mdshared-app", "crates/mdshared-ui", "crates/mdshared-text", "crates/mdshared-highlight", "crates/mdshared-fetch"]
 
 [workspace.package]
 version = "0.1.0"

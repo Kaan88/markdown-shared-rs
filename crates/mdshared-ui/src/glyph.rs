@@ -37,3 +37,4 @@ pub const WIN_MIN: &str = "\u{E921}";
 pub const WIN_MAX: &str = "\u{E922}";
 pub const WIN_RESTORE: &str = "\u{E923}";
 pub const WIN_CLOSE: &str = "\u{E8BB}";
+pub const DOWNLOAD: &str = "\u{E896}";

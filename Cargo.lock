@@ -1213,6 +1213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdshared-fetch"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "mdshared-highlight"
 version = "0.1.0"
 dependencies = [

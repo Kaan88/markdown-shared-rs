@@ -7,6 +7,7 @@ pub mod gfx;
 pub mod glyph;
 pub mod keys;
 pub mod menu;
+pub mod notice;
 pub mod overlay;
 pub mod pane;
 pub mod platform;
