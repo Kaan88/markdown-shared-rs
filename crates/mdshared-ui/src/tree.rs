@@ -184,8 +184,8 @@ impl FileTree {
         self.index_of_key(&key(path))
     }
 
-    /// The root and every visible expanded folder.
-    #[cfg(test)]
+    /// The root and every visible expanded folder: the folders whose contents the rows show, for a
+    /// watcher to follow.
     pub fn watched_dirs(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self.root.iter().cloned().collect();
         out.extend(

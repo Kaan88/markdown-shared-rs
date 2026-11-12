@@ -16,6 +16,8 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 struct Shared {
     /// The open files' folders and names, compared against each event's paths.
     files: std::sync::Mutex<BTreeSet<PathBuf>>,
+    /// The folders whose listing is followed.
+    listed: std::sync::Mutex<BTreeSet<PathBuf>>,
     /// A wake has been sent and the shell has not called `woken` yet.
     pending: AtomicBool,
 }
@@ -23,7 +25,12 @@ struct Shared {
 pub struct FileWatcher {
     watcher: RecommendedWatcher,
     shared: Arc<Shared>,
+    /// Every folder the OS watcher follows now.
     folders: BTreeSet<PathBuf>,
+    /// The parents of the followed files.
+    file_folders: BTreeSet<PathBuf>,
+    /// The folders whose listing is followed.
+    listed: BTreeSet<PathBuf>,
 }
 
 impl FileWatcher {
@@ -32,6 +39,7 @@ impl FileWatcher {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Option<FileWatcher> {
         let shared = Arc::new(Shared {
             files: Default::default(),
+            listed: Default::default(),
             pending: AtomicBool::new(false),
         });
         let seen = shared.clone();
@@ -45,6 +53,20 @@ impl FileWatcher {
             let ours = {
                 let files = seen.files.lock().unwrap_or_else(|e| e.into_inner());
                 event.paths.iter().any(|path| files.contains(path))
+            } || {
+                // Anything created, removed or renamed directly inside a listed folder.
+                let listed = seen.listed.lock().unwrap_or_else(|e| e.into_inner());
+                !listed.is_empty()
+                    && matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    )
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| path.parent().is_some_and(|dir| listed.contains(dir)))
             };
             if ours && !seen.pending.swap(true, Ordering::AcqRel) {
                 wake();
@@ -55,21 +77,40 @@ impl FileWatcher {
             watcher,
             shared,
             folders: BTreeSet::new(),
+            file_folders: BTreeSet::new(),
+            listed: BTreeSet::new(),
         })
     }
 
     /// Follows exactly these files from now on. Folders no longer needed are released.
     pub fn set_files<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) {
         let files: BTreeSet<PathBuf> = paths.into_iter().map(Path::to_path_buf).collect();
-        let folders: BTreeSet<PathBuf> = files
+        self.file_folders = files
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf))
             .collect();
-        for gone in self.folders.difference(&folders) {
+        self.rewatch();
+        *self.shared.files.lock().unwrap_or_else(|e| e.into_inner()) = files;
+    }
+
+    /// Follows the listing of exactly these folders from now on (a folder tree's root and its
+    /// expanded folders): an entry created, removed or renamed directly inside one wakes. A
+    /// change to the contents of a file there does not, unless the file is one of
+    /// [`set_files`](Self::set_files).
+    pub fn set_folders<'a>(&mut self, folders: impl IntoIterator<Item = &'a Path>) {
+        self.listed = folders.into_iter().map(Path::to_path_buf).collect();
+        self.rewatch();
+        *self.shared.listed.lock().unwrap_or_else(|e| e.into_inner()) = self.listed.clone();
+    }
+
+    /// Watches the folders the files and the listing need, and releases the rest.
+    fn rewatch(&mut self) {
+        let wanted: BTreeSet<PathBuf> = self.file_folders.union(&self.listed).cloned().collect();
+        for gone in self.folders.difference(&wanted) {
             _ = self.watcher.unwatch(gone);
         }
         let mut watched = BTreeSet::new();
-        for folder in &folders {
+        for folder in &wanted {
             if self.folders.contains(folder)
                 || self
                     .watcher
@@ -80,7 +121,6 @@ impl FileWatcher {
             }
         }
         self.folders = watched;
-        *self.shared.files.lock().unwrap_or_else(|e| e.into_inner()) = files;
     }
 
     /// The shell calls this before it checks the files, so a change during the check wakes again.
@@ -135,6 +175,69 @@ mod tests {
         assert!(
             receive.recv_timeout(Duration::from_millis(300)).is_err(),
             "nothing is watched after set_files([])"
+        );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listed_folder_wakes_for_new_and_removed_entries_only() {
+        let dir = std::env::temp_dir().join(format!("mdshared-watch-list-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let old = dir.join("old.md");
+        std::fs::write(
+            &old, "# old
+",
+        )
+        .unwrap();
+        let (send, receive) = channel();
+        let mut watcher = FileWatcher::new(move || _ = send.send(())).expect("watcher");
+        watcher.set_folders([dir.as_path()]);
+
+        std::fs::write(
+            &old,
+            "# changed
+",
+        )
+        .unwrap();
+        std::fs::write(dir.join("sub").join("deep.md"), "x").unwrap();
+        assert!(
+            receive.recv_timeout(Duration::from_millis(300)).is_err(),
+            "contents, and entries of a folder that is not listed, do not wake"
+        );
+
+        std::fs::write(
+            dir.join("new.md"),
+            "# new
+",
+        )
+        .unwrap();
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a new entry wakes");
+        std::thread::sleep(Duration::from_millis(200));
+        while receive.try_recv().is_ok() {}
+        watcher.woken();
+        std::fs::rename(dir.join("new.md"), dir.join("renamed.md")).unwrap();
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a rename wakes");
+        std::thread::sleep(Duration::from_millis(200));
+        watcher.woken();
+        std::fs::remove_file(&old).unwrap();
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a removal wakes");
+
+        std::thread::sleep(Duration::from_millis(200));
+        while receive.try_recv().is_ok() {}
+        watcher.woken();
+        watcher.set_folders([]);
+        std::fs::write(dir.join("later.md"), "x").unwrap();
+        assert!(
+            receive.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing is listed after set_folders([])"
         );
         _ = std::fs::remove_dir_all(&dir);
     }
