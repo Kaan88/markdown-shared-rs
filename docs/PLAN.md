@@ -19,7 +19,7 @@ lives, so that:
 
 ## What moves, and what does not
 
-State of the viewer on 2026-11-12 (`a7f24d7`). Line counts are from `wc -l`.
+State of the viewer on 2026-11-12 (`41e9978`). Line counts are from `wc -l`.
 
 | Code today | Lines | Depends on | Moves? |
 |---|---|---|---|
