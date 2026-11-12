@@ -5,6 +5,10 @@
 //! The bundled set has no TypeScript and no TOML. TypeScript and JSX are read as JavaScript,
 //! which colours their keywords, strings, numbers and comments; TOML has a small scanner here.
 //! Both cost nothing in the binary, which a second syntax dump would.
+//!
+//! [`incremental`] is the editor's line-by-line interface over the same set and themes.
+
+pub mod incremental;
 
 use std::ops::Range;
 use std::sync::OnceLock;
