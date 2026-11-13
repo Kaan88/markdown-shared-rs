@@ -8,7 +8,7 @@ pub struct Item<T> {
     pub id: T,
     pub label: String,
     pub hint: String,
-    /// An icon-font glyph, or empty.
+    /// An icon from `glyph`, or empty.
     pub icon: &'static str,
     pub enabled: bool,
     pub checked: bool,

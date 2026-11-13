@@ -67,18 +67,19 @@ impl Rect {
 pub enum Face {
     Ui,
     Semibold,
-    Icon,
 }
 
 const UI_FAMILY: &str =
     "Segoe UI Variable Text, Segoe UI, Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif";
-#[cfg(windows)]
-const ICON_FAMILY: &str = "Segoe Fluent Icons, Segoe MDL2 Assets";
-/// Elsewhere the icons come from a subset of Fluent UI System Icons (MIT) built into the binary.
-#[cfg(not(windows))]
-const ICON_FAMILY: &str = "FluentSystemIcons-Regular";
-#[cfg(not(windows))]
-static ICON_FONT: &[u8] = include_bytes!("../assets/icons/FluentSystemIcons-subset.ttf");
+
+/// An icon stroked at one size: coverage, one byte per device pixel, and where its top left
+/// corner sits from the corner of the icon's square.
+struct IconMask {
+    left: i32,
+    top: i32,
+    width: usize,
+    data: Vec<u8>,
+}
 
 /// Font contexts, the glyph cache and a cache of laid-out labels. One per window.
 pub struct Gfx {
@@ -86,6 +87,7 @@ pub struct Gfx {
     layouts: LayoutContext<Brush>,
     engine: TextEngine,
     cache: HashMap<u64, Rc<Layout<Brush>>>,
+    icons: HashMap<u64, Rc<IconMask>>,
 }
 
 fn key(face: Face, size: f32, color: Rgb, wrap: f32, text: &str) -> u64 {
@@ -100,18 +102,12 @@ impl Gfx {
     pub fn new() -> Gfx {
         let mut engine = TextEngine::new(2 << 20);
         engine.set_subpixel(crate::platform::subpixel_order());
-        #[allow(unused_mut)]
-        let mut fonts = shared_fonts();
-        #[cfg(not(windows))]
-        fonts.collection.register_fonts(
-            parley::fontique::Blob::new(std::sync::Arc::new(ICON_FONT)),
-            None,
-        );
         Gfx {
-            fonts,
+            fonts: shared_fonts(),
             layouts: LayoutContext::new(),
             engine,
             cache: HashMap::new(),
+            icons: HashMap::new(),
         }
     }
 
@@ -135,11 +131,7 @@ impl Gfx {
         let mut b = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        let family = match face {
-            Face::Ui | Face::Semibold => UI_FAMILY,
-            Face::Icon => ICON_FAMILY,
-        };
-        b.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
+        b.push_default(StyleProperty::FontFamily(FontFamily::from(UI_FAMILY)));
         b.push_default(StyleProperty::FontSize(size));
         let weight = if face == Face::Semibold { 600.0 } else { 400.0 };
         b.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
@@ -155,6 +147,33 @@ impl Gfx {
         let layout = Rc::new(layout);
         self.cache.insert(k, layout.clone());
         layout
+    }
+
+    /// The mask of an icon `side` device px across. The chrome draws the same few icons every
+    /// frame, so each is stroked once per size.
+    fn icon(&mut self, glyph: &str, side: f32) -> Rc<IconMask> {
+        let k = key(Face::Ui, side, [0; 3], 0.0, glyph);
+        if let Some(m) = self.icons.get(&k) {
+            return m.clone();
+        }
+        if self.icons.len() > 500 {
+            self.icons.clear();
+        }
+        let s = side / crate::glyph::GRID;
+        let mut stroke = zeno::Stroke::new(crate::glyph::STROKE);
+        stroke.cap(zeno::Cap::Round).join(zeno::Join::Round);
+        let (data, at) = zeno::Mask::new(glyph)
+            .style(stroke)
+            .transform(Some(zeno::Transform::scale(s, s)))
+            .render();
+        let mask = Rc::new(IconMask {
+            left: at.left,
+            top: at.top,
+            width: at.width as usize,
+            data,
+        });
+        self.icons.insert(k, mask.clone());
+        mask
     }
 }
 
@@ -499,14 +518,39 @@ impl<'a> Painter<'a> {
         w
     }
 
-    /// An icon-font glyph centred on a point.
+    /// An icon from [`glyph`](crate::glyph), `size` logical px across, centred on a point.
     pub fn icon(&mut self, glyph: &str, size: f32, cx: f32, cy: f32, c: Rgb) {
-        let layout = self
-            .gfx
-            .layout(Face::Icon, size * self.scale, c, 0.0, glyph);
-        let x = (cx * self.scale - layout.width() / 2.0).round();
-        let y = (cy * self.scale - layout.height() / 2.0).round();
-        self.draw_layout(&layout, x, y);
+        let side = size * self.scale;
+        let mask = self.gfx.icon(glyph, side);
+        if mask.width == 0 {
+            return;
+        }
+        let x0 = (cx * self.scale - side / 2.0).round() as i32 + mask.left;
+        let y0 = (cy * self.scale - side / 2.0).round() as i32 + mask.top;
+        let (xa, xb) = (
+            x0.max(self.clip.0),
+            (x0 + mask.width as i32).min(self.clip.2),
+        );
+        if xa >= xb {
+            return;
+        }
+        for (row, cover) in mask.data.chunks_exact(mask.width).enumerate() {
+            let y = y0 + row as i32;
+            if y < self.clip.1 || y >= self.clip.3 {
+                continue;
+            }
+            let o = (y as usize * self.bmp.width as usize + xa as usize) * 4;
+            let dst = &mut self.bmp.pixels[o..o + (xb - xa) as usize * 4];
+            let cover = &cover[(xa - x0) as usize..(xb - x0) as usize];
+            for (d, &a) in dst.as_chunks_mut::<4>().0.iter_mut().zip(cover) {
+                // 255 has to come out as the colour itself.
+                let a = a as u32 + (a as u32 >> 7);
+                let ia = 256 - a;
+                d[0] = ((c[2] as u32 * a + d[0] as u32 * ia) >> 8) as u8;
+                d[1] = ((c[1] as u32 * a + d[1] as u32 * ia) >> 8) as u8;
+                d[2] = ((c[0] as u32 * a + d[2] as u32 * ia) >> 8) as u8;
+            }
+        }
     }
 
     /// Wrapped text in a column `w` wide starting at `(x, y)`. Returns the height used.
@@ -539,5 +583,71 @@ impl<'a> Painter<'a> {
         }
         stops.push(self.measure(face, size, text));
         stops
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glyph;
+
+    /// Every icon parses to the end, stays on its grid and puts ink on it.
+    #[test]
+    fn every_icon_draws_inside_its_square() {
+        let mut gfx = Gfx::new();
+        for (name, path) in glyph::ALL {
+            let parsed = zeno::PathData::commands(path).count();
+            let asked = path.bytes().filter(|b| b.is_ascii_alphabetic()).count();
+            assert!(parsed >= asked, "{name}: {parsed} commands of {asked}");
+            let m = gfx.icon(path, 64.0);
+            let h = m.data.len() / m.width.max(1);
+            assert!(m.width >= 32 || h >= 32, "{name} is {} by {h}", m.width);
+            assert!(m.left >= 0 && m.top >= 0, "{name} starts outside");
+            assert!(
+                m.left + m.width as i32 <= 64 && m.top + h as i32 <= 64,
+                "{name} ends outside"
+            );
+            assert!(m.data.contains(&255), "{name} has no ink");
+        }
+    }
+
+    /// The sheet a person looks at: every icon at the sizes the apps use, in both themes.
+    /// `cargo test -p mdshared-ui icon_sheet -- --ignored`, then open target/icons.png.
+    #[test]
+    #[ignore]
+    fn icon_sheet() {
+        let sizes = [8.5, 10.0, 13.0, 15.0, 16.0, 20.0, 32.0];
+        let (cell, cols) = (180.0, 5);
+        let rows = glyph::ALL.len().div_ceil(cols);
+        let themes = [
+            (rgb(0xfbfbfb), rgb(0x1f1f1f)),
+            (rgb(0x1f1f1f), rgb(0xededed)),
+        ];
+        for (scale, file) in [(1.0, "icons.png"), (1.5, "icons-150.png")] {
+            let mut bmp = Bitmap::new(
+                (cell * cols as f32 * 2.0 * scale) as u32,
+                (rows as f32 * 62.0 * scale) as u32,
+            );
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            for (half, (bg, fg)) in themes.into_iter().enumerate() {
+                let ox = half as f32 * cell * cols as f32;
+                p.fill(
+                    Rect::new(ox, 0.0, cell * cols as f32, rows as f32 * 62.0),
+                    bg,
+                );
+                for (i, (name, path)) in glyph::ALL.iter().enumerate() {
+                    let (x, y) = (ox + (i % cols) as f32 * cell, (i / cols) as f32 * 62.0);
+                    let mut cx = x + 12.0;
+                    for s in sizes {
+                        p.icon(path, s, cx + s / 2.0, y + 22.0, fg);
+                        cx += s + 6.0;
+                    }
+                    p.text(Face::Ui, 10.0, x + 12.0, y + 50.0, name, fg, cell);
+                }
+            }
+            let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+            bmp.write_png(&out.join(file)).unwrap();
+        }
     }
 }
