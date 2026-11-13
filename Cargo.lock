@@ -1279,6 +1279,7 @@ dependencies = [
 name = "mdshared-fetch"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "windows-sys 0.59.0",
 ]
 

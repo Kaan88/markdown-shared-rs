@@ -52,7 +52,7 @@ fn unacceptable_urls_fail_without_a_thread() {
     assert_eq!(f.worker_count(), 0);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 mod net {
     use super::*;
     use std::io::{Read, Write};
@@ -178,6 +178,74 @@ mod net {
     fn get(url: &str, cfg: &Config) -> Result<Downloaded, Error> {
         let session = Session::new("mdshared").unwrap();
         download(&session, &Url::parse(url).unwrap(), None, cfg)
+    }
+
+    fn raw_get(url: &str, max: usize) -> Result<Response, Error> {
+        let session = Session::new("mdshared").unwrap();
+        session.get(
+            &Url::parse(url).unwrap(),
+            &[],
+            Instant::now() + Duration::from_secs(5),
+            max,
+        )
+    }
+
+    /// The transport itself: a redirect is reported, not followed; a non-200 body is not read; the
+    /// validators come back; the size cap holds with and without a declared length.
+    #[test]
+    fn transport_reports_redirects_and_enforces_the_cap() {
+        let server = Server::start(|path, _, s| match path {
+            "/r" => respond(s, "302 Found", &["Location: /elsewhere"], b"moved"),
+            "/v" => respond(
+                s,
+                "200 OK",
+                &[
+                    "ETag: \"abc\"",
+                    "Last-Modified: Tue, 01 Jan 2030 00:00:00 GMT",
+                ],
+                b"hi",
+            ),
+            "/big" => respond(s, "200 OK", &[], &[7u8; 5000]),
+            "/chunked" => {
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+                for _ in 0..50 {
+                    if s.write_all(&[1u8; 200]).is_err() {
+                        return;
+                    }
+                }
+            }
+            _ => respond(s, "404 Not Found", &[], b"no"),
+        });
+        let r = raw_get(&server.url("/r"), 1000).unwrap();
+        assert_eq!(r.status, 302);
+        assert_eq!(r.location.as_deref(), Some("/elsewhere"));
+        assert!(r.body.is_empty());
+        assert_eq!(server.connections(), 1, "the redirect was followed");
+
+        let r = raw_get(&server.url("/v"), 1000).unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"hi"[..]));
+        assert_eq!(r.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(
+            r.last_modified.as_deref(),
+            Some("Tue, 01 Jan 2030 00:00:00 GMT")
+        );
+
+        let r = raw_get(&server.url("/nope"), 1000).unwrap();
+        assert_eq!((r.status, r.body.len()), (404, 0));
+
+        assert_eq!(
+            raw_get(&server.url("/big"), 4999).unwrap_err(),
+            Error::TooLarge
+        );
+        assert_eq!(raw_get(&server.url("/big"), 5000).unwrap().body.len(), 5000);
+        assert_eq!(
+            raw_get(&server.url("/chunked"), 9999).unwrap_err(),
+            Error::TooLarge
+        );
+        assert_eq!(
+            raw_get(&server.url("/chunked"), 10_000).unwrap().body.len(),
+            10_000
+        );
     }
 
     #[test]

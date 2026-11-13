@@ -81,6 +81,7 @@ impl Url {
     }
 
     /// The host as WinHTTP wants it: IPv6 literals without their brackets.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn connect_host(&self) -> &str {
         self.host.trim_start_matches('[').trim_end_matches(']')
     }

@@ -10,3 +10,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
 ] }
+
+# Loads the system libcurl at run time (no link-time dependency on it).
+[target.'cfg(not(windows))'.dependencies]
+libloading = "0.8"

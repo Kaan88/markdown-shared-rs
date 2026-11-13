@@ -40,23 +40,22 @@
 //!
 //! # Platforms
 //!
-//! Windows uses WinHTTP (see `winhttp.rs`, the only `unsafe` code in the crate). Other platforms
-//! build a stub whose downloads always fail; see `stub.rs` for the intended approach.
-
-// The stub transport leaves the parts only a real transport uses (error kinds, header parsing).
-#![cfg_attr(not(windows), allow(dead_code))]
+//! Windows uses WinHTTP (see `winhttp.rs`). Other platforms use the system libcurl, loaded with
+//! `dlopen` at the first request (see `curl.rs`); where it is missing every download fails with
+//! `Error::Unsupported`, which callers see as [`State::Failed`]. These two files hold the only
+//! `unsafe` code in the crate.
 
 mod cache;
 mod requests;
 mod url;
 
 #[cfg(not(windows))]
-mod stub;
+mod curl;
 #[cfg(windows)]
 mod winhttp;
 
 #[cfg(not(windows))]
-use stub::Session;
+use curl::Session;
 #[cfg(windows)]
 use winhttp::Session;
 
