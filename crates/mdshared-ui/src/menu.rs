@@ -135,7 +135,9 @@ impl<T: Clone> Menu<T> {
         let mut y = if self.above {
             (self.anchor.1 - h).max(top)
         } else {
-            self.anchor.1.max(top)
+            // Where it was opened, even when that is in the title row (a tab's own menu); only
+            // being pushed up to fit stops at the area's top.
+            self.anchor.1
         };
         x = x.min(area.right() - w - 4.0).max(area.x + 4.0);
         if y + h > bottom {
@@ -396,6 +398,8 @@ mod tests {
         let menu = placed(many(5), (700.0, 50.0), area);
         assert_eq!(menu.rect().y, 50.0);
         assert!(!menu.scrolls());
+        // Opened inside the title row, a menu that fits stays where it was opened.
+        assert_eq!(placed(many(3), (700.0, 25.0), area).rect().y, 25.0);
         // Too low for its anchor: moved up, but not above the area.
         let menu = placed(many(10), (700.0, 400.0), area);
         assert_eq!(menu.rect().bottom(), 596.0);
