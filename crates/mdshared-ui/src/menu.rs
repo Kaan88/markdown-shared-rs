@@ -200,11 +200,17 @@ impl<T: Clone> Menu<T> {
             let color = if item.enabled { pal.text } else { pal.faint };
             let mut x = r.x + 9.0;
             if icons {
-                let glyph = if item.checked {
+                // A checked item keeps its own icon, in the accent colour on a tinted box; one
+                // without an icon shows the check mark.
+                let glyph = if item.checked && item.icon.is_empty() {
                     crate::glyph::CHECK
                 } else {
                     item.icon
                 };
+                if item.checked && !item.icon.is_empty() {
+                    let b = Rect::new(r.x + 6.0, r.cy() - 12.0, 24.0, 24.0);
+                    p.rbox_a(b, 5.0, pal.accent, 0.16);
+                }
                 if !glyph.is_empty() {
                     let c = if item.checked {
                         pal.accent
