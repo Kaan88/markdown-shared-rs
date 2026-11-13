@@ -90,6 +90,8 @@ impl Language {
     pub fn line_comment(self) -> Option<&'static str> {
         let name = match self {
             Language::Toml => return Some("#"),
+            Language::Scan(Lang::Kotlin | Lang::Swift) => return Some("//"),
+            Language::Scan(Lang::PowerShell | Lang::Dockerfile) => return Some("#"),
             Language::Syntax(syntax) => syntax.name.as_str(),
         };
         Some(match name {
