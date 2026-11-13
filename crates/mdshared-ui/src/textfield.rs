@@ -3,6 +3,7 @@
 //! a [`Painter`]. No clipboard or windowing code lives here.
 
 use crate::gfx::{Face, Painter, Rect, Rgb};
+use crate::keys::{KeyName, Mods};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditKey {
@@ -40,7 +41,7 @@ fn class(c: char) -> Class {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TextField {
     text: String,
     /// Byte offset of the caret (always on a char boundary).
@@ -233,6 +234,69 @@ impl TextField {
                 true
             }
         }
+    }
+
+    /// The editing keys every single-line box shares: caret movement, word movement (Ctrl),
+    /// selection (Shift), deletion, Ctrl+A/C/X/V when `clipboard` is on, and typed text. `typed`
+    /// is the text the key event produced. `None` when the key is not an editing key (the caller
+    /// treats it as its own: Enter, Escape, Up, Down, Tab, a shortcut); otherwise whether the
+    /// TEXT changed. Paste takes the clipboard's first line.
+    pub fn handle_key(
+        &mut self,
+        key: &KeyName,
+        mods: Mods,
+        typed: Option<&str>,
+        clipboard: bool,
+    ) -> Option<bool> {
+        let (word, extend) = (mods.ctrl, mods.shift);
+        Some(match key {
+            KeyName::Left => self.key(EditKey::Left, word, extend),
+            KeyName::Right => self.key(EditKey::Right, word, extend),
+            KeyName::Home => self.key(EditKey::Home, false, extend),
+            KeyName::End => self.key(EditKey::End, false, extend),
+            KeyName::Backspace => self.key(EditKey::Backspace, word, false),
+            KeyName::Delete => self.key(EditKey::Delete, word, false),
+            KeyName::Char('a') if mods.ctrl && !mods.alt => {
+                self.select_all();
+                false
+            }
+            KeyName::Char('c') if mods.ctrl && !mods.alt => {
+                if clipboard && self.has_selection() {
+                    crate::platform::set_clipboard_text(self.selected_text());
+                }
+                false
+            }
+            KeyName::Char('x') if mods.ctrl && !mods.alt => {
+                if clipboard && self.has_selection() {
+                    crate::platform::set_clipboard_text(self.selected_text());
+                    self.delete_selection()
+                } else {
+                    false
+                }
+            }
+            KeyName::Char('v') if mods.ctrl && !mods.alt => {
+                match crate::platform::clipboard_text().filter(|_| clipboard) {
+                    Some(t) => self.insert(t.lines().next().unwrap_or("")),
+                    None => false,
+                }
+            }
+            KeyName::Enter
+            | KeyName::Escape
+            | KeyName::Tab
+            | KeyName::Up
+            | KeyName::Down
+            | KeyName::PageUp
+            | KeyName::PageDown
+            | KeyName::F(_) => return None,
+            _ => {
+                // Ctrl alone is a shortcut; Ctrl+Alt is AltGr on Windows.
+                let t = typed.filter(|t| !t.chars().any(char::is_control))?;
+                if mods.ctrl && !mods.alt {
+                    return None;
+                }
+                self.insert(t)
+            }
+        })
     }
 
     /// Byte offset of the char boundary nearest to `x` (text-relative, scroll already applied).
@@ -614,5 +678,53 @@ mod tests {
         f.scroll = 20.0;
         f.press(0.0, &stops(s), false);
         assert_eq!(f.caret, 2);
+    }
+
+    #[test]
+    fn handle_key_edits_and_declines() {
+        let none = Mods::default();
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        let mut f = TextField::new();
+        assert_eq!(
+            f.handle_key(&KeyName::Char('a'), none, Some("a"), false),
+            Some(true)
+        );
+        assert_eq!(
+            f.handle_key(&KeyName::Char('b'), none, Some("b"), false),
+            Some(true)
+        );
+        assert_eq!(f.text(), "ab");
+        assert_eq!(
+            f.handle_key(&KeyName::Left, shift, None, false),
+            Some(false)
+        );
+        assert_eq!(f.selected_text(), "b");
+        assert_eq!(
+            f.handle_key(&KeyName::Backspace, none, None, false),
+            Some(true)
+        );
+        assert_eq!(f.text(), "a");
+        assert_eq!(
+            f.handle_key(&KeyName::Char('a'), ctrl, Some("a"), false),
+            Some(false)
+        );
+        assert!(f.has_selection());
+        // Ctrl+letters are shortcuts, not text; Enter and Escape are the caller's.
+        assert_eq!(
+            f.handle_key(&KeyName::Char('k'), ctrl, Some("k"), false),
+            None
+        );
+        assert_eq!(f.handle_key(&KeyName::Enter, none, Some("\r"), false), None);
+        assert_eq!(f.handle_key(&KeyName::Escape, none, None, false), None);
+        assert_eq!(f.handle_key(&KeyName::Down, none, None, false), None);
+        // A key with no text and no meaning is not an editing key.
+        assert_eq!(f.handle_key(&KeyName::Char('z'), none, None, false), None);
     }
 }
