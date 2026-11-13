@@ -50,6 +50,63 @@ pub const WIN_RESTORE: &str = "M3.5 5.5h6a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-6a1 1 0
 pub const WIN_CLOSE: &str = "M3 3l10 10M13 3L3 13";
 pub const DOWNLOAD: &str = "M8 2v8.5M4.5 7L8 10.5 11.5 7M2.5 13.5h11";
 
+pub const CHECK: &str = "M3 8.5l3.2 3.2L13 5";
+pub const NEW_FILE: &str =
+    "M8 14.5H4a.5 .5 0 0 1-.5-.5V2a.5 .5 0 0 1 .5-.5h5L12.5 5v3M9 1.5V5h3.5M12 10.5v4M10 12.5h4";
+pub const SAVE: &str = "M3 2.5h8.3l2.2 2.2V13a.5 .5 0 0 1-.5 .5H3a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM5 2.5V6h5V2.5M5 13.5v-4h6v4";
+pub const SAVE_AS: &str = "M7.5 13.5H3a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5h8.3l2.2 2.2V7M5 2.5V6h5V2.5M10 14.5l.4-1.9 3.2-3.2 1.5 1.5-3.2 3.2z";
+pub const CLOSE_ALL: &str = "M2 5.5l5 5M7 5.5l-5 5M9 5.5l5 5M14 5.5l-5 5";
+pub const CLOSE_OTHERS: &str = "M2.5 4l4 4M6.5 4l-4 4M9.5 3.5h4a.5 .5 0 0 1 .5 .5v8a.5 .5 0 0 1-.5 .5h-8a.5 .5 0 0 1-.5-.5v-1.5";
+pub const REPLACE: &str = "M2.5 5.5h10M10 3l2.5 2.5L10 8M13.5 10.5h-10M6 8l-2.5 2.5L6 13";
+pub const GO_TO_LINE: &str = "M2.5 3.5h11M2.5 12.5h11M2.5 8h7.5M7.5 5.5L10 8l-2.5 2.5";
+pub const VIEW: &str = "M1.5 8C3.3 5 5.5 3.5 8 3.5S12.7 5 14.5 8c-1.8 3-4 4.5-6.5 4.5S3.3 11 1.5 8zM6 8a2 2 0 1 0 4 0a2 2 0 1 0-4 0z";
+pub const MACRO: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM6.7 5.6l3.8 2.4-3.8 2.4z";
+pub const RECORD: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM6.425 8a1.575 1.575 0 1 0 3.15 0a1.575 1.575 0 1 0-3.15 0z";
+pub const STOP: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM6 6h4v4H6z";
+pub const PLAY: &str = "M4.5 3l8.5 5-8.5 5z";
+pub const PLAY_END: &str = "M3 3.5l7 4.5-7 4.5zM13 3.5v9";
+pub const UNDO: &str = "M3 6.5h6.5a3.5 3.5 0 0 1 0 7H6M5.5 4L3 6.5 5.5 9";
+pub const REDO: &str = "M13 6.5H6.5a3.5 3.5 0 0 0 0 7H10M10.5 4L13 6.5 10.5 9";
+pub const DUPLICATE_LINE: &str = "M2.5 4.5h9M2.5 8h5M11.5 8.5v5M9 11h5";
+pub const DELETE_LINE: &str = "M2.5 4.5h11M2.5 8h5M9.5 9l4 4M13.5 9l-4 4";
+pub const COMMENT: &str = "M7 3L4 13M12 3L9 13";
+pub const UPPERCASE: &str = "M1.5 12.5l3-9 3 9M2.6 9.5h3.8M12 12.5v-9M9.8 5.7L12 3.5l2.2 2.2";
+pub const LOWERCASE: &str = "M6.8 12.5V8.2c0-1.2-.8-2-2.2-2-1 0-1.8.4-2.4 1.1M6.8 9.6H4.6c-1.2 0-2 .6-2 1.5s.7 1.5 1.8 1.5c1 0 1.9-.5 2.4-1.400M12 3.5v9M9.8 10.300L12 12.5l2.2-2.2";
+pub const TRIM: &str = "M2.5 4.5h6M2.5 8h3.5M2.5 11.5h6M14 8H9.5M11.5 6l-2 2 2 2";
+pub const TABS: &str = "M2.5 8h8M8 5.5L10.5 8 8 10.5M13.5 4.5v7";
+pub const BOOKMARK: &str = "M4.5 2.5h7a.5 .5 0 0 1 .5 .5v10.5l-4-3-4 3V3a.5 .5 0 0 1 .5-.5z";
+pub const WRAP: &str = "M2.5 4h11M2.5 8H11a2 2 0 0 1 0 4H8.5M10 10.5L8.5 12l1.5 1.5M2.5 12h3";
+pub const WHITESPACE: &str = "M11.5 2.5H7a3 3 0 0 0 0 6h1.5M8.5 2.5v11M11.5 2.5v11";
+pub const MINIMAP: &str = "M2 2.5h12a.5 .5 0 0 1 .5 .5v10a.5 .5 0 0 1-.5 .5H2a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM10.5 2.5v11M12 5h1M12 7h1M12 9h1";
+pub const SPLIT: &str = "M2 2.5h12a.5 .5 0 0 1 .5 .5v10a.5 .5 0 0 1-.5 .5H2a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM8 2.5v11";
+pub const OTHER_PANE: &str = "M2 2.5h12a.5 .5 0 0 1 .5 .5v10a.5 .5 0 0 1-.5 .5H2a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM8 2.5v11M10 8h3M11.8 6.800L13 8l-1.2 1.2";
+pub const SIDEBAR: &str = "M2 2.5h12a.5 .5 0 0 1 .5 .5v10a.5 .5 0 0 1-.5 .5H2a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM5.5 2.5v11";
+pub const FOLD: &str = "M4 3.5l4 3 4-3M4 12.5l4-3 4 3";
+pub const FOLD_ALL: &str = "M4.5 2.5l3.5 2.7 3.5-2.700M4.5 13.5l3.5-2.7 3.5 2.700M2.5 8h11";
+pub const UNFOLD: &str = "M4 6.5l4-3 4 3M4 9.5l4 3 4-3";
+pub const FUNCTIONS: &str = "M5.5 2.5c-1.2 0-1.8 .600-1.8 1.800v1.900c0 .900-.5 1.5-1.4 1.8 .900 .300 1.4 .900 1.4 1.800v1.900c0 1.2 .600 1.8 1.8 1.800M10.5 2.5c1.2 0 1.8 .600 1.8 1.800v1.900c0 .900 .5 1.5 1.4 1.8-.900 .300-1.4 .900-1.4 1.800v1.900c0 1.2-.600 1.8-1.8 1.8";
+pub const ZOOM_OUT: &str = "M2.5 7a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0-9 0zM10.3 10.3L14 14M5 7h4";
+pub const ZOOM_RESET: &str =
+    "M2.5 7a4.5 4.5 0 1 0 9 0a4.5 4.5 0 1 0-9 0zM10.3 10.3L14 14M5.3 6h3.400M5.3 8h3.4";
+pub const PAGE_NARROW: &str = "M5.5 2.5h5v11h-5zM7.3 6h1.400M7.3 8.5h1.4";
+pub const PAGE_WIDE: &str = "M3.5 2.5h9v11h-9zM5.5 6h5M5.5 8.5h5";
+pub const PAGE_FULL: &str = "M1.5 2.5h13v11h-13zM4 6h8M4 8.5h8";
+pub const GLOBE: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM2 8h12M8 2C6 3.6 5 5.6 5 8s1 4.4 3 6c2-1.6 3-3.6 3-6s-1-4.4-3-6z";
+pub const TASK: &str = "M3 2.5h10a.5 .5 0 0 1 .5 .5v10a.5 .5 0 0 1-.5 .5H3a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM5 8.200l2.2 2.200L11 6";
+pub const ANIMATION: &str = "M2.5 3.5h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zM6.7 5.900l3.6 2.1-3.6 2.100z";
+pub const SLIDERS: &str = "M2.5 4.5h2M8 4.5h5.5M2.5 11.5h5.5M11.5 11.5h2M4.75 4.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0zM8.25 11.5a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0-3 0z";
+pub const FIND_TABS: &str =
+    "M2 4h5M2 8h3M2 12h5M7.75 8.5a2.75 2.75 0 1 0 5.5 0a2.75 2.75 0 1 0-5.5 0zM12.5 10.5l2 2";
+pub const CASE: &str = "M1.5 12l2.7-8 2.7 8M2.5 9.400h3.400M13.5 12V8.5c0-1-.700-1.7-1.9-1.7-.900 0-1.5 .300-2 .900M13.5 9.800h-1.900c-1 0-1.7 .5-1.7 1.200s.600 1.2 1.5 1.2 1.7-.400 2.1-1.1";
+pub const WORD: &str =
+    "M3.5 5.5v-2M12.5 5.5v-2M3.5 3.5h9M2.5 8.5h2M6 8.5h4M11.5 8.5h2M3.5 11v2M12.5 11v2M3.5 13h9";
+pub const REGEX: &str = "M10.5 2.5v6M7.9 4l5.2 3M13.1 4L7.9 7M3.525 12a0.475 0.475 0 1 0 0.95 0a0.475 0.475 0 1 0-0.95 0z";
+pub const EOL: &str = "M12.5 3v5a1.5 1.5 0 0 1-1.5 1.5H4M6.5 7L4 9.5 6.5 12";
+pub const ENCODING: &str = "M4.5 3.5L2 8l2.5 4.5M11.5 3.5L14 8l-2.5 4.5M6.5 10.5l1.5-5 1.5 5M7 9h2";
+pub const BACK: &str = "M13 8H3M7 4L3 8l4 4";
+pub const FORWARD: &str = "M3 8h10M9 4l4 4-4 4";
+pub const EDIT: &str = "M2.5 13.5l.700-3 7.5-7.5a1.3 1.3 0 0 1 1.8 0l.5 .5a1.3 1.3 0 0 1 0 1.800L5.5 12.800zM9.7 4l2.3 2.3";
+
 /// Every icon with its name, for the tests and the specimen sheet.
 pub const ALL: &[(&str, &str)] = &[
     ("DOC", DOC),
@@ -90,4 +147,56 @@ pub const ALL: &[(&str, &str)] = &[
     ("WIN_RESTORE", WIN_RESTORE),
     ("WIN_CLOSE", WIN_CLOSE),
     ("DOWNLOAD", DOWNLOAD),
+    ("CHECK", CHECK),
+    ("NEW_FILE", NEW_FILE),
+    ("SAVE", SAVE),
+    ("SAVE_AS", SAVE_AS),
+    ("CLOSE_ALL", CLOSE_ALL),
+    ("CLOSE_OTHERS", CLOSE_OTHERS),
+    ("REPLACE", REPLACE),
+    ("GO_TO_LINE", GO_TO_LINE),
+    ("VIEW", VIEW),
+    ("MACRO", MACRO),
+    ("RECORD", RECORD),
+    ("STOP", STOP),
+    ("PLAY", PLAY),
+    ("PLAY_END", PLAY_END),
+    ("UNDO", UNDO),
+    ("REDO", REDO),
+    ("DUPLICATE_LINE", DUPLICATE_LINE),
+    ("DELETE_LINE", DELETE_LINE),
+    ("COMMENT", COMMENT),
+    ("UPPERCASE", UPPERCASE),
+    ("LOWERCASE", LOWERCASE),
+    ("TRIM", TRIM),
+    ("TABS", TABS),
+    ("BOOKMARK", BOOKMARK),
+    ("WRAP", WRAP),
+    ("WHITESPACE", WHITESPACE),
+    ("MINIMAP", MINIMAP),
+    ("SPLIT", SPLIT),
+    ("OTHER_PANE", OTHER_PANE),
+    ("SIDEBAR", SIDEBAR),
+    ("FOLD", FOLD),
+    ("FOLD_ALL", FOLD_ALL),
+    ("UNFOLD", UNFOLD),
+    ("FUNCTIONS", FUNCTIONS),
+    ("ZOOM_OUT", ZOOM_OUT),
+    ("ZOOM_RESET", ZOOM_RESET),
+    ("PAGE_NARROW", PAGE_NARROW),
+    ("PAGE_WIDE", PAGE_WIDE),
+    ("PAGE_FULL", PAGE_FULL),
+    ("GLOBE", GLOBE),
+    ("TASK", TASK),
+    ("ANIMATION", ANIMATION),
+    ("SLIDERS", SLIDERS),
+    ("FIND_TABS", FIND_TABS),
+    ("CASE", CASE),
+    ("WORD", WORD),
+    ("REGEX", REGEX),
+    ("EOL", EOL),
+    ("ENCODING", ENCODING),
+    ("BACK", BACK),
+    ("FORWARD", FORWARD),
+    ("EDIT", EDIT),
 ];

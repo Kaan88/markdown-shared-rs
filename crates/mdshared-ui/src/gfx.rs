@@ -626,7 +626,7 @@ mod tests {
     #[ignore]
     fn icon_sheet() {
         let sizes = [8.5, 10.0, 13.0, 15.0, 16.0, 20.0, 32.0];
-        let (cell, cols) = (180.0, 5);
+        let (cell, cols) = (180.0, 6);
         let rows = glyph::ALL.len().div_ceil(cols);
         let themes = [
             (rgb(0xfbfbfb), rgb(0x1f1f1f)),

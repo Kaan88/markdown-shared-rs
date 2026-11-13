@@ -200,7 +200,11 @@ impl<T: Clone> Menu<T> {
             let color = if item.enabled { pal.text } else { pal.faint };
             let mut x = r.x + 9.0;
             if icons {
-                let glyph = if item.checked { "\u{E73E}" } else { item.icon };
+                let glyph = if item.checked {
+                    crate::glyph::CHECK
+                } else {
+                    item.icon
+                };
                 if !glyph.is_empty() {
                     let c = if item.checked {
                         pal.accent
