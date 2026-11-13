@@ -31,6 +31,37 @@ pub fn edge_at(x: f32, y: f32, w: f32, h: f32) -> Option<ResizeDirection> {
     })
 }
 
+/// Gives the window the application's identity on Linux: the Wayland app id and the X11 `WM_CLASS`
+/// (both `name`, which the desktop entry's `StartupWMClass` repeats, so the launcher's icon and
+/// grouping match), and from `icon_png` the X11 window icon (`_NET_WM_ICON`; Wayland takes its icon
+/// from the desktop entry). Call it on the attributes before `create_window`. On Windows and on
+/// other systems the attributes come back unchanged. A PNG that does not decode is ignored.
+#[cfg(target_os = "linux")]
+pub fn identify(
+    attrs: winit::window::WindowAttributes,
+    name: &str,
+    icon_png: Option<&[u8]>,
+) -> winit::window::WindowAttributes {
+    use winit::platform::wayland::WindowAttributesExtWayland;
+    use winit::platform::x11::WindowAttributesExtX11;
+    let mut attrs = WindowAttributesExtWayland::with_name(attrs, name, name);
+    attrs = WindowAttributesExtX11::with_name(attrs, name, name);
+    let icon = icon_png
+        .and_then(mdshared_text::decode_png_rgba)
+        .and_then(|(rgba, w, h)| winit::window::Icon::from_rgba(rgba, w, h).ok());
+    attrs.with_window_icon(icon)
+}
+
+/// See the Linux version: here the attributes are returned as they are.
+#[cfg(not(target_os = "linux"))]
+pub fn identify(
+    attrs: winit::window::WindowAttributes,
+    _name: &str,
+    _icon_png: Option<&[u8]>,
+) -> winit::window::WindowAttributes {
+    attrs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,41 @@
 //! A CPU framebuffer in BGRA order, plus the handful of antialiased shapes the page needs.
 
+/// Decodes a PNG into 8-bit RGBA, top-down: the pixels, the width and the height. `None` for
+/// anything that is not a PNG this can read, or one larger than 4096 px a side.
+pub fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    if info.width == 0 || info.height == 0 || info.width > 4096 || info.height > 4096 {
+        return None;
+    }
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let frame = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(frame.buffer_size());
+    if frame.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let rgba = match frame.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|c| [c[0], c[0], c[0], c[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some((rgba, frame.width, frame.height))
+}
+
 /// Opaque 8-bit BGRA pixels, top-down, stride `width * 4`. Alpha is always 255.
 #[derive(Clone)]
 pub struct Bitmap {
@@ -542,5 +578,29 @@ mod tests {
             reference(&mut slow, x, y, w, h, r, [20, 40, 200]);
             assert_eq!(fast.pixels, slow.pixels, "rect {x},{y} {w}x{h} r {r}");
         }
+    }
+}
+
+#[cfg(test)]
+mod png_tests {
+    use super::*;
+
+    #[test]
+    fn a_png_decodes_to_rgba() {
+        let mut out = Vec::new();
+        {
+            let mut e = png::Encoder::new(&mut out, 2, 1);
+            e.set_color(png::ColorType::Rgb);
+            e.set_depth(png::BitDepth::Eight);
+            e.write_header()
+                .unwrap()
+                .write_image_data(&[1, 2, 3, 4, 5, 6])
+                .unwrap();
+        }
+        assert_eq!(
+            decode_png_rgba(&out),
+            Some((vec![1, 2, 3, 255, 4, 5, 6, 255], 2, 1))
+        );
+        assert_eq!(decode_png_rgba(b"not a png"), None);
     }
 }

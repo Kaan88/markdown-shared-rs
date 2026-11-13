@@ -4,6 +4,6 @@ pub mod bitmap;
 mod fonts;
 pub mod text;
 
-pub use bitmap::Bitmap;
+pub use bitmap::{Bitmap, decode_png_rgba};
 pub use fonts::shared_fonts;
 pub use text::{CacheStats, Subpixel, TextEngine};
