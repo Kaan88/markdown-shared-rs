@@ -35,6 +35,118 @@ pub fn pick_folder(start_dir: Option<&Path>) -> Option<PathBuf> {
     d.pick_folder()
 }
 
+/// Set while a dialog started by one of the `*_async` functions is open.
+static DIALOG_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clears [`DIALOG_OPEN`] when the dialog's thread ends, even by a panic.
+struct DialogGuard;
+
+impl Drop for DialogGuard {
+    fn drop(&mut self) {
+        DIALOG_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a dialog opened by `pick_files_async`, `pick_folder_async` or `pick_save_async` is open.
+pub fn dialog_open() -> bool {
+    DIALOG_OPEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Runs `show` (a blocking dialog) on a helper thread and then `done` with its result, on that
+/// thread: the caller must only post a message to the UI thread from `done`. One dialog at a time:
+/// while one is open, a new request is refused, `done` is called at once on the calling thread with
+/// `empty`, and the result is false. True means the dialog was started. Used off the UI thread
+/// because on Linux a blocking dialog on it makes the window manager flag the window as not
+/// responding; it works the same on every OS.
+fn run_dialog<T: Send + 'static>(
+    empty: T,
+    show: impl FnOnce() -> T + Send + 'static,
+    done: impl FnOnce(T) + Send + 'static,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if DIALOG_OPEN
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        done(empty);
+        return false;
+    }
+    // `done` and `empty` are shared with the thread so they can still be used if it cannot start.
+    let job = std::sync::Arc::new(std::sync::Mutex::new(Some((show, done, empty))));
+    let thread_job = job.clone();
+    let spawned = std::thread::Builder::new()
+        .name("mdshared-dialog".into())
+        .spawn(move || {
+            let _guard = DialogGuard;
+            let taken = thread_job.lock().ok().and_then(|mut j| j.take());
+            if let Some((show, done, _)) = taken {
+                done(show());
+            }
+        });
+    if spawned.is_err() {
+        DIALOG_OPEN.store(false, Ordering::SeqCst);
+        if let Some((_, done, empty)) = job.lock().ok().and_then(|mut j| j.take()) {
+            done(empty);
+        }
+        return false;
+    }
+    true
+}
+
+/// [`pick_files`] without blocking the caller: the dialog runs on a helper thread and `done`
+/// receives the chosen files (empty when cancelled) on that thread. Returns false, with `done`
+/// called at once with an empty list, when another dialog of this family is already open.
+pub fn pick_files_async(
+    start_dir: Option<&Path>,
+    filter_name: &str,
+    extensions: &[&str],
+    done: impl FnOnce(Vec<PathBuf>) + Send + 'static,
+) -> bool {
+    let start = start_dir.map(Path::to_path_buf);
+    let name = filter_name.to_string();
+    let exts: Vec<String> = extensions.iter().map(|e| e.to_string()).collect();
+    run_dialog(
+        Vec::new(),
+        move || {
+            let exts: Vec<&str> = exts.iter().map(String::as_str).collect();
+            pick_files(start.as_deref(), &name, &exts)
+        },
+        done,
+    )
+}
+
+/// [`pick_folder`] without blocking the caller; see [`pick_files_async`].
+pub fn pick_folder_async(
+    start_dir: Option<&Path>,
+    done: impl FnOnce(Option<PathBuf>) + Send + 'static,
+) -> bool {
+    let start = start_dir.map(Path::to_path_buf);
+    run_dialog(None, move || pick_folder(start.as_deref()), done)
+}
+
+/// A Save as dialog opened on `current`'s folder (when it exists) with its file name filled in,
+/// without blocking the caller; `done` gets the chosen path or `None`. See [`pick_files_async`].
+pub fn pick_save_async(
+    current: &Path,
+    done: impl FnOnce(Option<PathBuf>) + Send + 'static,
+) -> bool {
+    let current = current.to_path_buf();
+    run_dialog(
+        None,
+        move || {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(dir) = current.parent().filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(name) = current.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+            dialog.save_file()
+        },
+        done,
+    )
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -481,5 +593,44 @@ mod tests {
             super::imp::select_argument(Path::new("C:/docs/a b/read me.md")),
             "/select,\"C:\\docs\\a b\\read me.md\""
         );
+    }
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// One dialog at a time: a second request is refused with the empty result at once, and a new
+    /// one is accepted after the first closes. The dialog itself is replaced by a channel wait.
+    #[test]
+    fn one_dialog_at_a_time() {
+        let (release, wait) = mpsc::channel::<()>();
+        let (result, got) = mpsc::channel();
+        assert!(run_dialog(
+            0,
+            move || {
+                wait.recv().unwrap();
+                7
+            },
+            move |v| result.send(v).unwrap(),
+        ));
+        assert!(dialog_open());
+        let (refused_tx, refused) = mpsc::channel();
+        assert!(!run_dialog(0, || 9, move |v| refused_tx.send(v).unwrap()));
+        assert_eq!(refused.try_recv(), Ok(0), "done runs at once, empty");
+        release.send(()).unwrap();
+        assert_eq!(got.recv_timeout(Duration::from_secs(5)), Ok(7));
+        for _ in 0..200 {
+            if !dialog_open() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!dialog_open());
+        let (again_tx, again) = mpsc::channel();
+        assert!(run_dialog(0, || 5, move |v| again_tx.send(v).unwrap()));
+        assert_eq!(again.recv_timeout(Duration::from_secs(5)), Ok(5));
     }
 }
