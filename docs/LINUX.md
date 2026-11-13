@@ -47,3 +47,27 @@ mime_types)` and `is_default(name, mime_types)` edit and read `[Default Applicat
 `$XDG_CONFIG_HOME` or `~/.config` `/mimeapps.list`; the apps call them from a menu command.
 `EDITOR_MIME_TYPES` and `VIEWER_MIME_TYPES` are the shared lists. Run: unit tests against a temp
 directory only; `update-desktop-database` was not checked to take effect in a desktop session.
+
+## Window shadow (`mdshared_ui::shadow`)
+
+Written 2026-11-14 on branch `feat/shadow`. An undecorated window gets no shadow from KWin on
+Wayland. `Shadow::attach(&window)` hands KWin eight tiles (premultiplied ARGB8888, black, about 21
+KB in one memfd-backed `wl_shm` pool, 36 px reach, sigma 12, dropped 6 px; peak alpha 0.35, 0.20
+when inactive) through `org_kde_kwin_shadow_manager`, on a private event queue over winit's
+`wl_display` and `wl_surface` (raw handles; winit's queue is never dispatched). KWin draws it, so
+nothing runs per frame. The apps call `Shadow::attach` once after `create_window` and keep the
+`Option<Shadow>`; they call `update(scale, active, maximized)` on `ScaleFactorChanged` and
+`Focused` (it returns at once when scale and focus are unchanged); a maximised window needs nothing,
+KWin hides the shadow itself (seen). The shadow object is leaked, not destroyed, when `Shadow` is
+dropped: the app's state is usually dropped after the event loop, when the `wl_display` is gone,
+and a request then crashes. The compositor removes it with the surface. `MDSHARED_NO_SHADOW=1`
+disables it. `examples/shadow.rs` shows it.
+
+Not available: GNOME (Mutter) and wlroots compositors have no such global, so `attach` returns
+`None` and nothing changes (not tested, no such compositor here). X11 sessions: `None`;
+`_KDE_NET_WM_SHADOW` was tried (property set correctly, checked with xprop) and KWin did not draw
+anything for an Xwayland window, so it was removed. The general route (a transparent margin
+plus `xdg_surface.set_window_geometry`) is not reachable with winit 0.30.13: it keeps the
+`xdg_surface` private and calls `set_window_geometry(0, 0, w, h)` itself on every resize
+(`wayland/window/state.rs`, `reload_state`). Scale factors above 1 are untested: the tiles and
+offsets are rendered in device pixels.
