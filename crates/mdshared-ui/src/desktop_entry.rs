@@ -9,6 +9,47 @@
 //! application is set (no `mimeapps.list`); every failure is silent. Not built into anything on
 //! Windows, where [`ensure`] does nothing.
 
+/// The MIME types the editor opens: text and source files.
+pub const EDITOR_MIME_TYPES: &[&str] = &[
+    "text/plain",
+    "text/x-log",
+    "application/json",
+    "application/xml",
+    "text/xml",
+    "application/x-yaml",
+    "application/toml",
+    "text/csv",
+    "text/markdown",
+    "text/x-rust",
+    "text/x-python",
+    "text/x-csrc",
+    "text/x-chdr",
+    "text/x-c++src",
+    "text/x-c++hdr",
+    "text/x-java",
+    "text/javascript",
+    "application/javascript",
+    "application/typescript",
+    "text/x-go",
+    "text/x-shellscript",
+    "application/x-shellscript",
+    "text/css",
+    "text/html",
+    "text/x-ini",
+    "text/x-cmake",
+    "text/x-lua",
+    "text/x-ruby",
+    "application/x-php",
+    "text/x-sql",
+    "text/x-kotlin",
+    "text/x-swift",
+    "text/x-diff",
+    "text/x-patch",
+];
+
+/// The MIME types the viewer opens: Markdown.
+pub const VIEWER_MIME_TYPES: &[&str] = &["text/markdown", "text/x-markdown"];
+
 /// What the application tells the launcher about itself.
 #[derive(Clone, Copy, Debug)]
 pub struct Spec {
@@ -181,7 +222,169 @@ fn ensure_in(spec: &Spec, appimage: &Path, data_home: &Path) -> std::io::Result<
     // The icon first, so an entry never names an icon that is not there yet.
     write_atomic(&icon, spec.icon_png)?;
     write_atomic(&entry, render(spec, path).as_bytes())?;
+    // So "Open with" lists the application without a logout. Absent or failing: ignored.
+    _ = std::process::Command::new("update-desktop-database")
+        .arg(data_home.join("applications"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     Ok(Outcome::Written)
+}
+
+/// Makes `<name>.desktop` the default application for `mime_types` in the user's `mimeapps.list`
+/// (`$XDG_CONFIG_HOME` or `~/.config`), under `[Default Applications]`. Call it only when the
+/// reader asks; [`ensure`] never does.
+#[cfg(not(windows))]
+pub fn make_default(name: &str, mime_types: &[&str]) -> Result<(), String> {
+    let dir = config_home(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .ok_or("no configuration directory")?;
+    make_default_in(&dir, name, mime_types)
+}
+
+/// Whether `<name>.desktop` is the first default for every one of `mime_types`.
+#[cfg(not(windows))]
+pub fn is_default(name: &str, mime_types: &[&str]) -> bool {
+    config_home(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .is_some_and(|dir| is_default_in(&dir, name, mime_types))
+}
+
+#[cfg(windows)]
+pub fn make_default(_name: &str, _mime_types: &[&str]) -> Result<(), String> {
+    Err("not supported on Windows".to_string())
+}
+
+#[cfg(windows)]
+pub fn is_default(_name: &str, _mime_types: &[&str]) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn config_home(xdg: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let xdg = xdg.map(PathBuf::from).filter(|p| p.is_absolute());
+    xdg.or_else(|| {
+        home.map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|h| h.join(".config"))
+    })
+}
+
+#[cfg(not(windows))]
+const DEFAULTS: &str = "[Default Applications]";
+
+#[cfg(not(windows))]
+fn valid_mime(t: &str) -> bool {
+    !t.is_empty() && !t.contains(['=', ';', '\n', '\r', ' ', '[', ']'])
+}
+
+#[cfg(not(windows))]
+fn valid_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+#[cfg(not(windows))]
+fn make_default_in(config: &Path, name: &str, mime_types: &[&str]) -> Result<(), String> {
+    if !valid_name(name) || !mime_types.iter().all(|t| valid_mime(t)) {
+        return Err("unsafe name or MIME type".to_string());
+    }
+    let path = config.join("mimeapps.list");
+    let old = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.to_string()),
+    };
+    let new = with_defaults(&old, name, mime_types);
+    if new != old {
+        write_atomic(&path, new.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// `old` with the defaults for `mime_types` set to `<name>.desktop`; every other byte kept.
+#[cfg(not(windows))]
+fn with_defaults(old: &str, name: &str, mime_types: &[&str]) -> String {
+    let value = format!("{name}.desktop;");
+    let mut lines: Vec<String> = old.split_inclusive('\n').map(str::to_string).collect();
+    let mut pending: Vec<&str> = mime_types.to_vec();
+    let header = lines.iter().position(|l| l.trim_end() == DEFAULTS);
+    let Some(start) = header else {
+        let mut out = old.to_string();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(DEFAULTS);
+        out.push('\n');
+        for t in mime_types {
+            out.push_str(&format!("{t}={value}\n"));
+        }
+        return out;
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |i| start + 1 + i);
+    for line in &mut lines[start + 1..end] {
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        if let Some(i) = pending.iter().position(|t| *t == key.trim()) {
+            pending.remove(i);
+            let eol = if line.ends_with("\r\n") {
+                "\r\n"
+            } else if line.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            *line = format!("{key}={value}{eol}");
+        }
+    }
+    if !pending.is_empty() {
+        // After the section's last non-blank line, so blank lines before the next section stay.
+        let mut at = end;
+        while at > start + 1 && lines[at - 1].trim().is_empty() {
+            at -= 1;
+        }
+        if at > 0 && !lines[at - 1].ends_with('\n') {
+            lines[at - 1].push('\n');
+        }
+        let added: Vec<String> = pending.iter().map(|t| format!("{t}={value}\n")).collect();
+        lines.splice(at..at, added);
+    }
+    lines.concat()
+}
+
+#[cfg(not(windows))]
+fn is_default_in(config: &Path, name: &str, mime_types: &[&str]) -> bool {
+    let Ok(text) = std::fs::read_to_string(config.join("mimeapps.list")) else {
+        return false;
+    };
+    let want = format!("{name}.desktop");
+    let mut in_defaults = false;
+    let mut found: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_defaults = t == DEFAULTS;
+        } else if in_defaults
+            && let Some((key, value)) = t.split_once('=')
+            && value.split(';').next() == Some(want.as_str())
+        {
+            found.push(key.trim());
+        }
+    }
+    !mime_types.is_empty() && mime_types.iter().all(|t| found.contains(t))
 }
 
 #[cfg(all(test, not(windows)))]
@@ -313,5 +516,77 @@ mod tests {
         );
         assert_eq!(data_home(None, home), Some("/home/u/.local/share".into()));
         assert_eq!(data_home(None, None), None);
+    }
+
+    #[test]
+    fn defaults_in_an_empty_or_missing_file() {
+        let d = dir("def-empty");
+        assert!(!is_default_in(&d, "mdtest", &["text/plain"]));
+        make_default_in(&d, "mdtest", &["text/plain", "text/markdown"]).unwrap();
+        let text = std::fs::read_to_string(d.join("mimeapps.list")).unwrap();
+        assert_eq!(
+            text,
+            "[Default Applications]\ntext/plain=mdtest.desktop;\ntext/markdown=mdtest.desktop;\n"
+        );
+        assert!(is_default_in(
+            &d,
+            "mdtest",
+            &["text/plain", "text/markdown"]
+        ));
+        assert!(!is_default_in(&d, "other", &["text/plain"]));
+        assert!(!is_default_in(&d, "mdtest", &[]));
+        // An existing empty file.
+        std::fs::write(d.join("mimeapps.list"), "").unwrap();
+        make_default_in(&d, "mdtest", &["text/plain"]).unwrap();
+        assert!(is_default_in(&d, "mdtest", &["text/plain"]));
+        _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn defaults_leave_everything_else_as_it_was() {
+        let d = dir("def-other");
+        let before = "# mine\n[Added Associations]\ntext/plain=gedit.desktop;\n\n\
+                      [Default Applications]\nimage/png=viewer.desktop;\n\
+                      text/plain=gedit.desktop;kate.desktop;\n\n[Removed Associations]\nx/y=z.desktop;";
+        std::fs::write(d.join("mimeapps.list"), before).unwrap();
+        make_default_in(&d, "mdtest", &["text/plain", "text/x-log"]).unwrap();
+        let after = std::fs::read_to_string(d.join("mimeapps.list")).unwrap();
+        assert_eq!(
+            after,
+            "# mine\n[Added Associations]\ntext/plain=gedit.desktop;\n\n\
+             [Default Applications]\nimage/png=viewer.desktop;\n\
+             text/plain=mdtest.desktop;\ntext/x-log=mdtest.desktop;\n\n\
+             [Removed Associations]\nx/y=z.desktop;"
+        );
+        assert!(is_default_in(&d, "mdtest", &["text/plain", "text/x-log"]));
+        // The Added Associations entry for the same type is not a default.
+        assert!(!is_default_in(&d, "gedit", &["text/plain"]));
+        // Idempotent: a second call changes no byte.
+        make_default_in(&d, "mdtest", &["text/plain", "text/x-log"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("mimeapps.list")).unwrap(),
+            after
+        );
+        // A file without the section, and without a final newline.
+        std::fs::write(
+            d.join("mimeapps.list"),
+            "[Added Associations]\na/b=c.desktop;",
+        )
+        .unwrap();
+        make_default_in(&d, "mdtest", &["text/plain"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(d.join("mimeapps.list")).unwrap(),
+            "[Added Associations]\na/b=c.desktop;\n\n[Default Applications]\ntext/plain=mdtest.desktop;\n"
+        );
+        assert!(make_default_in(&d, "mdtest", &["bad type"]).is_err());
+        _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_mime_lists_are_well_formed() {
+        for t in EDITOR_MIME_TYPES.iter().chain(VIEWER_MIME_TYPES) {
+            assert!(valid_mime(t) && t.contains('/'), "{t}");
+        }
+        assert_eq!(EDITOR_MIME_TYPES.len(), 34);
     }
 }

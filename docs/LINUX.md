@@ -37,3 +37,13 @@ The viewer's `sans-serif` has the same flaw (DejaVu Sans has a monochrome U+1F60
   desktop entry's `MimeType=`, HiDPI scale (`system_scale` is 1.0), double-click and caret-blink
   settings (fixed values), subpixel order (RGB), `reveal_in_file_manager` (opens the folder).
 - Non-x86_64 Linux: the manifest only has `linux-x86_64`.
+
+## File associations
+
+`desktop_entry::ensure` writes `MimeType=` (semicolon-terminated) and `Exec=... %F`, then runs
+`update-desktop-database <applications dir>` when that program exists (absence and failure ignored),
+so the app shows under "Open with" without a logout. It takes no defaults. `make_default(name,
+mime_types)` and `is_default(name, mime_types)` edit and read `[Default Applications]` in
+`$XDG_CONFIG_HOME` or `~/.config` `/mimeapps.list`; the apps call them from a menu command.
+`EDITOR_MIME_TYPES` and `VIEWER_MIME_TYPES` are the shared lists. Run: unit tests against a temp
+directory only; `update-desktop-database` was not checked to take effect in a desktop session.
