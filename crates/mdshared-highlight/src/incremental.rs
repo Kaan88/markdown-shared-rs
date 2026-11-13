@@ -11,6 +11,7 @@
 //! No threads and no text type: the text is read through [`Lines`], so this module needs no rope.
 
 use super::{scope_color, syntax, syntaxes, theme};
+use crate::scan::{self, Lang};
 use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
@@ -25,6 +26,9 @@ pub enum Language {
     /// TOML, which the bundled set lacks: a line-wise version of the viewer's TOML scanner, its
     /// state being the multi-line string still open.
     Toml,
+    /// Kotlin, Swift, PowerShell or Dockerfile, which the bundled set lacks: a line scanner from
+    /// [`scan`](crate::scan), its state being what it carries from line to line.
+    Scan(Lang),
 }
 
 /// A syntax worth highlighting with: not hidden, and not the plain-text one.
@@ -44,11 +48,17 @@ impl Language {
         if extension.is_some_and(|e| e.eq_ignore_ascii_case("toml")) || name == Some("Cargo.lock") {
             return Some(Language::Toml);
         }
+        if let Some(lang) = Lang::from_path(name, extension) {
+            return Some(Language::Scan(lang));
+        }
         if let Some(found) = extension.and_then(|e| usable(syntax(set, e))) {
             return Some(found);
         }
         if let Some(found) = name.and_then(|n| usable(set.find_syntax_by_extension(n))) {
             return Some(found);
+        }
+        if let Some(lang) = Lang::from_first_line(first_line) {
+            return Some(Language::Scan(lang));
         }
         usable(set.find_syntax_by_first_line(first_line))
     }
@@ -57,6 +67,9 @@ impl Language {
     pub fn by_token(token: &str) -> Option<Language> {
         if token.trim().eq_ignore_ascii_case("toml") {
             return Some(Language::Toml);
+        }
+        if let Some(lang) = Lang::from_token(token) {
+            return Some(Language::Scan(lang));
         }
         usable(syntax(syntaxes(), token))
     }
@@ -67,6 +80,7 @@ impl Language {
         match self {
             Language::Syntax(syntax) => syntax.name.as_str(),
             Language::Toml => "TOML",
+            Language::Scan(lang) => lang.name(),
         }
     }
 
@@ -83,6 +97,7 @@ impl PartialEq for Language {
         match (self, other) {
             (Language::Syntax(a), Language::Syntax(b)) => std::ptr::eq(*a, *b),
             (Language::Toml, Language::Toml) => true,
+            (Language::Scan(a), Language::Scan(b)) => a == b,
             _ => false,
         }
     }
@@ -307,6 +322,7 @@ enum Run {
     Toml {
         open: Option<&'static str>,
     },
+    Scan(scan::State),
 }
 
 impl Run {
@@ -318,6 +334,7 @@ impl Run {
                 hl: None,
             },
             Language::Toml => Run::Toml { open: None },
+            Language::Scan(_) => Run::Scan(scan::State::default()),
         }
     }
 
@@ -330,6 +347,7 @@ impl Run {
                 hl: None,
             },
             Run::Toml { open } => Run::Toml { open: *open },
+            Run::Scan(state) => Run::Scan(state.clone()),
         }
     }
 
@@ -347,6 +365,7 @@ struct Engine {
     max_line_chars: usize,
     highlighter: Highlighter<'static>,
     toml: TomlColors,
+    scan: scan::Colors,
     foreground: [u8; 3],
 }
 
@@ -358,6 +377,7 @@ impl Engine {
             max_line_chars: language.limits().max_line_chars,
             highlighter: Highlighter::new(theme(dark)),
             toml: TomlColors::new(dark),
+            scan: scan::Colors::new(theme(dark)),
             foreground: foreground(dark),
         }
     }
@@ -366,6 +386,7 @@ impl Engine {
         self.dark = dark;
         self.highlighter = Highlighter::new(theme(dark));
         self.toml = TomlColors::new(dark);
+        self.scan = scan::Colors::new(theme(dark));
         self.foreground = foreground(dark);
     }
 
@@ -381,6 +402,13 @@ impl Engine {
             Run::Toml { open } => {
                 let mut scratch = Vec::new();
                 toml_line(&self.toml, buf, open, out.unwrap_or(&mut scratch));
+            }
+            Run::Scan(state) => {
+                let Language::Scan(lang) = self.language else {
+                    return;
+                };
+                let mut scratch = Vec::new();
+                scan::scan_line(lang, &self.scan, buf, state, out.unwrap_or(&mut scratch));
             }
             Run::Syntax { parse, scopes, hl } => {
                 let backup = parse.clone();
@@ -1074,3 +1102,7 @@ mod tests {
         assert_eq!(h.spans(&text, 7..9, far()), Some(Vec::new()));
     }
 }
+
+#[cfg(test)]
+#[path = "incremental_scan_tests.rs"]
+mod scan_tests;

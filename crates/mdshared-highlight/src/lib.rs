@@ -4,11 +4,15 @@
 //!
 //! The bundled set has no TypeScript and no TOML. TypeScript and JSX are read as JavaScript,
 //! which colours their keywords, strings, numbers and comments; TOML has a small scanner here.
-//! Both cost nothing in the binary, which a second syntax dump would.
+//! Both cost nothing in the binary, which a second syntax dump would. Kotlin, Swift, PowerShell
+//! and Dockerfile are missing from the set too, and have line scanners of the same kind in
+//! [`scan`]; their colours are looked up when one of them is first highlighted, so documents that
+//! use none of them pay nothing.
 //!
 //! [`incremental`] is the editor's line-by-line interface over the same set and themes.
 
 pub mod incremental;
+pub mod scan;
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -80,6 +84,9 @@ pub fn tokens(source: &str, language: Option<&str>, dark: bool) -> Option<Vec<To
     if language.trim().eq_ignore_ascii_case("toml") {
         return Some(toml(source, theme));
     }
+    if let Some(lang) = scan::Lang::from_token(language) {
+        return Some(scanned(source, lang, theme));
+    }
     let syntax = syntax(set, language)?;
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut tokens = Vec::new();
@@ -118,6 +125,39 @@ pub fn tokens(source: &str, language: Option<&str>, dark: bool) -> Option<Vec<To
         offset += line.len();
     }
     (offset == source.len()).then_some(tokens)
+}
+
+/// Source in a language with a line scanner in [`scan`]: the scanner's spans per line, shifted to
+/// the source's offsets, with each line break coloured as plain text.
+fn scanned(source: &str, lang: scan::Lang, theme: &Theme) -> Vec<Token> {
+    let colors = scan::Colors::new(theme);
+    let plain = scope_color(theme, "source");
+    let mut state = scan::State::default();
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for line in LinesWithEndings::from(source) {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        spans.clear();
+        scan::scan_line(lang, &colors, text, &mut state, &mut spans);
+        let mut push = |range: Range<usize>, color: [u8; 3]| match tokens.last_mut() {
+            Some(last) if last.color == color && last.range.end == range.start => {
+                last.range.end = range.end;
+            }
+            _ => tokens.push(Token { range, color }),
+        };
+        for span in &spans {
+            push(
+                offset + span.start as usize..offset + span.end as usize,
+                span.color,
+            );
+        }
+        push(offset + text.len()..offset + line.len(), plain);
+        offset += line.len();
+    }
+    tokens.retain(|t| !t.range.is_empty());
+    tokens
 }
 
 /// The theme's colour for a scope such as `comment` or `string`.
