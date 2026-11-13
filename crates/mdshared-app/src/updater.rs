@@ -16,8 +16,6 @@ use crate::update::{self, Download, Platform, UpdateManifest, Version};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Seconds between two automatic looks for a newer version.
-pub const CHECK_EVERY: u64 = 24 * 60 * 60;
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// For every file of a release on a slow line.
 const FILE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -243,11 +241,12 @@ pub fn record_version(app: &App, version: &Version) {
 #[cfg(not(windows))]
 pub fn record_version(_app: &App, _version: &Version) {}
 
-/// True when a launch at `now` (seconds since the Unix epoch) should look for a newer version:
-/// the reader's setting is on, there is a settings file to remember the answer in, and the last
-/// look was [`CHECK_EVERY`] ago or more.
-pub fn check_due(enabled: bool, remembers: bool, last: u64, now: u64) -> bool {
-    enabled && remembers && now.saturating_sub(last) >= CHECK_EVERY
+/// True when a launch should look for a newer version: the reader's setting is on and there is
+/// a settings file to remember it in. Every launch looks. It used to be once a day, and a
+/// release published an hour after a look then stayed unseen until the next day, which read as
+/// the automatic look not working. The times stay in the signature for the callers.
+pub fn check_due(enabled: bool, remembers: bool, _last: u64, _now: u64) -> bool {
+    enabled && remembers
 }
 
 // ---- threads -----------------------------------------------------------------------------------
@@ -683,13 +682,11 @@ mod tests {
     }
 
     #[test]
-    fn a_look_is_due_once_a_day_when_it_can_be_remembered() {
-        let day = CHECK_EVERY;
-        assert!(check_due(true, true, 0, 10 * day), "never looked before");
-        assert!(!check_due(true, true, 10 * day, 11 * day - 1));
-        assert!(check_due(true, true, 10 * day, 11 * day));
-        assert!(!check_due(false, true, 0, 10 * day), "turned off");
-        assert!(!check_due(true, false, 0, 10 * day), "nowhere to remember");
+    fn a_look_is_due_at_every_launch_when_it_can_be_remembered() {
+        assert!(check_due(true, true, 0, 1000), "never looked before");
+        assert!(check_due(true, true, 999, 1000), "looked a second ago");
+        assert!(!check_due(false, true, 0, 1000), "turned off");
+        assert!(!check_due(true, false, 0, 1000), "nowhere to remember");
     }
 
     #[test]
