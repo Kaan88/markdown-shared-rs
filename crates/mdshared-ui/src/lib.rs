@@ -13,6 +13,7 @@ pub mod overlay;
 pub mod pane;
 pub mod platform;
 pub mod scroll;
+pub mod shadow;
 pub mod textfield;
 pub mod theme;
 pub mod tree;

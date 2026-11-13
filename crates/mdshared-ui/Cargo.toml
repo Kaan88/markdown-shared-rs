@@ -35,3 +35,15 @@ rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", 
 # The settings portal, for the system's colour scheme. The same zbus the file dialogs bring in.
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+# The compositor-drawn shadow of undecorated windows (src/shadow.rs). KDE's own protocol: the same
+# crates winit and softbuffer already bring in, here named so the shadow can talk to the
+# compositor on its own event queue.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31.15"
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
