@@ -3,6 +3,7 @@
 //! file watching, and updating the application in place. No window system and no Markdown.
 
 pub mod files;
+pub mod notes;
 pub mod paths;
 pub mod recents;
 pub mod selfupdate;
@@ -11,3 +12,4 @@ pub mod single;
 pub mod update;
 pub mod updater;
 pub mod watch;
+pub mod wikilink;
