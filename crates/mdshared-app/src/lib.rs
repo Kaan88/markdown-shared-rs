@@ -4,6 +4,7 @@
 //! system and no Markdown.
 
 pub mod files;
+pub mod notes;
 pub mod paths;
 pub mod places;
 pub mod recents;
@@ -13,3 +14,4 @@ pub mod single;
 pub mod update;
 pub mod updater;
 pub mod watch;
+pub mod wikilink;
