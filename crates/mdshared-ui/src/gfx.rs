@@ -72,7 +72,13 @@ pub enum Face {
 
 const UI_FAMILY: &str =
     "Segoe UI Variable Text, Segoe UI, Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif";
+#[cfg(windows)]
 const ICON_FAMILY: &str = "Segoe Fluent Icons, Segoe MDL2 Assets";
+/// Elsewhere the icons come from a subset of Fluent UI System Icons (MIT) built into the binary.
+#[cfg(not(windows))]
+const ICON_FAMILY: &str = "FluentSystemIcons-Regular";
+#[cfg(not(windows))]
+static ICON_FONT: &[u8] = include_bytes!("../assets/icons/FluentSystemIcons-subset.ttf");
 
 /// Font contexts, the glyph cache and a cache of laid-out labels. One per window.
 pub struct Gfx {
@@ -94,8 +100,15 @@ impl Gfx {
     pub fn new() -> Gfx {
         let mut engine = TextEngine::new(2 << 20);
         engine.set_subpixel(crate::platform::subpixel_order());
+        #[allow(unused_mut)]
+        let mut fonts = shared_fonts();
+        #[cfg(not(windows))]
+        fonts.collection.register_fonts(
+            parley::fontique::Blob::new(std::sync::Arc::new(ICON_FONT)),
+            None,
+        );
         Gfx {
-            fonts: shared_fonts(),
+            fonts,
             layouts: LayoutContext::new(),
             engine,
             cache: HashMap::new(),

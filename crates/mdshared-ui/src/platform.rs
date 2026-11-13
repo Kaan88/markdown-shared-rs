@@ -341,11 +341,25 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn clipboard_text() -> Option<String> {
-        None
+    use std::sync::Mutex;
+
+    /// One clipboard for the life of the process. On X11 the text is served by the process that
+    /// set it, so dropping the handle after a copy would empty the clipboard.
+    static CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+
+    fn with_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> Option<T>) -> Option<T> {
+        let mut guard = CLIPBOARD.lock().ok()?;
+        if guard.is_none() {
+            *guard = arboard::Clipboard::new().ok();
+        }
+        f(guard.as_mut()?)
     }
-    pub fn set_clipboard_text(_text: &str) -> bool {
-        false
+
+    pub fn clipboard_text() -> Option<String> {
+        with_clipboard(|c| c.get_text().ok())
+    }
+    pub fn set_clipboard_text(text: &str) -> bool {
+        with_clipboard(|c| c.set_text(text).ok()).is_some()
     }
     pub fn open_url(url: &str) -> bool {
         has_safe_scheme(url)

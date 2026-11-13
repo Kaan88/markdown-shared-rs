@@ -30,3 +30,4 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(not(windows))'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
