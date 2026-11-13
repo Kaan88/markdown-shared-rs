@@ -6,6 +6,7 @@
 #[cfg(not(windows))]
 pub mod appimage;
 pub mod files;
+pub mod fuzzy;
 pub mod notes;
 pub mod paths;
 pub mod places;
