@@ -3,6 +3,8 @@
 //! one-window-per-user hand-over, file watching, and updating the application in place. No window
 //! system and no Markdown.
 
+#[cfg(not(windows))]
+pub mod appimage;
 pub mod files;
 pub mod notes;
 pub mod paths;

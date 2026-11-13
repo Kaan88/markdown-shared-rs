@@ -104,6 +104,7 @@ impl Files {
 
 /// This process's executable (and the engine beside it), when this copy can update itself: the
 /// files are there, and the folder is not a cargo build's output.
+#[cfg(windows)]
 pub fn installed_files(app: &App) -> Option<Files> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -127,21 +128,48 @@ pub fn installed_files(app: &App) -> Option<Files> {
     Some(Files { app: exe, engine })
 }
 
+/// The AppImage this process runs from, when this copy can update itself: `$APPIMAGE` names an
+/// existing file whose folder can be written to. The engine, if the application has one, is inside
+/// the AppImage, so there is none to replace. A plain Linux binary updates nothing.
+#[cfg(not(windows))]
+pub fn installed_files(_app: &App) -> Option<Files> {
+    appimage_files(std::env::var_os("APPIMAGE").as_deref())
+}
+
+/// [`installed_files`] given the value of `$APPIMAGE`.
+#[cfg(not(windows))]
+fn appimage_files(value: Option<&std::ffi::OsStr>) -> Option<Files> {
+    let app = crate::appimage::path_from(value)?;
+    crate::appimage::folder_is_writable(app.parent()?).then_some(Files { app, engine: None })
+}
+
 /// Reads a manifest: the offer if it names a version newer than `current` with every file this
 /// application needs for this platform.
 pub fn offer(app: &App, manifest: &[u8], current: &Version) -> Result<Option<Offer>, String> {
-    let manifest = UpdateManifest::parse(manifest).map_err(|e| e.to_string())?;
     let Some(platform) = Platform::current() else {
         return Ok(None);
     };
+    offer_for(app, manifest, current, platform)
+}
+
+/// [`offer`] for a given platform.
+fn offer_for(
+    app: &App,
+    manifest: &[u8],
+    current: &Version,
+    platform: Platform,
+) -> Result<Option<Offer>, String> {
+    let manifest = UpdateManifest::parse(manifest).map_err(|e| e.to_string())?;
     let Some(asset) = update::newer(current, &manifest, platform) else {
         return Ok(None);
     };
-    let engine = match app.engine {
-        // A release without the engine cannot be installed in place; it is not an offer.
-        Some(_) if asset.engine.is_none() => return Ok(None),
-        Some(_) => asset.engine,
-        None => None,
+    let engine = match (app.engine, platform) {
+        // On Linux the engine is inside the AppImage, so the release lists no engine file.
+        (_, Platform::LinuxX64) => None,
+        // On Windows a release without the engine cannot be installed in place; it is not an offer.
+        (Some(_), _) if asset.engine.is_none() => return Ok(None),
+        (Some(_), _) => asset.engine,
+        (None, _) => None,
     };
     Ok(Some(Offer {
         version: manifest.version,
@@ -191,7 +219,15 @@ fn stage_and_swap(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), Stri
                 target.file_name().unwrap_or_default().to_string_lossy()
             ));
         }
-        std::fs::write(selfupdate::staged(target), &bytes).map_err(|e| e.to_string())?;
+        let staged = selfupdate::staged(target);
+        std::fs::write(&staged, &bytes).map_err(|e| e.to_string())?;
+        // An AppImage (or any file written fresh) must be executable once it is swapped in.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| e.to_string())?;
+        }
     }
     selfupdate::swap_in(&files.targets()).map_err(|e| e.to_string())
 }
@@ -496,6 +532,10 @@ mod tests {
         } else {
             "linux-x86_64"
         };
+        manifest_for(p, version, app, engine)
+    }
+
+    fn manifest_for(p: &str, version: &str, app: &[u8], engine: Option<&[u8]>) -> String {
         let mut m = format!(
             "manifest: 1\nversion: {version}\nnotes: Faster.\n{p}.asset: app.exe\n\
              {p}.url: https://example.com/app\n{p}.sha256: {}\n",
@@ -508,6 +548,15 @@ mod tests {
             ));
         }
         m
+    }
+
+    fn win_manifest(version: &str, app: &[u8], engine: Option<&[u8]>) -> String {
+        manifest_for("windows-x86_64", version, app, engine)
+    }
+
+    /// An offer as the Windows build reads a manifest, whatever this test runs on.
+    fn win_offer(app: &App, manifest: &str, current: &Version) -> Result<Option<Offer>, String> {
+        offer_for(app, manifest.as_bytes(), current, Platform::WindowsX64)
     }
 
     fn files(name: &str, engine: bool) -> Files {
@@ -583,26 +632,26 @@ mod tests {
     #[test]
     fn only_a_newer_version_with_every_file_is_an_offer() {
         let current = APP.current_version();
-        let newer = manifest("0.3.0", b"a", Some(b"e"));
-        let o = offer(&APP, newer.as_bytes(), &current).unwrap().unwrap();
+        let newer = win_manifest("0.3.0", b"a", Some(b"e"));
+        let o = win_offer(&APP, &newer, &current).unwrap().unwrap();
         assert_eq!(o.version.to_string(), "0.3.0");
         assert_eq!(o.notes.as_deref(), Some("Faster."));
         assert_eq!(o.app.url, "https://example.com/app");
         assert_eq!(o.engine.unwrap().sha256, sha256_hex(b"e"));
 
         for not_offered in [
-            manifest("0.2.0", b"a", Some(b"e")),
-            manifest("0.1.9", b"a", Some(b"e")),
-            manifest("0.3.0", b"a", None),
+            win_manifest("0.2.0", b"a", Some(b"e")),
+            win_manifest("0.1.9", b"a", Some(b"e")),
+            win_manifest("0.3.0", b"a", None),
         ] {
-            assert_eq!(offer(&APP, not_offered.as_bytes(), &current), Ok(None));
+            assert_eq!(win_offer(&APP, &not_offered, &current), Ok(None));
         }
-        assert!(offer(&APP, b"<html>Not Found</html>", &current).is_err());
+        assert!(win_offer(&APP, "<html>Not Found</html>", &current).is_err());
 
         // An application with one executable needs no engine, and ignores one that is listed.
         for engine in [None, Some(&b"e"[..])] {
-            let m = manifest("0.3.0", b"a", engine);
-            let o = offer(&ALONE, m.as_bytes(), &current).unwrap().unwrap();
+            let m = win_manifest("0.3.0", b"a", engine);
+            let o = win_offer(&ALONE, &m, &current).unwrap().unwrap();
             assert_eq!(o.engine, None);
         }
     }
@@ -611,8 +660,8 @@ mod tests {
     fn install_checks_every_hash_before_anything_is_replaced() {
         let files = files("install", true);
         let engine = files.engine.clone().unwrap();
-        let m = manifest("9.0.0", b"app 2", Some(b"engine 2"));
-        let o = offer(&APP, m.as_bytes(), &APP.current_version())
+        let m = win_manifest("9.0.0", b"app 2", Some(b"engine 2"));
+        let o = win_offer(&APP, &m, &APP.current_version())
             .unwrap()
             .unwrap();
 
@@ -671,6 +720,117 @@ mod tests {
         install(&o, &files, &good).unwrap();
         assert_eq!(*asked.borrow(), 1);
         assert_eq!(read(&files.app), "app 2");
+        _ = std::fs::remove_dir_all(files.app.parent().unwrap());
+    }
+
+    /// A manifest listing both platforms: the Windows one with its engine, the Linux one without.
+    fn both_platforms(version: &str) -> String {
+        format!(
+            "{}{}",
+            win_manifest(version, b"win app", Some(b"win engine")),
+            manifest_for("linux-x86_64", version, b"linux app", None)
+                .lines()
+                .skip(3)
+                .map(|l| format!("{l}\n"))
+                .collect::<String>()
+        )
+    }
+
+    #[test]
+    fn each_platform_picks_its_own_entry_of_a_shared_manifest() {
+        let m = both_platforms("0.3.0");
+        let current = APP.current_version();
+        let win = offer_for(&APP, m.as_bytes(), &current, Platform::WindowsX64);
+        let win = win.unwrap().unwrap();
+        assert_eq!(win.app.sha256, sha256_hex(b"win app"));
+        assert_eq!(win.engine.unwrap().sha256, sha256_hex(b"win engine"));
+        let linux = offer_for(&APP, m.as_bytes(), &current, Platform::LinuxX64);
+        let linux = linux.unwrap().unwrap();
+        assert_eq!(linux.app.sha256, sha256_hex(b"linux app"));
+        assert_eq!(linux.engine, None);
+        // The application with one executable reads the same manifest the same way.
+        let alone = offer_for(&ALONE, m.as_bytes(), &current, Platform::LinuxX64);
+        assert_eq!(alone.unwrap().unwrap().app.sha256, sha256_hex(b"linux app"));
+    }
+
+    #[test]
+    fn a_linux_release_needs_no_engine_key_even_for_an_application_with_an_engine() {
+        let m = manifest_for("linux-x86_64", "0.3.0", b"a", None);
+        let o = offer_for(
+            &APP,
+            m.as_bytes(),
+            &APP.current_version(),
+            Platform::LinuxX64,
+        );
+        let o = o.unwrap().unwrap();
+        assert_eq!(o.engine, None);
+        // Windows still demands it.
+        let w = manifest_for("windows-x86_64", "0.3.0", b"a", None);
+        let w = offer_for(
+            &APP,
+            w.as_bytes(),
+            &APP.current_version(),
+            Platform::WindowsX64,
+        );
+        assert_eq!(w, Ok(None));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn only_an_appimage_in_a_writable_folder_updates_itself() {
+        use std::ffi::OsStr;
+        let files = files("appimage", false);
+        let dir = files.app.parent().unwrap().to_path_buf();
+        let canonical = std::fs::canonicalize(&files.app).unwrap();
+        assert_eq!(
+            appimage_files(Some(files.app.as_os_str())),
+            Some(Files {
+                app: canonical,
+                engine: None
+            })
+        );
+        assert_eq!(appimage_files(None), None);
+        assert_eq!(appimage_files(Some(OsStr::new(""))), None);
+        assert_eq!(appimage_files(Some(dir.as_os_str())), None, "a folder");
+        assert_eq!(appimage_files(Some(dir.join("gone").as_os_str())), None);
+        // A read-only folder: skipped when the tests run as root, which ignores the mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if !crate::appimage::folder_is_writable(&dir) {
+                assert_eq!(appimage_files(Some(files.app.as_os_str())), None);
+            }
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_updated_appimage_is_executable_and_the_leftovers_go() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = files("exec", false);
+        // The old file is not executable here, so the bit must come from the update.
+        std::fs::set_permissions(&files.app, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let m = manifest_for("linux-x86_64", "9.0.0", b"app 2", None);
+        let o = offer_for(
+            &APP,
+            m.as_bytes(),
+            &APP.current_version(),
+            Platform::LinuxX64,
+        );
+        let o = o.unwrap().unwrap();
+        let good = |_: &str, _: usize, _: Duration| Ok(b"app 2".to_vec());
+        install(&o, &files, &good).unwrap();
+        assert_eq!(read(&files.app), "app 2");
+        let mode = std::fs::metadata(&files.app).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        // The old copy waits beside it as `.old`; clean_up removes it.
+        let old = selfupdate::retired(&files.app);
+        assert_eq!(read(&old), "app 1");
+        clean_up(&files);
+        assert!(!old.exists() && !selfupdate::staged(&files.app).exists());
         _ = std::fs::remove_dir_all(files.app.parent().unwrap());
     }
 
