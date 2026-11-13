@@ -297,6 +297,12 @@ impl<T: Clone> Menu<T> {
         moved
     }
 
+    /// Scrolls to the end of the rows at the next placement (for a menu opened already scrolled,
+    /// and for screenshots).
+    pub fn scroll_to_end(&mut self) {
+        self.scroll = f32::MAX;
+    }
+
     /// Whether the menu is taller than the room it was placed in, so that it scrolls.
     pub fn scrolls(&self) -> bool {
         self.content > self.rect.h + 0.5
@@ -420,6 +426,13 @@ mod tests {
         let last = menu.row_rect(19);
         assert_eq!(last.bottom() + PAD, menu.rect().bottom());
         assert!(!menu.scroll_by(1.0));
+        let mut ended = placed(many(20), (700.0, 4.0), area);
+        ended.scroll_to_end();
+        let mut bmp = Bitmap::new(100, 100);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        ended.place_in(&mut p, area);
+        assert_eq!(ended.scroll(), menu.scroll());
         assert!(menu.scroll_by(-1e6));
         assert_eq!(menu.scroll(), 0.0);
         assert!(!menu.scroll_by(-1.0));
