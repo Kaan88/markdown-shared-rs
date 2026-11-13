@@ -1651,9 +1651,10 @@ fn generic(lang: Lang, c: &Colors, line: &str, state: &mut State, p: &mut Painte
                     })
                 } else if word_in(spec.constants, word) {
                     Some(c.constant)
-                } else if word_in(spec.types, word) || (lang == Lang::Zig && zig_int(word)) {
-                    Some(c.type_)
-                } else if ch.is_ascii_uppercase() && !spec.style {
+                } else if word_in(spec.types, word)
+                    || (lang == Lang::Zig && zig_int(word))
+                    || (ch.is_ascii_uppercase() && !spec.style)
+                {
                     Some(c.type_)
                 } else if b.get(end) == Some(&b'(') && !spec.style {
                     Some(c.function)
