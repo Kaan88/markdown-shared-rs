@@ -13,6 +13,9 @@ pub struct Item<T> {
     pub icon: &'static str,
     pub enabled: bool,
     pub checked: bool,
+    /// The item is a toggle or one of a set of choices: its menu keeps room for a check mark
+    /// whether it is on or off, so the rows do not shift between openings.
+    pub checkable: bool,
     pub separator_before: bool,
 }
 
@@ -25,6 +28,7 @@ impl<T> Item<T> {
             icon: "",
             enabled: true,
             checked: false,
+            checkable: false,
             separator_before: false,
         }
     }
@@ -46,6 +50,7 @@ impl<T> Item<T> {
     }
     pub fn checked(mut self, on: bool) -> Self {
         self.checked = on;
+        self.checkable = true;
         self
     }
 }
@@ -74,7 +79,18 @@ pub struct Menu<T> {
     reveal: Option<usize>,
 }
 
+/// The width of the check-mark column in a menu that also has icons.
+const MARK: f32 = 20.0;
+
 impl<T: Clone> Menu<T> {
+    /// Whether the menu has a check-mark column and an icon column.
+    fn columns(&self) -> (bool, bool) {
+        (
+            self.items.iter().any(|i| i.checkable),
+            self.items.iter().any(|i| !i.icon.is_empty()),
+        )
+    }
+
     pub fn new(items: Vec<Item<T>>, x: f32, y: f32, align_right: bool) -> Menu<T> {
         Menu {
             items,
@@ -107,8 +123,9 @@ impl<T: Clone> Menu<T> {
     /// title row, say), with a margin of a few px. The menu never rises above the area; one
     /// taller than the area is as tall as fits and scrolls ([`scroll_by`](Self::scroll_by)).
     pub fn place_in(&mut self, p: &mut Painter, area: Rect) {
-        let icons = self.items.iter().any(|i| !i.icon.is_empty() || i.checked);
-        let lead = if icons { 40.0 } else { 14.0 };
+        let (marks, icons) = self.columns();
+        let lead =
+            if marks || icons { 40.0 } else { 14.0 } + if marks && icons { MARK } else { 0.0 };
         let mut w: f32 = 180.0;
         for item in &self.items {
             let hint = if item.hint.is_empty() {
@@ -179,7 +196,7 @@ impl<T: Clone> Menu<T> {
     /// Places the menu inside `area` ([`place_in`](Self::place_in)) and draws it.
     pub fn draw_in(&mut self, p: &mut Painter, pal: &Palette, area: Rect) {
         self.place_in(p, area);
-        let icons = self.items.iter().any(|i| !i.icon.is_empty() || i.checked);
+        let (marks, icons) = self.columns();
         p.shadow(self.rect, 8.0, pal.dark);
         p.frame(self.rect, 8.0, pal.popup, pal.popup_line);
         let old = p.clip(self.rect);
@@ -199,29 +216,22 @@ impl<T: Clone> Menu<T> {
             }
             let color = if item.enabled { pal.text } else { pal.faint };
             let mut x = r.x + 9.0;
-            if icons {
-                // A checked item keeps its own icon, in the accent colour on a tinted box; one
-                // without an icon shows the check mark.
-                let glyph = if item.checked && item.icon.is_empty() {
-                    crate::glyph::CHECK
-                } else {
-                    item.icon
-                };
-                if item.checked && !item.icon.is_empty() {
-                    let b = Rect::new(r.x + 6.0, r.cy() - 12.0, 24.0, 24.0);
-                    p.rbox_a(b, 5.0, pal.accent, 0.16);
+            if marks || icons {
+                // The check mark has a column of its own before the icons, so an item shows both
+                // what it is and whether it is on. A menu without icons has the mark where the
+                // icons would be.
+                let mut col = r.x + 18.0;
+                if item.checked {
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
                 }
-                if !glyph.is_empty() {
-                    let c = if item.checked {
-                        pal.accent
-                    } else if item.enabled {
-                        pal.muted
-                    } else {
-                        pal.faint
-                    };
-                    p.icon(glyph, 14.0, r.x + 18.0, r.cy(), c);
+                if marks && icons {
+                    col += MARK;
                 }
-                x = r.x + 36.0;
+                if icons && !item.icon.is_empty() {
+                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    p.icon(item.icon, 14.0, col, r.cy(), c);
+                }
+                x = col + 18.0;
             }
             let hint_w = if item.hint.is_empty() {
                 0.0
