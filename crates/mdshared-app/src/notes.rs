@@ -1018,6 +1018,8 @@ mod tests {
             "Another note of the same name. [[notes/Target]]\n",
         );
         let index = d.index();
+        // (file, line, context, section, heading) of each backlink
+        #[allow(clippy::type_complexity)]
         let found: Vec<(&str, u32, &str, Option<&str>, Option<&str>)> = index
             .backlinks(&target, 100)
             .iter()

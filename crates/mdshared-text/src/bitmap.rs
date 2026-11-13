@@ -34,7 +34,7 @@ impl Bitmap {
             .write_header()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut rgb = Vec::with_capacity(self.width as usize * self.height as usize * 3);
-        for c in self.pixels.chunks_exact(4) {
+        for c in self.pixels.as_chunks::<4>().0 {
             rgb.extend_from_slice(&[c[2], c[1], c[0]]);
         }
         writer
@@ -154,6 +154,7 @@ impl Bitmap {
     /// Draws a straight-alpha RGBA image scaled into the rectangle at `(x, y)`: bilinearly, or by
     /// area averaging when it is shrunk below half size on either axis, where bilinear sampling
     /// skips source pixels and turns fine detail into moiré.
+    #[allow(clippy::too_many_arguments)] // a rectangle and a source size: no natural grouping
     pub fn image(
         &mut self,
         rgba: &[u8],
@@ -353,11 +354,11 @@ impl Bitmap {
 fn fill(dst: &mut [u8], rgb: [u8; 3]) {
     let px = [rgb[2], rgb[1], rgb[0], 255];
     let pair = [px[0], px[1], px[2], px[3], px[0], px[1], px[2], px[3]];
-    let mut chunks = dst.chunks_exact_mut(8);
-    for c in &mut chunks {
+    let (pairs, rest) = dst.as_chunks_mut::<8>();
+    for c in pairs {
         c.copy_from_slice(&pair);
     }
-    for c in chunks.into_remainder().chunks_exact_mut(4) {
+    for c in rest.as_chunks_mut::<4>().0 {
         c.copy_from_slice(&px);
     }
 }
@@ -423,11 +424,11 @@ mod tests {
         // filter itself varies by 0.3 / 4.3 of full scale (18 levels); bilinear sampling swings
         // over nearly the whole range.
         let checker = |x: u32, y: u32| {
-            let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+            let v = if (x + y).is_multiple_of(2) { 255 } else { 0 };
             [v, v, v, 255]
         };
         let stripes = |x: u32, _| {
-            let v = if x % 2 == 0 { 255 } else { 0 };
+            let v = if x.is_multiple_of(2) { 255 } else { 0 };
             [v, v, v, 255]
         };
         for (name, size, pattern, most) in [

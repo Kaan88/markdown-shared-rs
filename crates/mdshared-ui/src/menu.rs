@@ -247,3 +247,54 @@ impl<T: Clone> Menu<T> {
             .map(|i| self.items[i].id.clone())
     }
 }
+
+/// Where row `index` of a menu with these `items` sits: its distance below the top of the placed
+/// menu ([`Menu::rect`]) and its height, in logical pixels. A submenu opened beside an item
+/// anchors on this, so no app needs to know the menu's padding, row height or separator gap.
+/// An index past the last item gives the offset a row would have there.
+pub fn row_span<T>(items: &[Item<T>], index: usize) -> (f32, f32) {
+    let mut y = PAD;
+    for (i, item) in items.iter().enumerate() {
+        if item.separator_before {
+            y += SEP;
+        }
+        if i == index {
+            return (y, ROW);
+        }
+        y += ROW;
+    }
+    (y, ROW)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::Gfx;
+    use mdshared_text::Bitmap;
+
+    /// `row_span` is what `place` lays out: every row's top and height, with separators.
+    #[test]
+    fn row_span_is_the_layout_the_menu_places() {
+        let items = vec![
+            Item::new(0u8, "One"),
+            Item::new(1, "Two").sep(),
+            Item::new(2, "Three"),
+            Item::new(3, "Four").sep(),
+            Item::new(4, "Five").sep(),
+        ];
+        let mut menu = Menu::new(items, 30.0, 40.0, false);
+        let mut bmp = Bitmap::new(400, 400);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        menu.place(&mut p, 400.0, 400.0);
+        let top = menu.rect().y;
+        for i in 0..menu.items.len() {
+            let (offset, height) = row_span(&menu.items, i);
+            assert_eq!(top + offset, menu.rows[i].y, "row {i}");
+            assert_eq!(height, menu.rows[i].h, "row {i}");
+        }
+        // The pinned numbers a viewer once copied: 5 px padding, 32 px rows, 9 px before a rule.
+        assert_eq!(row_span(&menu.items, 0), (5.0, 32.0));
+        assert_eq!(row_span(&menu.items, 2), (5.0 + 9.0 + 64.0, 32.0));
+    }
+}

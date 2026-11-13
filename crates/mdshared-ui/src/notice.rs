@@ -8,6 +8,7 @@ use mdshared_app::updater::{App, GO, Stage, Updates};
 
 /// A text button on a bar, its left edge at `x` and centred on `cy`: quiet until hovered, or
 /// filled with the accent when `primary`. Returns its rectangle.
+#[allow(clippy::too_many_arguments)] // a bar-button call: position, label and state flags
 pub fn bar_button(
     p: &mut Painter,
     pal: &Palette,

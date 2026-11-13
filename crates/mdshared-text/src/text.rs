@@ -272,7 +272,7 @@ impl TextEngine {
             Content::Color => (true, image.data.into_boxed_slice()),
             Content::SubpixelMask => {
                 let mut data = Vec::with_capacity((w * h * 3) as usize);
-                for pixel in image.data.chunks_exact(4) {
+                for pixel in image.data.as_chunks::<4>().0 {
                     data.extend_from_slice(&pixel[..3]);
                 }
                 (false, data.into_boxed_slice())
@@ -438,7 +438,12 @@ fn blit(
         let src = &entry.data[so..so + n * bpp];
         let dst = &mut fb.pixels[d0..d0 + n * 4];
         if entry.color {
-            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            for (s, d) in src
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+            {
                 let a = s[3] as u32;
                 if a == 0 {
                     continue;
@@ -450,7 +455,12 @@ fn blit(
                 d[2] = ((s[0] as u32 * a + d[2] as u32 * ia + 127) / 255) as u8;
             }
         } else {
-            for (s, d) in src.chunks_exact(3).zip(dst.chunks_exact_mut(4)) {
+            for (s, d) in src
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+            {
                 if s[0] | s[1] | s[2] == 0 {
                     continue;
                 }
@@ -497,7 +507,7 @@ mod tests {
         let (w, h) = (360u32, layout.height().ceil() as u32 + 30);
         let background = |bm: &mut Bitmap| {
             // A non-uniform background, so a write outside the clip cannot hide.
-            for (i, p) in bm.pixels.chunks_exact_mut(4).enumerate() {
+            for (i, p) in bm.pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 p.copy_from_slice(&[(i * 7) as u8, (i / 3) as u8, 200, 255]);
             }
         };
@@ -603,9 +613,11 @@ mod tests {
         let mut coloured = 0;
         for ((a, b), g) in rgb
             .pixels
-            .chunks_exact(4)
-            .zip(bgr.pixels.chunks_exact(4))
-            .zip(grey.pixels.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(bgr.pixels.as_chunks::<4>().0)
+            .zip(grey.pixels.as_chunks::<4>().0)
         {
             // A grey brush on white: BGR's blue is RGB's red and the other way round.
             assert_eq!([a[2], a[1], a[0]], [b[0], b[1], b[2]]);

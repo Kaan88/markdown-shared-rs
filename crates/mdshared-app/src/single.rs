@@ -153,7 +153,7 @@ mod tests {
         ));
         assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), file);
         assert!(
-            !forward("other-app", &settings, &[file.clone()]),
+            !forward("other-app", &settings, std::slice::from_ref(&file)),
             "another application's name is not accepted"
         );
         assert!(

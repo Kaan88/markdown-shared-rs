@@ -459,7 +459,7 @@ impl Sha256 {
 
     fn block(&mut self, b: &[u8]) {
         let mut w = [0u32; 64];
-        for (i, c) in b.chunks_exact(4).enumerate() {
+        for (i, c) in b.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
         }
         for i in 16..64 {
@@ -510,11 +510,10 @@ impl Sha256 {
             self.block(&b);
             self.buf_len = 0;
         }
-        let mut chunks = data.chunks_exact(64);
-        for c in &mut chunks {
+        let (blocks, rem) = data.as_chunks::<64>();
+        for c in blocks {
             self.block(c);
         }
-        let rem = chunks.remainder();
         self.buf[..rem.len()].copy_from_slice(rem);
         self.buf_len = rem.len();
     }
@@ -528,7 +527,7 @@ impl Sha256 {
         self.update(&pad);
         debug_assert_eq!(self.buf_len, 0);
         let mut out = [0u8; 32];
-        for (o, v) in out.chunks_exact_mut(4).zip(self.h) {
+        for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
             o.copy_from_slice(&v.to_be_bytes());
         }
         out

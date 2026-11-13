@@ -97,6 +97,12 @@ fn key(face: Face, size: f32, color: Rgb, wrap: f32, text: &str) -> u64 {
     h.finish()
 }
 
+impl Default for Gfx {
+    fn default() -> Self {
+        Gfx::new()
+    }
+}
+
 impl Gfx {
     /// UI text follows the system's subpixel order (ClearType's on Windows), read once here.
     pub fn new() -> Gfx {
@@ -270,6 +276,7 @@ impl<'a> Painter<'a> {
         self.rbox_dev(x0, y0, x1, y1, radius * self.scale, c, alpha);
     }
 
+    #[allow(clippy::too_many_arguments)] // drawing call: a rectangle plus style, no natural grouping
     fn rbox_dev(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, rad: f32, c: Rgb, alpha: f32) {
         if x1 <= x0 || y1 <= y0 {
             return;
@@ -472,6 +479,7 @@ impl<'a> Painter<'a> {
 
     /// One line of text starting at `x`, vertically centred on `cy`, elided to `max` logical px.
     /// Returns the width drawn.
+    #[allow(clippy::too_many_arguments)] // drawing call: a rectangle plus style, no natural grouping
     pub fn text(
         &mut self,
         face: Face,
@@ -554,6 +562,7 @@ impl<'a> Painter<'a> {
     }
 
     /// Wrapped text in a column `w` wide starting at `(x, y)`. Returns the height used.
+    #[allow(clippy::too_many_arguments)] // drawing call: a rectangle plus style, no natural grouping
     pub fn paragraph(
         &mut self,
         face: Face,
