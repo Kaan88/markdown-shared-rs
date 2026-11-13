@@ -32,4 +32,6 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(not(windows))'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
+# The settings portal, for the system's colour scheme. The same zbus the file dialogs bring in.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }

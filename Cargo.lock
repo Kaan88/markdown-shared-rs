@@ -1310,6 +1310,7 @@ dependencies = [
  "rfd",
  "windows-sys 0.59.0",
  "winit",
+ "zbus",
  "zeno",
 ]
 

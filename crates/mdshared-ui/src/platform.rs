@@ -487,8 +487,53 @@ mod imp {
             .spawn()
             .is_ok()
     }
+    /// The desktop's colour scheme from the settings portal, cached for a second.
     pub fn system_is_dark() -> bool {
-        false
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, dark)) = *cache
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return dark;
+        }
+        let dark = portal_prefers_dark(Duration::from_millis(500));
+        *cache = Some((Instant::now(), dark));
+        dark
+    }
+
+    /// Reads `org.freedesktop.appearance` `color-scheme` (1 is dark; 0 none, 2 light) from the
+    /// settings portal on a helper thread, giving up after `timeout`: a portal that is not running
+    /// may be started by the bus, and that can take long. False on any failure.
+    pub(super) fn portal_prefers_dark(timeout: Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("mdshared-portal".into())
+            .spawn(move || _ = tx.send(read_color_scheme()));
+        spawned.is_ok() && rx.recv_timeout(timeout).ok().flatten() == Some(1)
+    }
+
+    fn read_color_scheme() -> Option<u32> {
+        use zbus::zvariant::{OwnedValue, Value};
+        let bus = zbus::blocking::Connection::session().ok()?;
+        let call = |method: &str| {
+            bus.call_method(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                Some("org.freedesktop.portal.Settings"),
+                method,
+                &("org.freedesktop.appearance", "color-scheme"),
+            )
+        };
+        // `ReadOne` (portal version 2) answers with the value; the older `Read` wraps it once more.
+        let reply = call("ReadOne").or_else(|_| call("Read")).ok()?;
+        let value: OwnedValue = reply.body().deserialize().ok()?;
+        let mut value: &Value = &value;
+        while let Value::Value(inner) = value {
+            value = inner;
+        }
+        u32::try_from(value).ok()
     }
     pub fn double_click_time() -> Duration {
         Duration::from_millis(500)
@@ -592,6 +637,26 @@ mod tests {
         assert_eq!(
             super::imp::select_argument(Path::new("C:/docs/a b/read me.md")),
             "/select,\"C:\\docs\\a b\\read me.md\""
+        );
+    }
+}
+
+/// The portal read with a given time limit, for the test: false on any failure, never a hang.
+#[cfg(all(test, not(windows)))]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn the_portal_answer_is_a_bool_within_the_time_limit() {
+        let start = std::time::Instant::now();
+        let dark = imp::portal_prefers_dark(Duration::from_millis(500));
+        let took = start.elapsed();
+        println!("portal says dark: {dark}, in {took:?}");
+        assert!(took < Duration::from_millis(900));
+        // Asking again through the cached entry point agrees.
+        assert_eq!(
+            system_is_dark(),
+            imp::portal_prefers_dark(Duration::from_millis(500))
         );
     }
 }
