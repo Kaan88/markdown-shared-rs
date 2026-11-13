@@ -59,6 +59,8 @@ pub struct Menu<T> {
     /// Where the menu hangs from: its top-left corner, or its top-right when `align_right`.
     anchor: (f32, f32),
     align_right: bool,
+    /// The anchor is the menu's bottom edge, not its top.
+    above: bool,
     pub hover: Option<usize>,
     rect: Rect,
     rows: Vec<Rect>,
@@ -70,10 +72,18 @@ impl<T: Clone> Menu<T> {
             items,
             anchor: (x, y),
             align_right,
+            above: false,
             hover: None,
             rect: Rect::default(),
             rows: Vec::new(),
         }
+    }
+
+    /// Makes the menu stand on its anchor: `y` is its bottom edge, for a menu opened from the
+    /// bottom of a window.
+    pub fn above(mut self) -> Self {
+        self.above = true;
+        self
     }
 
     /// Places the menu inside a `width` x `height` window. Called by `draw`; call it before to
@@ -102,7 +112,11 @@ impl<T: Clone> Menu<T> {
         } else {
             self.anchor.0
         };
-        let mut y = self.anchor.1;
+        let mut y = if self.above {
+            (self.anchor.1 - h).max(4.0)
+        } else {
+            self.anchor.1
+        };
         x = x.min(width - w - 4.0).max(4.0);
         if y + h > height - 4.0 {
             y = (height - h - 4.0).max(4.0);
