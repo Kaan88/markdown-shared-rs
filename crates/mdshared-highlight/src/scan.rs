@@ -1,4 +1,5 @@
-//! Hand-written line scanners for Kotlin, Swift, PowerShell and Dockerfile, which syntect's
+//! Hand-written line scanners for Kotlin, Swift, PowerShell, Dockerfile, TypeScript, Dart, Zig,
+//! SCSS, Less, INI and CMake, which syntect's
 //! bundled set lacks. Like the TOML scanner they cost no binary size beyond their own code (a
 //! second syntax dump would) and nothing at start-up: the colours are looked up when a block in
 //! one of these languages is first highlighted.
@@ -21,6 +22,13 @@ pub enum Lang {
     Swift,
     PowerShell,
     Dockerfile,
+    TypeScript,
+    Dart,
+    Zig,
+    Scss,
+    Less,
+    Ini,
+    CMake,
 }
 
 impl Lang {
@@ -37,6 +45,28 @@ impl Lang {
             Some(Lang::PowerShell)
         } else if is(&["dockerfile", "docker", "containerfile"]) {
             Some(Lang::Dockerfile)
+        } else if is(&["typescript", "ts", "tsx", "mts", "cts"]) {
+            Some(Lang::TypeScript)
+        } else if is(&["dart"]) {
+            Some(Lang::Dart)
+        } else if is(&["zig"]) {
+            Some(Lang::Zig)
+        } else if is(&["scss"]) {
+            Some(Lang::Scss)
+        } else if is(&["less"]) {
+            Some(Lang::Less)
+        } else if is(&[
+            "ini",
+            "cfg",
+            "conf",
+            "env",
+            "dotenv",
+            "editorconfig",
+            "gitconfig",
+        ]) {
+            Some(Lang::Ini)
+        } else if is(&["cmake"]) {
+            Some(Lang::CMake)
         } else {
             None
         }
@@ -47,6 +77,16 @@ impl Lang {
     pub fn from_path(name: Option<&str>, extension: Option<&str>) -> Option<Lang> {
         if let Some(name) = name {
             let lower = name.to_ascii_lowercase();
+            if lower == "cmakelists.txt" {
+                return Some(Lang::CMake);
+            }
+            if lower == ".env"
+                || lower.starts_with(".env.")
+                || lower == ".editorconfig"
+                || lower == ".gitconfig"
+            {
+                return Some(Lang::Ini);
+            }
             for base in ["dockerfile", "containerfile"] {
                 if lower == base || lower.starts_with(&format!("{base}.")) {
                     return Some(Lang::Dockerfile);
@@ -69,6 +109,13 @@ impl Lang {
             Lang::Swift => "Swift",
             Lang::PowerShell => "PowerShell",
             Lang::Dockerfile => "Dockerfile",
+            Lang::TypeScript => "TypeScript",
+            Lang::Dart => "Dart",
+            Lang::Zig => "Zig",
+            Lang::Scss => "SCSS",
+            Lang::Less => "Less",
+            Lang::Ini => "INI",
+            Lang::CMake => "CMake",
         }
     }
 }
@@ -178,6 +225,11 @@ pub(crate) fn scan_line(
         Lang::Kotlin | Lang::Swift => cfamily(lang, colors, line, state, &mut p),
         Lang::PowerShell => powershell(colors, line, state, &mut p),
         Lang::Dockerfile => dockerfile(colors, line, state, &mut p),
+        Lang::Ini => ini(colors, line, &mut p),
+        Lang::CMake => cmake(colors, line, &mut p),
+        Lang::TypeScript | Lang::Dart | Lang::Zig | Lang::Scss | Lang::Less => {
+            generic(lang, colors, line, state, &mut p)
+        }
     }
     p.fill(line.len(), colors.plain);
 }
@@ -1206,3 +1258,599 @@ fn docker_variable_end(b: &[u8], i: usize) -> usize {
 #[cfg(test)]
 #[path = "scan_tests.rs"]
 mod tests;
+
+// ---------------------------------------------------------------------------------------------
+// TypeScript, Dart, Zig, SCSS and Less: one scanner with a table per language
+
+struct Spec {
+    keywords: &'static [&'static str],
+    types: &'static [&'static str],
+    constants: &'static [&'static str],
+    block_comment: bool,
+    /// `'` strings, `` ` `` strings, triple-quoted strings, `$name` variables and `#rrggbb`
+    /// colours (SCSS and Less), Zig's `\\` lines.
+    single: bool,
+    backtick: bool,
+    triple: bool,
+    style: bool,
+    zig_lines: bool,
+    fn_words: &'static [&'static str],
+    type_words: &'static [&'static str],
+}
+
+const TS_SPEC: Spec = Spec {
+    keywords: &[
+        "abstract",
+        "accessor",
+        "as",
+        "asserts",
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "constructor",
+        "continue",
+        "debugger",
+        "declare",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "from",
+        "function",
+        "get",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "infer",
+        "instanceof",
+        "interface",
+        "is",
+        "keyof",
+        "let",
+        "module",
+        "namespace",
+        "new",
+        "of",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "return",
+        "satisfies",
+        "set",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "try",
+        "type",
+        "typeof",
+        "unique",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    ],
+    types: &[
+        "string", "number", "boolean", "any", "unknown", "never", "object", "symbol", "bigint",
+    ],
+    constants: &["true", "false", "null", "undefined", "NaN", "Infinity"],
+    block_comment: true,
+    single: true,
+    backtick: true,
+    triple: false,
+    style: false,
+    zig_lines: false,
+    fn_words: &["function"],
+    type_words: &["class", "interface", "enum", "type", "namespace"],
+};
+
+const DART_SPEC: Spec = Spec {
+    keywords: &[
+        "abstract",
+        "as",
+        "assert",
+        "async",
+        "await",
+        "base",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "covariant",
+        "default",
+        "deferred",
+        "do",
+        "dynamic",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "extension",
+        "external",
+        "factory",
+        "final",
+        "finally",
+        "for",
+        "Function",
+        "get",
+        "hide",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "interface",
+        "is",
+        "late",
+        "library",
+        "mixin",
+        "new",
+        "on",
+        "operator",
+        "part",
+        "required",
+        "rethrow",
+        "return",
+        "sealed",
+        "set",
+        "show",
+        "static",
+        "super",
+        "switch",
+        "sync",
+        "this",
+        "throw",
+        "try",
+        "typedef",
+        "var",
+        "when",
+        "while",
+        "with",
+        "yield",
+    ],
+    types: &["int", "double", "num", "bool", "void"],
+    constants: &["true", "false", "null"],
+    block_comment: true,
+    single: true,
+    backtick: false,
+    triple: true,
+    style: false,
+    zig_lines: false,
+    fn_words: &[],
+    type_words: &["class", "enum", "mixin", "typedef", "extension"],
+};
+
+const ZIG_SPEC: Spec = Spec {
+    keywords: &[
+        "addrspace",
+        "align",
+        "allowzero",
+        "and",
+        "anyframe",
+        "anytype",
+        "asm",
+        "async",
+        "await",
+        "break",
+        "callconv",
+        "catch",
+        "comptime",
+        "const",
+        "continue",
+        "defer",
+        "else",
+        "enum",
+        "errdefer",
+        "error",
+        "export",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "inline",
+        "linksection",
+        "noalias",
+        "noinline",
+        "nosuspend",
+        "opaque",
+        "or",
+        "orelse",
+        "packed",
+        "pub",
+        "resume",
+        "return",
+        "struct",
+        "suspend",
+        "switch",
+        "test",
+        "threadlocal",
+        "try",
+        "union",
+        "unreachable",
+        "usingnamespace",
+        "var",
+        "volatile",
+        "while",
+    ],
+    types: &[
+        "usize",
+        "isize",
+        "bool",
+        "void",
+        "type",
+        "anyerror",
+        "noreturn",
+        "f16",
+        "f32",
+        "f64",
+        "f128",
+        "c_int",
+        "c_uint",
+        "c_long",
+        "c_char",
+        "anyopaque",
+    ],
+    constants: &["true", "false", "null", "undefined"],
+    block_comment: false,
+    single: true,
+    backtick: false,
+    triple: false,
+    style: false,
+    zig_lines: true,
+    fn_words: &["fn"],
+    type_words: &[],
+};
+
+const STYLE_SPEC: Spec = Spec {
+    keywords: &[],
+    types: &[],
+    constants: &["true", "false", "null", "auto", "inherit", "none"],
+    block_comment: true,
+    single: true,
+    backtick: false,
+    triple: false,
+    style: true,
+    zig_lines: false,
+    fn_words: &[],
+    type_words: &[],
+};
+
+/// Zig's integer types: `i` or `u` and digits.
+fn zig_int(word: &str) -> bool {
+    let b = word.as_bytes();
+    b.len() > 1 && matches!(b[0], b'i' | b'u') && b[1..].iter().all(u8::is_ascii_digit)
+}
+
+fn generic(lang: Lang, c: &Colors, line: &str, state: &mut State, p: &mut Painter) {
+    let spec = match lang {
+        Lang::TypeScript => &TS_SPEC,
+        Lang::Dart => &DART_SPEC,
+        Lang::Zig => &ZIG_SPEC,
+        _ => &STYLE_SPEC,
+    };
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    match *state {
+        State::Block(_) => match find(b, 0, b"*/") {
+            Some(k) => {
+                p.paint(0, k + 2, c.comment);
+                *state = State::Normal;
+                i = k + 2;
+            }
+            None => {
+                p.paint(0, n, c.comment);
+                i = n;
+            }
+        },
+        State::Str { hashes } => {
+            let (end, closed) = quoted(c, b, 0, hashes & 0x7f, hashes & 0x80 != 0, true, p);
+            i = end;
+            if closed {
+                *state = State::Normal;
+            }
+        }
+        _ => *state = State::Normal,
+    }
+    let mut pending = Pending::None;
+    while i < n {
+        let ch = b[i];
+        match ch {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                p.paint(i, n, c.comment);
+                i = n;
+            }
+            b'/' if spec.block_comment && b.get(i + 1) == Some(&b'*') => {
+                match find(b, i + 2, b"*/") {
+                    Some(k) => {
+                        p.paint(i, k + 2, c.comment);
+                        i = k + 2;
+                    }
+                    None => {
+                        p.paint(i, n, c.comment);
+                        *state = State::Block(1);
+                        i = n;
+                    }
+                }
+            }
+            b'\\' if spec.zig_lines && b.get(i + 1) == Some(&b'\\') => {
+                p.paint(i, n, c.string);
+                i = n;
+            }
+            b'"' | b'\'' | b'`'
+                if ch == b'"' || (ch == b'\'' && spec.single) || (ch == b'`' && spec.backtick) =>
+            {
+                let triple = spec.triple && b[i..].starts_with(&[ch, ch, ch]);
+                let (end, closed) = quoted(c, b, i, ch, triple, false, p);
+                if !closed && (triple || ch == b'`') {
+                    *state = State::Str {
+                        hashes: ch | if triple { 0x80 } else { 0 },
+                    };
+                }
+                i = end;
+                pending = Pending::None;
+            }
+            b'@' if b.get(i + 1).is_some_and(|x| ident_start(*x)) => {
+                let end = ident_end(b, i + 1);
+                p.paint(i, end, c.annotation);
+                i = end;
+            }
+            b'$' if spec.style && b.get(i + 1).is_some_and(|x| ident_start(*x)) => {
+                let end = ident_end(b, i + 1);
+                p.paint(i, end, c.variable);
+                i = end;
+            }
+            b'#' if spec.style => {
+                let end = ident_end(b, i + 1);
+                if matches!(end - i - 1, 3 | 4 | 6 | 8)
+                    && b[i + 1..end].iter().all(u8::is_ascii_hexdigit)
+                {
+                    p.paint(i, end, c.number);
+                }
+                i = end.max(i + 1);
+            }
+            b'0'..=b'9' => {
+                let end = number_end(b, i);
+                p.paint(i, end, c.number);
+                i = end;
+                pending = Pending::None;
+            }
+            _ if ident_start(ch) => {
+                let end = ident_end(b, i);
+                let word = &line[i..end];
+                let declares = if word_in(spec.fn_words, word) {
+                    Pending::Function
+                } else if word_in(spec.type_words, word) {
+                    Pending::Type
+                } else {
+                    Pending::None
+                };
+                let color = if word_in(spec.keywords, word) {
+                    Some(c.keyword)
+                } else if declares == Pending::None && pending != Pending::None {
+                    Some(if pending == Pending::Function {
+                        c.function
+                    } else {
+                        c.type_
+                    })
+                } else if word_in(spec.constants, word) {
+                    Some(c.constant)
+                } else if word_in(spec.types, word) || (lang == Lang::Zig && zig_int(word)) {
+                    Some(c.type_)
+                } else if ch.is_ascii_uppercase() && !spec.style {
+                    Some(c.type_)
+                } else if b.get(end) == Some(&b'(') && !spec.style {
+                    Some(c.function)
+                } else {
+                    None
+                };
+                if let Some(color) = color {
+                    p.paint(i, end, color);
+                }
+                pending = declares;
+                i = end;
+            }
+            _ => {
+                i += 1;
+                pending = Pending::None;
+            }
+        }
+    }
+}
+
+/// A string literal with escapes painted apart, from its opening quote(s) at `start`, or from
+/// `start` inside it when `inside` (the continuation of a multi-line one). Returns where it
+/// stopped and whether it closed.
+fn quoted(
+    c: &Colors,
+    b: &[u8],
+    start: usize,
+    quote: u8,
+    triple: bool,
+    inside: bool,
+    p: &mut Painter,
+) -> (usize, bool) {
+    let n = b.len();
+    let width = if triple { 3 } else { 1 };
+    let mut seg = start;
+    let mut j = if inside { start } else { start + width };
+    while j < n {
+        if b[j] == b'\\' {
+            p.paint(seg, j, c.string);
+            let end = (j + 1 + char_len(b, j + 1)).min(n);
+            p.paint(j, end, c.escape);
+            j = end;
+            seg = end;
+            continue;
+        }
+        if b[j] == quote && (!triple || b[j..].starts_with(&[quote, quote, quote])) {
+            let end = j + width;
+            p.paint(seg, end, c.string);
+            return (end, true);
+        }
+        j += 1;
+    }
+    p.paint(seg, n, c.string);
+    (n, false)
+}
+
+// ---------------------------------------------------------------------------------------------
+// INI, .env and conf files
+
+fn ini(c: &Colors, line: &str, p: &mut Painter) {
+    let b = line.as_bytes();
+    let n = b.len();
+    let blank = |x: &u8| matches!(x, b' ' | b'\t');
+    let i = b.iter().position(|x| !blank(x)).unwrap_or(n);
+    if i >= n {
+        return;
+    }
+    if matches!(b[i], b';' | b'#') {
+        p.paint(i, n, c.comment);
+        return;
+    }
+    if b[i] == b'[' {
+        let end = b[i..]
+            .iter()
+            .position(|x| *x == b']')
+            .map_or(n, |k| i + k + 1);
+        p.paint(i, end, c.type_);
+        return;
+    }
+    let Some(eq) = b[i..]
+        .iter()
+        .position(|x| matches!(x, b'=' | b':'))
+        .map(|k| i + k)
+    else {
+        return;
+    };
+    let mut key = i;
+    if line[i..].starts_with("export ") {
+        p.paint(i, i + 6, c.keyword);
+        key = i + 7;
+    }
+    if key <= eq {
+        p.paint(key, key + line[key..eq].trim_end().len(), c.variable);
+    }
+    let v = eq
+        + 1
+        + b[eq + 1..]
+            .iter()
+            .position(|x| !blank(x))
+            .unwrap_or(n - eq - 1);
+    if v >= n {
+        return;
+    }
+    let value = line[v..].trim_end();
+    let end = v + value.len();
+    if matches!(b[v], b'"' | b'\'') {
+        p.paint(v, end, c.string);
+    } else if b[v].is_ascii_digit()
+        && value
+            .bytes()
+            .all(|x| x.is_ascii_alphanumeric() || matches!(x, b'.' | b'_' | b'-'))
+    {
+        p.paint(v, end, c.number);
+    } else if word_in_nocase(
+        &["true", "false", "yes", "no", "on", "off", "null", "none"],
+        value,
+    ) {
+        p.paint(v, end, c.constant);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// CMake
+
+fn cmake(c: &Colors, line: &str, p: &mut Painter) {
+    const CONTROL: &[&str] = &[
+        "if",
+        "elseif",
+        "else",
+        "endif",
+        "foreach",
+        "endforeach",
+        "while",
+        "endwhile",
+        "function",
+        "endfunction",
+        "macro",
+        "endmacro",
+        "return",
+        "break",
+        "continue",
+        "block",
+        "endblock",
+    ];
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        let ch = b[i];
+        match ch {
+            b'#' => {
+                p.paint(i, n, c.comment);
+                i = n;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < n && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                let end = (j + 1).min(n);
+                p.paint(i, end, c.string);
+                i = end;
+            }
+            b'$' if line[i..].starts_with("${") || line[i..].starts_with("$ENV{") => {
+                let open = i + line[i..].find('{').unwrap_or(1) + 1;
+                let (end, _) = close_group(b, open, b'{', b'}');
+                p.paint(i, end, c.variable);
+                i = end;
+            }
+            b'0'..=b'9' => {
+                let end = number_end(b, i);
+                p.paint(i, end, c.number);
+                i = end;
+            }
+            _ if ident_start(ch) => {
+                let end = ident_end(b, i);
+                let word = &line[i..end];
+                let call = b.get(end) == Some(&b'(');
+                let color = if call && word_in_nocase(CONTROL, word) {
+                    Some(c.keyword)
+                } else if call {
+                    Some(c.function)
+                } else if word.len() > 1
+                    && word
+                        .bytes()
+                        .all(|x| x.is_ascii_uppercase() || x == b'_' || x.is_ascii_digit())
+                {
+                    Some(c.constant)
+                } else {
+                    None
+                };
+                if let Some(color) = color {
+                    p.paint(i, end, color);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+}

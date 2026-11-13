@@ -90,8 +90,18 @@ impl Language {
     pub fn line_comment(self) -> Option<&'static str> {
         let name = match self {
             Language::Toml => return Some("#"),
-            Language::Scan(Lang::Kotlin | Lang::Swift) => return Some("//"),
-            Language::Scan(Lang::PowerShell | Lang::Dockerfile) => return Some("#"),
+            Language::Scan(
+                Lang::Kotlin
+                | Lang::Swift
+                | Lang::TypeScript
+                | Lang::Dart
+                | Lang::Zig
+                | Lang::Scss
+                | Lang::Less,
+            ) => return Some("//"),
+            Language::Scan(Lang::PowerShell | Lang::Dockerfile | Lang::Ini | Lang::CMake) => {
+                return Some("#");
+            }
             Language::Syntax(syntax) => syntax.name.as_str(),
         };
         Some(match name {
@@ -1125,8 +1135,11 @@ mod tests {
         assert_eq!(find("Cargo.toml", ""), Some(Language::Toml));
         assert_eq!(find("Cargo.lock", ""), Some(Language::Toml));
         assert_eq!(find("a.TOML", ""), Some(Language::Toml));
-        for ts in ["x.ts", "x.tsx", "x.jsx", "x.mjs", "x.cjs", "x.js"] {
-            assert_eq!(find(ts, "").unwrap().name(), "JavaScript", "{ts}");
+        for js in ["x.jsx", "x.mjs", "x.cjs", "x.js"] {
+            assert_eq!(find(js, "").unwrap().name(), "JavaScript", "{js}");
+        }
+        for ts in ["x.ts", "x.tsx"] {
+            assert_eq!(find(ts, "").unwrap().name(), "TypeScript", "{ts}");
         }
         assert_eq!(find("script.py", "").unwrap().name(), "Python");
         let bash = find("deploy", "#!/bin/bash").unwrap();
@@ -1143,7 +1156,8 @@ mod tests {
         assert_eq!(Language::Toml.limits(), Limits::CODE);
         assert_eq!(find("a.md", "").unwrap().limits(), Limits::MARKDOWN);
         assert_eq!(find("a.rs", "").unwrap().limits(), Limits::CODE);
-        assert_eq!(Language::by_token("ts"), Language::by_token("js"));
+        assert_eq!(Language::by_token("ts").unwrap().name(), "TypeScript");
+        assert_eq!(Language::by_token("jsx"), Language::by_token("js"));
         assert_eq!(Language::by_token("TOML"), Some(Language::Toml));
         assert_eq!(Language::by_token("nope"), None);
         assert_eq!(Language::by_token("text"), None);

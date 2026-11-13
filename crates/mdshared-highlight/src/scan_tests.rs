@@ -249,6 +249,17 @@ fn hostile_input_is_scanned_in_linear_time() {
     let mb = 1 << 20;
     let cases: Vec<(&str, String)> = vec![
         ("kotlin", format!("val s = \"{}", "${".repeat(mb / 2))),
+        ("typescript", format!("let s = `{}", "${".repeat(mb / 2))),
+        ("typescript", "/*".repeat(mb / 2)),
+        ("typescript", "'".repeat(mb)),
+        ("typescript", format!("s = \"{}", "\\".repeat(mb))),
+        ("dart", "'''".repeat(mb / 2)),
+        ("zig", "@".repeat(mb)),
+        ("scss", "#fff$a@".repeat(mb / 7)),
+        ("ini", "[a=:".repeat(mb / 4)),
+        ("ini", "export ".repeat(mb / 7)),
+        ("cmake", "${".repeat(mb / 2)),
+        ("cmake", "$ENV{(".repeat(mb / 6)),
         (
             "kotlin",
             format!("val s = \"\"\"{}", "${x}$".repeat(mb / 5)),
@@ -356,4 +367,109 @@ fn names_and_aliases_resolve() {
         Some(Lang::PowerShell)
     );
     assert_eq!(Lang::from_first_line("#!/bin/sh"), None);
+}
+
+#[test]
+fn more_languages_are_found_by_file_name_and_coloured() {
+    use crate::incremental::Language;
+    let cases: [(&str, &str, &[&str], &[&str]); 8] = [
+        (
+            "a.ts",
+            "import { x } from \"y\"; // c\ninterface User { name: string }\n@Component()\nexport class App<T> { readonly n = 0x1F; s = `a\n  b`; t = 1 }\nconst v = true\n",
+            &[
+                "import",
+                "\"y\"",
+                "// c",
+                "interface",
+                "User",
+                "string",
+                "@Component",
+                "export",
+                "readonly",
+                "0x1F",
+                "`a",
+                "b`",
+                "true",
+            ],
+            &["x }"],
+        ),
+        (
+            "a.tsx",
+            "export function App(): JSX.Element { return null }\n",
+            &["export", "function", "App", "null"],
+            &[],
+        ),
+        (
+            "a.dart",
+            "import 'dart:io';\n/* c */\nclass Foo extends Bar { final int n = 3; String s = '''a\nb'''; }\n",
+            &[
+                "import",
+                "'dart:io'",
+                "/* c */",
+                "class",
+                "Foo",
+                "final",
+                "int",
+                "3",
+                "'''a",
+                "b'''",
+            ],
+            &[],
+        ),
+        (
+            "a.zig",
+            "const std = @import(\"std\");\n// c\npub fn main() !void { var x: u32 = 5; }\n\\\\raw line\n",
+            &[
+                "const", "@import", "\"std\"", "// c", "pub", "main", "u32", "5", "\\\\raw",
+            ],
+            &[],
+        ),
+        (
+            "a.scss",
+            "$c: #fff; // c\n/* b */\n.a { color: $c; margin: 10px; @include m; }\n",
+            &["$c", "#fff", "// c", "/* b */", "10px", "@include"],
+            &[".a"],
+        ),
+        (
+            "a.less",
+            "@w: 10px; // c\n.a { width: @w }\n",
+            &["@w", "// c", "10px"],
+            &[],
+        ),
+        (
+            "a.ini",
+            "; c\n[core]\nname = \"x\"\nn = 12\nflag = true\n",
+            &["; c", "[core]", "name", "\"x\"", "12", "true"],
+            &["= \"x\""],
+        ),
+        (
+            "CMakeLists.txt",
+            "# c\nproject(demo)\nif(WIN32)\n  set(X \"a${B}\" 1)\nendif()\nfind_package(Foo REQUIRED)\n",
+            &[
+                "# c", "project", "if", "set", "\"a", "${B}", "1", "REQUIRED",
+            ],
+            &[],
+        ),
+    ];
+    for (file, source, coloured, plain_needles) in cases {
+        let lang =
+            Language::for_path(std::path::Path::new(file), "").unwrap_or_else(|| panic!("{file}"));
+        assert!(matches!(lang, Language::Scan(_)), "{file}");
+        let token = lang.name().to_ascii_lowercase();
+        check(&token, source, coloured, plain_needles);
+        assert!(lang.line_comment().is_some(), "{file}");
+    }
+    for (file, name) in [
+        ("a.mts", "TypeScript"),
+        ("a.cts", "TypeScript"),
+        ("a.cfg", "INI"),
+        ("a.conf", "INI"),
+        (".env", "INI"),
+        (".env.local", "INI"),
+        ("a.cmake", "CMake"),
+    ] {
+        let lang =
+            Language::for_path(std::path::Path::new(file), "").unwrap_or_else(|| panic!("{file}"));
+        assert_eq!(lang.name(), name, "{file}");
+    }
 }
