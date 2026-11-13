@@ -84,6 +84,34 @@ impl Language {
         }
     }
 
+    /// What starts a comment that runs to the end of the line ("//", "#"), for an editor's
+    /// toggle-comment command. `None` for a language that has only block comments (HTML, CSS,
+    /// Markdown), none at all (JSON), or is not in the table.
+    pub fn line_comment(self) -> Option<&'static str> {
+        let name = match self {
+            Language::Toml => return Some("#"),
+            Language::Syntax(syntax) => syntax.name.as_str(),
+        };
+        Some(match name {
+            "Rust" | "C" | "C++" | "C#" | "Java" | "JavaScript" | "Go" | "D" | "Objective-C"
+            | "Objective-C++" | "Scala" | "PHP" | "Groovy" | "ActionScript" | "Pascal"
+            | "Graphviz (DOT)" => "//",
+            "Python"
+            | "Ruby"
+            | "Bourne Again Shell (bash)"
+            | "Perl"
+            | "R"
+            | "YAML"
+            | "Makefile"
+            | "Tcl" => "#",
+            "SQL" | "Lua" | "Haskell" => "--",
+            "Lisp" | "Clojure" => ";",
+            "LaTeX" | "TeX" | "Erlang" | "MATLAB" => "%",
+            "Batch File" => "REM",
+            _ => return None,
+        })
+    }
+
     pub fn limits(self) -> Limits {
         match self {
             Language::Syntax(syntax) if syntax.name == "Markdown" => Limits::MARKDOWN,
@@ -765,6 +793,73 @@ mod tests {
                 );
             }
             offset += line.len() + 1;
+        }
+    }
+
+    #[test]
+    fn line_comments_by_language() {
+        let of =
+            |file: &str| Language::for_path(Path::new(file), "").and_then(Language::line_comment);
+        assert_eq!(of("a.rs"), Some("//"));
+        assert_eq!(of("a.c"), Some("//"));
+        assert_eq!(of("a.js"), Some("//"));
+        assert_eq!(of("a.ts"), Some("//"));
+        assert_eq!(of("a.py"), Some("#"));
+        assert_eq!(of("a.sh"), Some("#"));
+        assert_eq!(of("a.yaml"), Some("#"));
+        assert_eq!(of("Cargo.toml"), Some("#"));
+        assert_eq!(of("Makefile"), Some("#"));
+        assert_eq!(of("a.sql"), Some("--"));
+        assert_eq!(of("a.lua"), Some("--"));
+        assert_eq!(of("a.bat"), Some("REM"));
+        assert_eq!(of("a.tex"), Some("%"));
+        // Block comments only, or none.
+        assert_eq!(of("a.html"), None);
+        assert_eq!(of("a.css"), None);
+        assert_eq!(of("a.md"), None);
+        assert_eq!(of("a.json"), None);
+        // Every name in the table is a syntax of the bundled set.
+        for token in [
+            "Rust",
+            "C",
+            "C++",
+            "C#",
+            "Java",
+            "JavaScript",
+            "Go",
+            "D",
+            "Objective-C",
+            "Objective-C++",
+            "Scala",
+            "PHP",
+            "Groovy",
+            "ActionScript",
+            "Pascal",
+            "Graphviz (DOT)",
+            "Python",
+            "Ruby",
+            "Bourne Again Shell (bash)",
+            "Perl",
+            "R",
+            "YAML",
+            "Makefile",
+            "Tcl",
+            "SQL",
+            "Lua",
+            "Haskell",
+            "Lisp",
+            "Clojure",
+            "LaTeX",
+            "TeX",
+            "Erlang",
+            "MATLAB",
+            "Batch File",
+        ] {
+            let found = syntaxes().find_syntax_by_name(token).map(Language::Syntax);
+            assert!(
+                found.and_then(Language::line_comment).is_some(),
+                "{token} is not a bundled syntax"
+            );
         }
     }
 
