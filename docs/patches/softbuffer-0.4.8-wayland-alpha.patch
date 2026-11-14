@@ -1,0 +1,157 @@
+diff -ruN a/src/backend_dispatch.rs b/src/backend_dispatch.rs
+--- a/src/backend_dispatch.rs	2026-11-14 04:03:12.502850327 +0300
++++ b/src/backend_dispatch.rs	2026-11-14 04:03:12.506236521 +0300
+@@ -117,6 +117,15 @@
+                 }
+             }
+ 
++            fn set_premultiplied_alpha(&mut self, on: bool) -> bool {
++                match self {
++                    $(
++                        $(#[$attr])*
++                        Self::$name(inner) => inner.set_premultiplied_alpha(on),
++                    )*
++                }
++            }
++
+             fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+                 match self {
+                     $(
+diff -ruN a/src/backend_interface.rs b/src/backend_interface.rs
+--- a/src/backend_interface.rs	2026-11-14 04:03:12.502850327 +0300
++++ b/src/backend_interface.rs	2026-11-14 04:03:12.506236521 +0300
+@@ -29,6 +29,12 @@
+     /// Get a mutable reference to the buffer.
+     fn buffer_mut(&mut self) -> Result<Self::Buffer<'_>, SoftBufferError>;
+     /// Fetch the buffer from the window.
++    /// Ask for buffers whose alpha channel is honoured (premultiplied). Only Wayland does
++    /// anything; returns whether alpha is honoured now.
++    fn set_premultiplied_alpha(&mut self, _on: bool) -> bool {
++        false
++    }
++
+     fn fetch(&mut self) -> Result<Vec<u32>, SoftBufferError> {
+         Err(SoftBufferError::Unimplemented)
+     }
+diff -ruN a/src/backends/wayland/buffer.rs b/src/backends/wayland/buffer.rs
+--- a/src/backends/wayland/buffer.rs	2026-11-14 04:03:12.502996831 +0300
++++ b/src/backends/wayland/buffer.rs	2026-11-14 04:03:12.506369550 +0300
+@@ -78,11 +78,26 @@
+     pub width: i32,
+     pub height: i32,
+     released: Arc<AtomicBool>,
++    argb: bool,
+     pub age: u8,
+ }
+ 
++fn format(argb: bool) -> wl_shm::Format {
++    if argb {
++        wl_shm::Format::Argb8888
++    } else {
++        wl_shm::Format::Xrgb8888
++    }
++}
++
+ impl WaylandBuffer {
+-    pub fn new(shm: &wl_shm::WlShm, width: i32, height: i32, qh: &QueueHandle<State>) -> Self {
++    pub fn new(
++        shm: &wl_shm::WlShm,
++        width: i32,
++        height: i32,
++        qh: &QueueHandle<State>,
++        argb: bool,
++    ) -> Self {
+         // Calculate size to use for shm pool
+         let pool_size = get_pool_size(width, height);
+ 
+@@ -99,12 +114,13 @@
+             width,
+             height,
+             width * 4,
+-            wl_shm::Format::Xrgb8888,
++            format(argb),
+             qh,
+             released.clone(),
+         );
+ 
+         Self {
++            argb,
+             qh: qh.clone(),
+             map,
+             tempfile,
+@@ -139,7 +155,7 @@
+                 width,
+                 height,
+                 width * 4,
+-                wl_shm::Format::Xrgb8888,
++                format(self.argb),
+                 &self.qh,
+                 self.released.clone(),
+             );
+diff -ruN a/src/backends/wayland/mod.rs b/src/backends/wayland/mod.rs
+--- a/src/backends/wayland/mod.rs	2026-11-14 04:03:12.502996831 +0300
++++ b/src/backends/wayland/mod.rs	2026-11-14 04:03:12.506369550 +0300
+@@ -81,6 +81,7 @@
+     surface: Option<wl_surface::WlSurface>,
+     buffers: Option<(WaylandBuffer, WaylandBuffer)>,
+     size: Option<(NonZeroI32, NonZeroI32)>,
++    argb: bool,
+ 
+     /// The pointer to the window object.
+     ///
+@@ -178,6 +179,7 @@
+             surface: Some(surface),
+             buffers: Default::default(),
+             size: None,
++            argb: false,
+             window_handle: window,
+         })
+     }
+@@ -187,6 +189,15 @@
+         &self.window_handle
+     }
+ 
++    fn set_premultiplied_alpha(&mut self, on: bool) -> bool {
++        if self.argb != on {
++            self.argb = on;
++            // The buffers are created with the format: start over.
++            self.buffers = None;
++        }
++        self.argb
++    }
++
+     fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> Result<(), SoftBufferError> {
+         self.size = Some(
+             (|| {
+@@ -232,12 +243,14 @@
+                     width.get(),
+                     height.get(),
+                     &self.display.qh,
++                    self.argb,
+                 ),
+                 WaylandBuffer::new(
+                     &self.display.shm,
+                     width.get(),
+                     height.get(),
+                     &self.display.qh,
++                    self.argb,
+                 ),
+             ));
+         };
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-14 04:03:12.502996831 +0300
++++ b/src/lib.rs	2026-11-14 04:03:12.506817071 +0300
+@@ -115,6 +115,13 @@
+         self.surface_impl.resize(width, height)
+     }
+ 
++    /// Wayland only (a no-op returning `false` elsewhere): from the next [`Surface::buffer_mut`]
++    /// on, the buffer is premultiplied ARGB8888 instead of XRGB8888, so the alpha byte of every
++    /// pixel is honoured (0xFF for opaque). Needs a transparent window to be useful.
++    pub fn set_premultiplied_alpha(&mut self, on: bool) -> bool {
++        self.surface_impl.set_premultiplied_alpha(on)
++    }
++
+     /// Copies the window contents into a buffer.
+     ///
+     /// ## Platform Dependent Behavior

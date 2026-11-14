@@ -1,29 +1,40 @@
-//! A drop shadow behind an undecorated window, drawn by the compositor.
+//! A drop shadow behind an undecorated window.
 //!
 //! On Windows `with_undecorated_shadow(true)` does it. On Linux a window without server-side
-//! decorations gets no shadow, so it looks pasted onto what is behind it. KDE's KWin has a
-//! protocol for exactly this: the client hands over eight small shadow images (four edges, four
-//! corners) and four offsets, and KWin draws them outside the window, for the window's whole life,
-//! without the client painting anything. [`Shadow::attach`] does that on Wayland
-//! (`org_kde_kwin_shadow_manager`). Where the compositor lacks that global (GNOME's Mutter,
-//! wlroots compositors) and on X11 sessions it returns `None` and nothing changes.
+//! decorations gets no shadow, so it looks pasted onto what is behind it. [`Shadow::attach`] is the
+//! one entry point and picks a route:
+//!
+//! 1. **client** (Wayland, any compositor; feature `client-margin`): the window is the inner
+//!    rectangle of a larger transparent surface and the app paints the shadow into the margin
+//!    ([`Shadow::paint`]). Needs the patched winit and softbuffer, see `docs/LINUX.md`.
+//! 2. **kwin** (Wayland on KDE): KWin's `org_kde_kwin_shadow_manager`: eight small tiles handed to
+//!    the compositor, which draws them outside the window. Nothing for the app to paint.
+//! 3. **x11** (X11 and Xwayland; feature `client-margin`): the same margin, announced with
+//!    `_GTK_FRAME_EXTENTS`; the compositor treats it as an invisible frame.
+//! 4. nothing: `attach` returns `None` and the window is as it was.
+//!
+//! The client routes make the surface bigger than the window by [`Shadow::margin`] on every side
+//! while the window is in a normal state; maximized, fullscreen or tiled the margin is 0 and the
+//! surface is the window. The app's checklist (transparent window, buffer sizes, where to call
+//! [`Shadow::paint`], pointer mapping, minimum size) is in `docs/LINUX.md`.
 //!
 //! Where the apps call it:
 //!
-//! 1. Once after `create_window`: `let shadow = Shadow::attach(&window);` and keep the `Option`
-//!    in the app for the window's life (dropping it removes the shadow).
-//! 2. `if let Some(s) = &mut shadow { s.update(scale, active, maximized) }` on
-//!    `WindowEvent::ScaleFactorChanged`, on `WindowEvent::Focused` (the shadow is lighter while the
-//!    window is inactive), and after a maximise or un-maximise (`window.is_maximized()`).
-//!    `update` does nothing when nothing it depends on changed, so it is cheap to call often.
-//! 3. A shadow set here takes effect at the surface's next commit; the apps' next `present` is
-//!    that commit, `update` itself requests no redraw.
+//! 1. `Shadow::prepare(attributes, mode)` on the window attributes (turns on transparency when a
+//!    client route may be used), then `Shadow::attach_mode(&window, mode)` (or `attach`) once after
+//!    `create_window`; keep the `Option` for the window's life.
+//! 2. `shadow.update(&window, scale, active)` on `Resized`, `ScaleFactorChanged` and `Focused`;
+//!    it returns `true` when the margin or look changed (redraw then).
+//! 3. In the redraw: allocate the buffer at `window.inner_size()` (the SURFACE), render the content
+//!    at [`Shadow::content_size`], copy it to [`Shadow::content_origin`], and call
+//!    [`Shadow::paint_frame`] with the buffer's age.
 //!
-//! Nothing runs per frame: the shadow lives in the compositor. On other systems `Shadow` is an
-//! empty stub whose `attach` returns `None`, so the call sites need no `cfg`.
+//! On other systems `Shadow` is an empty stub whose `attach` returns `None`, so the call sites
+//! need no `cfg`.
 
 #[cfg(target_os = "linux")]
 use winit::window::Window;
+use winit::window::WindowAttributes;
 
 /// Where the shadow reaches beyond the window, in logical px, and how it is shaped.
 pub const EXTENT: f64 = 36.0;
@@ -122,55 +133,348 @@ pub fn render(scale: f64, active: bool) -> Tiles {
     }
 }
 
+mod client;
+pub use client::takes_input;
+
 #[cfg(target_os = "linux")]
 mod wl;
+#[cfg(all(target_os = "linux", feature = "client-margin"))]
+mod x11;
 
-/// The shadow of one window. Dropping it removes the shadow.
+/// Logical px outside the content that still take pointer input on the client route (the winit
+/// patch's input region), so an edge resize can start just outside the visible window.
+pub const RESIZE_BAND: u32 = 6;
+
+/// Which route [`Shadow::attach_mode`] may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Client-drawn margin where the patched winit is in use, else KWin's protocol, else nothing.
+    #[default]
+    Auto,
+    /// Only the client-drawn margin (Wayland or X11).
+    Client,
+    /// Only KWin's shadow protocol.
+    Kwin,
+    /// No shadow.
+    None,
+}
+
+impl Mode {
+    /// `MD_SHADOW=client|kwin|none|auto` (anything else: auto).
+    pub fn from_env() -> Mode {
+        match std::env::var("MD_SHADOW").as_deref() {
+            Ok("client") => Mode::Client,
+            Ok("kwin") => Mode::Kwin,
+            Ok("none") => Mode::None,
+            _ => Mode::Auto,
+        }
+    }
+}
+
+/// Whether this build can use the client-drawn margin (feature `client-margin`, which the apps turn
+/// on together with the patched winit and softbuffer).
+pub const CLIENT_ROUTE_BUILT: bool = cfg!(all(target_os = "linux", feature = "client-margin"));
+
+/// The shadow of one window. Dropping it removes the KWin shadow; the client margin stays with the
+/// window (keep the `Shadow` for the window's life).
 #[cfg(target_os = "linux")]
 pub struct Shadow {
-    inner: wl::Inner,
+    route: Route,
     scale: f64,
     active: bool,
+    /// The margin in force, device px (client routes; 0 when maximized, tiled, fullscreen).
+    margin: u32,
+    painter: Option<client::Painter>,
+    gate: client::Gate,
+}
+
+#[cfg(target_os = "linux")]
+enum Route {
+    Kwin(wl::Inner),
+    #[cfg(feature = "client-margin")]
+    ClientWayland,
+    #[cfg(feature = "client-margin")]
+    ClientX11(Box<x11::Inner>),
+}
+
+/// The resize band in device px.
+#[cfg(target_os = "linux")]
+fn band(scale: f64) -> u32 {
+    (RESIZE_BAND as f64 * scale).ceil() as u32
 }
 
 #[cfg(target_os = "linux")]
 impl Shadow {
-    /// Attaches a shadow to `window` if the compositor can draw one, `None` otherwise (no
-    /// compositor support, `MDSHARED_NO_SHADOW` set, or any failure on the way).
+    /// Window attributes for a window that will get a shadow under `mode`: when a client route may
+    /// be used the window is transparent (the margin shows through) and a logical `with_inner_size`
+    /// (the CONTENT size the app wants) is grown by the margin, because on the client route the
+    /// initial size is a surface size (X11: not grown). Min/max sizes stay content sizes.
+    /// Otherwise unchanged.
+    pub fn prepare(
+        mut attributes: WindowAttributes,
+        mode: Mode,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> WindowAttributes {
+        if CLIENT_ROUTE_BUILT && matches!(mode, Mode::Auto | Mode::Client) {
+            // Only Wayland takes the initial size as the surface; on X11 the window manager
+            // treats it as the frame (seen on KWin), so it is left alone there.
+            use winit::platform::wayland::ActiveEventLoopExtWayland;
+            if event_loop.is_wayland()
+                && let Some(winit::dpi::Size::Logical(l)) = attributes.inner_size
+            {
+                attributes.inner_size = Some(winit::dpi::Size::Logical(
+                    winit::dpi::LogicalSize::new(l.width + 2.0 * EXTENT, l.height + 2.0 * EXTENT),
+                ));
+            }
+            attributes.with_transparent(true)
+        } else {
+            attributes
+        }
+    }
+
+    /// Attaches a shadow to `window` by the best route, `None` if there is none (no compositor
+    /// support, `MDSHARED_NO_SHADOW` set, or any failure on the way). `MD_SHADOW` picks a route.
     pub fn attach(window: &Window) -> Option<Shadow> {
-        if std::env::var_os("MDSHARED_NO_SHADOW").is_some() {
+        Shadow::attach_mode(window, Mode::from_env())
+    }
+
+    /// [`Shadow::attach`] restricted to one route.
+    pub fn attach_mode(window: &Window, mode: Mode) -> Option<Shadow> {
+        if std::env::var_os("MDSHARED_NO_SHADOW").is_some() || mode == Mode::None {
             return None;
         }
         let scale = window.scale_factor();
+        #[cfg(feature = "client-margin")]
+        if matches!(mode, Mode::Auto | Mode::Client)
+            && let Some(s) = Shadow::attach_client(window, scale)
+        {
+            return Some(s);
+        }
+        if mode == Mode::Client {
+            return None;
+        }
         let inner = wl::Inner::attach(window, scale, true)?;
         Some(Shadow {
-            inner,
+            route: Route::Kwin(inner),
             scale,
             active: true,
+            margin: 0,
+            painter: None,
+            gate: client::Gate::default(),
         })
     }
 
-    /// Brings the shadow in line with the window: re-renders when the scale factor or the focus
-    /// changed. `maximized` is accepted so the call sites pass everything they know;
-    /// see [`Shadow::attach`] and the docs for what the compositor does with it.
-    pub fn update(&mut self, scale: f64, active: bool, maximized: bool) {
-        let _ = maximized;
-        if (scale - self.scale).abs() < 1e-6 && active == self.active {
+    #[cfg(feature = "client-margin")]
+    fn attach_client(window: &Window, scale: f64) -> Option<Shadow> {
+        use winit::platform::wayland::WindowExtWayland;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let route = match window.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Wayland(_) => {
+                window.set_content_margin(EXTENT as u32);
+                Route::ClientWayland
+            }
+            RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_) => {
+                let inner = x11::Inner::attach(window)?;
+                let size = window.inner_size();
+                inner.set(
+                    (EXTENT * scale).ceil() as u32,
+                    band(scale),
+                    size.width,
+                    size.height,
+                );
+                Route::ClientX11(Box::new(inner))
+            }
+            _ => return None,
+        };
+        let mut s = Shadow {
+            route,
+            scale,
+            active: true,
+            margin: 0,
+            painter: Some(client::Painter::new(scale, true)),
+            gate: client::Gate::default(),
+        };
+        s.margin = s.margin_now(window);
+        Some(s)
+    }
+
+    /// The margin in force, device px, read from the window.
+    #[cfg_attr(not(feature = "client-margin"), allow(unused_variables))]
+    fn margin_now(&self, window: &Window) -> u32 {
+        match self.route {
+            #[cfg(feature = "client-margin")]
+            Route::ClientWayland => {
+                use winit::platform::wayland::WindowExtWayland;
+                match window.content_margin_now() {
+                    0 => 0,
+                    l => self
+                        .painter
+                        .as_ref()
+                        .map_or(0, |p| p.m.min((l as f64 * self.scale).ceil() as u32)),
+                }
+            }
+            // X11: the extents are announced once and the window manager keeps the margin even
+            // maximized (the frame is the inner rectangle, the margin lies off screen).
+            #[cfg(feature = "client-margin")]
+            Route::ClientX11(_) => self.painter.as_ref().map_or(0, |p| p.m),
+            Route::Kwin(_) => 0,
+        }
+    }
+
+    /// Brings the shadow in line with the window; call on `Resized`, `ScaleFactorChanged` and
+    /// `Focused` (cheap when nothing changed). Re-renders the tiles for a new scale or focus and
+    /// re-reads the margin in force (it is 0 while maximized, fullscreen or tiled). Returns `true`
+    /// when something the app draws changed: the margin, the scale, or the focus look. Redraw then.
+    pub fn update(&mut self, window: &Window, scale: f64, active: bool) -> bool {
+        let look = (scale - self.scale).abs() >= 1e-6 || active != self.active;
+        if look {
+            self.scale = scale;
+            self.active = active;
+            match &mut self.route {
+                Route::Kwin(w) => w.set(scale, active),
+                #[cfg(feature = "client-margin")]
+                Route::ClientWayland => self.painter = Some(client::Painter::new(scale, active)),
+                #[cfg(feature = "client-margin")]
+                Route::ClientX11(_) => self.painter = Some(client::Painter::new(scale, active)),
+            }
+            self.gate.invalidate();
+        }
+        let margin = self.margin_now(window);
+        #[cfg(feature = "client-margin")]
+        if let Route::ClientX11(x) = &self.route {
+            // The extents and the input shape follow the window's size and scale.
+            let size = window.inner_size();
+            x.set(margin, band(scale), size.width, size.height);
+        }
+        let moved = margin != self.margin;
+        self.margin = margin;
+        if moved {
+            self.gate.invalidate();
+        }
+        // The KWin route draws nothing in the app: nothing for it to redraw.
+        look && self.painter.is_some() || moved
+    }
+
+    /// Which route this is, for logging: `"client"`, `"client-x11"` or `"kwin"`.
+    pub fn kind(&self) -> &'static str {
+        match self.route {
+            Route::Kwin(_) => "kwin",
+            #[cfg(feature = "client-margin")]
+            Route::ClientWayland => "client",
+            #[cfg(feature = "client-margin")]
+            Route::ClientX11(_) => "client-x11",
+        }
+    }
+
+    /// Bytes of tile memory kept (the client route) or handed to the compositor (KWin).
+    pub fn bytes(&self) -> usize {
+        match &self.route {
+            Route::Kwin(w) => w.bytes(),
+            #[cfg(feature = "client-margin")]
+            Route::ClientWayland | Route::ClientX11(_) => {
+                self.painter.as_ref().map_or(0, |p| p.bytes())
+            }
+        }
+    }
+
+    /// Whether the app must give the window an alpha channel: the client routes. With the patched
+    /// softbuffer: `surface.set_premultiplied_alpha(shadow.wants_alpha())`; the content must then
+    /// be written with alpha `0xFF`.
+    pub fn wants_alpha(&self) -> bool {
+        !matches!(self.route, Route::Kwin(_))
+    }
+
+    /// Sets the window's minimum CONTENT size, in logical px, by what the route needs: on
+    /// Wayland the patched winit already counts min/max sizes as content, on X11 the window
+    /// manager sees the whole window so the margin is added; the other routes pass it through.
+    pub fn set_min_content_size(&self, window: &Window, size: winit::dpi::LogicalSize<f64>) {
+        #[cfg(feature = "client-margin")]
+        if matches!(self.route, Route::ClientX11(_)) {
+            window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(
+                size.width + 2.0 * EXTENT,
+                size.height + 2.0 * EXTENT,
+            )));
             return;
         }
-        self.scale = scale;
-        self.active = active;
-        self.inner.set(scale, active);
+        window.set_min_inner_size(Some(size));
     }
 
-    /// Which kind of shadow this is, for logging: `"wayland"` currently always `"wayland"`.
-    pub fn kind(&self) -> &'static str {
-        self.inner.kind()
+    /// The margin in force, in device px: the shadow's reach on every side while the window is in
+    /// a normal state, 0 when maximized, fullscreen or tiled (the surface is the window then) and
+    /// on the KWin route. As of the last [`Shadow::update`].
+    pub fn margin(&self) -> u32 {
+        self.margin
     }
 
-    /// Bytes of tile memory handed to the compositor.
-    pub fn bytes(&self) -> usize {
-        self.inner.bytes()
+    /// Where the content rectangle starts in the surface buffer, device px: `(margin, margin)`.
+    pub fn content_origin(&self) -> (u32, u32) {
+        (self.margin, self.margin)
+    }
+
+    /// The content size inside a surface of `surface_w` x `surface_h` device px (never 0).
+    pub fn content_size(&self, surface_w: u32, surface_h: u32) -> (u32, u32) {
+        let m2 = self.margin * 2;
+        (
+            surface_w.saturating_sub(m2).max(1),
+            surface_h.saturating_sub(m2).max(1),
+        )
+    }
+
+    /// The surface size for a content of `content_w` x `content_h` device px.
+    pub fn surface_size(&self, content_w: u32, content_h: u32) -> (u32, u32) {
+        (content_w + self.margin * 2, content_h + self.margin * 2)
+    }
+
+    /// A pointer position in surface coordinates (what `CursorMoved` reports) as content
+    /// coordinates. It is negative or past the content size in the margin's resize band.
+    pub fn to_content(&self, x: f64, y: f64) -> (f64, f64) {
+        (x - self.margin as f64, y - self.margin as f64)
+    }
+
+    /// The inverse of [`Shadow::to_content`].
+    pub fn to_surface(&self, x: f64, y: f64) -> (f64, f64) {
+        (x + self.margin as f64, y + self.margin as f64)
+    }
+
+    /// Whether a pointer at surface position `(x, y)` lands on the window (the content grown by
+    /// the resize band) or goes through to what is behind it. What the winit patch sets as the
+    /// input region, here for the app's own hit-testing and for tests.
+    pub fn takes_input(&self, x: f64, y: f64, surface_w: u32, surface_h: u32) -> bool {
+        client::takes_input(x, y, surface_w, surface_h, self.margin, band(self.scale))
+    }
+
+    /// Fills the margin of a surface buffer (`surface_w` x `surface_h` device px, stride
+    /// `surface_w`) with the shadow, premultiplied ARGB over transparent, and leaves the content
+    /// rectangle untouched. Does nothing when no margin is in force or on the KWin route. About
+    /// 1.4 MB of writes at 3440x1440 scale 1 (well under a millisecond); prefer
+    /// [`Shadow::paint_frame`], which skips it when the margin is already there.
+    pub fn paint(&self, pixels: &mut [u32], surface_w: u32, surface_h: u32) {
+        if let Some(p) = &self.painter {
+            p.paint(pixels, surface_w, surface_h, self.margin);
+        }
+    }
+
+    /// [`Shadow::paint`] only when the buffer's margin may be stale: `age` is softbuffer's
+    /// `Buffer::age()` (0: undefined contents). softbuffer's Wayland backend swaps two buffers
+    /// and resizes each lazily, so after any change of size, margin, scale or focus both buffers
+    /// are repainted once (two frames); otherwise a frame touches no margin pixel. Returns whether
+    /// it painted. With damage-limited presents (`present_with_damage`) the margin needs no
+    /// damage rectangle on a normal frame; on the repainted frames damage the whole surface.
+    pub fn paint_frame(
+        &mut self,
+        pixels: &mut [u32],
+        surface_w: u32,
+        surface_h: u32,
+        age: u8,
+    ) -> bool {
+        if self.painter.is_none() {
+            return false;
+        }
+        if !self.gate.needed((surface_w, surface_h), age) {
+            return false;
+        }
+        self.paint(pixels, surface_w, surface_h);
+        true
     }
 }
 
@@ -180,15 +484,62 @@ pub struct Shadow;
 #[cfg(not(target_os = "linux"))]
 impl Shadow {
     /// No-op off Linux (Windows has `with_undecorated_shadow`).
+    pub fn prepare(
+        attributes: WindowAttributes,
+        _mode: Mode,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> WindowAttributes {
+        attributes
+    }
     pub fn attach(_window: &winit::window::Window) -> Option<Shadow> {
         None
     }
-    pub fn update(&mut self, _scale: f64, _active: bool, _maximized: bool) {}
+    pub fn attach_mode(_window: &winit::window::Window, _mode: Mode) -> Option<Shadow> {
+        None
+    }
+    pub fn update(&mut self, _window: &winit::window::Window, _scale: f64, _active: bool) -> bool {
+        false
+    }
     pub fn kind(&self) -> &'static str {
         ""
     }
     pub fn bytes(&self) -> usize {
         0
+    }
+    pub fn wants_alpha(&self) -> bool {
+        false
+    }
+    pub fn set_min_content_size(
+        &self,
+        window: &winit::window::Window,
+        size: winit::dpi::LogicalSize<f64>,
+    ) {
+        window.set_min_inner_size(Some(size));
+    }
+    pub fn margin(&self) -> u32 {
+        0
+    }
+    pub fn content_origin(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    pub fn content_size(&self, w: u32, h: u32) -> (u32, u32) {
+        (w, h)
+    }
+    pub fn surface_size(&self, w: u32, h: u32) -> (u32, u32) {
+        (w, h)
+    }
+    pub fn to_content(&self, x: f64, y: f64) -> (f64, f64) {
+        (x, y)
+    }
+    pub fn to_surface(&self, x: f64, y: f64) -> (f64, f64) {
+        (x, y)
+    }
+    pub fn takes_input(&self, _x: f64, _y: f64, _w: u32, _h: u32) -> bool {
+        true
+    }
+    pub fn paint(&self, _pixels: &mut [u32], _w: u32, _h: u32) {}
+    pub fn paint_frame(&mut self, _pixels: &mut [u32], _w: u32, _h: u32, _age: u8) -> bool {
+        false
     }
 }
 

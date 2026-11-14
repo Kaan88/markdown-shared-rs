@@ -78,12 +78,6 @@ impl Inner {
         }
     }
 
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Inner::Wayland(_) => "wayland",
-        }
-    }
-
     pub fn bytes(&self) -> usize {
         match self {
             Inner::Wayland(w) => w.bytes,

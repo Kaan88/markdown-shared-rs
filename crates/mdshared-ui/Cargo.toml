@@ -44,6 +44,15 @@ wayland-client = "0.31.15"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# The X11 route of the client-drawn margin (src/shadow/x11.rs): a second connection that sets
+# `_GTK_FRAME_EXTENTS` and the input shape. The same x11rb winit already brings in.
+x11rb = { version = "0.13.2", optional = true, default-features = false, features = ["shape"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
+
+[features]
+# The client-drawn shadow margin (Wayland any compositor, X11): needs the patched winit (a content
+# margin on the Wayland window) and, in the app, the patched softbuffer (alpha on Wayland); see
+# docs/LINUX.md. Off: the crate builds against stock winit and uses KWin's protocol only.
+client-margin = ["dep:x11rb"]

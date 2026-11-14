@@ -1330,6 +1330,7 @@ dependencies = [
  "wayland-protocols-plasma",
  "windows-sys 0.59.0",
  "winit",
+ "x11rb",
  "zbus",
  "zeno",
 ]
