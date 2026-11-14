@@ -38,6 +38,9 @@ const CANCEL_EVERY: usize = 2048;
 /// the page would.
 pub type Matcher<'a> = &'a dyn Fn(&str, usize) -> Vec<Range<usize>>;
 
+/// A [`Matcher`] that can move to the search thread.
+pub type BoxedMatcher = Box<dyn Fn(&str, usize) -> Vec<Range<usize>> + Send>;
+
 /// What a search leaves out and where it stops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -335,7 +338,7 @@ impl Search {
     pub fn start(
         root: PathBuf,
         shows_file: Box<dyn Fn(&Path) -> bool + Send>,
-        matcher: Box<dyn Fn(&str, usize) -> Vec<Range<usize>> + Send>,
+        matcher: BoxedMatcher,
         opts: Options,
         wake: impl Fn() + Send + 'static,
     ) -> Search {
@@ -611,20 +614,20 @@ mod tests {
     #[test]
     fn long_lines_are_cut_around_the_first_match() {
         let line = format!("{}needle{}", "é".repeat(150), "x".repeat(300));
-        let (text, marks) = snippet(&line, &[300..306]);
+        let (text, marks) = snippet(&line, std::slice::from_ref(&(300..306)));
         assert!(text.starts_with('…') && text.ends_with('…'));
         assert_eq!(&text[marks[0].clone()], "needle");
         assert!(text.chars().count() <= SNIPPET_MAX + 2);
         // A match at the start is not cut at its front.
         let line = format!("needle{}", "y".repeat(400));
-        let (text, marks) = snippet(&line, &[0..6]);
+        let (text, marks) = snippet(&line, std::slice::from_ref(&(0..6)));
         assert!(!text.starts_with('…') && text.ends_with('…'));
         assert_eq!(marks, vec![0..6]);
     }
 
     #[test]
     fn leading_whitespace_is_trimmed_and_the_marks_move() {
-        let (text, marks) = snippet("    - a needle ", &[8..14]);
+        let (text, marks) = snippet("    - a needle ", std::slice::from_ref(&(8..14)));
         assert_eq!(text, "- a needle");
         assert_eq!(&text[marks[0].clone()], "needle");
     }
