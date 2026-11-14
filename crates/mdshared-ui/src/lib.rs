@@ -12,6 +12,7 @@ pub mod notice;
 pub mod overlay;
 pub mod palette;
 pub mod pane;
+pub mod place;
 pub mod platform;
 pub mod scroll;
 pub mod settings;

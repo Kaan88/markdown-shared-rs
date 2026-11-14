@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
+use crate::sister::Request;
+
 /// Where the running instance records its port.
 pub fn port_file(settings: &Path) -> PathBuf {
     settings.with_file_name("instance.port")
@@ -61,6 +63,27 @@ fn hold_lock(settings: &Path) -> Option<std::fs::File> {
 
 /// Hands `paths` to an already running instance. True when one answered, so the caller can exit.
 pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
+    let mut message = format!("{app}\n");
+    for path in paths {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        message.push_str(&absolute.display().to_string());
+        message.push('\n');
+    }
+    message.push('\n');
+    send(settings, &message)
+}
+
+/// [`forward`] for a file with a place to show: see [`Request::encode`] for what travels. A
+/// running instance that predates these options opens the file and ignores the rest; with
+/// `follow` it does nothing at all.
+pub fn forward_request(app: &str, settings: &Path, request: &Request) -> bool {
+    let mut request = request.clone();
+    request.path = std::path::absolute(&request.path).unwrap_or(request.path);
+    send(settings, &request.encode(app))
+}
+
+/// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
+fn send(settings: &Path, message: &str) -> bool {
     let Some(port) = std::fs::read_to_string(port_file(settings))
         .ok()
         .and_then(|t| t.trim().parse::<u16>().ok())
@@ -75,13 +98,6 @@ pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
         return false;
     };
     _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-    let mut message = format!("{app}\n");
-    for path in paths {
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
-        message.push_str(&absolute.display().to_string());
-        message.push('\n');
-    }
-    message.push('\n');
     if stream.write_all(message.as_bytes()).is_err() {
         return false;
     }
@@ -95,12 +111,42 @@ pub fn listen(app: &str, settings: &Path) -> Option<Receiver<PathBuf>> {
 }
 
 /// `listen`, calling `wake` from the listener thread after each launch's paths are queued, so the
-/// shell can drain them at once instead of on a timer.
+/// shell can drain them at once instead of on a timer. What a launch asked beyond opening its
+/// files is dropped: see [`listen_requests_waking`].
 pub fn listen_waking(
     app: &str,
     settings: &Path,
     wake: impl Fn() + Send + 'static,
 ) -> Option<Receiver<PathBuf>> {
+    let (sender, receiver) = channel();
+    serve(app, settings, wake, move |request| {
+        _ = sender.send(request.path);
+    })?;
+    Some(receiver)
+}
+
+/// [`listen_waking`] handing over whole requests: the file and what the launch asked for it. A
+/// window that wants to know about them calls this instead; it must not also call `listen_waking`.
+pub fn listen_requests_waking(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+) -> Option<Receiver<Request>> {
+    let (sender, receiver) = channel();
+    serve(app, settings, wake, move |request| {
+        _ = sender.send(request);
+    })?;
+    Some(receiver)
+}
+
+/// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
+/// existing file a message names, then `wake`.
+fn serve(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+    deliver: impl Fn(Request) + Send + 'static,
+) -> Option<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
     let port = listener.local_addr().ok()?.port();
     if let Some(dir) = settings.parent() {
@@ -108,7 +154,6 @@ pub fn listen_waking(
     }
     std::fs::write(port_file(settings), port.to_string()).ok()?;
     let lock = hold_lock(settings);
-    let (sender, receiver) = channel();
     let app = app.to_string();
     std::thread::spawn(move || {
         // Held until the process ends: this thread never returns.
@@ -119,17 +164,17 @@ pub fn listen_waking(
             if lines.next().as_deref() != Some(app.as_str()) {
                 continue;
             }
-            for line in lines.take_while(|l| !l.is_empty()) {
-                let path = PathBuf::from(line);
-                if path.is_file() {
-                    _ = sender.send(path);
+            let body: Vec<String> = lines.take_while(|l| !l.is_empty()).collect();
+            for request in Request::parse(body.iter().map(String::as_str)) {
+                if request.path.is_file() {
+                    deliver(request);
                 }
             }
             _ = (&stream).write_all(b"ok\n");
             wake();
         }
     });
-    Some(receiver)
+    Some(())
 }
 
 #[cfg(test)]
