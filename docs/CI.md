@@ -21,4 +21,11 @@ only when their pin moves; their own CI builds against the pinned commit.
 There is no release workflow here: the crates are not published, the applications' releases are
 made in their own repositories (`docs/CI.md` there).
 
+Finding from the first runs: on real Windows `paths::tests::canonical_paths_have_one_identity_on_windows`
+failed because `%TEMP%` on the runner is the 8.3 short path (`C:\Users\RUNNER~1\...`) and the test
+compares the canonical (long) path with one built from the temp folder. The program is right (the
+canonical path is the long one); the test assumes a long `%TEMP%`. The Windows test step therefore
+runs with `TEMP` and `TMP` set to the runner's long `runner.temp`. Everything else passes on
+Windows and Linux, clippy with `-D warnings` and `cargo fmt` included.
+
 Known limits: x86_64 only, no macOS; the tests run headless, so nothing here opens a window.
