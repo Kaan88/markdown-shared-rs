@@ -443,11 +443,23 @@ mod tests {
         for (cx, cy) in [(0, 0), (cw - 1, 0), (0, ch - 1), (cw - 1, ch - 1)] {
             let v = at(cx, cy);
             assert_eq!(v & 0x00FF_FFFF, 0, "({cx},{cy}) has no colour");
+            let a = v >> 24;
+            assert!(a > 0 && a < 255, "({cx},{cy}) shows the shadow: {a}");
+            // It carries on from the margin: the margin pixel diagonally outside it is half a
+            // pixel further from the window, so no stronger, and not far from it either.
+            let (ox, oy) = (
+                if cx == 0 { m - 1 } else { cx + m + 1 },
+                if cy == 0 { m - 1 } else { cy + m + 1 },
+            );
+            let outside = buf[(oy * W + ox) as usize] >> 24;
             assert!(
-                v >> 24 > 20 && v >> 24 < 255,
-                "({cx},{cy}) shows the shadow"
+                outside <= a && a - outside <= 24,
+                "({cx},{cy}) carries on from the margin: {outside} then {a}"
             );
         }
+        // The shadow drops, so it is stronger under the bottom corners than over the top ones.
+        assert!(at(0, ch - 1) >> 24 > at(0, 0) >> 24);
+        assert!(at(cw - 1, ch - 1) >> 24 > at(cw - 1, 0) >> 24);
         // The innermost pixel of each square is the content, whole.
         for (cx, cy) in [
             (r - 1, r - 1),
