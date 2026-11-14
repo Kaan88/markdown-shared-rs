@@ -1,5 +1,6 @@
 //! OS glue: clipboard, URLs, file manager, system theme/metrics, dialogs.
 
+use mdshared_app::backdrop::Backdrop;
 pub use mdshared_text::Subpixel;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -447,6 +448,122 @@ mod imp {
             DwmSetWindowAttribute(h, 20, &dark as *const u32 as *const _, 4);
         }
     }
+
+    /// The Windows build number ("22621"), from the registry; 0 when it cannot be read.
+    fn windows_build() -> u32 {
+        use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+        let sub = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+        let nm = wide("CurrentBuildNumber");
+        let mut buf = [0u16; 16];
+        let mut size: u32 = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: strings are NUL-terminated; buf/size describe a live buffer of that many bytes.
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                sub.as_ptr(),
+                nm.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut _,
+                &mut size,
+            )
+        };
+        if rc != 0 {
+            return 0;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn high_contrast() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SystemParametersInfoW;
+        // HIGHCONTRASTW, declared here so the crate needs no further windows-sys feature.
+        #[repr(C)]
+        struct HighContrast {
+            size: u32,
+            flags: u32,
+            scheme: *mut u16,
+        }
+        const SPI_GETHIGHCONTRAST: u32 = 0x0042;
+        const HCF_HIGHCONTRASTON: u32 = 1;
+        let mut hc = HighContrast {
+            size: std::mem::size_of::<HighContrast>() as u32,
+            flags: 0,
+            scheme: std::ptr::null_mut(),
+        };
+        // SAFETY: hc is a live HIGHCONTRASTW of the size it states.
+        let ok = unsafe {
+            SystemParametersInfoW(SPI_GETHIGHCONTRAST, hc.size, &mut hc as *mut _ as *mut _, 0)
+        };
+        ok != 0 && hc.flags & HCF_HIGHCONTRASTON != 0
+    }
+
+    fn battery_saver() -> bool {
+        use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        // SAFETY: a zeroed SYSTEM_POWER_STATUS is a valid out-parameter.
+        let mut st: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        // SAFETY: st is a live out-parameter.
+        let ok = unsafe { GetSystemPowerStatus(&mut st) };
+        ok != 0 && st.SystemStatusFlag == 1
+    }
+
+    pub fn backdrop_available() -> bool {
+        super::backdrop_allowed(
+            windows_build(),
+            reg_dword(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                "EnableTransparency",
+            ),
+            high_contrast(),
+            battery_saver(),
+        )
+    }
+
+    pub fn set_backdrop(hwnd: isize, backdrop: Backdrop) -> bool {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DwmEnableBlurBehindWindow,
+        };
+        use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
+        let h = hwnd as HWND;
+        let on = backdrop != Backdrop::Off;
+        // An empty blur region: DWM then honours the alpha of every pixel the window presents
+        // (what winit's `with_transparent` does at creation).
+        let region = if on {
+            // SAFETY: plain GDI call; the region is deleted below.
+            unsafe { CreateRectRgn(0, 0, -1, -1) }
+        } else {
+            std::ptr::null_mut()
+        };
+        let bb = DWM_BLURBEHIND {
+            dwFlags: if on {
+                DWM_BB_ENABLE | DWM_BB_BLURREGION
+            } else {
+                DWM_BB_ENABLE
+            },
+            fEnable: on as i32,
+            hRgnBlur: region,
+            fTransitionOnMaximized: 0,
+        };
+        // DWM_SYSTEMBACKDROP_TYPE: 0 is the system's choice (the state of a new window).
+        let kind: u32 = match backdrop {
+            Backdrop::Off => 0,
+            Backdrop::Mica => 2,
+            Backdrop::Acrylic => 3,
+        };
+        // SAFETY: bb and kind are live for the calls; the region handle is ours.
+        let (blur, attr) = unsafe {
+            let blur = DwmEnableBlurBehindWindow(h, &bb);
+            if !region.is_null() {
+                DeleteObject(region);
+            }
+            let attr = DwmSetWindowAttribute(h, 38, &kind as *const u32 as *const _, 4);
+            (blur, attr)
+        };
+        blur >= 0 && attr >= 0
+    }
 }
 
 #[cfg(not(windows))]
@@ -542,6 +659,12 @@ mod imp {
         Some(Duration::from_millis(530))
     }
     pub fn style_window(_hwnd: isize, _dark: bool) {}
+    pub fn backdrop_available() -> bool {
+        false
+    }
+    pub fn set_backdrop(_hwnd: isize, _backdrop: Backdrop) -> bool {
+        false
+    }
     pub fn system_scale() -> f32 {
         1.0
     }
@@ -598,6 +721,66 @@ pub fn frame_report(hwnd: isize) -> String {
 /// Windows 11 polish for a borderless window (rounded corners, dark mode).
 pub fn style_window(hwnd: isize, dark: bool) {
     imp::style_window(hwnd, dark)
+}
+
+/// The first Windows build with `DWMWA_SYSTEMBACKDROP_TYPE` (Windows 11 22H2).
+pub const BACKDROP_MIN_BUILD: u32 = 22621;
+
+/// Whether a system backdrop can be counted on to show behind transparent pixels: the Windows
+/// build has one, "Transparency effects" is not switched off (`transparency` is the registry's
+/// `EnableTransparency`, `None` when the value is missing, which is the system's default: on),
+/// and neither high contrast nor battery saver is on (the system then shows a flat colour of its
+/// own choosing). The rule behind [`backdrop_available`], apart so it can be tested.
+pub fn backdrop_allowed(
+    build: u32,
+    transparency: Option<u32>,
+    high_contrast: bool,
+    battery_saver: bool,
+) -> bool {
+    build >= BACKDROP_MIN_BUILD && transparency != Some(0) && !high_contrast && !battery_saver
+}
+
+/// Whether this system, as it is set up right now, shows a backdrop behind a window that asks for
+/// one ([`backdrop_allowed`] of what the system says). Always false off Windows. A few registry
+/// and system-parameter reads: call it when the setting is on, not at every start.
+pub fn backdrop_available() -> bool {
+    imp::backdrop_available()
+}
+
+/// Asks the compositor for `backdrop` behind the window, or with `Backdrop::Off` takes it away
+/// again. With a backdrop the window's pixels are composed by their alpha: every pixel the
+/// application wants opaque must carry alpha 255, and one with alpha 0 shows the backdrop
+/// (see [`crate::frost`]). Returns whether the system took the request; false off Windows. Call
+/// it only after [`backdrop_available`] said yes: on a system without backdrops a window made
+/// transparent shows the desktop itself.
+pub fn set_backdrop(hwnd: isize, backdrop: Backdrop) -> bool {
+    imp::set_backdrop(hwnd, backdrop)
+}
+
+#[cfg(test)]
+mod backdrop_tests {
+    use super::*;
+
+    #[test]
+    fn a_backdrop_needs_the_build_and_nothing_switched_off() {
+        assert!(backdrop_allowed(22621, Some(1), false, false));
+        assert!(backdrop_allowed(26300, None, false, false));
+        // Windows 10 and Windows 11 21H2.
+        assert!(!backdrop_allowed(19045, Some(1), false, false));
+        assert!(!backdrop_allowed(22000, Some(1), false, false));
+        assert!(!backdrop_allowed(0, None, false, false));
+        // Transparency effects off, high contrast, battery saver.
+        assert!(!backdrop_allowed(26300, Some(0), false, false));
+        assert!(!backdrop_allowed(26300, Some(1), true, false));
+        assert!(!backdrop_allowed(26300, Some(1), false, true));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn there_is_no_backdrop_off_windows() {
+        assert!(!backdrop_available());
+        assert!(!set_backdrop(0, Backdrop::Mica));
+    }
 }
 
 #[cfg(all(test, windows))]
