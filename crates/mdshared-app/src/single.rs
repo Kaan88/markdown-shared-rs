@@ -82,17 +82,30 @@ pub fn forward_request(app: &str, settings: &Path, request: &Request) -> bool {
     send(settings, &request.to_wire(app))
 }
 
-/// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
-fn send(settings: &Path, message: &[u8]) -> bool {
-    let Some(port) = std::fs::read_to_string(port_file(settings))
+/// The loopback port of the instance recorded beside `settings`, if one is known to run.
+fn instance_port(settings: &Path) -> Option<u16> {
+    let port = std::fs::read_to_string(port_file(settings))
         .ok()
-        .and_then(|t| t.trim().parse::<u16>().ok())
-    else {
+        .and_then(|t| t.trim().parse::<u16>().ok())?;
+    instance_alive(settings).then_some(port)
+}
+
+/// Whether an instance answers on its port: a connection that is closed again at once, with
+/// nothing sent. The listener reads that as an empty message and does nothing, so the window is
+/// not opened, raised or changed. Blocks for at most 300 ms, so call it off the UI thread.
+pub fn alive(settings: &Path) -> bool {
+    let Some(port) = instance_port(settings) else {
         return false;
     };
-    if !instance_alive(settings) {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
+fn send(settings: &Path, message: &[u8]) -> bool {
+    let Some(port) = instance_port(settings) else {
         return false;
-    }
+    };
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
         return false;
@@ -243,6 +256,24 @@ mod tests {
             receiver.try_recv().is_err(),
             "a missing file is not forwarded"
         );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alive_is_a_bare_connection_that_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("mdshared-alive-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        assert!(!alive(&settings), "nothing listens yet");
+        let receiver = listen(APP, &settings).expect("listen");
+        assert!(alive(&settings));
+        assert!(alive(&settings));
+        // The listener took the connections for empty messages: nothing was delivered, and it
+        // still serves the next real one.
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        assert!(forward(APP, &settings, std::slice::from_ref(&file)));
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), file);
+        assert!(receiver.try_recv().is_err());
         _ = std::fs::remove_dir_all(&dir);
     }
 

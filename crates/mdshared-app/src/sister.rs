@@ -414,6 +414,13 @@ pub fn send(name: &str, request: &Request) -> bool {
         .is_some_and(|settings| crate::single::forward_request(name, &settings, request))
 }
 
+/// Whether a window of `name` answers on its instance channel, with nothing sent to it: it is
+/// not opened, raised or changed. For a live link to notice that the other window is gone.
+/// Blocks for at most 300 ms: call it off the UI thread.
+pub fn alive(name: &str) -> bool {
+    settings_of(name).is_some_and(|settings| crate::single::alive(&settings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

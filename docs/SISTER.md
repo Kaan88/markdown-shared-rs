@@ -34,6 +34,7 @@ file shown, and if no window runs, start nothing.
 |---|---|---|---|
 | Open | `sister::open(name, &Request) -> Result<(), String>` | yes | the first hand-off; works whether or not the other window runs |
 | Send | `sister::send(name, &Request) -> bool` | no | live updates (`follow`); false when no window of `name` answers |
+| Alive | `sister::alive(name) -> bool` | no | whether a window of `name` answers: a bare connection, closed at once, that changes nothing in it; up to 300 ms, so off the UI thread |
 
 `open` finds the application (below), starts it detached (no stdio, no console window on Windows,
 its own process group on Unix) with the arguments of `Request::args(name)`, and returns. The
@@ -188,8 +189,9 @@ monitor for the window, which Wayland does until the window has been shown on an
 - Live ends, and the tab shows the file again, when: `live_off` arrives; the file changes on disk
   and no newer live text follows (the editor saved, so disk is now the newest: each live text
   records the file's state as of its arrival, and a later difference is a save); the user reloads
-  (F5); or the tab closes. Nothing else keeps unsaved text, so a dead editor leaves it until the
-  file is touched or F5 is pressed. A `follow` without text does not end it. Only an open, loaded
+  (F5); or the tab closes. A dead editor sends no `live_off`, so while a tab is live the viewer asks `sister::alive("mdedit")`
+  every 5 seconds on a helper thread; when none answers, every live tab returns to its file as for
+  `live_off`, with the toast "mdedit closed: showing the saved file". No tab live, no check. A `follow` without text does not end it. Only an open, loaded
   tab takes text; a request never opens a file or switches tabs. The mark is a dot before the tab's
   name, and one toast says when it starts.
 
