@@ -60,4 +60,10 @@ jobs:
           key: windows
       - run: cargo fmt --all --check
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
-      - run: cargo test --release --workspace
+      # TEMP is the 8.3 short path (C:\Users\RUNNER~1\...) on the runner image, and a test that
+      # compares a canonical path with one built from the temp folder (paths::tests::
+      # canonical_paths_have_one_identity_on_windows) expects the long form: use the runner's own.
+      - run: cargo test --release --workspace --no-fail-fast
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
