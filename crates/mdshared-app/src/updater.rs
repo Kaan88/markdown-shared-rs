@@ -368,7 +368,11 @@ pub fn at_launch_label(on: bool) -> &'static str {
 }
 
 /// Shown when the reader asks a copy that is not installed to update.
-pub const NOT_INSTALLED: &str = "Only an installed copy can update itself.";
+pub const NOT_INSTALLED: &str = if cfg!(windows) {
+    "Only an installed copy can update itself."
+} else {
+    "Only the AppImage can update itself."
+};
 
 /// The update as the application's window shows it: the stage, and whether its bar was closed.
 #[derive(Clone, Debug, Default)]

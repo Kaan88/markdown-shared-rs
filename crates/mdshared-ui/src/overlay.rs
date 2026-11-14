@@ -57,7 +57,7 @@ impl Bubble {
     pub fn hint(p: &mut Painter, text: &str, page: Rect) -> Bubble {
         let max = (page.w * 0.7).min(640.0);
         let w = (p.measure(Face::Ui, 12.0, text) + 20.0).min(max);
-        let rect = Rect::new(page.x + 6.0, page.bottom() - 6.0 - 24.0, w.round(), 24.0);
+        let rect = Rect::new(page.x + 6.0, page.bottom() - 6.0 - 24.0, w.ceil(), 24.0);
         Bubble {
             kind: Kind::Hint,
             rect,
@@ -76,7 +76,7 @@ impl Bubble {
         }
         Bubble {
             kind: Kind::Tip,
-            rect: Rect::new(x.round(), y.round(), w.round(), h),
+            rect: Rect::new(x.round(), y.round(), w.ceil(), h),
             text: text.to_string(),
         }
     }
