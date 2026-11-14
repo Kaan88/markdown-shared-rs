@@ -2,7 +2,8 @@
 //!
 //! On Windows `with_undecorated_shadow(true)` does it. On Linux a window without server-side
 //! decorations gets no shadow, so it looks pasted onto what is behind it. [`Shadow::attach`] is the
-//! one entry point and picks a route:
+//! one entry point and picks a route (the policy is [`decide`]: KWin's protocol wherever the
+//! compositor has it, the client margin only where it is missing):
 //!
 //! 1. **client** (Wayland, any compositor; feature `client-margin`): the window is the inner
 //!    rectangle of a larger transparent surface and the app paints the shadow into the margin
@@ -141,6 +142,62 @@ mod wl;
 #[cfg(all(target_os = "linux", feature = "client-margin"))]
 mod x11;
 
+/// The kind of display the window lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    Wayland,
+    X11,
+    Other,
+}
+
+/// The route chosen for a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    Kwin,
+    ClientWayland,
+    ClientX11,
+    None,
+}
+
+/// The routing policy, pure so it can be tested as a table. `client_built`: the crate has the
+/// `client-margin` feature; `kwin`: the compositor offers KWin's shadow protocol.
+///
+/// `Auto`: on Wayland KWin's protocol wherever it exists (KDE: the proven path, the window is
+/// created as without a shadow: not transparent, no margin), the client margin only where it is
+/// missing (GNOME, sway, other compositors) and the feature is built; on X11 nothing, because a
+/// tiled X11 window would draw its shadow over its neighbour (winit cannot report tiling there).
+/// The other modes force their route wherever it can work.
+pub fn decide(mode: Mode, client_built: bool, session: Session, kwin: bool) -> RouteKind {
+    match (mode, session) {
+        (Mode::None, _) | (_, Session::Other) => RouteKind::None,
+        (Mode::Kwin, Session::Wayland) if kwin => RouteKind::Kwin,
+        (Mode::Kwin, _) => RouteKind::None,
+        (Mode::Client, Session::Wayland) if client_built => RouteKind::ClientWayland,
+        (Mode::Client, Session::X11) if client_built => RouteKind::ClientX11,
+        (Mode::Client, _) => RouteKind::None,
+        (Mode::Auto, Session::Wayland) if kwin => RouteKind::Kwin,
+        (Mode::Auto, Session::Wayland) if client_built => RouteKind::ClientWayland,
+        (Mode::Auto, _) => RouteKind::None,
+    }
+}
+
+/// The session and the KWin answer for a display, probed once per process (the answer is cached
+/// for `attach`; the probe is one registry round trip, measured at start-up in `docs/LINUX.md`).
+#[cfg(target_os = "linux")]
+fn probe(display: &impl winit::raw_window_handle::HasDisplayHandle) -> (Session, bool) {
+    use std::sync::OnceLock;
+    use winit::raw_window_handle::RawDisplayHandle;
+    static CACHE: OnceLock<(Session, bool)> = OnceLock::new();
+    *CACHE.get_or_init(|| match display.display_handle().map(|h| h.as_raw()) {
+        Ok(RawDisplayHandle::Wayland(d)) => (
+            Session::Wayland,
+            wl::kwin_shadow_available(d.display.as_ptr().cast()),
+        ),
+        Ok(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => (Session::X11, false),
+        _ => (Session::Other, false),
+    })
+}
+
 /// Logical px outside the content that still take pointer input on the client route (the winit
 /// patch's input region), so an edge resize can start just outside the visible window.
 pub const RESIZE_BAND: u32 = 6;
@@ -148,7 +205,8 @@ pub const RESIZE_BAND: u32 = 6;
 /// Which route [`Shadow::attach_mode`] may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Client-drawn margin where the patched winit is in use, else KWin's protocol, else nothing.
+    /// KWin's protocol where the compositor offers it, else the client margin on Wayland (feature
+    /// `client-margin`), else nothing; nothing on X11. See [`decide`].
     #[default]
     Auto,
     /// Only the client-drawn margin (Wayland or X11).
@@ -215,20 +273,26 @@ impl Shadow {
         mode: Mode,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> WindowAttributes {
-        if CLIENT_ROUTE_BUILT && matches!(mode, Mode::Auto | Mode::Client) {
-            // Only Wayland takes the initial size as the surface; on X11 the window manager
-            // treats it as the frame (seen on KWin), so it is left alone there.
-            use winit::platform::wayland::ActiveEventLoopExtWayland;
-            if event_loop.is_wayland()
-                && let Some(winit::dpi::Size::Logical(l)) = attributes.inner_size
-            {
-                attributes.inner_size = Some(winit::dpi::Size::Logical(
-                    winit::dpi::LogicalSize::new(l.width + 2.0 * EXTENT, l.height + 2.0 * EXTENT),
-                ));
-            }
-            attributes.with_transparent(true)
+        let mode = if std::env::var_os("MDSHARED_NO_SHADOW").is_some() {
+            Mode::None
         } else {
-            attributes
+            mode
+        };
+        let (session, kwin) = probe(event_loop);
+        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin) {
+            RouteKind::ClientWayland => {
+                if let Some(winit::dpi::Size::Logical(l)) = attributes.inner_size {
+                    attributes.inner_size =
+                        Some(winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(
+                            l.width + 2.0 * EXTENT,
+                            l.height + 2.0 * EXTENT,
+                        )));
+                }
+                attributes.with_transparent(true)
+            }
+            // X11: the window manager takes the initial size as the frame, not grown.
+            RouteKind::ClientX11 => attributes.with_transparent(true),
+            RouteKind::Kwin | RouteKind::None => attributes,
         }
     }
 
@@ -240,28 +304,27 @@ impl Shadow {
 
     /// [`Shadow::attach`] restricted to one route.
     pub fn attach_mode(window: &Window, mode: Mode) -> Option<Shadow> {
-        if std::env::var_os("MDSHARED_NO_SHADOW").is_some() || mode == Mode::None {
+        if std::env::var_os("MDSHARED_NO_SHADOW").is_some() {
             return None;
         }
+        let (session, kwin) = probe(window);
         let scale = window.scale_factor();
-        #[cfg(feature = "client-margin")]
-        if matches!(mode, Mode::Auto | Mode::Client)
-            && let Some(s) = Shadow::attach_client(window, scale)
-        {
-            return Some(s);
+        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin) {
+            RouteKind::Kwin => {
+                let inner = wl::Inner::attach(window, scale, true)?;
+                Some(Shadow {
+                    route: Route::Kwin(inner),
+                    scale,
+                    active: true,
+                    margin: 0,
+                    painter: None,
+                    gate: client::Gate::default(),
+                })
+            }
+            #[cfg(feature = "client-margin")]
+            RouteKind::ClientWayland | RouteKind::ClientX11 => Shadow::attach_client(window, scale),
+            _ => None,
         }
-        if mode == Mode::Client {
-            return None;
-        }
-        let inner = wl::Inner::attach(window, scale, true)?;
-        Some(Shadow {
-            route: Route::Kwin(inner),
-            scale,
-            active: true,
-            margin: 0,
-            painter: None,
-            gate: client::Gate::default(),
-        })
     }
 
     #[cfg(feature = "client-margin")]
@@ -546,6 +609,44 @@ impl Shadow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_table() {
+        use Mode::*;
+        use RouteKind as R;
+        use Session::*;
+        // (mode, client built, session, kwin) -> route
+        let t = |m, b, s, k| decide(m, b, s, k);
+        for built in [false, true] {
+            // KDE Wayland: Auto and Kwin use KWin's protocol, windows untouched.
+            assert_eq!(t(Auto, built, Wayland, true), R::Kwin);
+            assert_eq!(t(Kwin, built, Wayland, true), R::Kwin);
+            // Without the protocol, Kwin has nothing.
+            assert_eq!(t(Kwin, built, Wayland, false), R::None);
+            // Never on X11 or elsewhere through KWin; Auto gives nothing on X11.
+            assert_eq!(t(Auto, built, X11, false), R::None);
+            assert_eq!(t(Kwin, built, X11, false), R::None);
+            assert_eq!(t(Auto, built, Other, false), R::None);
+            assert_eq!(t(Client, built, Other, false), R::None);
+            // None is none.
+            for s in [Wayland, X11, Other] {
+                for k in [false, true] {
+                    assert_eq!(t(None, built, s, k), R::None);
+                }
+            }
+        }
+        // Feature off: no client route at all.
+        assert_eq!(t(Auto, false, Wayland, false), R::None);
+        assert_eq!(t(Client, false, Wayland, true), R::None);
+        assert_eq!(t(Client, false, X11, false), R::None);
+        // Feature on: the client margin where KWin's protocol is missing (GNOME, sway) ...
+        assert_eq!(t(Auto, true, Wayland, false), R::ClientWayland);
+        // ... forced on KDE only on request ...
+        assert_eq!(t(Client, true, Wayland, true), R::ClientWayland);
+        assert_eq!(t(Client, true, Wayland, false), R::ClientWayland);
+        // ... and on X11 only on request.
+        assert_eq!(t(Client, true, X11, false), R::ClientX11);
+    }
 
     fn alpha(t: &(u32, u32, Vec<u8>), x: u32, y: u32) -> u8 {
         t.2[((y * t.0 + x) * 4 + 3) as usize]

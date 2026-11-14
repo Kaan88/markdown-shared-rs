@@ -135,7 +135,12 @@ fn main() {
                 });
             if !backdrop {
                 // `prepare` grows the initial (content) size by the margin on Wayland.
+                let t = Instant::now();
                 attributes = Shadow::prepare(attributes, self.mode, event_loop);
+                println!(
+                    "prepare (includes the one-time KWin probe): {:.3} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
             }
             let window = Rc::new(event_loop.create_window(attributes).unwrap());
             let mut surface = softbuffer::Context::new(window.clone())
