@@ -62,9 +62,17 @@ the one entry point and picks a route (`MD_SHADOW=client|kwin|none` forces one,
 | **kwin** | KDE Wayland | KWin's `org_kde_kwin_shadow_manager`: eight tiles handed over once (about 21 KB, 36 px reach, sigma 12, dropped 6 px; peak alpha 0.35, 0.20 inactive) | no |
 | none | anything else | `attach` returns `None` | |
 
-`Auto` tries them in that order. The client routes exist only when the crate is built with the
-cargo feature `client-margin`; without it the crate builds against stock winit and `Auto` is
-KWin-or-nothing, exactly as before.
+**Policy (`Mode::Auto`, `shadow::decide`, a tested table).** On Wayland where the compositor offers
+KWin's shadow protocol (KDE) Auto uses it and the window is created exactly as without a shadow:
+not transparent, no margin, no size growth. The client margin is used only where the protocol is
+missing (GNOME, sway, other compositors) and the feature is built. On X11 Auto gives no shadow (a
+tiled X11 window would draw its shadow over its neighbour: winit cannot report tiling there).
+`MD_SHADOW=client|kwin|none` force a route wherever it can work (`client` also on X11 and on KDE).
+`Shadow::prepare` runs before the window exists, so it asks the event loop's display whether the
+protocol is there (one registry round trip on a private queue, cached for `attach`): measured
+0.07 to 0.5 ms (first call in a process; 0.07-0.09 ms typical), release build, KDE. The client
+routes exist only with the cargo feature `client-margin`; without it the crate builds against
+stock winit and Auto is KWin-or-nothing, as before.
 
 ### Why a patched winit (and softbuffer)
 
@@ -81,8 +89,9 @@ that). softbuffer's unreleased master has `AlphaMode`, but a different API (`Pix
 `buffer.pixels()`), so the apps would have to be ported; the small patch
 `docs/patches/softbuffer-0.4.8-wayland-alpha.patch` (about 55 changed lines in 5 files) adds
 `Surface::set_premultiplied_alpha(bool)` instead (Wayland: ARGB8888 buffers; everywhere else a
-no-op returning false; X11 with an ARGB window already honours alpha). It has not been published
-as a fork yet; until it is, apply it to a vendored 0.4.8 or point `[patch.crates-io]` at a fork.
+no-op returning false; X11 with an ARGB window already honours alpha). It is published as
+`github.com/Kaan88/softbuffer`, branch `md-0.4.8`, rev `dd18fec9d08e2f466c42d4c2cece62aa0ee1eba9`
+(the patch on the v0.4.8 tag, crate version unchanged).
 
 ### Enabling it in an app
 
@@ -91,7 +100,7 @@ In the app's workspace root, next to the other overrides:
 ```toml
 [patch.crates-io]
 winit = { git = "https://github.com/Kaan88/winit", rev = "<sha of md-0.30.13>" }
-softbuffer = { git = "<the softbuffer fork>", rev = "<sha>" }   # or path = "vendor/softbuffer"
+softbuffer = { git = "https://github.com/Kaan88/softbuffer", rev = "dd18fec9d08e2f466c42d4c2cece62aa0ee1eba9" }
 ```
 
 and in the app's `Cargo.toml`: `mdshared-ui = { ..., features = ["client-margin"] }`. Both

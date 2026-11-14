@@ -45,6 +45,21 @@ delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore OrgKdeKwinShadowManager);
 delegate_noop!(State: ignore OrgKdeKwinShadow);
 
+/// Whether the compositor offers KWin's shadow protocol: one registry round trip on a private
+/// queue over winit's `wl_display` (alive: the caller holds the event loop or a window).
+pub fn kwin_shadow_available(display: *mut std::ffi::c_void) -> bool {
+    // SAFETY: as in `Wayland::attach`; the foreign backend does not own or close the display.
+    let backend = unsafe { Backend::from_foreign_display(display.cast()) };
+    let conn = Connection::from_backend(backend);
+    let Ok((globals, _queue)) = registry_queue_init::<State>(&conn) else {
+        return false;
+    };
+    globals.contents().with_list(|list| {
+        list.iter()
+            .any(|g| g.interface == "org_kde_kwin_shadow_manager")
+    })
+}
+
 pub enum Inner {
     // Never dropped (leaked, about 25 KB of memory the compositor frees when the surface or the
     // connection goes): an app usually drops its state after the event loop, when the
