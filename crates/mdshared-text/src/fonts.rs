@@ -10,16 +10,14 @@ thread_local! {
 /// The per-thread font context every renderer clones. A shell that draws its own text takes a
 /// clone too, so system fonts are still enumerated once.
 ///
-/// Off Windows the context already has [`add_fallbacks`] applied. On Windows it is the system's
-/// own, as before; an application that wants the fallbacks there calls [`add_fallbacks`] on its
-/// copy.
+/// The context has [`add_fallbacks`] applied on every system, Windows included (the viewer drew
+/// U+2714 and U+2764 as boxes on Windows without it, where the editor already applied it).
+/// Applying it again on a clone changes nothing.
 pub fn shared_fonts() -> FontContext {
     FONTS.with(|cell| {
         cell.borrow_mut()
             .get_or_insert_with(|| {
-                #[cfg_attr(windows, allow(unused_mut))]
                 let mut fonts = FontContext::new();
-                #[cfg(not(windows))]
                 add_fallbacks(&mut fonts);
                 fonts
             })

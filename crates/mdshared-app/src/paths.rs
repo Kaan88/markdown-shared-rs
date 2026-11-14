@@ -12,9 +12,12 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Canonical form used to tell whether a path is already open. A missing file falls back to its
-/// absolute path, so a restored tab for a deleted file keeps a stable identity.
+/// absolute path with its nearest existing folder canonicalized, so a restored tab for a deleted
+/// file keeps the identity it had while the file existed (symlinks and, on Windows, 8.3 short
+/// names such as `C:\Users\RUNNER~1` resolve the same way with or without the file).
 pub fn canonical_or_absolute(path: &Path) -> PathBuf {
     let resolved = std::fs::canonicalize(path)
+        .or_else(|_| canonical_parent_join(path))
         .or_else(|_| std::path::absolute(path))
         .unwrap_or_else(|_| path.to_path_buf());
     if cfg!(windows)
@@ -23,6 +26,27 @@ pub fn canonical_or_absolute(path: &Path) -> PathBuf {
         return PathBuf::from(plain);
     }
     resolved
+}
+
+/// A missing path: its nearest existing ancestor canonicalized, the missing tail appended.
+fn canonical_parent_join(path: &Path) -> std::io::Result<PathBuf> {
+    let abs = std::path::absolute(path)?;
+    let mut tail = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(base) = std::fs::canonicalize(cur) {
+            let mut out = base;
+            out.extend(tail.iter().rev());
+            return Ok(out);
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => return Ok(abs),
+        }
+    }
 }
 
 /// On Windows, `canonicalize` returns `\\?\C:\x`, which `absolute` does not, and which reads badly in
@@ -182,6 +206,18 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
         assert_eq!(canonical_or_absolute(&path), present);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_keeps_the_identity_of_its_folder() {
+        let dir = std::env::temp_dir().join(format!("mdshared-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let there = canonical_or_absolute(&dir.join("sub").join("gone.md"));
+        assert_eq!(
+            there,
+            canonical_or_absolute(&dir).join("sub").join("gone.md")
+        );
         _ = std::fs::remove_dir_all(&dir);
     }
 
