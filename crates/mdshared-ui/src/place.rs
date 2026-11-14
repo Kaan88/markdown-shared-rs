@@ -113,7 +113,8 @@ fn lists_kde(desktops: &str) -> bool {
 }
 
 /// The KWin script that places the window of process `pid` at `rect`, in KWin's logical pixels,
-/// kept inside the area panels leave free.
+/// kept inside the area the panels of the screen it lands on leave free (the window's own screen
+/// when no screen holds the rectangle's centre).
 #[cfg(not(windows))]
 fn kwin_script(pid: u32, rect: Rect) -> String {
     let Rect { x, y, w, h } = rect;
@@ -122,7 +123,13 @@ fn kwin_script(pid: u32, rect: Rect) -> String {
          for (var i = 0; i < list.length; i++) {{\n\
          \tvar w = list[i];\n\
          \tif (w.pid !== {pid}) continue;\n\
-         \tvar a = workspace.clientArea(KWin.PlacementArea, w);\n\
+         \tvar a = null, screens = workspace.screens || [];\n\
+         \tfor (var s = 0; s < screens.length && !a; s++) {{\n\
+         \t\tvar g = screens[s].geometry, cx = {x} + {w} / 2, cy = {y} + {h} / 2;\n\
+         \t\tif (cx >= g.x && cx < g.x + g.width && cy >= g.y && cy < g.y + g.height)\n\
+         \t\t\ta = workspace.clientArea(KWin.PlacementArea, screens[s], workspace.currentDesktop);\n\
+         \t}}\n\
+         \tif (!a) a = workspace.clientArea(KWin.PlacementArea, w);\n\
          \tvar left = Math.max({x}, a.x), top = Math.max({y}, a.y);\n\
          \tvar right = Math.min({x} + {w}, a.x + a.width), bottom = Math.min({y} + {h}, a.y + a.height);\n\
          \tif (right <= left || bottom <= top) {{ left = {x}; top = {y}; right = {x} + {w}; bottom = {y} + {h}; }}\n\
@@ -254,7 +261,7 @@ mod tests {
         assert!(script.contains("Math.min(10 + 800, a.x + a.width)"));
         assert!(script.contains("w.setMaximize(false, false)"));
         assert!(script.contains("w.frameGeometry ="));
-        assert!(script.contains("KWin.PlacementArea"));
+        assert!(script.contains("KWin.PlacementArea") && script.contains("screens[s].geometry"));
         assert_eq!(script.matches('{').count(), script.matches('}').count());
     }
 

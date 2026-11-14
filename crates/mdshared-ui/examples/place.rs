@@ -103,6 +103,14 @@ fn main() {
                 self.report("before");
                 let area = place::work_area(&window);
                 println!("work area: {area:?}");
+                for m in window.available_monitors() {
+                    println!(
+                        "  monitor {:?} at {:?} size {:?}",
+                        m.name(),
+                        m.position(),
+                        m.size()
+                    );
+                }
                 if let Some(area) = area {
                     let (left, right) = place::halves(area);
                     let rect = if self.right { right } else { left };
