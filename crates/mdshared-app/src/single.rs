@@ -136,13 +136,17 @@ pub fn listen_waking(
 ) -> Option<Receiver<PathBuf>> {
     let (sender, receiver) = channel();
     serve(app, settings, wake, move |request| {
-        _ = sender.send(request.path);
+        // This receiver is for files; folders reach only [`listen_requests_waking`].
+        if request.path.is_file() {
+            _ = sender.send(request.path);
+        }
     })?;
     Some(receiver)
 }
 
 /// [`listen_waking`] handing over whole requests: the file and what the launch asked for it. A
 /// window that wants to know about them calls this instead; it must not also call `listen_waking`.
+/// A request may name a folder (`mdedit <dir>`), which the paths-only receivers drop.
 pub fn listen_requests_waking(
     app: &str,
     settings: &Path,
@@ -177,7 +181,7 @@ fn read_text(reader: &mut impl std::io::Read, n: usize) -> Option<String> {
 }
 
 /// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
-/// existing file a message names, then `wake`.
+/// existing file or folder a message names, then `wake`.
 ///
 /// A message may be followed by the text its `?text=<bytes>` line announces: it is read here, up to
 /// [`MAX_TEXT`] bytes within [`READ_DEADLINE`], and attached to each request. A message that
@@ -216,7 +220,7 @@ fn serve(
                 },
             };
             for mut request in Request::parse(body.iter().map(String::as_str)) {
-                if request.path.is_file() {
+                if request.path.is_file() || request.path.is_dir() {
                     request.text = text.clone();
                     deliver(request);
                 }
@@ -256,6 +260,22 @@ mod tests {
             receiver.try_recv().is_err(),
             "a missing file is not forwarded"
         );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_reaches_a_request_receiver_and_not_a_paths_one() {
+        let dir = std::env::temp_dir().join(format!("mdshared-single-dir-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let requests = dir.join("requests.ini");
+        let receiver = listen_requests_waking(APP, &requests, || {}).expect("listen");
+        assert!(forward(APP, &requests, &[dir.join("sub")]));
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got.path, dir.join("sub"));
+        let paths = dir.join("paths.ini");
+        let only = listen(APP, &paths).expect("listen");
+        assert!(forward(APP, &paths, &[dir.join("sub")]));
+        assert!(only.recv_timeout(Duration::from_millis(300)).is_err());
         _ = std::fs::remove_dir_all(&dir);
     }
 
