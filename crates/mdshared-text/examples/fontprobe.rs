@@ -2,7 +2,8 @@
 //! id is 0 (a missing-glyph box), and writes the rendering to a PNG.
 //!
 //! `cargo run -p mdshared-text --example fontprobe -- [out.png] [text...]`
-//! The family string is the editor's by default; set `FAMILY` to change it.
+//! The family string is the editor's by default; set `FAMILY` to change it. Emoji sequences get
+//! `push_emoji_runs` as the apps do; set `NO_EMOJI_RUNS` to see the layout without it.
 
 use mdshared_text::{Bitmap, TextEngine, shared_fonts};
 use parley::{FontFamily, LayoutContext, PositionedLayoutItem, StyleProperty};
@@ -36,6 +37,9 @@ fn main() {
         b.push_default(StyleProperty::FontFamily(FontFamily::from(family.as_str())));
         b.push_default(StyleProperty::FontSize(size));
         b.push_default(StyleProperty::Brush([0, 0, 0, 255]));
+        if std::env::var_os("NO_EMOJI_RUNS").is_none() {
+            mdshared_text::push_emoji_runs(&mut b, text, &family);
+        }
         let mut layout = b.build(text);
         layout.break_all_lines(None);
         println!("line: {text}");

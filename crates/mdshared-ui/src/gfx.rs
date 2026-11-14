@@ -147,6 +147,7 @@ impl Gfx {
             )));
         }
         b.push_default(StyleProperty::Brush([color[0], color[1], color[2], 255]));
+        mdshared_text::push_emoji_runs(&mut b, text, UI_FAMILY);
         let mut layout = b.build(text);
         layout.break_all_lines(if wrap > 0.0 { Some(wrap) } else { None });
         layout.align(Alignment::Start, AlignmentOptions::default());

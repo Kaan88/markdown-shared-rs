@@ -149,6 +149,83 @@ pub fn add_fallbacks(fonts: &mut FontContext) {
 /// fonts only take what is left, which is emoji.
 pub const EMOJI_FAMILIES: &str = "Noto Color Emoji, Segoe UI Emoji, Apple Color Emoji";
 
+/// Byte ranges of `text` that are emoji sequences needing the colour emoji font ahead of the
+/// style's own families: a base character followed by U+FE0F (variation selector 16) or the
+/// keycap U+20E3, an emoji modifier (U+1F3FB..U+1F3FF), or a joined (U+200D) sequence of
+/// pictographs. Adjacent sequences are one range. Empty for ASCII (one fast scan) and on Windows.
+///
+/// Why: parley looks an emoji cluster up in the style's family list first and in the `emoji`
+/// generic only after it, and the first font with the base character wins. U+2764 and U+26A0 are
+/// text-default characters that DejaVu Sans, Noto Sans Symbols and others have, so with U+FE0F
+/// they drew as a monochrome glyph (and a keycap as a plain digit) although the font that makes
+/// them emoji was in the family string. Characters without U+FE0F (a bare U+2714, U+2192, U+00A9)
+/// are not returned and keep the family list's own glyph. On Windows the system's fallback
+/// already picks Segoe UI Emoji, so nothing changes there.
+pub fn emoji_presentation_runs(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    if cfg!(windows) || text.is_ascii() {
+        return out;
+    }
+    // The pictographic range of a sequence's base: what a ZWJ may join. Kept narrow so the ZWJ
+    // of Indic conjuncts never splits a style run.
+    fn pictographic(c: char) -> bool {
+        matches!(c as u32, 0xA9 | 0xAE | 0x203C | 0x2049 | 0x2122 | 0x2139
+            | 0x2190..=0x2BFF | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0x1F000..)
+    }
+    let (mut start, mut end) = (0, 0);
+    let (mut ext, mut zwj, mut pict, mut joined) = (false, false, false, false);
+    let mut flush = |start: usize, end: usize, marked: bool| {
+        if marked {
+            match out.last_mut() {
+                Some(last) if last.end == start => last.end = end,
+                _ => out.push(start..end),
+            }
+        }
+    };
+    for (i, c) in text.char_indices() {
+        match c {
+            '\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}' => ext = true,
+            '\u{200D}' => {
+                zwj = true;
+                joined = true;
+            }
+            _ if joined => {
+                pict |= pictographic(c);
+                joined = false;
+            }
+            _ => {
+                flush(start, end, ext || (zwj && pict));
+                (start, ext, zwj, pict) = (i, false, false, pictographic(c));
+            }
+        }
+        end = i + c.len_utf8();
+    }
+    flush(start, end, ext || (zwj && pict));
+    out
+}
+
+/// Pushes the colour emoji families ([`EMOJI_FAMILIES`], then `base`, the style's own family
+/// string, so a system without them draws what it drew before) for every range of
+/// [`emoji_presentation_runs`]. Call it on a builder after the default and run styles are pushed,
+/// since a later push wins.
+pub fn push_emoji_runs<B: parley::Brush>(
+    builder: &mut parley::RangedBuilder<'_, B>,
+    text: &str,
+    base: &str,
+) {
+    let runs = emoji_presentation_runs(text);
+    if runs.is_empty() {
+        return;
+    }
+    let family = format!("{EMOJI_FAMILIES}, {base}");
+    for run in runs {
+        builder.push(
+            parley::StyleProperty::FontFamily(parley::FontFamily::from(family.as_str())),
+            run,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +254,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn emoji_runs_cover_variation_keycap_modifier_and_joined_sequences_only() {
+        fn runs(t: &str) -> Vec<&str> {
+            emoji_presentation_runs(t)
+                .into_iter()
+                .map(|r| &t[r])
+                .collect()
+        }
+        assert!(runs("plain ascii").is_empty(), "ascii is skipped");
+        assert_eq!(runs("a \u{2764}\u{FE0F} b"), ["\u{2764}\u{FE0F}"]);
+        assert_eq!(
+            runs("\u{2764}\u{FE0F}\u{26A0}\u{FE0F}"),
+            ["\u{2764}\u{FE0F}\u{26A0}\u{FE0F}"],
+            "adjacent sequences are one range"
+        );
+        assert_eq!(runs("x 1\u{FE0F}\u{20E3} y"), ["1\u{FE0F}\u{20E3}"]);
+        assert_eq!(runs("\u{1F44D}\u{1F3FD} ok"), ["\u{1F44D}\u{1F3FD}"]);
+        let flag = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}";
+        assert_eq!(runs(&format!("a {flag} b")), [flag]);
+        let tech = "\u{1F469}\u{200D}\u{1F4BB}";
+        assert_eq!(runs(tech), [tech]);
+        // Text-style characters and a text selector are left alone.
+        assert!(runs("\u{2714} \u{2192} \u{A9} \u{2764}\u{FE0E}").is_empty());
+        // The ZWJ of a conjunct is not an emoji sequence.
+        assert!(runs("\u{0915}\u{094D}\u{200D}\u{0937}").is_empty());
     }
 }
