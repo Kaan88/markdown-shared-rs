@@ -107,6 +107,13 @@ pub const BACK: &str = "M13 8H3M7 4L3 8l4 4";
 pub const FORWARD: &str = "M3 8h10M9 4l4 4-4 4";
 pub const EDIT: &str = "M2.5 13.5l.700-3 7.5-7.5a1.3 1.3 0 0 1 1.8 0l.5 .5a1.3 1.3 0 0 1 0 1.800L5.5 12.800zM9.7 4l2.3 2.3";
 
+pub const SORT: &str = "M4 3v10M2 11l2 2 2-2M8.5 4h3M8.5 8h4.5M8.5 12h6";
+pub const SORT_DESC: &str = "M4 13V3M2 5l2-2 2 2M8.5 4h6M8.5 8h4.5M8.5 12h3";
+pub const SORT_CASE: &str = "M4 3v10M2 11l2 2 2-2M8.5 12.5l2.7-8.5 2.7 8.5M9.5 9.5h3.4";
+pub const REVERSE: &str = "M5 13V3M3 5l2-2 2 2M11 3v10M9 11l2 2 2-2";
+pub const DEDUPE: &str = "M2.5 4h9M2.5 7.5h9M2.5 11.5h5M10.5 10l3 3M13.5 10l-3 3";
+pub const JOIN: &str = "M2.5 4.5h5.5M2.5 11.5h5.5M12 4.5v2.5a1 1 0 0 1-1 1H7M9 6L7 8l2 2";
+
 /// Every icon with its name, for the tests and the specimen sheet.
 pub const ALL: &[(&str, &str)] = &[
     ("DOC", DOC),
@@ -199,4 +206,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("BACK", BACK),
     ("FORWARD", FORWARD),
     ("EDIT", EDIT),
+    ("SORT", SORT),
+    ("SORT_DESC", SORT_DESC),
+    ("SORT_CASE", SORT_CASE),
+    ("REVERSE", REVERSE),
+    ("DEDUPE", DEDUPE),
+    ("JOIN", JOIN),
 ];
