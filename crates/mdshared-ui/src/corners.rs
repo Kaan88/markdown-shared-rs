@@ -91,6 +91,15 @@ impl Corners {
     }
 }
 
+/// The help line under the setting: what the platform does with it.
+pub fn setting_help() -> &'static str {
+    if cfg!(windows) {
+        "Windows 11 only; Windows 10 is square."
+    } else {
+        "Some desktops need a restart to apply."
+    }
+}
+
 /// How much of each pixel of the top-left corner square (`r` x `r`, row-major) lies inside the
 /// window's rounded corner: 255 inside the arc, 0 outside, a ramp one pixel wide across it. The
 /// arc is centred `r` px in from both edges. The other three corners are mirror images. Empty for
