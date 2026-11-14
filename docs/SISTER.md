@@ -197,6 +197,10 @@ monitor for the window, which Wayland does until the window has been shown on an
 
 ## What the editor must do
 
+(When this was written it was the editor's to-do list. mdedit 0.5.0 builds the receiving and the
+sending, the live text and the side-by-side placement; see its `docs/DESIGN.md`, section 54, and
+`docs/HANDOFF.md`. The boxes were not ticked one by one in this file (not re-checked per item).)
+
 Receiving ("Edit in mdedit", from the viewer):
 
 - [ ] Accept `--from NAME`, `--follow` and `--place x,y,w,h` in `args.rs`; `--goto` exists.
@@ -240,7 +244,10 @@ Live text (unsaved changes in the viewer):
 
 ## Run and not run
 
-Run on KDE Plasma 6.8 Wayland (CachyOS): the KWin move (`examples/place.rs`, checked by a KWin
+Run on KDE Plasma 6.8 Wayland (CachyOS), with both apps running: side-by-side placement (the editor
+and the viewer at the two halves) and a scripted edit shown in the viewer as unsaved text, with the
+live dot in its tab; the viewer's return to the saved file when the editor was gone (seen; the
+toast was not). Earlier: the KWin move (`examples/place.rs`, checked by a KWin
 listing script), the single-instance message with options between two processes, finding and
-spawning with a recording script. Not run: Windows (type-checked for `x86_64-pc-windows-msvc`
-only), X11, GNOME, Plasma 5's script object path (`/<id>`), a second monitor with another scale.
+spawning with a recording script. Not run: Windows (the apps' Windows files were cross-built and
+checked under Wine only), X11, GNOME, Plasma 5's script object path (`/<id>`), a second monitor with another scale.

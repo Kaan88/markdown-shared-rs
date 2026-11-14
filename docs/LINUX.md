@@ -1,42 +1,55 @@
 # Linux (and other non-Windows) support in the shared crates
 
-Written 2026-11-14 on branch `feat/linux`. Everything here is under `cfg(not(windows))` (or
-`target_os = "linux"`); the Windows paths are unchanged. Nothing below has been built or run for
-Windows from this branch. Everything marked "run" was run on one machine: CachyOS, KDE Plasma on
-Wayland, cargo 1.99.
+Written 2026-11-14 on branch `feat/linux` (`7cd6461` when mdedit 0.5.0 and mdview 0.3.0 were
+released from it; it is to become `main`). Everything here is under `cfg(not(windows))` (or
+`target_os = "linux"`) unless it says otherwise; the Windows paths are unchanged. Both apps use all of
+it. Nothing below has run on Windows from this branch: the apps' Windows files were cross-compiled
+on Linux and checked under Wine only. Everything marked "run" was run on one machine: CachyOS, KDE
+Plasma on Wayland, cargo 1.99, except where sway (headless, in a container) is named.
 
 ## What is implemented
 
 | Area | Off Windows | How it was checked |
 |---|---|---|
 | Downloads (`mdshared-fetch`) | The system libcurl, loaded at run time with `dlopen` (`libcurl.so.4`, then `libcurl.so`; the `libloading` crate). No link-time dependency: without libcurl every download fails as before (`Error::Unsupported`, seen by callers as `State::Failed`). Same contract as WinHTTP: no redirects followed, no cookies/netrc/auth/`Accept-Encoding`, http and https only, TLS verification on, size cap from `Content-Length` and while reading, overall deadline. | The network tests (local TCP server) run on unix; `live_https_badge` (`--ignored`) fetched an https badge. |
-| File dialogs (`platform`) | `pick_files_async`, `pick_folder_async`, `pick_save_async`: the blocking dialog on a helper thread; one at a time (a second request calls `done` at once with the empty result and returns false). The blocking `pick_files`/`pick_folder` stay for Windows. | Unit test of the one-at-a-time rule; `examples/dialog.rs` run: a portal request was open on the bus while it waited. |
+| File dialogs (`platform`) | Both apps use these for Open files, Open folder and Save as. `pick_files_async`, `pick_folder_async`, `pick_save_async`: the blocking dialog on a helper thread; one at a time (a second request calls `done` at once with the empty result and returns false). The blocking `pick_files`/`pick_folder` stay for Windows. | Unit test of the one-at-a-time rule; `examples/dialog.rs` run: a portal request was open on the bus while it waited. The apps' dialog flows were not run by hand (not re-checked). |
 | Self-update (`mdshared-app`) | Only inside an AppImage: `updater::installed_files` returns the canonical `$APPIMAGE` when it is an existing file in a writable folder, with no engine. A Linux release lists no `engine.*` keys. The staged file gets mode 0755. `.new`/`.old` sit beside the AppImage. A plain Linux binary updates nothing. | Unit tests. |
-| Window identity (`window::identify`) | Wayland app id and X11 `WM_CLASS` from the app name; the X11 window icon from PNG bytes. | Compiles; not run in a window. |
-| Desktop entry (`desktop_entry::ensure`) | From an AppImage: writes `applications/<name>.desktop` and the 256 px icon under `$XDG_DATA_HOME` (or `~/.local/share`) when missing or when the recorded `X-AppImage-Path` differs; never touches an entry without the marker; sets no defaults. | Unit tests with a temp data directory. |
-| Fonts (`mdshared-text`) | `add_fallbacks` (applied by `shared_fonts()`): Windows names first, then Noto/Twemoji/JoyPixels/Symbola, Noto Symbols/Math, DejaVu Sans, and the CJK families, behind the system's fallback for Han, Common, Inherited and Latin. `EMOJI_FAMILIES` for family strings (see below). | `examples/fontprobe.rs` rendered to PNG and looked at. |
-| Hand-off between the apps (`sister`, `single::forward_request`, `place`) | Finding the other app (`$APPIMAGE` neighbours and the `X-AppImage-Path` of its desktop entry among the rules), starting it detached, and sending it a line, a follow update or a window rectangle over the single-instance port. Window placement: winit on X11; on Wayland under KDE a KWin script loaded through `org.kde.KWin` `/Scripting` on a helper thread; false on other Wayland desktops. `docs/SISTER.md` is the protocol. | Unit tests; run on KDE Wayland: the KWin move (`examples/place.rs`, seen with a KWin listing script, left and right half, clamped to the panel), the message between two real processes, a spawn of a recording script. X11, GNOME, Plasma 5 not run. |
+| Window identity (`window::identify`) | Wayland app id and X11 `WM_CLASS` from the app name; the X11 window icon from PNG bytes. | Used by both apps. Compiles; the identity as the desktop shows it (taskbar name and icon) was not re-checked. |
+| Desktop entry (`desktop_entry::ensure`) | From an AppImage: writes `applications/<name>.desktop` and the 256 px icon under `$XDG_DATA_HOME` (or `~/.local/share`) when missing or when the recorded `X-AppImage-Path` differs; never touches an entry without the marker; sets no defaults. | Unit tests with a temp data directory; mdedit run with `$APPIMAGE` set and `XDG_DATA_HOME` on a scratch folder wrote the entry and the icon. |
+| Fonts (`mdshared-text`) | `add_fallbacks` (applied by `shared_fonts()`): Windows names first, then Noto/Twemoji/JoyPixels/Symbola, Noto Symbols/Math, DejaVu Sans, and the CJK families, behind the system's fallback for Han, Common, Inherited and Latin. `EMOJI_FAMILIES` for family strings, and `emoji_presentation_runs` / `push_emoji_runs` so that emoji with U+FE0F, keycaps, skin tones and ZWJ sequences draw in colour (see below; both apps call it, the chrome text too; empty on Windows). | `examples/fontprobe.rs` rendered to PNG and looked at. |
+| Clipboard and icons (`mdshared-ui`) | The clipboard uses `arboard`, one handle kept for the life of the process; the icons come from a small subset of the Fluent UI System Icons built into the binary. | Copy and paste read back with `xclip` on X11 and between two editor windows (mdedit's HANDOFF); not checked on Wayland. Icons looked at in shots; some were never seen (mdedit's HANDOFF lists them). |
+| Hand-off between the apps (`sister`, `single::forward_request`, `place`) | Finding the other app (`$APPIMAGE` neighbours and the `X-AppImage-Path` of its desktop entry among the rules), starting it detached, and sending it a line, a follow update or a window rectangle over the single-instance port. Window placement: winit on X11; on Wayland under KDE a KWin script loaded through `org.kde.KWin` `/Scripting` on a helper thread; false on other Wayland desktops. `sister::alive(name)` asks whether a window answers without sending it anything. A request can carry live text (2 MiB cap) or end it. Request receivers are handed folders as well as files (`mdedit <dir>`); the paths-only receivers still get files only. `docs/SISTER.md` is the protocol. | Unit tests; run on KDE Wayland with both apps: side-by-side placement and a scripted edit showing unsaved in the viewer; the KWin move (`examples/place.rs`, seen with a KWin listing script, left and right half, clamped to the panel), the message between two real processes, a spawn of a recording script. X11, GNOME, Plasma 5 not run. |
 | System theme (`platform::system_is_dark`) | `org.freedesktop.appearance` `color-scheme` from the settings portal (zbus, blocking call on a helper thread, 500 ms limit, cached for 1 s). False on any failure. | Run: about 1.6 ms, dark, matching `gdbus` and KDE's BreezeDark. |
 
 The emoji box: a cluster flagged as emoji is looked up in the style's family list first and in the
 `emoji` generic only afterwards, and the first font with the character wins. The editor's list ends
 in `monospace`, which on this machine includes Adwaita Mono, whose monochrome U+1F642 is a tall
 pill with a face (glyph id 7598, not `.notdef`): that is the "box". Fix in the family string: name
-the colour emoji fonts before the generic (`"..., DejaVu Sans Mono, Noto Color Emoji, monospace"`).
-The viewer's `sans-serif` has the same flaw (DejaVu Sans has a monochrome U+1F600).
+the colour emoji fonts before the generic (`"..., DejaVu Sans Mono, Noto Color Emoji, monospace"`);
+both apps do. The viewer's `sans-serif` had the same flaw (DejaVu Sans has a monochrome U+1F600).
+A second case: `❤️` and `⚠️` (a base plus U+FE0F) drew as text glyphs because a font in the style's
+own list has the base character. `push_emoji_runs(&mut builder, text, &stack)` (bbb1c7a) pushes the
+colour emoji families, then the style's own, for the byte ranges that are a base plus U+FE0F, a
+keycap U+20E3 or a skin-tone modifier, or a ZWJ sequence of pictographs. A bare `✔`, `→` or `©` is
+not touched. Looked at in shots of both apps; cost about 29 us against 20 us for a line with emoji
+in the editor, none for ASCII.
 
 ## What is not implemented or not verified
 
-- Windows build of this branch (a later stage cross-compiles).
-- Any run in a real application window on Linux: the window identity helper, the desktop entry
-  written from a real AppImage, and the dialogs beside a window (they have no parent window, so
-  they are not modal to it).
-- GNOME, other portal backends, X11 (xdg-desktop-portal-gtk was running; KDE's portal answered).
+- Any run on Windows of this branch. The apps' Windows files were cross-compiled on Linux and
+  checked under Wine only.
+- Desktops: GNOME (Mutter) and other portal backends were not available; X11 (Xwayland) was run
+  only for the shadow example. KDE Plasma on Wayland and sway (headless) are what ran.
+- Fractional display scales in a real window, and two monitors with different scales.
+- The dialogs beside a window: they have no parent window, so they are not modal to it.
 - A theme-changed event: `system_is_dark` is read when called; nothing listens for the portal's
   `SettingChanged` signal.
-- Packaging (building the AppImage), `update-desktop-database`, MIME registration beyond the
-  desktop entry's `MimeType=`, HiDPI scale (`system_scale` is 1.0), double-click and caret-blink
-  settings (fixed values), subpixel order (RGB), `reveal_in_file_manager` (opens the folder).
+- HiDPI scale without a window (`system_scale` is 1.0), double-click and caret-blink settings
+  (fixed values), subpixel order (RGB), `reveal_in_file_manager` (runs `xdg-open` on the folder, so
+  it does not select the file).
+- `update-desktop-database` taking effect in a desktop session, and the apps' "Make default"
+  command (it edits `mimeapps.list`; only unit-tested against a temp directory).
+- An AppImage updating itself from a published release.
 - Non-x86_64 Linux: the manifest only has `linux-x86_64`.
 
 ## File associations
@@ -47,7 +60,10 @@ so the app shows under "Open with" without a logout. It takes no defaults. `make
 mime_types)` and `is_default(name, mime_types)` edit and read `[Default Applications]` in
 `$XDG_CONFIG_HOME` or `~/.config` `/mimeapps.list`; the apps call them from a menu command.
 `EDITOR_MIME_TYPES` and `VIEWER_MIME_TYPES` are the shared lists. Run: unit tests against a temp
-directory only; `update-desktop-database` was not checked to take effect in a desktop session.
+directory only (and mdedit's entry and icon written to a scratch data folder); the apps' command
+was not run, and `update-desktop-database` was not checked to take effect in a desktop session.
+The AppImages are built in the apps' repositories (Ubuntu 20.04 container, so glibc 2.31 or later),
+not here.
 
 ## Window shadow (`mdshared_ui::shadow`)
 
@@ -92,6 +108,9 @@ that). softbuffer's unreleased master has `AlphaMode`, but a different API (`Pix
 no-op returning false; X11 with an ARGB window already honours alpha). It is published as
 `github.com/Kaan88/softbuffer`, branch `md-0.4.8`, rev `dd18fec9d08e2f466c42d4c2cece62aa0ee1eba9`
 (the patch on the v0.4.8 tag, crate version unchanged).
+
+Both apps pin winit `89ace86e65387b44cec55730e5691e894b451722` and softbuffer
+`dd18fec9d08e2f466c42d4c2cece62aa0ee1eba9` this way.
 
 ### Enabling it in an app
 
