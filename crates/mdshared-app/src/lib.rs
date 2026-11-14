@@ -11,6 +11,7 @@ pub mod notes;
 pub mod paths;
 pub mod places;
 pub mod recents;
+pub mod relaunch;
 pub mod selfupdate;
 pub mod settings;
 pub mod single;

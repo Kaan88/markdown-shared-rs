@@ -4,6 +4,7 @@
 use crate::gfx::{Face, Painter, Rect, mix};
 use crate::glyph;
 use crate::theme::Palette;
+use mdshared_app::relaunch::RESTART;
 use mdshared_app::updater::{App, GO, Stage, Updates};
 
 /// A text button on a bar, its left edge at `x` and centred on `cy`: quiet until hovered, or
@@ -52,6 +53,10 @@ pub struct UpdateBarState {
     pub go_hovered: bool,
     pub go_pressed: bool,
     pub close_hovered: bool,
+    /// Whether the installed state offers a restart (the application has a file to start).
+    pub restart: bool,
+    pub restart_hovered: bool,
+    pub restart_pressed: bool,
 }
 
 /// Where the update bar's controls were drawn, for the caller's hits.
@@ -59,6 +64,8 @@ pub struct UpdateBarState {
 pub struct UpdateBarHits {
     /// The button that starts the update, while one is on offer.
     pub go: Option<Rect>,
+    /// The button that restarts into the installed version, once it is installed.
+    pub restart: Option<Rect>,
     /// The close button; absent while an update downloads.
     pub close: Option<Rect>,
 }
@@ -102,6 +109,20 @@ pub fn draw_update_bar(
             true,
             state.go_hovered,
             state.go_pressed,
+        ));
+        right -= 12.0;
+    }
+    if matches!(stage, Stage::Installed(_)) && state.restart {
+        right -= bar_button_w(p, RESTART);
+        hits.restart = Some(bar_button(
+            p,
+            pal,
+            right,
+            bar.cy(),
+            RESTART,
+            true,
+            state.restart_hovered,
+            state.restart_pressed,
         ));
         right -= 12.0;
     }

@@ -101,6 +101,23 @@ pub fn alive(settings: &Path) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// Waits until no instance recorded beside `settings` is running, for at most `timeout`. True
+/// when none is. A restarted process calls this before [`forward`]: the old process, still closing,
+/// would otherwise answer, take the hand-over, and leave no window behind. It polls [`alive`], which
+/// turns false the moment the old process has ended (its port refuses, its lock is released).
+pub fn wait_gone(settings: &Path, timeout: Duration) -> bool {
+    let end = std::time::Instant::now() + timeout;
+    loop {
+        if !alive(settings) {
+            return true;
+        }
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
 /// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
 fn send(settings: &Path, message: &[u8]) -> bool {
     let Some(port) = instance_port(settings) else {
@@ -237,6 +254,38 @@ mod tests {
     use super::*;
 
     const APP: &str = "test-app";
+
+    #[test]
+    fn a_restart_waits_for_the_old_instance_to_end() {
+        let dir = std::env::temp_dir().join(format!("mdshared-wait-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(wait_gone(&settings, Duration::from_secs(1)), "none runs");
+        // An instance by hand: its port, its port file and its lock, which it lets go of later.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        std::fs::write(
+            port_file(&settings),
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        let lock = hold_lock(&settings);
+        assert!(
+            !wait_gone(&settings, Duration::from_millis(150)),
+            "a running instance is waited for, not skipped"
+        );
+        let ends = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(listener);
+            drop(lock);
+        });
+        let started = std::time::Instant::now();
+        assert!(wait_gone(&settings, Duration::from_secs(10)));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        ends.join().unwrap();
+        // The ordinary launch that follows finds nothing to hand its files to.
+        assert!(!forward(APP, &settings, &[]));
+    }
 
     #[test]
     fn a_second_launch_reaches_the_first() {
