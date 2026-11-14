@@ -237,6 +237,11 @@ const NAV_W: f32 = 176.0;
 const NAV_ITEM: f32 = 34.0;
 const BODY_TOP: f32 = DIALOG_PAD + 36.0;
 const MAX_CARD_H: f32 = 640.0;
+/// The single-page form's headings are tighter and its card may be a little taller, so a form of
+/// a dozen rows needs no scrolling in an ordinary window.
+const SINGLE_HEADER_H: f32 = 32.0;
+const SINGLE_HEADER_FIRST_H: f32 = 28.0;
+const SINGLE_MAX_CARD_H: f32 = 680.0;
 /// The card gets a category list at least this wide.
 const NAV_MIN_CARD: f32 = 700.0;
 const TOGGLE_W: f32 = 40.0;
@@ -295,6 +300,8 @@ pub struct Form {
     menu_pressed: Option<usize>,
     /// The category the user jumped to, and the scroll that put it at the top.
     pin: Option<(usize, f32)>,
+    /// One page: the groups are headings in the scrolling body, with no category list.
+    single_page: bool,
 
     // The last layout.
     laid: bool,
@@ -328,6 +335,7 @@ impl Form {
             menu: None,
             menu_pressed: None,
             pin: None,
+            single_page: false,
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -344,6 +352,15 @@ impl Form {
         f.set_rows(rows);
         f.focus = f.rows.iter().position(Row::focusable);
         f
+    }
+
+    /// Makes this a single page: the groups stay as headings (tighter ones) in the body, there is
+    /// never a category list, and the card is 600 px wide however many groups there are. The
+    /// default is the list, which [`new`](Self::new) keeps.
+    pub fn single_page(mut self) -> Form {
+        self.single_page = true;
+        self.laid = false;
+        self
     }
 
     // ---- data --------------------------------------------------------------------------------
@@ -470,13 +487,12 @@ impl Form {
 
     fn row_height(&self, i: usize) -> f32 {
         match &self.rows[i] {
-            Row::Header(_) => {
-                if i == 0 {
-                    HEADER_FIRST_H
-                } else {
-                    HEADER_H
-                }
-            }
+            Row::Header(_) => match (self.single_page, i == 0) {
+                (false, true) => HEADER_FIRST_H,
+                (false, false) => HEADER_H,
+                (true, true) => SINGLE_HEADER_FIRST_H,
+                (true, false) => SINGLE_HEADER_H,
+            },
             r if r.help_text().is_empty() => ROW_H,
             _ => ROW_HELP_H,
         }
@@ -506,8 +522,17 @@ impl Form {
         }
 
         let groups = self.header_rows().len();
-        let want_w = if groups > 1 { 780.0 } else { 600.0 };
-        let want_h = (BODY_TOP + self.content + 4.0 + DIALOG_FOOTER).min(MAX_CARD_H);
+        let want_w = if groups > 1 && !self.single_page {
+            780.0
+        } else {
+            600.0
+        };
+        let max_h = if self.single_page {
+            SINGLE_MAX_CARD_H
+        } else {
+            MAX_CARD_H
+        };
+        let want_h = (BODY_TOP + self.content + 4.0 + DIALOG_FOOTER).min(max_h);
         let c = dialog_card(want_w, want_h, window.w, window.h);
         self.card = Rect::new(window.x + c.x, window.y + c.y, c.w, c.h);
         let r = self.card;
@@ -526,7 +551,7 @@ impl Form {
         );
         let top = r.y + BODY_TOP;
         let bottom = self.footer.y - 4.0;
-        self.nav = (groups > 1 && r.w >= NAV_MIN_CARD)
+        self.nav = (groups > 1 && !self.single_page && r.w >= NAV_MIN_CARD)
             .then(|| Rect::new(r.x + 12.0, top, NAV_W, (bottom - top).max(0.0)));
         let bx = match self.nav {
             Some(n) => n.right() + 8.0,
@@ -1786,6 +1811,37 @@ mod tests {
         // None at all is fine too.
         let none = vec![Row::toggle(1, "A", true)];
         assert!(!T::new(none, 1000.0, 600.0).f.has_nav());
+    }
+
+    #[test]
+    fn a_single_page_has_headings_but_no_category_list() {
+        let mut t = T::new(rows(), 1000.0, 800.0);
+        assert!(t.f.has_nav());
+        let tabbed = t.f.rect();
+        t.f = Form::new("Settings", rows()).single_page();
+        t.lay(1000.0, 800.0);
+        assert!(!t.f.has_nav());
+        assert_eq!(t.f.categories().len(), 3, "the headings stay");
+        assert_eq!(t.f.rect().w, 600.0);
+        assert!(t.f.rect().w < tabbed.w);
+        assert_eq!(t.f.category_rect(0), Rect::default());
+        // Every row still has its control inside the body, and Tab still reaches them.
+        let body = t.f.body_rect();
+        for (i, r) in t.f.rows().iter().enumerate() {
+            if r.id().is_some() && t.f.max_scroll() == 0.0 {
+                let c = t.f.control_rect(i);
+                assert!(
+                    c.x >= body.x
+                        && c.right() <= body.right()
+                        && c.y >= body.y
+                        && c.bottom() <= body.bottom(),
+                    "{c:?} in {body:?}"
+                );
+            }
+        }
+        // A short window scrolls instead of clipping.
+        t.lay(600.0, 360.0);
+        assert!(t.f.max_scroll() > 0.0 && t.f.rect().bottom() <= 360.0);
     }
 
     #[test]
