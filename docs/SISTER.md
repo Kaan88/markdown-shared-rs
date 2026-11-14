@@ -186,9 +186,12 @@ monitor for the window, which Wayland does until the window has been shown on an
   Images and links resolve against the file's folder as before. While live, file-change reloads of
   that tab are ignored.
 - Live ends, and the tab shows the file again, when: `live_off` arrives; the file changes on disk
-  after the last live text (the editor saved, so disk is now the newest); the user reloads (F5);
-  or the tab closes. Nothing else keeps unsaved text, so it cannot outlive its editor by more than
-  until the file is touched or F5 pressed. A `follow` without text does not end it.
+  and no newer live text follows (the editor saved, so disk is now the newest: each live text
+  records the file's state as of its arrival, and a later difference is a save); the user reloads
+  (F5); or the tab closes. Nothing else keeps unsaved text, so a dead editor leaves it until the
+  file is touched or F5 is pressed. A `follow` without text does not end it. Only an open, loaded
+  tab takes text; a request never opens a file or switches tabs. The mark is a dot before the tab's
+  name, and one toast says when it starts.
 
 ## What the editor must do
 
