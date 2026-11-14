@@ -37,6 +37,8 @@
 use winit::window::Window;
 use winit::window::WindowAttributes;
 
+use crate::corners::Corners;
+
 /// Where the shadow reaches beyond the window, in logical px, and how it is shaped.
 pub const EXTENT: f64 = 36.0;
 /// Standard deviation of the blur, in logical px (a blur radius of about 24).
@@ -76,18 +78,27 @@ fn coverage(d: f64, sigma: f64) -> f64 {
     0.5 * (1.0 - erf(d / (sigma * std::f64::consts::SQRT_2)))
 }
 
-/// Renders the eight tiles for a window scale factor. The shadow is the window's rectangle shifted
-/// down by [`DROP`] and blurred, so each tile is the product of one horizontal and one vertical
-/// half-plane coverage; the part under the window is never seen, so the tiles stop at its edge.
-pub fn render(scale: f64, active: bool) -> Tiles {
+/// The tile depth in device px, the blur's sigma and the drop, for a scale factor.
+fn metrics(scale: f64) -> (u32, f64, f64) {
     let scale = if scale.is_finite() {
         scale.clamp(1.0, 8.0)
     } else {
         1.0
     };
-    let m = (EXTENT * scale).ceil() as u32;
-    let (sigma, drop) = (SIGMA * scale, DROP * scale);
-    let peak = if active { PEAK_ACTIVE } else { PEAK_INACTIVE };
+    ((EXTENT * scale).ceil() as u32, SIGMA * scale, DROP * scale)
+}
+
+/// The shadow's darkest alpha for a focus state.
+fn peak(active: bool) -> f64 {
+    if active { PEAK_ACTIVE } else { PEAK_INACTIVE }
+}
+
+/// Renders the eight tiles for a window scale factor. The shadow is the window's rectangle shifted
+/// down by [`DROP`] and blurred, so each tile is the product of one horizontal and one vertical
+/// half-plane coverage; the part under the window is never seen, so the tiles stop at its edge.
+pub fn render(scale: f64, active: bool) -> Tiles {
+    let (m, sigma, drop) = metrics(scale);
+    let peak = peak(active);
     // `h`/`v`: -1 = tile on the left/top of the window, +1 = right/bottom, 0 = spans the side.
     let tile = |h: i32, v: i32| {
         let (w, hgt) = (if h == 0 { 1 } else { m }, if v == 0 { 1 } else { m });
@@ -135,6 +146,10 @@ pub fn render(scale: f64, active: bool) -> Tiles {
 }
 
 mod client;
+/// The pre-rendered look of a client-drawn window: the shadow margin and the rounded corners, as
+/// pure pixel code with no window behind it (what [`Shadow`] paints with, and what a screenshot
+/// uses to show the window's shape).
+pub use client::Painter as Frame;
 pub use client::takes_input;
 
 #[cfg(target_os = "linux")]
@@ -166,8 +181,16 @@ pub enum RouteKind {
 /// created as without a shadow: not transparent, no margin), the client margin only where it is
 /// missing (GNOME, sway, other compositors) and the feature is built; on X11 nothing, because a
 /// tiled X11 window would draw its shadow over its neighbour (winit cannot report tiling there).
-/// The other modes force their route wherever it can work.
-pub fn decide(mode: Mode, client_built: bool, session: Session, kwin: bool) -> RouteKind {
+/// With `round` (rounded corners wanted) and the client route built, `Auto` takes the client margin
+/// on KDE as well, because the corners need an alpha channel. The other modes force their route
+/// wherever it can work.
+pub fn decide(
+    mode: Mode,
+    client_built: bool,
+    session: Session,
+    kwin: bool,
+    round: bool,
+) -> RouteKind {
     match (mode, session) {
         (Mode::None, _) | (_, Session::Other) => RouteKind::None,
         (Mode::Kwin, Session::Wayland) if kwin => RouteKind::Kwin,
@@ -175,7 +198,9 @@ pub fn decide(mode: Mode, client_built: bool, session: Session, kwin: bool) -> R
         (Mode::Client, Session::Wayland) if client_built => RouteKind::ClientWayland,
         (Mode::Client, Session::X11) if client_built => RouteKind::ClientX11,
         (Mode::Client, _) => RouteKind::None,
-        (Mode::Auto, Session::Wayland) if kwin => RouteKind::Kwin,
+        // Rounded corners need transparent pixels, which KWin's route does not give (the window is
+        // opaque there): with rounding wanted and the client route built, KDE uses the margin too.
+        (Mode::Auto, Session::Wayland) if kwin && !(round && client_built) => RouteKind::Kwin,
         (Mode::Auto, Session::Wayland) if client_built => RouteKind::ClientWayland,
         (Mode::Auto, _) => RouteKind::None,
     }
@@ -244,6 +269,11 @@ pub struct Shadow {
     margin: u32,
     painter: Option<client::Painter>,
     gate: client::Gate,
+    /// The corner rounding asked for (applies on the client routes only).
+    corners: Corners,
+    /// X11 client route: the window is maximized or fullscreen, so its corners are square (on
+    /// Wayland the margin is 0 then, which says the same).
+    flat: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -269,8 +299,19 @@ impl Shadow {
     /// initial size is a surface size (X11: not grown). Min/max sizes stay content sizes.
     /// Otherwise unchanged.
     pub fn prepare(
+        attributes: WindowAttributes,
+        mode: Mode,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> WindowAttributes {
+        Shadow::prepare_corners(attributes, mode, Corners::Square, event_loop)
+    }
+
+    /// [`Shadow::prepare`] for a window that will have `corners`: when they are rounded the client
+    /// margin is used on KDE too (see [`decide`]), because the corners need an alpha channel.
+    pub fn prepare_corners(
         mut attributes: WindowAttributes,
         mode: Mode,
+        corners: Corners,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) -> WindowAttributes {
         let mode = if std::env::var_os("MDSHARED_NO_SHADOW").is_some() {
@@ -279,7 +320,8 @@ impl Shadow {
             mode
         };
         let (session, kwin) = probe(event_loop);
-        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin) {
+        let round = corners != Corners::Square;
+        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin, round) {
             RouteKind::ClientWayland => {
                 if let Some(winit::dpi::Size::Logical(l)) = attributes.inner_size {
                     attributes.inner_size =
@@ -304,12 +346,19 @@ impl Shadow {
 
     /// [`Shadow::attach`] restricted to one route.
     pub fn attach_mode(window: &Window, mode: Mode) -> Option<Shadow> {
+        Shadow::attach_corners(window, mode, Corners::Square)
+    }
+
+    /// [`Shadow::attach_mode`] for a window made with [`Shadow::prepare_corners`] and the same
+    /// `corners`.
+    pub fn attach_corners(window: &Window, mode: Mode, corners: Corners) -> Option<Shadow> {
         if std::env::var_os("MDSHARED_NO_SHADOW").is_some() {
             return None;
         }
         let (session, kwin) = probe(window);
         let scale = window.scale_factor();
-        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin) {
+        let round = corners != Corners::Square;
+        match decide(mode, CLIENT_ROUTE_BUILT, session, kwin, round) {
             RouteKind::Kwin => {
                 let inner = wl::Inner::attach(window, scale, true)?;
                 Some(Shadow {
@@ -319,16 +368,20 @@ impl Shadow {
                     margin: 0,
                     painter: None,
                     gate: client::Gate::default(),
+                    corners,
+                    flat: false,
                 })
             }
             #[cfg(feature = "client-margin")]
-            RouteKind::ClientWayland | RouteKind::ClientX11 => Shadow::attach_client(window, scale),
+            RouteKind::ClientWayland | RouteKind::ClientX11 => {
+                Shadow::attach_client(window, scale, corners)
+            }
             _ => None,
         }
     }
 
     #[cfg(feature = "client-margin")]
-    fn attach_client(window: &Window, scale: f64) -> Option<Shadow> {
+    fn attach_client(window: &Window, scale: f64, corners: Corners) -> Option<Shadow> {
         use winit::platform::wayland::WindowExtWayland;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let route = match window.window_handle().ok()?.as_raw() {
@@ -354,8 +407,10 @@ impl Shadow {
             scale,
             active: true,
             margin: 0,
-            painter: Some(client::Painter::new(scale, true)),
+            painter: Some(client::Painter::with_radius(scale, true, corners.px(scale))),
             gate: client::Gate::default(),
+            corners,
+            flat: false,
         };
         s.margin = s.margin_now(window);
         Some(s)
@@ -396,9 +451,13 @@ impl Shadow {
             match &mut self.route {
                 Route::Kwin(w) => w.set(scale, active),
                 #[cfg(feature = "client-margin")]
-                Route::ClientWayland => self.painter = Some(client::Painter::new(scale, active)),
-                #[cfg(feature = "client-margin")]
-                Route::ClientX11(_) => self.painter = Some(client::Painter::new(scale, active)),
+                Route::ClientWayland | Route::ClientX11(_) => {
+                    self.painter = Some(client::Painter::with_radius(
+                        scale,
+                        active,
+                        self.corners.px(scale),
+                    ))
+                }
             }
             self.gate.invalidate();
         }
@@ -409,8 +468,15 @@ impl Shadow {
             let size = window.inner_size();
             x.set(margin, band(scale), size.width, size.height);
         }
-        let moved = margin != self.margin;
+        // X11 keeps its margin when maximized, so the window says whether the corners are square.
+        #[cfg(feature = "client-margin")]
+        let flat = matches!(self.route, Route::ClientX11(_))
+            && (window.is_maximized() || window.fullscreen().is_some());
+        #[cfg(not(feature = "client-margin"))]
+        let flat = false;
+        let moved = margin != self.margin || flat != self.flat;
         self.margin = margin;
+        self.flat = flat;
         if moved {
             self.gate.invalidate();
         }
@@ -427,6 +493,33 @@ impl Shadow {
             #[cfg(feature = "client-margin")]
             Route::ClientX11(_) => "client-x11",
         }
+    }
+
+    /// Takes a new corner setting. Returns `true` when the app must redraw the whole window (the
+    /// client routes); on the KWin route the window is opaque and stays square, so there is
+    /// nothing to draw (the setting then applies at the next start, where the client margin is
+    /// chosen for rounded corners, see [`decide`]).
+    pub fn set_corners(&mut self, corners: Corners) -> bool {
+        if corners == self.corners {
+            return false;
+        }
+        self.corners = corners;
+        if self.painter.is_none() {
+            return false;
+        }
+        self.painter = Some(client::Painter::with_radius(
+            self.scale,
+            self.active,
+            corners.px(self.scale),
+        ));
+        self.gate.invalidate();
+        true
+    }
+
+    /// Whether the window's corners are drawn rounded right now: a client route, a radius above 0,
+    /// and not maximized, tiled or fullscreen.
+    pub fn rounds(&self) -> bool {
+        self.margin > 0 && !self.flat && self.painter.as_ref().is_some_and(|p| p.radius() > 0)
     }
 
     /// Bytes of tile memory kept (the client route) or handed to the compositor (KWin).
@@ -539,6 +632,30 @@ impl Shadow {
         self.paint(pixels, surface_w, surface_h);
         true
     }
+
+    /// Cuts the four rounded corners out of the content that was just copied into a surface
+    /// buffer, so they are transparent with the shadow beneath, anti-aliased. Call it after
+    /// the content rows are in the buffer. `content` is the app's bitmap (BGRA bytes, opaque,
+    /// `surface_w - 2 * margin` px wide): the corner pixels are rebuilt from it, so a corner that
+    /// was not copied again this frame keeps its cut. `damage` is the content rectangles copied
+    /// this frame (`x0, y0, x1, y1`), or `None` when the whole content was copied; only the corner
+    /// squares they touch are redone. Does nothing when [`Shadow::rounds`] is false. Costs
+    /// `4 * radius^2` pixels at most.
+    pub fn paint_corners(
+        &self,
+        pixels: &mut [u32],
+        surface_w: u32,
+        surface_h: u32,
+        content: &[u8],
+        damage: Option<&[(usize, usize, usize, usize)]>,
+    ) {
+        if !self.rounds() {
+            return;
+        }
+        if let Some(p) = &self.painter {
+            p.paint_corners(pixels, surface_w, surface_h, self.margin, content, damage);
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -554,8 +671,38 @@ impl Shadow {
     ) -> WindowAttributes {
         attributes
     }
+    pub fn prepare_corners(
+        attributes: WindowAttributes,
+        _mode: Mode,
+        _corners: Corners,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> WindowAttributes {
+        attributes
+    }
     pub fn attach(_window: &winit::window::Window) -> Option<Shadow> {
         None
+    }
+    pub fn attach_corners(
+        _window: &winit::window::Window,
+        _mode: Mode,
+        _corners: Corners,
+    ) -> Option<Shadow> {
+        None
+    }
+    pub fn set_corners(&mut self, _corners: Corners) -> bool {
+        false
+    }
+    pub fn rounds(&self) -> bool {
+        false
+    }
+    pub fn paint_corners(
+        &self,
+        _pixels: &mut [u32],
+        _w: u32,
+        _h: u32,
+        _content: &[u8],
+        _damage: Option<&[(usize, usize, usize, usize)]>,
+    ) {
     }
     pub fn attach_mode(_window: &winit::window::Window, _mode: Mode) -> Option<Shadow> {
         None
@@ -616,7 +763,7 @@ mod tests {
         use RouteKind as R;
         use Session::*;
         // (mode, client built, session, kwin) -> route
-        let t = |m, b, s, k| decide(m, b, s, k);
+        let t = |m, b, s, k| decide(m, b, s, k, false);
         for built in [false, true] {
             // KDE Wayland: Auto and Kwin use KWin's protocol, windows untouched.
             assert_eq!(t(Auto, built, Wayland, true), R::Kwin);
@@ -646,6 +793,29 @@ mod tests {
         assert_eq!(t(Client, true, Wayland, false), R::ClientWayland);
         // ... and on X11 only on request.
         assert_eq!(t(Client, true, X11, false), R::ClientX11);
+    }
+
+    #[test]
+    fn rounded_corners_take_the_margin_on_kde_too() {
+        use Mode::*;
+        use RouteKind as R;
+        use Session::*;
+        // Rounding wanted and the client route built: KDE leaves KWin's opaque window for the
+        // margin; everything else is as without rounding.
+        assert_eq!(decide(Auto, true, Wayland, true, true), R::ClientWayland);
+        assert_eq!(decide(Auto, true, Wayland, false, true), R::ClientWayland);
+        // Not built: KWin's route stays, the corners stay square.
+        assert_eq!(decide(Auto, false, Wayland, true, true), R::Kwin);
+        assert_eq!(decide(Auto, false, Wayland, false, true), R::None);
+        // Square: KDE keeps KWin's protocol.
+        assert_eq!(decide(Auto, true, Wayland, true, false), R::Kwin);
+        // X11 and other sessions: no margin by default, so square.
+        assert_eq!(decide(Auto, true, X11, false, true), R::None);
+        assert_eq!(decide(Auto, true, Other, false, true), R::None);
+        // The forced modes are not changed by the setting.
+        assert_eq!(decide(Kwin, true, Wayland, true, true), R::Kwin);
+        assert_eq!(decide(Client, true, X11, false, true), R::ClientX11);
+        assert_eq!(decide(None, true, Wayland, true, true), R::None);
     }
 
     fn alpha(t: &(u32, u32, Vec<u8>), x: u32, y: u32) -> u8 {

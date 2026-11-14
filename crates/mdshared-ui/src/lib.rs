@@ -3,6 +3,7 @@
 //! tabs, panes, scrollbar, tooltips, toasts, dialog frames). No window loop; the application owns that.
 
 pub mod chrome;
+pub mod corners;
 pub mod desktop_entry;
 pub mod gfx;
 pub mod glyph;

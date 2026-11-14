@@ -434,15 +434,11 @@ mod imp {
         )
     }
 
+    /// The dark title-bar mode. The corners are the apps' setting: `corners::set_window_corners`.
     pub fn style_window(hwnd: isize, dark: bool) {
         let h = hwnd as HWND;
-        let corner: u32 = 2; // DWMWCP_ROUND
         let dark: u32 = dark as u32;
-        // SAFETY: pointers reference 4-byte locals valid for the call; failures are ignored.
-        unsafe {
-            DwmSetWindowAttribute(h, 33, &corner as *const u32 as *const _, 4);
-        }
-        // SAFETY: as above.
+        // SAFETY: the pointer references a 4-byte local valid for the call; failure is ignored.
         unsafe {
             DwmSetWindowAttribute(h, 20, &dark as *const u32 as *const _, 4);
         }
@@ -595,7 +591,7 @@ pub fn subpixel_order() -> Subpixel {
 pub fn frame_report(hwnd: isize) -> String {
     imp::frame_report(hwnd)
 }
-/// Windows 11 polish for a borderless window (rounded corners, dark mode).
+/// Windows 11 polish for a borderless window (dark title-bar mode; the corners are `corners::set_window_corners`).
 pub fn style_window(hwnd: isize, dark: bool) {
     imp::style_window(hwnd, dark)
 }

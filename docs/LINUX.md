@@ -176,6 +176,27 @@ The shadow's logical reach is 36 px (`EXTENT`); the margin in device px is `ceil
 fractional scales it is whole for 1.25, 1.5 and 1.75 (45, 54, 63); at others the content edge
 falls between device pixels and blurs by under half a pixel.
 
+## Rounded window corners (`mdshared_ui::corners`, `shadow::Frame`)
+
+Both apps offer a "Window corners" setting (Square, Small = 4, Round = 8 logical px, default
+Round; the radius scales with the display). Per platform:
+
+| Where | How |
+|---|---|
+| Windows 11 | `corners::set_window_corners(hwnd, c)`: `DWMWA_WINDOW_CORNER_PREFERENCE` (do not round, small, round). DWM draws it and squares a maximized window itself. Windows 10 does not know the attribute: the call fails and is ignored. |
+| Wayland, client margin | The content's four corner squares are cut with an anti-aliased mask in the ARGB buffer (`Shadow::paint_corners`); the shadow beneath them is drawn for the window's own rounded shape. Square while maximized, tiled or fullscreen (margin 0). |
+| KDE Wayland | KWin's shadow route leaves the window opaque, so with rounded corners wanted `Auto` takes the client margin on KDE too (`decide(.., round)`); with Square it keeps KWin's protocol. Switching on from Square at run time on KDE has nothing to draw on until the next start. |
+| X11 | No margin by default, so the window is opaque and stays square. With `MD_SHADOW=client` (ARGB window) it rounds like Wayland, and squares while maximized or fullscreen (winit reports no tiling there). |
+
+Cost: the mask touches only the four corner squares (`4 * r^2` pixels, 256 at scale 1), and only
+in a frame that copied content into them (`paint_corners` takes the damage rectangles; it rebuilds
+the squares from the app's bitmap, so a corner that was not copied again keeps its cut). Nothing
+runs per frame when the corners are square or when the window is maximized. The shadow's margin
+tiles are unchanged: the blurred shadow of a rounded rectangle differs from the plain one by about
+one alpha step for these radii, so only the shadow beneath the uncovered pixels is added
+(`r * r` values per top and bottom corner, computed once with the tiles). `Frame::preview` composes
+the same pixels over a flat backdrop for the apps' `--shot` pictures.
+
 ### What was run (2026-11-14, this machine: KDE Plasma 6 Wayland, 3440x1440, scale 1; cargo 1.99)
 
 `examples/shadow.rs` models the apps (content bitmap rendered separately, copied to the margin
