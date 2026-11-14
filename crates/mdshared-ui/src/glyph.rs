@@ -114,6 +114,13 @@ pub const REVERSE: &str = "M5 13V3M3 5l2-2 2 2M11 3v10M9 11l2 2 2-2";
 pub const DEDUPE: &str = "M2.5 4h9M2.5 7.5h9M2.5 11.5h5M10.5 10l3 3M13.5 10l-3 3";
 pub const JOIN: &str = "M2.5 4.5h5.5M2.5 11.5h5.5M12 4.5v2.5a1 1 0 0 1-1 1H7M9 6L7 8l2 2";
 
+pub const BOLD: &str = "M4.5 3h4.2a2.4 2.4 0 0 1 0 4.8H4.5zM4.5 7.8h4.9a2.6 2.6 0 0 1 0 5.2H4.5z";
+pub const ITALIC: &str = "M6.5 3h5M4.5 13h5M9.5 3L6.5 13";
+pub const CODE: &str = "M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5";
+pub const STRIKE: &str = "M2.5 8h11M11 5.2C10.6 3.9 9.5 3 8 3 6.3 3 5 4 5 5.4c0 1 .6 1.7 1.8 2.1M5 10.8C5.4 12.1 6.5 13 8 13c1.7 0 3-1 3-2.4 0-.4-.1-.8-.3-1.1";
+pub const HEADING: &str = "M2.5 3.5v9M8.5 3.5v9M2.5 8h6M11.5 7.5l2-1.5v7";
+pub const TABLE: &str = "M2 3h12a.5 .5 0 0 1 .5 .5v9a.5 .5 0 0 1-.5 .5H2a.5 .5 0 0 1-.5-.5v-9A.5 .5 0 0 1 2 3zM1.5 6.5h13M6 3v10";
+
 /// Every icon with its name, for the tests and the specimen sheet.
 pub const ALL: &[(&str, &str)] = &[
     ("DOC", DOC),
@@ -212,4 +219,10 @@ pub const ALL: &[(&str, &str)] = &[
     ("REVERSE", REVERSE),
     ("DEDUPE", DEDUPE),
     ("JOIN", JOIN),
+    ("BOLD", BOLD),
+    ("ITALIC", ITALIC),
+    ("CODE", CODE),
+    ("STRIKE", STRIKE),
+    ("HEADING", HEADING),
+    ("TABLE", TABLE),
 ];
