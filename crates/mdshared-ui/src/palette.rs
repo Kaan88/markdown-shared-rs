@@ -793,6 +793,21 @@ impl Palette {
         self.set_scroll(self.scroll + dy)
     }
 
+    /// The count at the left of the footer. Empty while a message row stands in for results
+    /// ("Go to line 25") and there are no entries: "0 results" would contradict it.
+    fn footer_count(&self) -> String {
+        if self.shown.is_empty() && self.message.is_some() {
+            return String::new();
+        }
+        let n = self.shown.len();
+        match (self.needle().is_empty(), n) {
+            (true, 1) => "1 item".to_string(),
+            (true, n) => format!("{n} items"),
+            (false, 1) => "1 result".to_string(),
+            (false, n) => format!("{n} results"),
+        }
+    }
+
     // ---- drawing -----------------------------------------------------------------------------
 
     /// Lays the card out in `window` and draws it. `caret_on` is the blink phase.
@@ -900,17 +915,7 @@ impl Palette {
             Rect::new(f.x + 1.0, f.y, f.w - 2.0, px.max(1.0)),
             pal.popup_line,
         );
-        let count = if self.needle().is_empty() {
-            match self.shown.len() {
-                1 => "1 item".to_string(),
-                n => format!("{n} items"),
-            }
-        } else {
-            match self.shown.len() {
-                1 => "1 result".to_string(),
-                n => format!("{n} results"),
-            }
-        };
+        let count = self.footer_count();
         p.text(
             Face::Ui,
             11.5,
@@ -1385,9 +1390,12 @@ mod tests {
         let r = p.line_rect(p.lines[0]);
         p.press(r.x + 20.0, r.cy(), NONE, 1);
         assert_eq!(p.release(r.x + 20.0, r.cy()), Outcome::Submitted);
+        // No entries and a message: the footer says no count (not "0 results").
+        assert_eq!(p.footer_count(), "");
         // With entries, the message is a row above them and Enter still chooses.
         let mut p = plain(entries(2));
         p.set_message(Some("Searching".into()));
+        assert_eq!(p.footer_count(), "2 items");
         assert_eq!(p.lines.len(), 3);
         assert_eq!(p.key(&KeyName::Enter, NONE, None), Outcome::Chosen(0));
         // The palette says "No matches" for an empty result on its own.
@@ -1395,6 +1403,7 @@ mod tests {
         typed(&mut p, "qqq");
         assert_eq!(p.lines.len(), 1);
         assert_eq!(p.lines[0].line, Line::Message);
+        assert_eq!(p.footer_count(), "0 results");
         p.set_message(None);
         assert_eq!(p.lines.len(), 1);
     }
