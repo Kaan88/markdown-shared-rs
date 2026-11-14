@@ -51,24 +51,129 @@ directory only; `update-desktop-database` was not checked to take effect in a de
 
 ## Window shadow (`mdshared_ui::shadow`)
 
-Written 2026-11-14 on branch `feat/shadow`. An undecorated window gets no shadow from KWin on
-Wayland. `Shadow::attach(&window)` hands KWin eight tiles (premultiplied ARGB8888, black, about 21
-KB in one memfd-backed `wl_shm` pool, 36 px reach, sigma 12, dropped 6 px; peak alpha 0.35, 0.20
-when inactive) through `org_kde_kwin_shadow_manager`, on a private event queue over winit's
-`wl_display` and `wl_surface` (raw handles; winit's queue is never dispatched). KWin draws it, so
-nothing runs per frame. The apps call `Shadow::attach` once after `create_window` and keep the
-`Option<Shadow>`; they call `update(scale, active, maximized)` on `ScaleFactorChanged` and
-`Focused` (it returns at once when scale and focus are unchanged); a maximised window needs nothing,
-KWin hides the shadow itself (seen). The shadow object is leaked, not destroyed, when `Shadow` is
-dropped: the app's state is usually dropped after the event loop, when the `wl_display` is gone,
-and a request then crashes. The compositor removes it with the surface. `MDSHARED_NO_SHADOW=1`
-disables it. `examples/shadow.rs` shows it.
+An undecorated window gets no shadow from the compositor on Linux. `Shadow::attach(&window)` is
+the one entry point and picks a route (`MD_SHADOW=client|kwin|none` forces one,
+`MDSHARED_NO_SHADOW=1` turns it off):
 
-Not available: GNOME (Mutter) and wlroots compositors have no such global, so `attach` returns
-`None` and nothing changes (not tested, no such compositor here). X11 sessions: `None`;
-`_KDE_NET_WM_SHADOW` was tried (property set correctly, checked with xprop) and KWin did not draw
-anything for an Xwayland window, so it was removed. The general route (a transparent margin
-plus `xdg_surface.set_window_geometry`) is not reachable with winit 0.30.13: it keeps the
-`xdg_surface` private and calls `set_window_geometry(0, 0, w, h)` itself on every resize
-(`wayland/window/state.rs`, `reload_state`). Scale factors above 1 are untested: the tiles and
-offsets are rendered in device pixels.
+| Route | Where | How | The app paints? |
+|---|---|---|---|
+| **client** (Wayland) | every compositor, with the patched winit | the window is the inner rectangle of a larger transparent surface (`xdg_surface.set_window_geometry`), the shadow lives in the margin | yes, `Shadow::paint_frame` |
+| **client-x11** | X11 and Xwayland, feature on | ARGB window plus `_GTK_FRAME_EXTENTS` and an input shape (x11rb, a second connection; no winit change) | yes, same call |
+| **kwin** | KDE Wayland | KWin's `org_kde_kwin_shadow_manager`: eight tiles handed over once (about 21 KB, 36 px reach, sigma 12, dropped 6 px; peak alpha 0.35, 0.20 inactive) | no |
+| none | anything else | `attach` returns `None` | |
+
+`Auto` tries them in that order. The client routes exist only when the crate is built with the
+cargo feature `client-margin`; without it the crate builds against stock winit and `Auto` is
+KWin-or-nothing, exactly as before.
+
+### Why a patched winit (and softbuffer)
+
+winit creates the `xdg_surface` privately and itself calls `set_window_geometry(0, 0, w, h)` on
+every resize, so an app cannot say "my window is an inner rectangle of the surface". The fork
+`github.com/Kaan88/winit`, branch `md-0.30.13` (version still 0.30.13; see `PATCH.md` there) adds
+`WindowExtWayland::set_content_margin(u32)` and `content_margin_now() -> u32`. Behaviour is
+unchanged unless `set_content_margin` is called with a margin above 0, and nothing happens while
+winit's own client-side frame (sctk-adwaita) is shown.
+
+softbuffer 0.4.8 on Wayland always creates its buffers as `wl_shm` XRGB8888: the alpha byte is
+ignored, so the margin comes out opaque black (run: `MD_ALPHA=0` in the example shows exactly
+that). softbuffer's unreleased master has `AlphaMode`, but a different API (`Pixel`,
+`buffer.pixels()`), so the apps would have to be ported; the small patch
+`docs/patches/softbuffer-0.4.8-wayland-alpha.patch` (about 55 changed lines in 5 files) adds
+`Surface::set_premultiplied_alpha(bool)` instead (Wayland: ARGB8888 buffers; everywhere else a
+no-op returning false; X11 with an ARGB window already honours alpha). It has not been published
+as a fork yet; until it is, apply it to a vendored 0.4.8 or point `[patch.crates-io]` at a fork.
+
+### Enabling it in an app
+
+In the app's workspace root, next to the other overrides:
+
+```toml
+[patch.crates-io]
+winit = { git = "https://github.com/Kaan88/winit", rev = "<sha of md-0.30.13>" }
+softbuffer = { git = "<the softbuffer fork>", rev = "<sha>" }   # or path = "vendor/softbuffer"
+```
+
+and in the app's `Cargo.toml`: `mdshared-ui = { ..., features = ["client-margin"] }`. Both
+together: the feature calls winit functions that stock winit does not have. A build without the
+patches leaves the feature and the `[patch]` out; the same source then falls back to KWin.
+
+### The app-side checklist
+
+1. **Transparent window.** `Shadow::prepare(attributes, Mode::from_env(), event_loop)`: sets
+   `with_transparent(true)` when a client route may be used and, on Wayland, grows a logical
+   `with_inner_size` (the CONTENT size you want) by the margin, because there the initial size is
+   a surface size. Do not pass a min size through the attributes; see 7.
+2. **Attach** once after `create_window`: `let mut shadow = Shadow::attach_mode(&window, mode);`;
+   keep it for the window's life. Then, if `shadow.wants_alpha()`:
+   `surface.set_premultiplied_alpha(true)` on the softbuffer surface (patched softbuffer), and
+   write **content pixels with alpha 0xFF** (a `0x00RRGGBB` pixel is transparent from then on: an
+   invisible window if you forget).
+3. **Two sizes.** `window.inner_size()` and `WindowEvent::Resized` report the SURFACE: allocate
+   the softbuffer buffer from them. The content is `shadow.content_size(sw, sh)` (surface minus
+   `2 * margin`, device px): render the content at that size into its own bitmap and copy it to
+   `shadow.content_origin()` (`(margin, margin)`) in the buffer, row by row. `shadow.margin()` is
+   0 while maximized, fullscreen or tiled: the content is the whole surface then and nothing is
+   painted. `surface_size` is the inverse of `content_size`.
+4. **Keep the shadow in step.** On `Resized`, `ScaleFactorChanged` and `Focused` call
+   `shadow.update(&window, scale, active)`; it re-reads the margin in force from winit (a
+   maximize, restore or tile arrives as a `Resized`) and returns true when what you draw
+   changed: redraw then.
+5. **Paint** in the redraw, after the content copy: `shadow.paint_frame(&mut buffer, sw, sh,
+   buffer.age())`. It fills only the margin and touches no content pixel. The margin does not
+   change between frames at one size, so a normal frame writes none of it: softbuffer keeps two
+   buffers and resizes each lazily, so after a change of size, margin, scale or focus both are
+   repainted once (two frames); a buffer of age 0 is repainted at once. Cost, release build,
+   scale 1: `paint` 10 us at 672x472 and 45 us at 3440x1440 (1.35 MB written), 113 us at 3840x2160
+   scale 2; `Painter::new` (tiles, on a scale or focus change) 0.14 ms; `paint_frame` on a normal
+   frame is a comparison. With `present_with_damage`: the margin needs no rectangle on a normal
+   frame; on the two repaint frames damage the whole surface (a buffer after a resize is new
+   memory).
+6. **Pointer.** `CursorMoved` is in surface coordinates: `shadow.to_content(x, y)` gives content
+   coordinates for hit-testing (`to_surface` goes back). In the resize band they are negative or
+   past the content size: the compositor delivers events only from the content grown by
+   `RESIZE_BAND` (6 logical px, the winit patch's input region) and lets clicks in the rest of the
+   shadow through to the window behind. An edge hit test written as `x < edge` (not `0 <= x <
+   edge`) therefore catches the outer band too and `drag_resize_window` keeps working; an app that
+   resizes only from inside its content needs no change. `shadow.takes_input(x, y, sw, sh)` is the
+   same rule for tests. X11: the same, by an input shape.
+7. **Minimum size.** The winit patch counts min/max sizes as CONTENT sizes on Wayland, so
+   `with_min_inner_size(520x360)` keeps its meaning there. On X11 the window manager sees the whole
+   window: call `shadow.set_min_content_size(&window, size)` after `attach` on every route (it adds
+   the margin on X11 only) instead of the attribute.
+8. **Sizes you request** (`request_inner_size`) are surface sizes on Wayland: add `2 * margin /
+   scale` logical px.
+
+The shadow's logical reach is 36 px (`EXTENT`); the margin in device px is `ceil(36 * scale)`. At
+fractional scales it is whole for 1.25, 1.5 and 1.75 (45, 54, 63); at others the content edge
+falls between device pixels and blurs by under half a pixel.
+
+### What was run (2026-11-14, this machine: KDE Plasma 6 Wayland, 3440x1440, scale 1; cargo 1.99)
+
+`examples/shadow.rs` models the apps (content bitmap rendered separately, copied to the margin
+offset; `drag_resize_window` from the content edges, `drag_window` from a fake 40 px title row).
+`MD_SHADOW=client|kwin|none`; arguments `backdrop`, `backdrop-dark`, `maximize`.
+
+- softbuffer: stock 0.4.8 gives an opaque black margin; with the alpha patch the margin is
+  transparent and the shadow shows. Screenshots over a light and a dark backdrop: the content
+  pixels (corner marks, 1 px border, title row) are exactly what was rendered and the shadow is
+  pixel-identical to the KWin route's.
+- KWin's `frameGeometry` read from a KWin script: normal 600x400 (the content; surface 672x472);
+  maximized 3440x1396 (surface 3440x1396, margin 0, content flush to the screen edges); restored
+  600x400 with the shadow back; quick-tiled left 1720x1396 (surface 1720x1396, margin 0, content
+  edge on the screen edge and flush on the split line).
+- X11 (Xwayland, `WAYLAND_DISPLAY` unset): ARGB window, `_GTK_FRAME_EXTENTS` honoured by KWin:
+  `frameGeometry` 600x400 normal, 3440x1396 maximized, 1720x1396 tiled; the shadow shows. On X11
+  the margin stays in force when maximized (it lies off screen) and when tiled (the shadow is then
+  drawn over the neighbouring tile: winit's X11 window does not report tiling, so the app cannot
+  know; GTK sets the extents to 0 on maximize and tile for this reason).
+- A wlroots compositor: sway in a container (`WLR_BACKENDS=headless`, no display access): the
+  client route works, window geometry honoured (`swaymsg` rect = content), fullscreen margin 0,
+  scale 2 correct. Not run: Mutter/GNOME (not available), a click through the margin and
+  `drag_resize_window` from the outer band (need input), fractional scales on a real compositor.
+
+GNOME (Mutter) and wlroots compositors have no KWin shadow protocol, so the kwin route returns
+`None` there; they use the client route when the patches are in. The KWin shadow object is leaked,
+not destroyed, when `Shadow` is dropped: the app's state is usually dropped after the event loop,
+when the `wl_display` is gone, and a request then crashes. The compositor removes it with the
+surface.
