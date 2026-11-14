@@ -90,6 +90,44 @@ Receiver side: `single::listen_requests_waking(app, settings, wake) -> Option<Re
 (instead of `listen_waking`, which still gives paths only). Sender side:
 `single::forward_request(app, settings, &Request) -> bool`, and `single::forward` as before.
 
+### Live text
+
+`?text=<n>` announces `n` bytes of raw UTF-8 that follow the message's terminating empty line,
+unframed and uncounted otherwise: the sender writes `Request::to_wire(app)` (the message, then the
+text). `?live=off` has no bytes. Both imply `follow`, so they never raise, focus or open, and the
+message gives its path as `?path=`.
+
+```
+mdview
+?path=/home/u/notes.md
+?follow
+?line=200
+?from=mdedit
+?text=18423
+
+<18423 bytes of the document as the editor has it>
+```
+
+- Cap: `MAX_TEXT` = 2 MiB per update. A sender whose document is larger sends no text and leaves the
+  viewer on the file (the save-driven preview); a receiver that is announced more reads nothing and
+  does not answer. Text that is not UTF-8, or does not arrive in full within 2 seconds in all,
+  delivers nothing and gets no `ok`. The receiver reads on the listener thread; the window thread
+  only sees a finished `Request` in its channel.
+- `Request.text` and `Request.live_off` are set only by `send`; no command-line argument carries
+  them.
+- Sending: `sister::send` connects with a 300 ms limit and writes within 1.5 s; for 200 KB, one send
+  and receive over loopback is about 0.5 ms (a test measures it).
+
+Why older receivers are safe. An old receiver reads the name line and then lines up to the first
+empty line; everything after it is never looked at (`take_while` stops, and the answer is written).
+`?text=` is an option line it skips like `?line=`, and the request is `follow`, so it does nothing
+with it. The text cannot be taken for a message or paths, because the old reader stops at that empty
+line and the connection handles one message. One effect remains, and a test against a copy of the old
+listener shows it: an old receiver closes with the text unread, which resets the connection when
+that is more than its read buffer held, so for about 2 MiB the sender gets `false` instead of `ok`
+(up to at least 20 KB it gets `ok`). The editor must treat `false` as "no live link", never as
+an error. The old receiver has by then done nothing to the window.
+
 ## Finding the other application
 
 `sister::find(name) -> Option<PathBuf>`, first match wins:
@@ -141,6 +179,17 @@ monitor for the window, which Wayland does until the window has been shown on an
 - At the top of the page, "the source line" is the line of the first text in view: the innermost
   block there (a list item, a table cell), not the whole list.
 
+- With `text`: the tab of that file (it must already be open; nothing is opened) shows the text
+  instead of the file's, with the same parser, incremental updates and keeping its place; the
+  request's `line` is the scroll target. A small "live" mark shows in the tab and status. At most
+  one parse a frame; of updates that wait together the last wins, and all earlier ones are skipped.
+  Images and links resolve against the file's folder as before. While live, file-change reloads of
+  that tab are ignored.
+- Live ends, and the tab shows the file again, when: `live_off` arrives; the file changes on disk
+  after the last live text (the editor saved, so disk is now the newest); the user reloads (F5);
+  or the tab closes. Nothing else keeps unsaved text, so it cannot outlive its editor by more than
+  until the file is touched or F5 pressed. A `follow` without text does not end it.
+
 ## What the editor must do
 
 Receiving ("Edit in mdedit", from the viewer):
@@ -169,6 +218,20 @@ Sending ("Preview in mdview"):
 - [ ] Unsaved changes are not in the viewer; the line still maps. Saving makes the viewer reload
       (its file watcher) and keep its place.
 - [ ] Nothing is started or sent at launch, and nothing runs while no link exists.
+
+Live text (unsaved changes in the viewer):
+
+- [ ] While linked, after an edit: send `Request { follow: true, text: Some(whole document), line:
+      Some(caret line), from, ..Request::new(path) }`. Debounced to at most 10 a second, the latest
+      text when the interval has passed, and only when the text differs from what was last sent.
+      Never when the document is over `MAX_TEXT` bytes: send nothing and leave the viewer on the
+      file, which it shows after a save.
+- [ ] On save: send nothing more for it; the viewer sees the file change and returns to the file.
+      (A final live text equal to the saved one is harmless.)
+- [ ] On unlink (the user ends the link), on closing the document's tab, and on leaving the file
+      (rename, close without save): send `Request { live_off: true, ..Request::new(path) }`.
+- [ ] The path is the file's, saved or not; for a document that has no file, send no text.
+- [ ] `send` false: as above, no live link. A false after a large text may only mean an old viewer.
 
 ## Run and not run
 

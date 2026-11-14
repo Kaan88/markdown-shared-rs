@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use crate::sister::Request;
+use crate::sister::{MAX_TEXT, Request};
 
 /// Where the running instance records its port.
 pub fn port_file(settings: &Path) -> PathBuf {
@@ -70,7 +70,7 @@ pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
         message.push('\n');
     }
     message.push('\n');
-    send(settings, &message)
+    send(settings, message.as_bytes())
 }
 
 /// [`forward`] for a file with a place to show: see [`Request::encode`] for what travels. A
@@ -79,11 +79,11 @@ pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
 pub fn forward_request(app: &str, settings: &Path, request: &Request) -> bool {
     let mut request = request.clone();
     request.path = std::path::absolute(&request.path).unwrap_or(request.path);
-    send(settings, &request.encode(app))
+    send(settings, &request.to_wire(app))
 }
 
 /// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
-fn send(settings: &Path, message: &str) -> bool {
+fn send(settings: &Path, message: &[u8]) -> bool {
     let Some(port) = std::fs::read_to_string(port_file(settings))
         .ok()
         .and_then(|t| t.trim().parse::<u16>().ok())
@@ -98,7 +98,10 @@ fn send(settings: &Path, message: &str) -> bool {
         return false;
     };
     _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-    if stream.write_all(message.as_bytes()).is_err() {
+    // A message with text can be a megabyte or two, which the socket buffer takes in one go on
+    // loopback; the write timeout bounds a receiver that does not read.
+    _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+    if stream.write_all(message).is_err() {
         return false;
     }
     let mut reply = String::new();
@@ -139,8 +142,33 @@ pub fn listen_requests_waking(
     Some(receiver)
 }
 
+/// How long a message's text may take to arrive, in all.
+const READ_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The `n` bytes of text after a message, as UTF-8, or `None` when they do not arrive within
+/// [`READ_DEADLINE`] or are not valid text. Runs on the listener thread, never the window's.
+fn read_text(reader: &mut impl std::io::Read, n: usize) -> Option<String> {
+    let end = std::time::Instant::now() + READ_DEADLINE;
+    let mut bytes = vec![0; n];
+    let mut filled = 0;
+    while filled < n {
+        if std::time::Instant::now() >= end {
+            return None;
+        }
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) | Err(_) => return None,
+            Ok(got) => filled += got,
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
 /// existing file a message names, then `wake`.
+///
+/// A message may be followed by the text its `?text=<bytes>` line announces: it is read here, up to
+/// [`MAX_TEXT`] bytes within [`READ_DEADLINE`], and attached to each request. A message that
+/// announces more, or whose text is late, short or not UTF-8, gets no `ok` and delivers nothing.
 fn serve(
     app: &str,
     settings: &Path,
@@ -160,13 +188,23 @@ fn serve(
         let _lock = lock;
         for stream in listener.incoming().flatten() {
             _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut lines = BufReader::new(&stream).lines().map_while(Result::ok);
+            let mut reader = BufReader::new(&stream);
+            let mut lines = (&mut reader).lines().map_while(Result::ok);
             if lines.next().as_deref() != Some(app.as_str()) {
                 continue;
             }
             let body: Vec<String> = lines.take_while(|l| !l.is_empty()).collect();
-            for request in Request::parse(body.iter().map(String::as_str)) {
+            let text = match Request::text_length(body.iter().map(String::as_str)) {
+                None => None,
+                Some(n) if n > MAX_TEXT => continue,
+                Some(n) => match read_text(&mut reader, n) {
+                    Some(text) => Some(text),
+                    None => continue,
+                },
+            };
+            for mut request in Request::parse(body.iter().map(String::as_str)) {
                 if request.path.is_file() {
+                    request.text = text.clone();
                     deliver(request);
                 }
             }
@@ -205,6 +243,159 @@ mod tests {
             receiver.try_recv().is_err(),
             "a missing file is not forwarded"
         );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The listener of the release before text existed, as it was: the same lines, the same reads.
+    fn old_serve(app: &'static str, delivered: std::sync::mpsc::Sender<Request>) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut lines = BufReader::new(&stream).lines().map_while(Result::ok);
+                if lines.next().as_deref() != Some(app) {
+                    continue;
+                }
+                let body: Vec<String> = lines.take_while(|l| !l.is_empty()).collect();
+                for request in Request::parse(body.iter().map(String::as_str)) {
+                    if request.path.is_file() {
+                        _ = delivered.send(request);
+                    }
+                }
+                _ = (&stream).write_all(b"ok\n");
+            }
+        });
+        port
+    }
+
+    fn ask(port: u16, message: &[u8]) -> bool {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
+        // A receiver that closes with bytes unread resets the connection: the write or the read
+        // then fails, which is an answer of "no" like any other.
+        if stream.write_all(message).is_err() {
+            return false;
+        }
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).is_ok() && reply.trim() == "ok"
+    }
+
+    #[test]
+    fn an_old_receiver_ignores_text_and_does_nothing_with_it() {
+        let dir = std::env::temp_dir().join(format!("mdshared-oldtext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        let (tx, rx) = channel();
+        let port = old_serve("test-app", tx);
+        // Small, larger than the old reader's buffer, and the cap. The bytes after the empty line
+        // are never read by it. It must not deliver them as paths, and must not be broken by
+        // them. What the sender sees is another matter: closing with bytes unread resets the
+        // connection, so a large text may get "no" instead of "ok" (a small one, already in the
+        // reader's buffer, gets "ok"). Either is an answer the editor treats as no live link.
+        let mut answers = Vec::new();
+        for size in [10, 4_000, 20_000, MAX_TEXT] {
+            let mut request = Request::new(&file);
+            request.text = Some("x".repeat(size));
+            request.line = Some(3);
+            answers.push(ask(port, &request.to_wire("test-app")));
+        }
+        eprintln!("old receiver answers for 10 B, 4 KB, 20 KB, 2 MiB: {answers:?}");
+        assert!(answers[0], "a small text is answered");
+        let mut off = Request::new(&file);
+        off.live_off = true;
+        assert!(ask(port, &off.to_wire("test-app")));
+        // A text that looks like a message of its own is not read as one either.
+        let mut tricky = Request::new(&file);
+        tricky.text = Some(format!("test-app\n{}\n\n", file.display()));
+        assert!(ask(port, &tricky.to_wire("test-app")));
+        // Exactly one request per message, each the follow request itself, which the viewer of
+        // that release treats as a follow: no raise, no open, and no text.
+        let got: Vec<Request> = (0..6)
+            .map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        assert!(got.iter().all(|r| r.follow && r.path == file));
+        assert!(got.iter().all(|r| r.text.is_none()));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_arrives_with_its_request_and_only_within_the_cap() {
+        let dir = std::env::temp_dir().join(format!("mdshared-text-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        let receiver = listen_requests_waking(APP, &settings, || {}).expect("listen");
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        let mut request = Request::new(&file);
+        request.text = Some("# live \u{e9}\u{1f600}\n".repeat(1000));
+        request.line = Some(7);
+        assert!(forward_request(APP, &settings, &request));
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(got.text, request.text);
+        assert!(got.follow && got.line == Some(7));
+
+        let mut off = Request::new(&file);
+        off.live_off = true;
+        assert!(forward_request(APP, &settings, &off));
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.live_off && got.follow && got.text.is_none());
+
+        // The cap is exact: the largest passes, one byte more is refused unanswered.
+        let mut big = Request::new(&file);
+        big.text = Some("a".repeat(MAX_TEXT));
+        assert!(forward_request(APP, &settings, &big));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap().text,
+            big.text
+        );
+        big.text = Some("a".repeat(MAX_TEXT + 1));
+        assert!(!forward_request(APP, &settings, &big));
+        assert!(receiver.try_recv().is_err());
+
+        // Text that is not UTF-8, or that is shorter than announced, delivers nothing.
+        let port: u16 = std::fs::read_to_string(port_file(&settings))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut head = Request::new(&file);
+        head.text = Some("abcd".into());
+        let mut message = head.encode(APP).into_bytes();
+        message.extend_from_slice(&[0xff, 0xfe, b'a', b'b']);
+        assert!(!ask(port, &message));
+        let mut message = head.encode(APP).into_bytes();
+        message.extend_from_slice(b"ab");
+        assert!(!ask(port, &message), "two bytes short, never completes");
+        assert!(receiver.try_recv().is_err());
+        // The listener is still serving.
+        assert!(forward_request(APP, &settings, &Request::new(&file)));
+        assert!(receiver.recv_timeout(Duration::from_secs(2)).is_ok());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_round_trip_of_200_kb_is_quick() {
+        let dir = std::env::temp_dir().join(format!("mdshared-rtt-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        let receiver = listen_requests_waking(APP, &settings, || {}).expect("listen");
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        let mut request = Request::new(&file);
+        request.text = Some("line of text\n".repeat(200 * 1024 / 13));
+        let mut worst = Duration::ZERO;
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            assert!(forward_request(APP, &settings, &request));
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            worst = worst.max(t.elapsed());
+        }
+        eprintln!("200 KB send + receive, worst of 20: {worst:?}");
+        assert!(worst < Duration::from_millis(250));
         _ = std::fs::remove_dir_all(&dir);
     }
 

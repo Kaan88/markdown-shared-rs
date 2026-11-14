@@ -60,7 +60,18 @@ pub struct Request {
     pub place: Option<Rect>,
     /// The sending application's name (`mdview`, `mdedit`).
     pub from: Option<String>,
+    /// The document's text as the sender has it now, unsaved changes included, for the receiver
+    /// to show in place of the file's. At most [`MAX_TEXT`] bytes. Implies `follow`. Only
+    /// [`send`] carries it; no argument does.
+    pub text: Option<String>,
+    /// Ends the live state a `text` started for `path`: the receiver goes back to the file. Implies
+    /// `follow`. Only [`send`] carries it.
+    pub live_off: bool,
 }
+
+/// The most text one request may carry, in bytes. A sender with a larger document sends none and
+/// leaves the receiver to the file on disk; a receiver refuses more.
+pub const MAX_TEXT: usize = 2 * 1024 * 1024;
 
 /// The first character of a line that carries an option instead of a path. No absolute path begins
 /// with it, and a receiver that does not know the options finds no such file and skips the line.
@@ -95,7 +106,8 @@ impl Request {
     pub fn encode(&self, app: &str) -> String {
         let path = self.path.display();
         let mut out = format!("{app}\n");
-        if self.follow {
+        let follow = self.follow || self.text.is_some() || self.live_off;
+        if follow {
             out.push_str(&format!("{OPTION}path={path}\n{OPTION}follow\n"));
         } else {
             out.push_str(&format!("{path}\n"));
@@ -109,11 +121,37 @@ impl Request {
         if let Some(rect) = self.place {
             out.push_str(&format!("{OPTION}place={rect}\n"));
         }
+        if let Some(text) = &self.text {
+            out.push_str(&format!("{OPTION}text={}\n", text.len()));
+        }
+        if self.live_off {
+            out.push_str(&format!("{OPTION}live=off\n"));
+        }
         if let Some(from) = self.from.as_deref().filter(|f| !f.contains(['\n', '\r'])) {
             out.push_str(&format!("{OPTION}from={from}\n"));
         }
         out.push('\n');
         out
+    }
+
+    /// [`encode`](Self::encode) and then the raw UTF-8 bytes of `text`, which the `?text=<bytes>`
+    /// line announces and which follow the empty line that ends the message. An older receiver
+    /// answers `ok` after that line and never reads them, and skips the `?text` line like any
+    /// other option; it does nothing else, since a request with text is a `follow`.
+    pub fn to_wire(&self, app: &str) -> Vec<u8> {
+        let mut out = self.encode(app).into_bytes();
+        if let Some(text) = &self.text {
+            out.extend_from_slice(text.as_bytes());
+        }
+        out
+    }
+
+    /// The byte count a message's `?text=` line announces, if it has one.
+    pub fn text_length<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<usize> {
+        lines.into_iter().find_map(|line| {
+            let value = line.strip_prefix(OPTION)?.strip_prefix("text=")?;
+            value.parse().ok()
+        })
     }
 
     /// The requests in a message's lines, after the application's name and up to the empty line:
@@ -134,6 +172,12 @@ impl Request {
                 "line" => options.line = number(),
                 "col" => options.column = number(),
                 "follow" => options.follow = true,
+                // The text itself comes after the message; the receiver attaches it.
+                "text" => options.follow = true,
+                "live" => {
+                    options.live_off = value == "off";
+                    options.follow |= options.live_off;
+                }
                 "place" => options.place = Rect::parse(value),
                 "from" => options.from = Some(value.to_string()).filter(|f| !f.is_empty()),
                 _ => {}
@@ -373,6 +417,28 @@ pub fn send(name: &str, request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_is_an_option_line_and_a_tail() {
+        let mut r = Request::new("/a/b.md");
+        r.text = Some("# hi\n".into());
+        r.line = Some(2);
+        let wire = r.to_wire("mdview");
+        assert_eq!(
+            String::from_utf8(wire.clone()).unwrap(),
+            "mdview\n?path=/a/b.md\n?follow\n?line=2\n?text=5\n\n# hi\n"
+        );
+        let head = r.encode("mdview");
+        let parsed = Request::parse(head.lines().skip(1).take_while(|l| !l.is_empty()));
+        assert_eq!(Request::text_length(head.lines()), Some(5));
+        assert!(parsed[0].follow && parsed[0].text.is_none());
+        let mut off = Request::new("/a/b.md");
+        off.live_off = true;
+        let head = off.encode("mdview");
+        assert!(head.contains("?follow\n") && head.contains("?live=off\n"));
+        assert!(Request::parse(head.lines().skip(1).take_while(|l| !l.is_empty()))[0].live_off);
+        assert_eq!(Request::text_length(head.lines()), None);
+    }
 
     fn lines(message: &str) -> Vec<&str> {
         // What a receiver reads: after the name, up to the empty line.
