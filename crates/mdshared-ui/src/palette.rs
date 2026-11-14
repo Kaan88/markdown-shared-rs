@@ -385,6 +385,14 @@ impl Palette {
         self.selected.map(|s| self.entries[self.shown[s].entry].id)
     }
 
+    /// The label of the entry with this id, if it is held.
+    pub fn label_of(&self, id: u32) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.label.as_str())
+    }
+
     /// How many entries the list holds now.
     pub fn len(&self) -> usize {
         self.shown.len()
