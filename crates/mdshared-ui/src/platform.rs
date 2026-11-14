@@ -153,7 +153,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+        SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
         GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -211,6 +212,55 @@ mod imp {
         // SAFETY: matches the GlobalLock above.
         unsafe { GlobalUnlock(h) };
         Some(text.replace("\r\n", "\n"))
+    }
+
+    /// Text and HTML together: CF_UNICODETEXT and "HTML Format". The text is what counts; the
+    /// HTML is best effort, so a failure of it still leaves the copy usable.
+    pub fn set_clipboard_html(html: &str, text: &str) -> bool {
+        let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+        let data: Vec<u8> = wide(&text).iter().flat_map(|u| u.to_le_bytes()).collect();
+        let mut cf = crate::cf_html::cf_html(html).into_bytes();
+        cf.push(0);
+        // SAFETY: a NUL-terminated UTF-16 name.
+        let format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
+        if !open_clipboard() {
+            return false;
+        }
+        // SAFETY: the clipboard was opened by this thread above.
+        let ok = unsafe { EmptyClipboard() } != 0 && put_format(CF_UNICODETEXT, &data);
+        if ok && format != 0 {
+            put_format(format, &cf);
+        }
+        // SAFETY: the clipboard is open and owned by this thread.
+        unsafe { CloseClipboard() };
+        ok
+    }
+
+    /// Puts one format on the open clipboard; the system owns the memory once that succeeds.
+    fn put_format(format: u32, bytes: &[u8]) -> bool {
+        // SAFETY: plain allocation request.
+        let h = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+        if h.is_null() {
+            return false;
+        }
+        // SAFETY: h is a valid moveable global handle.
+        let dst = unsafe { GlobalLock(h) } as *mut u8;
+        if dst.is_null() {
+            // SAFETY: h is still owned by us.
+            unsafe { GlobalFree(h) };
+            return false;
+        }
+        // SAFETY: dst has room for `bytes.len()` bytes; regions do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+        // SAFETY: matches the GlobalLock above.
+        unsafe { GlobalUnlock(h) };
+        // SAFETY: h holds the bytes of the format; on success the system owns it.
+        if unsafe { SetClipboardData(format, h) }.is_null() {
+            // SAFETY: ownership was not transferred.
+            unsafe { GlobalFree(h) };
+            return false;
+        }
+        true
     }
 
     pub fn set_clipboard_text(text: &str) -> bool {
@@ -473,6 +523,10 @@ mod imp {
     pub fn set_clipboard_text(text: &str) -> bool {
         with_clipboard(|c| c.set_text(text).ok()).is_some()
     }
+    pub fn set_clipboard_html(html: &str, text: &str) -> bool {
+        let document = crate::cf_html::html_document(html);
+        with_clipboard(|c| c.set().html(document.as_str(), Some(text)).ok()).is_some()
+    }
     pub fn open_url(url: &str) -> bool {
         has_safe_scheme(url)
             && std::process::Command::new("xdg-open")
@@ -561,6 +615,13 @@ pub fn clipboard_text() -> Option<String> {
 pub fn set_clipboard_text(text: &str) -> bool {
     imp::set_clipboard_text(text)
 }
+/// Puts HTML and its plain-text equivalent on the clipboard together, so a paste into a word
+/// processor or mail keeps the formatting and one into a text field gets the text. `html` is a
+/// fragment (no `<html>` or `<body>`). Windows writes CF_HTML; elsewhere `text/html` goes out with
+/// the text as its alternative. Returns false when the text could not be placed.
+pub fn set_clipboard_html(html: &str, text: &str) -> bool {
+    imp::set_clipboard_html(html, text)
+}
 /// Opens an http(s)/mailto URL with the default handler.
 pub fn open_url(url: &str) -> bool {
     imp::open_url(url)
@@ -609,6 +670,15 @@ mod explorer_tests {
         let s = "İstanbul ı ğ 😀 ok\nsecond line";
         assert!(set_clipboard_text(s));
         assert_eq!(clipboard_text().as_deref(), Some(s));
+    }
+
+    #[test]
+    fn html_copy_leaves_the_text_readable() {
+        assert!(set_clipboard_html(
+            "<p><b>bold</b> \u{e9}</p>",
+            "bold \u{e9}\nnext"
+        ));
+        assert_eq!(clipboard_text().as_deref(), Some("bold \u{e9}\nnext"));
     }
 
     #[test]
