@@ -129,6 +129,62 @@ that is more than its read buffer held, so for about 2 MiB the sender gets `fals
 (up to at least 20 KB it gets `ok`). The editor must treat `false` as "no live link", never as
 an error. The old receiver has by then done nothing to the window.
 
+### A document that has no file
+
+Added on branch `f/live-preview-unsaved` (2026-11-15), for the editor's "Preview in mdview" on a
+document that was never saved. Three more fields, carried only by `send`:
+
+```rust
+pub struct Request {
+    // ...
+    pub doc: Option<String>,    // the sender's name for a document without a file
+    pub title: Option<String>,  // with `doc`: what to call it ("Untitled 1")
+    pub open: bool,             // with `doc` and `text`: show it (make the tab, switch, raise)
+}
+Request::document(id, title)    // such a request; its `path` is empty
+sister::doc_id(id)              // Some(id) if it is 1 to 64 of A-Z a-z 0-9 . _ -
+sister::deliver(name, &request) -> Delivery   // Taken | Older | Nobody
+```
+
+The name is the sender's and lasts as long as the sender has the document open; the receiver
+only compares it. It is not a path, and nothing with that name exists on disk.
+
+```
+mdview
+?doc=mdedit-4120-7
+?title=Untitled 1
+?open
+?line=3
+?place=960,0,960,1040
+?text=18
+?from=mdedit
+
+# never saved yet
+```
+
+- Showing it (`open`, with `text`): the one request with text that is not a `follow`. The
+  receiver makes a tab for the document if it has none, switches to it, moves its window if
+  `place`, and raises it. There is no path line and no `?path=`.
+- Later texts: `?follow`, `?doc=`, `?title=`, `?text=`, as for a file. A receiver that has no
+  tab for the document does nothing (it never opens one for a `follow`).
+- `?live=off` with `?doc=`: the sender no longer sends this document's text.
+- Saved: `?path=<the file>`, `?follow`, `?doc=<the name it had>`. The receiver's tab for the
+  document becomes the tab of that file.
+- No argument carries any of this: a document is started by `open(name, &Request { from, .. })`
+  with an empty path, which starts the application bare (or reaches the running window, which
+  raises itself), and the text follows over the port. `Request::args` leaves an empty path out.
+- The receiver delivers a request with `doc` whether or not anything is on disk
+  (`listen_requests_waking`; `listen_waking`, which gives paths, never sees one) and answers
+  `ok doc` instead of `ok`.
+
+Why older builds are safe. An older receiver finds only option lines, so no file: it delivers
+nothing and answers `ok`. The sender asked about a document and wants `ok doc`, so
+`deliver` returns `Delivery::Older` (and `send` false): the editor says that this mdview cannot
+show a document that has no file, and ends the link. The saved message does carry a path, as
+`?path=` with `?follow`: to an older receiver it is an ordinary live update for a file it does
+not show, which does nothing. An older *sender* never writes `?doc=`. A test against a copy of
+the old listener shows both answers.
+
 ## Finding the other application
 
 `sister::find(name) -> Option<PathBuf>`, first match wins:
@@ -180,6 +236,8 @@ monitor for the window, which Wayland does until the window has been shown on an
 - At the top of the page, "the source line" is the line of the first text in view: the innermost
   block there (a list item, a table cell), not the whole list.
 
+- A document without a file (`doc`): see "The preview of a document that has no file" in the
+  viewer's `docs/next/live-preview-unsaved.md` (later its DESIGN.md).
 - With `text`: the tab of that file (it must already be open; nothing is opened) shows the text
   instead of the file's, with the same parser, incremental updates and keeping its place; the
   request's `line` is the scroll target. A small "live" mark shows in the tab and status. At most
