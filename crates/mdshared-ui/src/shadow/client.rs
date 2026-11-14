@@ -20,6 +20,44 @@ pub struct Painter {
     pix: [Vec<u32>; 8],
     /// The rounded corners, when the radius is above 0.
     round: Option<Round>,
+    /// How the edge bands weaken toward the window's corners.
+    ends: Option<Ends>,
+}
+
+/// The edge tiles hold the shadow of an endless edge. Near a corner of the window the shadow is
+/// weaker (the product of the two edges' coverages, as in the corner tiles), so the ends of each
+/// band are scaled by the other edge's coverage: without it the band meets its corner tile with a
+/// step. Each table is indexed by the pixel's distance in from the window's edge and holds the
+/// factor in 1/256ths; past its end the factor is 1.
+struct Ends {
+    /// For the top and bottom bands, by the distance in from the left or the right edge.
+    side: Vec<u16>,
+    /// For the left and right bands, by the distance down from the top edge (the shadow's top
+    /// edge is the drop further in), and by the distance up from the bottom edge.
+    top: Vec<u16>,
+    bottom: Vec<u16>,
+}
+
+impl Ends {
+    fn new(scale: f64) -> Ends {
+        let (_, sigma, drop) = metrics(scale);
+        let len = (3.5 * sigma + drop).ceil() as usize;
+        let table = |dy: f64| -> Vec<u16> {
+            (0..len)
+                .map(|d| (coverage(dy - (d as f64 + 0.5), sigma) * 256.0).round() as u16)
+                .collect()
+        };
+        Ends {
+            side: table(0.0),
+            top: table(drop),
+            bottom: table(-drop),
+        }
+    }
+}
+
+/// A shadow pixel (`alpha << 24`) at `f` 256ths of its strength.
+fn weaken(px: &mut u32, f: u16) {
+    *px = (((*px >> 24) * f as u32 + 128) >> 8) << 24;
 }
 
 /// What rounded corners need, for a radius `r` (device px).
@@ -68,6 +106,7 @@ impl Painter {
     /// A painter whose window corners have a radius of `radius` device px (0: square; at most 48).
     pub fn with_radius(scale: f64, active: bool, radius: u32) -> Painter {
         let mut p = Painter::from_tiles(&render(scale, active));
+        p.ends = Some(Ends::new(scale));
         let r = radius.min(MAX_RADIUS);
         if r > 0 {
             p.round = Some(Round::new(scale, active, r));
@@ -94,6 +133,7 @@ impl Painter {
             m: t.m,
             pix: std::array::from_fn(conv),
             round: None,
+            ends: None,
         }
     }
 
@@ -102,7 +142,11 @@ impl Painter {
         let round = self.round.as_ref().map_or(0, |r| {
             r.cov.len() + r.shadow.iter().map(Vec::len).sum::<usize>()
         });
-        self.pix.iter().map(|v| v.len() * 4).sum::<usize>() + round
+        let ends = self
+            .ends
+            .as_ref()
+            .map_or(0, |e| (e.side.len() + e.top.len() + e.bottom.len()) * 2);
+        self.pix.iter().map(|v| v.len() * 4).sum::<usize>() + round + ends
     }
 
     /// Fills the margin of a `w` x `h` surface buffer (row-major, stride `w`) with the shadow and
@@ -141,6 +185,28 @@ impl Painter {
             let row = &mut pixels[y * w..(y + 1) * w];
             row[..k].copy_from_slice(left);
             row[w - k..].copy_from_slice(right);
+        }
+        let Some(ends) = &self.ends else { return };
+        // The ends of the top and bottom bands, by the column's distance from each side edge. In
+        // a window narrower than two tables a column takes both factors.
+        let (cw, ch) = (w - 2 * k, h - 2 * k);
+        for (d, &f) in ends.side.iter().enumerate().take(cw) {
+            for y in (0..k).chain(h - k..h) {
+                weaken(&mut pixels[y * w + k + d], f);
+                weaken(&mut pixels[y * w + w - k - 1 - d], f);
+            }
+        }
+        // The ends of the left and right bands, by the row's distance from the top and from the
+        // bottom edge.
+        for (rows, from_top) in [(&ends.top, true), (&ends.bottom, false)] {
+            for (d, &f) in rows.iter().enumerate().take(ch) {
+                let y = if from_top { k + d } else { h - k - 1 - d };
+                let row = &mut pixels[y * w..(y + 1) * w];
+                let (left, rest) = row.split_at_mut(k);
+                for px in left.iter_mut().chain(rest[w - 2 * k..].iter_mut()) {
+                    weaken(px, f);
+                }
+            }
         }
     }
 
@@ -335,8 +401,28 @@ mod tests {
         assert_eq!(col(0, 0), col(w - 1, 0));
         assert_eq!(col(m - 1, m - 1), col(w - m, m - 1));
         assert!(col(150, h - m) > col(150, m - 1));
-        // The side bands are continuous with the corners above and below.
-        assert_eq!(col(5, m - 1), col(5, m));
+        // Every band carries on from its corner tiles without a step, at each depth of the
+        // margin: the shadow changes by a few alpha steps from one pixel to the next, no more.
+        let near = |a: u32, b: u32| a.abs_diff(b) <= 4;
+        for i in 0..m {
+            for (yc, yb) in [(m - 1, m), (h - m, h - m - 1)] {
+                assert!(near(col(i, yc), col(i, yb)), "left band at {i}, row {yb}");
+                assert!(
+                    near(col(w - 1 - i, yc), col(w - 1 - i, yb)),
+                    "right band at {i}, row {yb}"
+                );
+            }
+            for (xc, xb) in [(m - 1, m), (w - m, w - m - 1)] {
+                assert!(near(col(xc, i), col(xb, i)), "top band at {i}, column {xb}");
+                assert!(
+                    near(col(xc, h - 1 - i), col(xb, h - 1 - i)),
+                    "bottom band at {i}, column {xb}"
+                );
+            }
+        }
+        // Away from the corners the bands are the tiles, whole.
+        assert_eq!(col(150, m - 1), p.pix[0][m - 1] >> 24);
+        assert_eq!(col(m - 1, 100), p.pix[6][m - 1] >> 24);
     }
 
     #[test]
