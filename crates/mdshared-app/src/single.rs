@@ -221,7 +221,8 @@ fn read_text(reader: &mut impl std::io::Read, n: usize) -> Option<String> {
 }
 
 /// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
-/// existing file or folder a message names, and of a document without a file (`?doc=`, which
+/// existing file or folder a message names, of an `?unplace` (which is about the window, not a
+/// file), and of a document without a file (`?doc=`, which
 /// needs nothing on disk), then `wake`. A message with such a document is answered `ok doc`.
 ///
 /// A message may be followed by the text its `?text=<bytes>` line announces: it is read here, up to
@@ -265,7 +266,12 @@ fn serve(
                 if request.doc.is_some() {
                     answer = OK_DOC;
                 }
-                if request.doc.is_some() || request.path.is_file() || request.path.is_dir() {
+                // `unplace` is about the window, not about a file: it needs none.
+                if request.unplace
+                    || request.doc.is_some()
+                    || request.path.is_file()
+                    || request.path.is_dir()
+                {
                     request.text = text.clone();
                     deliver(request);
                 }
@@ -352,6 +358,31 @@ mod tests {
         let paths = dir.join("paths.ini");
         let only = listen(APP, &paths).expect("listen");
         assert!(forward(APP, &paths, &[dir.join("sub")]));
+        assert!(only.recv_timeout(Duration::from_millis(300)).is_err());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unplace_reaches_a_request_receiver_though_it_names_no_file() {
+        let dir =
+            std::env::temp_dir().join(format!("mdshared-single-unplace-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        let receiver = listen_requests_waking(APP, &settings, || {}).expect("listen");
+        let request = Request {
+            unplace: true,
+            ..Request::default()
+        };
+        assert_eq!(
+            deliver_request(APP, &settings, &request),
+            Delivery::Taken,
+            "answered ok"
+        );
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.unplace && got.follow && got.path.as_os_str().is_empty());
+        // A receiver that takes files only gets nothing.
+        let paths = dir.join("paths.ini");
+        let only = listen(APP, &paths).expect("listen");
+        assert_eq!(deliver_request(APP, &paths, &request), Delivery::Taken);
         assert!(only.recv_timeout(Duration::from_millis(300)).is_err());
         _ = std::fs::remove_dir_all(&dir);
     }
