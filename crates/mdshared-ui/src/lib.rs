@@ -5,6 +5,7 @@
 pub mod chrome;
 pub mod corners;
 pub mod desktop_entry;
+pub mod frost;
 pub mod gfx;
 pub mod glyph;
 pub mod keys;
