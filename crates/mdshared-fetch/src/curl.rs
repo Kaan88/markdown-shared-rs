@@ -86,8 +86,18 @@ fn api() -> Option<&'static Api> {
 
 fn load() -> Option<Api> {
     // SAFETY: loading libcurl runs its initializers, which are benign; the names are the SONAME
-    // of the stable ABI (`libcurl.so.4`) and the development symlink.
-    let lib = ["libcurl.so.4", "libcurl.so"]
+    // of the stable ABI (`libcurl.so.4`) and the development symlink, and on macOS the system's
+    // copy, which lives in the dyld shared cache (the path loads though no file is there).
+    const NAMES: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/usr/lib/libcurl.4.dylib",
+            "libcurl.4.dylib",
+            "libcurl.dylib",
+        ]
+    } else {
+        &["libcurl.so.4", "libcurl.so"]
+    };
+    let lib = NAMES
         .iter()
         .find_map(|name| unsafe { Library::new(name) }.ok())?;
     // SAFETY: each symbol is looked up by its documented name and given its documented C

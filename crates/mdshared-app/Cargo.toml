@@ -6,3 +6,7 @@ publish.workspace = true
 
 [dependencies]
 notify = { version = "=8.2.1", default-features = false }
+
+# macOS: the FSEvents backend (Linux uses inotify, Windows ReadDirectoryChangesW, with no feature).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }

@@ -334,6 +334,9 @@ pub struct Env {
     pub appimage: Option<PathBuf>,
     /// Windows: `%LOCALAPPDATA%`.
     pub local_app_data: Option<PathBuf>,
+    /// macOS: the folders bundles are looked for in after the one beside this bundle,
+    /// `/Applications` and `~/Applications`.
+    pub applications: Vec<PathBuf>,
     pub path: Option<OsString>,
 }
 
@@ -341,10 +344,18 @@ impl Env {
     /// The environment of this process, for the application `name`.
     pub fn current(name: &str) -> Env {
         let windows = cfg!(windows);
+        let linux = !windows && !cfg!(target_os = "macos");
+        let applications = if cfg!(target_os = "macos") {
+            let mut dirs = vec![PathBuf::from("/Applications")];
+            dirs.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Applications")));
+            dirs
+        } else {
+            Vec::new()
+        };
         Env {
             over: std::env::var_os(override_variable(name)),
             exe: std::env::current_exe().ok(),
-            data_home: (!windows)
+            data_home: linux
                 .then(|| {
                     let env = |v| std::env::var_os(v).map(PathBuf::from);
                     env("XDG_DATA_HOME")
@@ -352,13 +363,14 @@ impl Env {
                         .or_else(|| env("HOME").map(|h| h.join(".local/share")))
                 })
                 .flatten(),
-            appimage: (!windows)
+            appimage: linux
                 .then(|| std::env::var_os("APPIMAGE").map(PathBuf::from))
                 .flatten(),
             local_app_data: windows
                 .then(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
                 .flatten(),
             path: std::env::var_os("PATH"),
+            applications,
         }
     }
 }
@@ -388,7 +400,8 @@ fn runnable(path: &Path) -> bool {
 /// The executable of the application `name`, looked for in this order: `MD_SISTER_<NAME>`; beside
 /// the running executable; the AppImage recorded in `<name>.desktop` (Linux), then another AppImage
 /// named `<name>-*.AppImage` beside this one; `%LOCALAPPDATA%\Programs\<name>\<name>.exe`
-/// (Windows, where the installers put it); the `PATH`.
+/// (Windows, where the installers put it); `<name>.app` beside this bundle, then in
+/// `/Applications` and `~/Applications` (macOS); the `PATH`.
 pub fn find(name: &str) -> Option<PathBuf> {
     find_in(name, &Env::current(name))
 }
@@ -396,7 +409,7 @@ pub fn find(name: &str) -> Option<PathBuf> {
 /// [`find`] in a given environment.
 pub fn find_in(name: &str, env: &Env) -> Option<PathBuf> {
     let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    let rules: [&dyn Fn() -> Option<PathBuf>; 6] = [
+    let rules: [&dyn Fn() -> Option<PathBuf>; 7] = [
         &|| {
             env.over
                 .as_deref()
@@ -418,6 +431,7 @@ pub fn find_in(name: &str, env: &Env) -> Option<PathBuf> {
                 .join(&file);
             runnable(&installed).then_some(installed)
         },
+        &|| bundle(name, env),
         &|| {
             std::env::split_paths(env.path.as_deref()?)
                 .map(|dir| dir.join(&file))
@@ -425,6 +439,28 @@ pub fn find_in(name: &str, env: &Env) -> Option<PathBuf> {
         },
     ];
     rules.iter().find_map(|rule| rule())
+}
+
+/// The executable in `<name>.app`: in the folder that holds the bundle this process runs from
+/// (`…/mdview.app/Contents/MacOS/mdview`), then in each of [`Env::applications`].
+fn bundle(name: &str, env: &Env) -> Option<PathBuf> {
+    let own = env.exe.as_deref().and_then(|exe| {
+        let macos = exe.parent()?;
+        let contents = macos.parent()?;
+        let app = contents.parent()?;
+        let in_bundle = macos.file_name() == Some(OsStr::new("MacOS"))
+            && contents.file_name() == Some(OsStr::new("Contents"))
+            && app.extension() == Some(OsStr::new("app"));
+        in_bundle.then(|| app.parent()).flatten()
+    });
+    own.into_iter()
+        .chain(env.applications.iter().map(PathBuf::as_path))
+        .map(|dir| {
+            dir.join(format!("{name}.app"))
+                .join("Contents/MacOS")
+                .join(name)
+        })
+        .find(|p| runnable(p))
 }
 
 /// The `X-AppImage-Path=` that `mdshared_ui::desktop_entry` records in the application's own entry
@@ -910,6 +946,33 @@ mod tests {
         };
         assert_eq!(find_in("mdedit", &env), Some(installed));
         env.local_app_data = None;
+        assert_eq!(find_in("mdedit", &env), Some(on_path));
+    }
+
+    #[test]
+    fn a_bundle_beside_this_one_then_in_the_applications_folders() {
+        let t = Tree::new("bundle");
+        let beside = t.file("Downloads/mdedit.app/Contents/MacOS/mdedit", "", true);
+        let system = t.file("Applications/mdedit.app/Contents/MacOS/mdedit", "", true);
+        let user = t.file(
+            "home/Applications/mdedit.app/Contents/MacOS/mdedit",
+            "",
+            true,
+        );
+        let on_path = t.file(&format!("bin/mdedit{EXE}"), "", true);
+        let mut env = Env {
+            exe: Some(t.at("Downloads/mdview.app/Contents/MacOS/mdview")),
+            applications: vec![t.at("Applications"), t.at("home/Applications")],
+            path: Some(t.at("bin").into_os_string()),
+            ..Env::default()
+        };
+        assert_eq!(find_in("mdedit", &env), Some(beside));
+        // A plain executable is not in a bundle: only the folders are looked in.
+        env.exe = Some(t.at("Downloads/mdview"));
+        assert_eq!(find_in("mdedit", &env), Some(system.clone()));
+        std::fs::remove_file(&system).unwrap();
+        assert_eq!(find_in("mdedit", &env), Some(user));
+        env.applications.clear();
         assert_eq!(find_in("mdedit", &env), Some(on_path));
     }
 

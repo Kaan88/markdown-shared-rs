@@ -2,9 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// Whether two paths name the same file as far as spelling goes: case-insensitive on Windows.
+/// File names differ only in case on the same file: NTFS on Windows, and APFS as macOS formats
+/// it by default (a case-sensitive volume is rare, and then two names that differ only in case
+/// are taken for one file).
+pub const NAMES_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Whether two paths name the same file as far as spelling goes: case-insensitive on Windows and
+/// macOS ([`NAMES_IGNORE_CASE`]).
 pub fn same_path(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
+    if NAMES_IGNORE_CASE {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
         a == b

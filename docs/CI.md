@@ -1,10 +1,12 @@
 # CI (GitHub Actions)
 
-`.github/workflows/ci.yml` runs on a push to `main` or `feat/linux`, on every pull request and by
+`.github/workflows/ci.yml` runs on a push to `main`, `feat/linux` or `f/macos`, on every pull request and by
 hand (`workflow_dispatch`); a newer run of the same branch cancels the older one. Permissions:
 `contents: read`; no secrets.
 
-Two jobs, `linux` (ubuntu-latest) and `windows` (windows-latest, MSVC, natively), each:
+Three jobs, `linux` (ubuntu-latest), `windows` (windows-latest, MSVC, natively) and `macos` (a
+matrix of two real Macs: `macos-15` for Apple Silicon, `macos-15-intel` for Intel; `macos-13` is
+retired), each:
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --release --workspace --all-targets -- -D warnings`
@@ -30,4 +32,4 @@ file had two identities. `canonical_or_absolute` now canonicalizes the nearest e
 a missing file, so the identity is the same with or without the file (and the CI job needs no
 `TEMP` override).
 
-Known limits: x86_64 only, no macOS; the tests run headless, so nothing here opens a window.
+Known limits: no ARM Windows or ARM Linux; the tests run headless, so nothing here opens a window.

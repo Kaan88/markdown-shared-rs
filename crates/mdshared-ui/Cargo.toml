@@ -30,8 +30,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
 ] }
 
-# Linux is not built or run yet; these are the features it will need.
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
 # The settings portal, for the system's colour scheme. The same zbus the file dialogs bring in.
@@ -41,7 +40,6 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # The compositor-drawn shadow of undecorated windows (src/shadow.rs). KDE's own protocol: the same
 # crates winit and softbuffer already bring in, here named so the shadow can talk to the
 # compositor on its own event queue.
-[target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31.15"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
@@ -49,6 +47,15 @@ rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 # The X11 route of the client-drawn margin (src/shadow/x11.rs): a second connection that sets
 # `_GTK_FRAME_EXTENTS` and the input shape. The same x11rb winit already brings in.
 x11rb = { version = "0.13.2", optional = true, default-features = false, features = ["shape"] }
+
+# macOS: AppKit through winit and rfd; the colour scheme comes from winit's theme.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
+rfd = { version = "0.15.4", default-features = false }
+arboard = { version = "3", default-features = false }
+# The appearance setting (dark mode) from the user defaults. The version winit's AppKit side and
+# rfd already bring in.
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSUserDefaults"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }

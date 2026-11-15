@@ -34,12 +34,15 @@ pub struct FileTree {
     rows: Vec<Row>,
 }
 
-/// A comparison key: no verbatim prefix, no trailing separator, case-folded with `\` on Windows.
+/// A comparison key: no verbatim prefix, no trailing separator, case-folded with `\` on Windows,
+/// case-folded on macOS.
 fn key(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut s = strip_verbatim(&s).unwrap_or_else(|| s.into_owned());
     if cfg!(windows) {
         s = s.replace('/', "\\").to_lowercase();
+    } else if mdshared_app::paths::NAMES_IGNORE_CASE {
+        s = s.to_lowercase();
     }
     while s.len() > 1 && s.ends_with(is_sep) && !s.ends_with(":\\") {
         s.pop();

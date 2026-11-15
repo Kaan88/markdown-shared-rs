@@ -6,10 +6,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// The per-user application data folder for `app`: `%LOCALAPPDATA%\<app>` on Windows,
-/// `$XDG_DATA_HOME/<app>` or `~/.local/share/<app>` elsewhere. `None` if no base is known.
+/// `~/Library/Application Support/<app>` on macOS, `$XDG_DATA_HOME/<app>` or
+/// `~/.local/share/<app>` elsewhere. `None` if no base is known.
 pub fn data_dir(app: &str) -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)

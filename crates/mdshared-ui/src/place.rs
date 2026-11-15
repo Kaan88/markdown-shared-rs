@@ -72,7 +72,7 @@ fn work_of_monitor(_window: &Window) -> Option<Rect> {
 /// later, and a failure there is silent. False where nothing can be done (Wayland on another
 /// desktop), so the caller can show a hint.
 pub fn set(window: &Window, rect: Rect) -> bool {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     if is_wayland(window) {
         return kde_session() && kwin::place(window, rect);
     }
@@ -289,7 +289,7 @@ fn normal_rect(_window: &Window) -> Option<Rect> {
 #[cfg(not(windows))]
 fn set_normal_rect(_window: &Window, _normal: Rect) {}
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn is_wayland(window: &Window) -> bool {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     window
@@ -298,13 +298,13 @@ fn is_wayland(window: &Window) -> bool {
 }
 
 /// `$XDG_CURRENT_DESKTOP` lists KDE.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn kde_session() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| lists_kde(&d))
 }
 
 /// `desktops` is a colon-separated `$XDG_CURRENT_DESKTOP`.
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn lists_kde(desktops: &str) -> bool {
     desktops.split(':').any(|d| d.eq_ignore_ascii_case("KDE"))
 }
@@ -312,7 +312,7 @@ fn lists_kde(desktops: &str) -> bool {
 /// The KWin script that places the window of process `pid` at `rect`, in KWin's logical pixels,
 /// kept inside the area the panels of the screen it lands on leave free (the window's own screen
 /// when no screen holds the rectangle's centre).
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn kwin_script(pid: u32, rect: Rect) -> String {
     let Rect { x, y, w, h } = rect;
     format!(
@@ -336,7 +336,7 @@ fn kwin_script(pid: u32, rect: Rect) -> String {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod kwin {
     use super::{Rect, Window, kwin_script};
 
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(left.w + right.w, area.w);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_kwin_script_names_the_process_and_the_rectangle() {
         let script = kwin_script(
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(script.matches('{').count(), script.matches('}').count());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn only_a_kde_desktop_is_taken_for_kde() {
         assert!(lists_kde("KDE") && lists_kde("ubuntu:kde"));

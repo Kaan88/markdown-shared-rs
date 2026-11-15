@@ -28,7 +28,8 @@ pub struct App {
     pub name: &'static str,
     /// The running version: the application's own `env!("CARGO_PKG_VERSION")`.
     pub version: &'static str,
-    /// The manifest of the latest release.
+    /// The manifest of the latest release. The macOS builds read a file of their own beside it
+    /// (see [`App::manifest_url`]).
     pub manifest_url: &'static str,
     /// An environment variable that names another manifest, for trying a release before it is
     /// the latest. It is fetched under the same rules: https only, and its hashes are checked.
@@ -47,8 +48,27 @@ impl App {
         Version::parse(self.version).expect("the package version is a valid version")
     }
 
+    /// The manifest this build reads: the one named by [`App::manifest_env`] if set, else
+    /// [`App::manifest_url`], which a macOS build turns into its own file
+    /// (`mdview-update.txt` to `mdview-update-macos.txt`). Builds up to mdview 0.5.0 and mdedit
+    /// 0.7.0 refuse a manifest with keys they do not know, so the macOS entries cannot go into the
+    /// shared file without stopping their update checks.
     pub fn manifest_url(&self) -> String {
-        std::env::var(self.manifest_env).unwrap_or_else(|_| self.manifest_url.to_string())
+        std::env::var(self.manifest_env).unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                macos_manifest(self.manifest_url)
+            } else {
+                self.manifest_url.to_string()
+            }
+        })
+    }
+}
+
+/// `…/name.txt` to `…/name-macos.txt`; any other URL gets `-macos` at its end.
+fn macos_manifest(url: &str) -> String {
+    match url.strip_suffix(".txt") {
+        Some(stem) => format!("{stem}-macos.txt"),
+        None => format!("{url}-macos"),
     }
 }
 
@@ -131,13 +151,22 @@ pub fn installed_files(app: &App) -> Option<Files> {
 /// The AppImage this process runs from, when this copy can update itself: `$APPIMAGE` names an
 /// existing file whose folder can be written to. The engine, if the application has one, is inside
 /// the AppImage, so there is none to replace. A plain Linux binary updates nothing.
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn installed_files(_app: &App) -> Option<Files> {
     appimage_files(std::env::var_os("APPIMAGE").as_deref())
 }
 
+/// A macOS build never updates itself: the bar names the new version and opens the download
+/// page (the owner's decision of 2026-11-15; an unsigned bundle replaced in place would meet the
+/// first-open warning again on every update).
+#[cfg(target_os = "macos")]
+pub fn installed_files(_app: &App) -> Option<Files> {
+    None
+}
+
 /// [`installed_files`] given the value of `$APPIMAGE`.
 #[cfg(not(windows))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn appimage_files(value: Option<&std::ffi::OsStr>) -> Option<Files> {
     let app = crate::appimage::path_from(value)?;
     crate::appimage::folder_is_writable(app.parent()?).then_some(Files { app, engine: None })
@@ -164,8 +193,9 @@ fn offer_for(
         return Ok(None);
     };
     let engine = match (app.engine, platform) {
-        // On Linux the engine is inside the AppImage, so the release lists no engine file.
-        (_, Platform::LinuxX64) => None,
+        // On Linux the engine is inside the AppImage, on macOS inside the bundle, so the release
+        // lists no engine file.
+        (_, Platform::LinuxX64 | Platform::MacArm64 | Platform::MacX64) => None,
         // On Windows a release without the engine cannot be installed in place; it is not an offer.
         (Some(_), _) if asset.engine.is_none() => return Ok(None),
         (Some(_), _) => asset.engine,
@@ -370,6 +400,8 @@ pub fn at_launch_label(on: bool) -> &'static str {
 /// Shown when the reader asks a copy that is not installed to update.
 pub const NOT_INSTALLED: &str = if cfg!(windows) {
     "Only an installed copy can update itself."
+} else if cfg!(target_os = "macos") {
+    "This version is installed from the download page."
 } else {
     "Only the AppImage can update itself."
 };
@@ -628,6 +660,18 @@ mod tests {
         } else {
             Ok(b"app 2".to_vec())
         }
+    }
+
+    #[test]
+    fn the_macos_builds_read_a_manifest_of_their_own() {
+        assert_eq!(
+            macos_manifest("https://example.com/dl/mdview-update.txt"),
+            "https://example.com/dl/mdview-update-macos.txt"
+        );
+        assert_eq!(
+            macos_manifest("https://example.com/m"),
+            "https://example.com/m-macos"
+        );
     }
 
     #[test]

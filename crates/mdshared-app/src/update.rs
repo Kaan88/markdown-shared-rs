@@ -14,7 +14,7 @@
 //! * Keys (all lower-case, no others are accepted; duplicates are rejected):
 //!   * `version: MAJOR.MINOR.PATCH[-pre]` (required)
 //!   * `notes: text` (optional, at most [`MAX_NOTES_BYTES`] bytes, no control characters)
-//!   * per platform `P` in `windows-x86_64`, `linux-x86_64`:
+//!   * per platform `P` in `windows-x86_64`, `linux-x86_64`, `macos-aarch64`, `macos-x86_64`:
 //!     `P.asset: file name` (letters, digits, `.`, `_`, `-`; no path separators; <= 128 bytes),
 //!     `P.url: https://...` (https only, <= 512 bytes, no whitespace/control characters, no
 //!     userinfo), `P.sha256: 64 hex digits` (either case, stored lower-case).
@@ -24,6 +24,10 @@
 //!     executable that ships beside it. A build that updates itself in place needs both files, so
 //!     it ignores a platform entry without them.
 //! * At least one platform must be present.
+//! * A key for a platform this build does not know (`os-arch.field`, such as a later
+//!   `linux-aarch64.url`) is skipped, so a manifest can grow new platforms without stopping older
+//!   builds. Builds up to mdview 0.5.0 and mdedit 0.7.0 reject such keys; the macOS builds
+//!   therefore read their own manifest file (see `updater::App::manifest_url`).
 //!
 //! Example:
 //!
@@ -38,7 +42,7 @@
 //! windows-x86_64.engine.sha256: fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 //! ```
 //!
-//! Anything else (unknown key, bad value, http URL, short hash) rejects the whole manifest. The
+//! Anything else (other unknown key, unknown field of a known platform, bad value, http URL, short hash) rejects the whole manifest. The
 //! manifest is data: the only thing a valid one can do is name a newer version and an https
 //! download whose hash the shell must check before use.
 //!
@@ -219,6 +223,8 @@ impl Ord for Version {
 pub enum Platform {
     WindowsX64,
     LinuxX64,
+    MacArm64,
+    MacX64,
 }
 
 impl Platform {
@@ -228,6 +234,10 @@ impl Platform {
             Some(Platform::WindowsX64)
         } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             Some(Platform::LinuxX64)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(Platform::MacArm64)
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some(Platform::MacX64)
         } else {
             None
         }
@@ -237,11 +247,43 @@ impl Platform {
         match self {
             Platform::WindowsX64 => "windows-x86_64",
             Platform::LinuxX64 => "linux-x86_64",
+            Platform::MacArm64 => "macos-aarch64",
+            Platform::MacX64 => "macos-x86_64",
         }
+    }
+
+    /// Whether this is one of the macOS builds, which do not update themselves.
+    pub fn is_macos(self) -> bool {
+        matches!(self, Platform::MacArm64 | Platform::MacX64)
     }
 }
 
-const PLATFORMS: [Platform; 2] = [Platform::WindowsX64, Platform::LinuxX64];
+const PLATFORMS: [Platform; 4] = [
+    Platform::WindowsX64,
+    Platform::LinuxX64,
+    Platform::MacArm64,
+    Platform::MacX64,
+];
+
+/// `key` has the shape of a platform's key, `os-arch.field` (lower-case letters and digits, `_`
+/// in the architecture), for a platform not in [`PLATFORMS`].
+fn other_platform_key(key: &str) -> bool {
+    let Some((prefix, field)) = key.split_once('.') else {
+        return false;
+    };
+    let Some((os, arch)) = prefix.split_once('-') else {
+        return false;
+    };
+    let word = |w: &str, extra: &[u8]| {
+        !w.is_empty()
+            && w.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || extra.contains(&b))
+    };
+    word(os, b"")
+        && word(arch, b"_")
+        && !field.is_empty()
+        && PLATFORMS.iter().all(|p| p.prefix() != prefix)
+}
 
 /// A file to download and the hash it must have.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,16 +307,14 @@ pub struct Asset {
 pub struct UpdateManifest {
     pub version: Version,
     pub notes: Option<String>,
-    windows: Option<Asset>,
-    linux: Option<Asset>,
+    /// One entry per platform, in the order of [`PLATFORMS`].
+    assets: [Option<Asset>; 4],
 }
 
 impl UpdateManifest {
     pub fn asset(&self, platform: Platform) -> Option<&Asset> {
-        match platform {
-            Platform::WindowsX64 => self.windows.as_ref(),
-            Platform::LinuxX64 => self.linux.as_ref(),
-        }
+        let i = PLATFORMS.iter().position(|p| *p == platform)?;
+        self.assets[i].as_ref()
     }
 
     pub fn parse(bytes: &[u8]) -> Result<UpdateManifest, UpdateError> {
@@ -289,7 +329,7 @@ impl UpdateManifest {
         let mut header = false;
         let mut version = None;
         let mut notes = None;
-        let mut fields: [[Option<String>; 5]; 2] = Default::default();
+        let mut fields: [[Option<String>; 5]; 4] = Default::default();
         for (i, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -322,6 +362,10 @@ impl UpdateManifest {
                         let rest = k.strip_prefix(p.prefix())?.strip_prefix('.')?;
                         Some((pi, rest))
                     }) else {
+                        if other_platform_key(k) {
+                            seen.push(k);
+                            continue;
+                        }
                         return Err(UpdateError::UnknownKey(k.chars().take(40).collect()));
                     };
                     let (slot, val) = match field {
@@ -346,7 +390,7 @@ impl UpdateManifest {
             return Err(UpdateError::BadHeader);
         }
         let version = version.ok_or(UpdateError::MissingField("version"))?;
-        let mut assets: [Option<Asset>; 2] = [None, None];
+        let mut assets: [Option<Asset>; 4] = Default::default();
         for (pi, f) in fields.into_iter().enumerate() {
             let [name, url, sha256, engine_url, engine_sha256] = f;
             let engine = match (engine_url, engine_sha256) {
@@ -371,15 +415,13 @@ impl UpdateManifest {
                 _ => return Err(UpdateError::MissingField("platform asset/url/sha256")),
             }
         }
-        let [windows, linux] = assets;
-        if windows.is_none() && linux.is_none() {
+        if assets.iter().all(Option::is_none) {
             return Err(UpdateError::NoAssets);
         }
         Ok(UpdateManifest {
             version,
             notes,
-            windows,
-            linux,
+            assets,
         })
     }
 }
@@ -815,6 +857,63 @@ linux-x86_64.engine.sha256: {SHA}
         assert_eq!(
             UpdateManifest::parse(long_url.as_bytes()).unwrap_err(),
             UpdateError::BadValue("url")
+        );
+    }
+
+    #[test]
+    fn macos_platforms_are_read_and_other_platforms_skipped() {
+        let mac = format!(
+            "{}macos-aarch64.asset: mdview-macos-aarch64.zip\nmacos-aarch64.url: https://example.com/a.zip\nmacos-aarch64.sha256: {SHA}\n\
+             macos-x86_64.asset: mdview-macos-x86_64.zip\nmacos-x86_64.url: https://example.com/x.zip\nmacos-x86_64.sha256: {SHA}\n",
+            manifest("")
+        );
+        let m = UpdateManifest::parse(mac.as_bytes()).unwrap();
+        assert_eq!(
+            m.asset(Platform::MacArm64).unwrap().name,
+            "mdview-macos-aarch64.zip"
+        );
+        assert_eq!(
+            m.asset(Platform::MacX64).unwrap().url,
+            "https://example.com/x.zip"
+        );
+        assert!(m.asset(Platform::LinuxX64).is_none());
+        assert!(Platform::MacArm64.is_macos() && !Platform::LinuxX64.is_macos());
+
+        // A platform this build does not know is skipped, its keys checked for nothing.
+        let later = format!(
+            "{}linux-aarch64.asset: x\nlinux-aarch64.url: whatever\nlinux-aarch64.engine.sha256: 1\n",
+            manifest("")
+        );
+        let m = UpdateManifest::parse(later.as_bytes()).unwrap();
+        assert!(m.asset(Platform::WindowsX64).is_some());
+        // ... but only a key of that shape: other unknown keys, unknown fields of a known
+        // platform, and duplicates are still refused.
+        for (extra, key) in [
+            ("bogus: 1\n", "bogus"),
+            ("Linux-aarch64.url: x\n", "Linux-aarch64.url"),
+            ("linux-.url: x\n", "linux-.url"),
+            ("macos-aarch64.exec: x\n", "macos-aarch64.exec"),
+        ] {
+            let text = format!("{}{extra}", manifest(""));
+            assert_eq!(
+                UpdateManifest::parse(text.as_bytes()),
+                Err(UpdateError::UnknownKey(key.into())),
+                "{extra}"
+            );
+        }
+        let twice = format!(
+            "{}linux-aarch64.url: a\nlinux-aarch64.url: b\n",
+            manifest("")
+        );
+        assert_eq!(
+            UpdateManifest::parse(twice.as_bytes()),
+            Err(UpdateError::DuplicateKey("linux-aarch64.url".into()))
+        );
+        // A manifest of unknown platforms only names nothing to install.
+        let none = "manifest: 1\nversion: 0.2.0\nlinux-aarch64.url: x\n";
+        assert_eq!(
+            UpdateManifest::parse(none.as_bytes()),
+            Err(UpdateError::NoAssets)
         );
     }
 

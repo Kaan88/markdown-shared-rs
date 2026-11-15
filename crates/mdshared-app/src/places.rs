@@ -182,11 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn paths_differing_in_case_are_one_file_on_windows_only() {
+    fn paths_differing_in_case_are_one_file_where_names_ignore_case() {
         let mut places = Places::default();
         places.set("/Docs/Read.md", "1");
         places.set("/docs/read.md", "2");
-        assert_eq!(places.len(), if cfg!(windows) { 1 } else { 2 });
+        let one = crate::paths::NAMES_IGNORE_CASE;
+        assert_eq!(places.len(), if one { 1 } else { 2 });
         assert_eq!(places.get(Path::new("/docs/read.md")), Some("2"));
     }
 

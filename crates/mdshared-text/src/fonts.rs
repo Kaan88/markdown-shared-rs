@@ -31,7 +31,7 @@ pub fn shared_fonts() -> FontContext {
 /// common-script characters found its fallback under Latin, not Common, so Latin gets them too.
 ///
 /// The Windows names come first and in their original order; the families of Linux distributions
-/// follow, and a name that is not installed is skipped. On Windows only the Windows names are used.
+/// follow, then those of macOS, and a name that is not installed is skipped. On Windows only the Windows names are used.
 const EXTRA_FALLBACKS: &[([u8; 4], &[&str])] = &[
     (
         *b"Hani",
@@ -51,6 +51,14 @@ const EXTRA_FALLBACKS: &[([u8; 4], &[&str])] = &[
             "WenQuanYi Micro Hei",
             #[cfg(not(windows))]
             "Source Han Sans SC",
+            #[cfg(target_os = "macos")]
+            "PingFang SC",
+            #[cfg(target_os = "macos")]
+            "PingFang TC",
+            #[cfg(target_os = "macos")]
+            "Hiragino Sans",
+            #[cfg(target_os = "macos")]
+            "Apple SD Gothic Neo",
         ],
     ),
     (
@@ -74,6 +82,12 @@ const EXTRA_FALLBACKS: &[([u8; 4], &[&str])] = &[
             "Noto Sans Math",
             #[cfg(not(windows))]
             "DejaVu Sans",
+            #[cfg(target_os = "macos")]
+            "Apple Color Emoji",
+            #[cfg(target_os = "macos")]
+            "Apple Symbols",
+            #[cfg(target_os = "macos")]
+            "STIX Two Math",
         ],
     ),
     (
@@ -88,6 +102,8 @@ const EXTRA_FALLBACKS: &[([u8; 4], &[&str])] = &[
             "Noto Sans Math",
             #[cfg(not(windows))]
             "DejaVu Sans",
+            #[cfg(target_os = "macos")]
+            "Apple Symbols",
         ],
     ),
     (
@@ -111,6 +127,12 @@ const EXTRA_FALLBACKS: &[([u8; 4], &[&str])] = &[
             "Noto Sans Math",
             #[cfg(not(windows))]
             "DejaVu Sans",
+            #[cfg(target_os = "macos")]
+            "Apple Color Emoji",
+            #[cfg(target_os = "macos")]
+            "Apple Symbols",
+            #[cfg(target_os = "macos")]
+            "STIX Two Math",
         ],
     ),
 ];

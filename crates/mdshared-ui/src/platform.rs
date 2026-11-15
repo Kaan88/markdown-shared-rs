@@ -686,19 +686,29 @@ mod imp {
         let document = crate::cf_html::html_document(html);
         with_clipboard(|c| c.set().html(document.as_str(), Some(text)).ok()).is_some()
     }
+    /// The program that opens a URL or a file with its default handler.
+    const OPENER: &str = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+
     pub fn open_url(url: &str) -> bool {
-        has_safe_scheme(url)
-            && std::process::Command::new("xdg-open")
-                .arg(url)
-                .spawn()
-                .is_ok()
+        has_safe_scheme(url) && std::process::Command::new(OPENER).arg(url).spawn().is_ok()
     }
     pub fn open_file(path: &Path) -> bool {
-        std::process::Command::new("xdg-open")
+        std::process::Command::new(OPENER).arg(path).spawn().is_ok()
+    }
+    /// Finder selects the file itself (`open -R`); the XDG route can only open its folder.
+    #[cfg(target_os = "macos")]
+    pub fn reveal_in_file_manager(path: &Path) -> bool {
+        std::process::Command::new("open")
+            .arg("-R")
             .arg(path)
             .spawn()
             .is_ok()
     }
+    #[cfg(not(target_os = "macos"))]
     pub fn reveal_in_file_manager(path: &Path) -> bool {
         let dir = path.parent().unwrap_or(path);
         std::process::Command::new("xdg-open")
@@ -706,7 +716,19 @@ mod imp {
             .spawn()
             .is_ok()
     }
+    /// The system's appearance: `AppleInterfaceStyle` in the global defaults is "Dark" while dark
+    /// mode is on (also while "Auto" is in its dark half) and absent otherwise. A read of the
+    /// defaults database, cheap enough for every call and safe off the main thread.
+    #[cfg(target_os = "macos")]
+    pub fn system_is_dark() -> bool {
+        use objc2_foundation::{NSString, NSUserDefaults};
+        let defaults = NSUserDefaults::standardUserDefaults();
+        defaults
+            .stringForKey(&NSString::from_str("AppleInterfaceStyle"))
+            .is_some_and(|style| style.to_string().eq_ignore_ascii_case("dark"))
+    }
     /// The desktop's colour scheme from the settings portal, cached for a second.
+    #[cfg(not(target_os = "macos"))]
     pub fn system_is_dark() -> bool {
         use std::sync::Mutex;
         use std::time::Instant;
@@ -725,6 +747,7 @@ mod imp {
     /// Reads `org.freedesktop.appearance` `color-scheme` (1 is dark; 0 none, 2 light) from the
     /// settings portal on a helper thread, giving up after `timeout`: a portal that is not running
     /// may be started by the bus, and that can take long. False on any failure.
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn portal_prefers_dark(timeout: Duration) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
@@ -733,6 +756,7 @@ mod imp {
         spawned.is_ok() && rx.recv_timeout(timeout).ok().flatten() == Some(1)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn read_color_scheme() -> Option<u32> {
         use zbus::zvariant::{OwnedValue, Value};
         let bus = zbus::blocking::Connection::session().ok()?;
@@ -770,8 +794,14 @@ mod imp {
     pub fn system_scale() -> f32 {
         1.0
     }
+    /// macOS draws text with greyscale smoothing only (subpixel smoothing went in 10.14), and a
+    /// Retina screen has no use for it; elsewhere the common RGB stripe order.
     pub fn subpixel_order() -> Subpixel {
-        Subpixel::Rgb
+        if cfg!(target_os = "macos") {
+            Subpixel::None
+        } else {
+            Subpixel::Rgb
+        }
     }
     pub fn frame_report(_hwnd: isize) -> String {
         String::new()
@@ -977,7 +1007,7 @@ mod tests {
 }
 
 /// The portal read with a given time limit, for the test: false on any failure, never a hang.
-#[cfg(all(test, not(windows)))]
+#[cfg(all(test, not(windows), not(target_os = "macos")))]
 mod theme_tests {
     use super::*;
 

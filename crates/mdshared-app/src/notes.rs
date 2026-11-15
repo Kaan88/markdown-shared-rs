@@ -588,9 +588,9 @@ fn path_display(path: &Path) -> String {
     s
 }
 
-/// How files are told apart: by spelling, without case on Windows.
+/// How files are told apart: by spelling, without case on Windows and macOS.
 fn ident_of(rel: &str) -> String {
-    if cfg!(windows) {
+    if crate::paths::NAMES_IGNORE_CASE {
         rel.to_lowercase()
     } else {
         rel.to_string()
