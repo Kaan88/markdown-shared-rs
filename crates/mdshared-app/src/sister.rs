@@ -51,7 +51,9 @@ pub struct Request {
     pub path: PathBuf,
     /// Show or put the caret at this source line (1-based).
     pub line: Option<u32>,
-    /// With `line`: the column (1-based). The viewer has no use for it.
+    /// With `line`: the byte in that line, from 1. The editor puts its caret there; the viewer
+    /// shows the row that holds it when the line wraps to several (a build that predates that
+    /// shows the line's beginning).
     pub column: Option<u32>,
     /// A live update, not an opening: do not raise or focus the window, and do nothing when the
     /// file is not already the one shown. When no window runs, nothing is started.
