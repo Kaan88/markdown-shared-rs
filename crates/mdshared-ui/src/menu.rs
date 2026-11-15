@@ -3,6 +3,8 @@
 use crate::gfx::{Face, Painter, Rect};
 use crate::scroll;
 use crate::theme::Palette;
+use std::borrow::Cow;
+use std::ops::Range;
 
 #[derive(Clone, Debug)]
 pub struct Item<T> {
@@ -55,6 +57,65 @@ impl<T> Item<T> {
     }
 }
 
+/// A label read for access keys: what is drawn, and which character, if any, is the access key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Access {
+    /// The label as drawn: every `&&` is one `&`, and the marking `&` is gone.
+    pub text: String,
+    /// The byte range in `text` of the marked character.
+    pub key: Option<Range<usize>>,
+}
+
+/// Reads `label` for access keys. `&x` marks `x` (the first mark in the label is the access key;
+/// a later `&y` drops its `&` and marks nothing), `&&` is a literal `&`, and a `&` before white
+/// space or at the end of the label is a literal `&` as well.
+pub fn parse_access(label: &str) -> Access {
+    let mut text = String::with_capacity(label.len());
+    let mut key = None;
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            text.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('&') => {
+                chars.next();
+                text.push('&');
+            }
+            Some(next) if !next.is_whitespace() => {
+                chars.next();
+                if key.is_none() {
+                    key = Some(text.len()..text.len() + next.len_utf8());
+                }
+                text.push(next);
+            }
+            _ => text.push('&'),
+        }
+    }
+    Access { text, key }
+}
+
+/// `text` with every `&` doubled, for a label that comes from data (a file name, a completion)
+/// and goes into a menu that reads access keys.
+pub fn escape_access(text: &str) -> String {
+    text.replace('&', "&&")
+}
+
+/// The access key of `label`, if it marks one.
+pub fn access_key_of(label: &str) -> Option<char> {
+    if !label.contains('&') {
+        return None;
+    }
+    let parsed = parse_access(label);
+    parsed.key.and_then(|k| parsed.text[k].chars().next())
+}
+
+/// Whether the typed `typed` is the access key `key`: equal, or equal in Unicode lower case.
+pub fn same_letter(key: char, typed: char) -> bool {
+    key == typed || key.to_lowercase().eq(typed.to_lowercase())
+}
+
 const ROW: f32 = 32.0;
 const SEP: f32 = 9.0;
 const PAD: f32 = 5.0;
@@ -77,6 +138,10 @@ pub struct Menu<T> {
     content: f32,
     /// A row the keyboard moved to, brought into view by the next `place`.
     reveal: Option<usize>,
+    /// Labels are read for access keys ([`parse_access`]).
+    access: bool,
+    /// Whether the marked letters are drawn underlined.
+    access_visible: bool,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -103,7 +168,51 @@ impl<T: Clone> Menu<T> {
             scroll: 0.0,
             content: 0.0,
             reveal: None,
+            access: false,
+            access_visible: true,
         }
+    }
+
+    /// Reads the labels of this menu for access keys: `Open &files…` marks `f`, `&&` is a
+    /// literal `&`. Off by default, so a label with a `&` in it (a file name in a Recent menu, say)
+    /// is drawn as it is. In a menu that has it on, label text that comes from data goes through
+    /// [`escape_access`].
+    pub fn access_keys(mut self, on: bool) -> Self {
+        self.access = on;
+        self
+    }
+
+    /// Whether the marked letters are drawn underlined (default: yes, always). An application
+    /// that wants the Windows convention sets it to true only while the menu was opened with the
+    /// keyboard or Alt is held, and calls this again when that changes.
+    pub fn set_access_visible(&mut self, on: bool) {
+        self.access_visible = on;
+    }
+
+    /// The label as drawn and its marked character: the label itself, borrowed, unless this menu
+    /// reads access keys and the label has a `&`.
+    fn shown<'a>(&self, label: &'a str) -> (Cow<'a, str>, Option<Range<usize>>) {
+        if !self.access || !label.contains('&') {
+            return (Cow::Borrowed(label), None);
+        }
+        let parsed = parse_access(label);
+        (Cow::Owned(parsed.text), parsed.key)
+    }
+
+    /// For the key `typed` while the menu is open: the first enabled item whose access key it is
+    /// (case-insensitively, by Unicode lower case) gets the highlight, and its id is returned for
+    /// the application to act on as it does for Enter. `None` when no item has the key or the menu
+    /// does not read access keys; the application then handles the key as before.
+    pub fn access_key(&mut self, typed: char) -> Option<T> {
+        if !self.access {
+            return None;
+        }
+        let index = self.items.iter().position(|item| {
+            item.enabled && access_key_of(&item.label).is_some_and(|k| same_letter(k, typed))
+        })?;
+        self.hover = Some(index);
+        self.reveal = Some(index);
+        Some(self.items[index].id.clone())
     }
 
     /// Makes the menu stand on its anchor: `y` is its bottom edge, for a menu opened from the
@@ -133,7 +242,8 @@ impl<T: Clone> Menu<T> {
             } else {
                 p.measure(Face::Ui, 12.0, &item.hint) + 28.0
             };
-            w = w.max(lead + p.measure(Face::Ui, 13.5, &item.label) + hint + 16.0);
+            let (label, _) = self.shown(&item.label);
+            w = w.max(lead + p.measure(Face::Ui, 13.5, &label) + hint + 16.0);
         }
         let w = w.min(MAX_WIDTH).min(area.w - 8.0);
         let h: f32 = 2.0 * PAD
@@ -245,15 +355,15 @@ impl<T: Clone> Menu<T> {
                     pal.faint,
                 ) + 18.0
             };
-            p.text(
-                Face::Ui,
-                13.5,
-                x,
-                r.cy(),
-                &item.label,
-                color,
-                r.right() - x - hint_w - 8.0,
-            );
+            let (label, key) = self.shown(&item.label);
+            let room = r.right() - x - hint_w - 8.0;
+            p.text(Face::Ui, 13.5, x, r.cy(), &label, color, room);
+            if let Some(key) = key.filter(|_| self.access_visible) {
+                // Only when the label was drawn whole: an elided one may have cut the letter.
+                if p.measure(Face::Ui, 13.5, &label) <= room {
+                    p.underline_range(Face::Ui, 13.5, x, r.cy(), &label, key, color);
+                }
+            }
         }
         p.restore(old);
         if let Some((track, thumb)) =
@@ -478,6 +588,165 @@ mod tests {
         assert_eq!(menu.hover, None);
     }
 
+    #[test]
+    fn labels_are_read_for_access_keys() {
+        let read = |s: &str| {
+            let a = parse_access(s);
+            let key = a.key.clone().map(|k| a.text[k].to_string());
+            (a.text, key)
+        };
+        assert_eq!(
+            read("Open &files…"),
+            ("Open files…".into(), Some("f".into()))
+        );
+        assert_eq!(read("&&"), ("&".into(), None));
+        assert_eq!(
+            read("Fish && &Chips"),
+            ("Fish & Chips".into(), Some("C".into()))
+        );
+        // A `&` before a space or at the end is the character itself.
+        assert_eq!(read("A & B"), ("A & B".into(), None));
+        assert_eq!(read("Save &"), ("Save &".into(), None));
+        assert_eq!(read("&"), ("&".into(), None));
+        // The first mark wins; a later one loses its `&` and marks nothing.
+        assert_eq!(
+            read("&Alpha &beta"),
+            ("Alpha beta".into(), Some("A".into()))
+        );
+        // Non-ASCII letters: the range is in bytes of the text drawn.
+        let a = parse_access("Çı&kış &Ç");
+        assert_eq!(a.text, "Çıkış Ç");
+        assert_eq!(a.key, Some(4..5));
+        assert_eq!(access_key_of("&Ünite"), Some('Ü'));
+        assert_eq!(access_key_of("No mark"), None);
+        assert_eq!(access_key_of("A && B"), None);
+        assert_eq!(escape_access("Q&A & more"), "Q&&A && more");
+        assert_eq!(parse_access(&escape_access("Q&A && &x")).text, "Q&A && &x");
+        assert!(parse_access(&escape_access("Q&A & &x")).key.is_none());
+        // Case-insensitive, by Unicode lower case.
+        assert!(same_letter('f', 'F') && same_letter('F', 'f'));
+        assert!(same_letter('Ç', 'ç') && same_letter('ç', 'Ç'));
+        assert!(same_letter('Ö', 'ö'));
+        assert!(!same_letter('f', 'g'));
+        assert!(!same_letter('ç', 'c'));
+    }
+
+    fn menu_of(labels: &[&str], access: bool) -> Menu<u8> {
+        let items = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Item::new(i as u8, *l))
+            .collect();
+        Menu::new(items, 10.0, 10.0, false).access_keys(access)
+    }
+
+    fn placed_width(menu: &mut Menu<u8>) -> f32 {
+        let mut bmp = Bitmap::new(600, 400);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        menu.place(&mut p, 600.0, 400.0);
+        menu.rect().w
+    }
+
+    #[test]
+    fn the_ampersand_is_not_measured() {
+        let long = "x".repeat(24);
+        let plain = format!("Open {long} files…");
+        let marked = format!("Open {long} &files…");
+        let both = format!("Open {long} &&files…");
+        let mut a = menu_of(&[&plain], true);
+        let mut b = menu_of(&[&marked], true);
+        assert_eq!(placed_width(&mut a), placed_width(&mut b));
+        // `&&` draws one `&`, which has width.
+        let mut c = menu_of(&[&both], true);
+        assert!(placed_width(&mut c) > placed_width(&mut a));
+        // A menu that does not read access keys draws the label as it is, `&` included.
+        let mut d = menu_of(&[&marked], false);
+        assert!(placed_width(&mut d) > placed_width(&mut a));
+    }
+
+    #[test]
+    fn a_letter_activates_the_first_enabled_item_with_that_key() {
+        let mut menu = menu_of(
+            &["&New", "&Open files…", "Sa&ve", "Çık&ış", "O&pen again"],
+            true,
+        );
+        menu.items[1].enabled = false;
+        // Case does not matter, and a disabled item is skipped for the next one with the key.
+        assert_eq!(menu.access_key('n'), Some(0));
+        assert_eq!(menu.hover, Some(0));
+        assert_eq!(menu.access_key('N'), Some(0));
+        assert_eq!(menu.access_key('o'), None);
+        assert_eq!(menu.access_key('p'), Some(4));
+        assert_eq!(menu.hover, Some(4));
+        assert_eq!(menu.chosen(), Some(4));
+        assert_eq!(menu.access_key('V'), Some(2));
+        assert_eq!(menu.access_key('Ş'), None);
+        assert_eq!(menu.access_key('x'), None);
+        // The same key on two enabled items: the first.
+        let mut two = menu_of(&["&Copy", "Co&py path", "C&ut"], true);
+        assert_eq!(two.access_key('c'), Some(0));
+        assert_eq!(two.access_key('y'), None);
+        assert_eq!(two.access_key('u'), Some(2));
+        // Non-ASCII, by Unicode lower case.
+        let mut turkish = menu_of(&["&Çıkış", "&Ünite", "&İlk"], true);
+        assert_eq!(turkish.access_key('ç'), Some(0));
+        assert_eq!(turkish.access_key('Ç'), Some(0));
+        assert_eq!(turkish.access_key('ü'), Some(1));
+        // A menu that does not read access keys never answers.
+        let mut off = menu_of(&["&New", "Sa&ve"], false);
+        assert_eq!(off.access_key('n'), None);
+        assert_eq!(off.hover, None);
+        // A label without a mark has no key, in a menu that reads them.
+        let mut none = menu_of(&["New", "Open"], true);
+        assert_eq!(none.access_key('n'), None);
+        assert_eq!(none.hover, None);
+    }
+
+    fn drawn(menu: &mut Menu<u8>) -> Vec<u8> {
+        let mut bmp = Bitmap::new(400, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        menu.draw(&mut p, &crate::theme::LIGHT, 400.0, 300.0);
+        bmp.pixels
+    }
+
+    #[test]
+    fn marks_are_underlined_only_where_asked_and_unmarked_menus_draw_as_before() {
+        let labels = ["&New", "Open", "Sa&ve"];
+        // Labels without a `&` draw identically whether the menu reads access keys or not, and
+        // whether the underlines are shown.
+        let plain = ["New", "Open", "Save"];
+        let reference = drawn(&mut menu_of(&plain, false));
+        assert_eq!(reference, drawn(&mut menu_of(&plain, true)));
+        let mut hidden = menu_of(&plain, true);
+        hidden.set_access_visible(false);
+        assert_eq!(reference, drawn(&mut hidden));
+        // With marks: the text is that of the unmarked labels, plus an underline when shown.
+        let mut shown = menu_of(&labels, true);
+        let with_line = drawn(&mut shown);
+        let mut quiet = menu_of(&labels, true);
+        quiet.set_access_visible(false);
+        let without_line = drawn(&mut quiet);
+        assert_eq!(without_line, reference, "no mark is visible when hidden");
+        assert_ne!(with_line, reference, "the marks are underlined");
+        // Menu width and row positions are the same, so the underline is all that differs, and
+        // it is on the marked letters' rows only (rows 0 and 2).
+        let rows = shown.rect();
+        let (r0, r1, r2) = (shown.row_rect(0), shown.row_rect(1), shown.row_rect(2));
+        let differs = |r: Rect| {
+            let (y0, y1) = (r.y as usize, r.bottom() as usize);
+            (y0..y1).any(|y| {
+                let row = |b: &[u8]| {
+                    let start = (y * 400 + rows.x as usize) * 4;
+                    b[start..start + rows.w as usize * 4].to_vec()
+                };
+                row(&with_line) != row(&reference)
+            })
+        };
+        assert!(differs(r0) && differs(r2));
+        assert!(!differs(r1));
+    }
     #[test]
     fn stepping_keeps_the_row_in_view_and_wraps() {
         let area = Rect::new(0.0, 40.0, 800.0, 400.0);

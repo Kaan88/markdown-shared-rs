@@ -46,3 +46,44 @@ the spans, the two samples through the incremental path, edits that open comment
 expressions, hostile and unterminated input, linear time). Not run: either application, a real
 `.vue` or `.svelte` project, a comparison of colours against an editor. Speed was checked only by
 the linear-time tests, not by a benchmark.
+
+## Access keys in menus (`mdshared_ui::menu`)
+
+Opt-in, per menu. `Menu::new(items, x, y, right).access_keys(true)` makes the menu read its
+labels for access keys: `Open &files…` marks `f`, `&&` is a literal `&`, a `&` before white space
+or at the end of a label is a literal `&`, and only the first mark counts (a later `&x` loses its
+`&` and marks nothing, as on Windows). The marked letter is drawn underlined, the width of a label
+is measured without the `&`, and `Menu::access_key(typed: char) -> Option<T>` gives the first
+enabled item whose key is the typed letter (equal, or equal in Unicode lower case; Turkish `İ`/`ı`
+are not folded to `i`) the highlight and returns its id, for the application to act on as for
+Enter. A menu that has not called `access_keys(true)` is exactly what it was: labels are drawn
+verbatim, `access_key` returns `None`, and nothing is allocated or parsed.
+
+Why per menu and not per label. Both applications build menus whose labels come from data: the
+Recent menus (`e.label`, a file name, which may hold `&`), the editor's completion list
+(`c.text`, source code) and its saved searches. Reading `&` in those would eat characters. The
+literal labels of the two applications (read on 2026-11-15) contain no `&` at all, so a global
+switch would have been harmless today, but the menus above would not be. For a label that
+comes from data and sits in a menu that has the switch on, `menu::escape_access` doubles its `&`.
+
+Underlines. They are shown always by default; `Menu::set_access_visible(false)` hides them, so
+an application that wants the Windows convention (only after Alt, or when the menu was opened by
+keyboard) tracks that itself and calls it when it changes: the shared code does not see the
+keyboard. The line is drawn by the new `Painter::underline_range` at the layout's baseline plus 2
+device px, 1 device px thick, in the label's colour; it is skipped when the label was elided.
+
+Public API added: `menu::{Access, parse_access, escape_access, access_key_of, same_letter}`,
+`Menu::{access_keys, set_access_visible, access_key}`, `gfx::Painter::underline_range`. No
+signature changed and `Item` gained no field (a literal `Item { .. }` elsewhere still compiles).
+
+What an application does: add `&` to the labels of the menus it opts in, call `.access_keys(true)`
+where it builds them, and in its key handler for an open menu try `menu.access_key(ch)` for a
+printable character with no Ctrl or Alt held (after Up, Down, Enter and Escape are handled),
+treating `Some(id)` like a click on that item. Mark each item of a menu with a different letter.
+
+Run: unit tests for parsing (`&&`, lone `&`, first mark wins, non-ASCII byte ranges), width
+(the `&` is not measured, `&&` is, an opt-out menu measures it), activation (case, Unicode,
+disabled items, duplicates, opt-out), and drawing (a menu without marks is bit-identical with
+the switch on or off and with underlines shown or hidden; marks change pixels only in the marked
+rows). Not verified: how the underline looks (its offset from the baseline was chosen from the
+font metrics, not seen), keyboard handling in either application, and the menus' use of it.

@@ -527,6 +527,36 @@ impl<'a> Painter<'a> {
         w
     }
 
+    /// A 1 device px underline below the characters `range` (byte offsets) of `text`, which was
+    /// or would be drawn by [`text`](Self::text) at `x` and `cy` with the same `face` and `size`.
+    /// The position comes from the layout's baseline; the extent of the characters is measured as
+    /// a prefix, so kerning across the boundary may move it by a fraction of a pixel.
+    #[allow(clippy::too_many_arguments)] // drawing call: as `text`
+    pub fn underline_range(
+        &mut self,
+        face: Face,
+        size: f32,
+        x: f32,
+        cy: f32,
+        text: &str,
+        range: std::ops::Range<usize>,
+        c: Rgb,
+    ) {
+        if range.start >= range.end || range.end > text.len() {
+            return;
+        }
+        let before = self.measure(face, size, &text[..range.start]);
+        let width = self.measure(face, size, &text[range.clone()]);
+        let layout = self.gfx.layout(face, size * self.scale, c, 0.0, text);
+        let top = (cy * self.scale - layout.height() / 2.0).round();
+        let baseline = layout
+            .lines()
+            .next()
+            .map_or(layout.height() * 0.8, |l| l.metrics().baseline);
+        let y = (top + baseline.round() + 2.0) / self.scale;
+        self.fill(Rect::new(x + before, y, width, 1.0 / self.scale), c);
+    }
+
     /// An icon from [`glyph`](crate::glyph), `size` logical px across, centred on a point.
     pub fn icon(&mut self, glyph: &str, size: f32, cx: f32, cy: f32, c: Rgb) {
         let side = size * self.scale;
