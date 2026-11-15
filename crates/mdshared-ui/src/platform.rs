@@ -360,6 +360,24 @@ mod imp {
         (r as isize) > 32
     }
 
+    pub fn open_file(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let verb = wide("open");
+        let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both strings are NUL-terminated and outlive the call.
+        let r = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        (r as isize) > 32
+    }
+
     pub fn reveal_in_file_manager(path: &Path) -> bool {
         use std::os::windows::process::CommandExt;
         // raw_arg avoids Rust's own quoting, which Explorer does not understand.
@@ -558,6 +576,12 @@ mod imp {
                 .spawn()
                 .is_ok()
     }
+    pub fn open_file(path: &Path) -> bool {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .is_ok()
+    }
     pub fn reveal_in_file_manager(path: &Path) -> bool {
         let dir = path.parent().unwrap_or(path);
         std::process::Command::new("xdg-open")
@@ -649,6 +673,18 @@ pub fn set_clipboard_html(html: &str, text: &str) -> bool {
 /// Opens an http(s)/mailto URL with the default handler.
 pub fn open_url(url: &str) -> bool {
     imp::open_url(url)
+}
+/// Opens an existing local file with the system's default app for its type (an HTML file opens
+/// in the default browser). Only a file whose extension is one of `extensions` (case does not
+/// matter) is opened, so a caller that means to open a document it wrote cannot be turned into
+/// launching a program. False when the file is missing, the extension is not listed, or the
+/// system could not start the handler.
+pub fn open_file(path: &Path, extensions: &[&str]) -> bool {
+    let listed = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)));
+    listed && path.is_file() && imp::open_file(path)
 }
 /// Opens the file manager with the file selected.
 pub fn reveal_in_file_manager(path: &Path) -> bool {
@@ -813,5 +849,30 @@ mod dialog_tests {
         let (again_tx, again) = mpsc::channel();
         assert!(run_dialog(0, || 5, move |v| again_tx.send(v).unwrap()));
         assert_eq!(again.recv_timeout(Duration::from_secs(5)), Ok(5));
+    }
+}
+
+#[cfg(test)]
+mod open_file_tests {
+    use super::*;
+
+    /// Every refusal happens before anything is launched: nothing starts in this test.
+    #[test]
+    fn open_file_refuses_unlisted_types_and_missing_files() {
+        let dir = std::env::temp_dir().join(format!("mdshared-open-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("run.bat");
+        std::fs::write(&script, "echo hi").unwrap();
+        assert!(
+            !open_file(&script, &["html", "htm"]),
+            "extension not listed"
+        );
+        assert!(
+            !open_file(&dir.join("gone.html"), &["html"]),
+            "no such file"
+        );
+        assert!(!open_file(&dir.join("noext"), &["html"]));
+        assert!(!open_file(&script, &[]));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
