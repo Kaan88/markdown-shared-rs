@@ -211,6 +211,19 @@ mdshared_ui::place::halves(Rect) -> (Rect, Rect)      // left, right; the odd pi
 mdshared_ui::place::set(&Window, Rect) -> bool
 ```
 
+**Going back (2026-11-15).** `mdshared_ui::place::Tiling` is one window's side-by-side
+arrangement: `set` remembers where the window is (outer rectangle, inner size, maximised) and
+then places it; `restore` puts it back, unless the user has moved, resized or maximised it
+since (it is then no longer within 4 px of where it was put); `before` says what is remembered,
+for an application that exits while arranged and wants to save the place it had. A second `set`
+while the window is still where the first put it keeps the first place. Where the desktop does
+not tell a window its position (Wayland) nothing is remembered. The request option `?unplace`
+(`Request::unplace`, a `follow`, sent alone with an empty `?path=`) asks the other application
+to do its `restore`: an older build skips it and does not raise its window. Each application
+restores itself when it ends the arrangement and tells the other; one that is told does not
+tell back.
+
+
 `set` takes the outer rectangle. Windows and X11: un-maximise, `set_outer_position`,
 `request_inner_size`. Wayland on KDE: a client cannot position itself, so a KWin script is
 written to `$XDG_RUNTIME_DIR`, loaded and run through `org.kde.KWin` `/Scripting`, and unloaded,

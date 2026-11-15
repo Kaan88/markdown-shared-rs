@@ -92,6 +92,133 @@ pub fn set(window: &Window, rect: Rect) -> bool {
     true
 }
 
+/// The window's outer rectangle, where the desktop tells (a Wayland client is not told its
+/// position).
+pub fn outer(window: &Window) -> Option<Rect> {
+    let at = window.outer_position().ok()?;
+    let size = window.outer_size();
+    Some(Rect {
+        x: at.x,
+        y: at.y,
+        w: size.width,
+        h: size.height,
+    })
+}
+
+/// Where a window was before it was placed for a side-by-side preview.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Before {
+    /// The outer rectangle it had.
+    pub outer: Rect,
+    /// Its inner size then, in physical px: what a session file keeps.
+    pub inner: (u32, u32),
+    pub maximized: bool,
+    /// Where it was put.
+    pub tiled: Rect,
+}
+
+/// How far a placed window may be from where it was put and still count as untouched: a desktop
+/// may round, or keep a pixel of frame.
+const SLACK: u32 = 4;
+
+impl Before {
+    /// Whether a window that is at `now` is still where it was put: the user has neither moved
+    /// nor resized nor maximised it since.
+    pub fn untouched(&self, now: Rect, maximized: bool) -> bool {
+        let t = self.tiled;
+        !maximized
+            && now.x.abs_diff(t.x) <= SLACK
+            && now.y.abs_diff(t.y) <= SLACK
+            && now.w.abs_diff(t.w) <= SLACK
+            && now.h.abs_diff(t.h) <= SLACK
+    }
+}
+
+/// A window's side-by-side arrangement: where it was before, for as long as it stays where the
+/// arrangement put it. A window the user has moved since is theirs, and is not put back.
+#[derive(Debug, Default)]
+pub struct Tiling(Option<Before>);
+
+impl Tiling {
+    /// [`set`], remembering first where the window is. A window that is still where an earlier
+    /// call put it keeps what was remembered then. Where the desktop does not tell a window its
+    /// position nothing is remembered, and nothing will be put back.
+    pub fn set(&mut self, window: &Window, rect: Rect) -> bool {
+        let maximized = window.is_maximized();
+        let inner = window.inner_size();
+        self.0 = remember(
+            self.0,
+            outer(window),
+            (inner.width, inner.height),
+            maximized,
+            rect,
+        );
+        let placed = set(window, rect);
+        if !placed {
+            self.0 = None;
+        }
+        placed
+    }
+
+    /// Where the window was before, if it is still where the arrangement put it. `None` once the
+    /// user has moved it (and then for good), and when nothing is arranged.
+    pub fn before(&mut self, window: &Window) -> Option<Before> {
+        let before = self.0?;
+        let still = outer(window).is_some_and(|now| before.untouched(now, window.is_maximized()));
+        if !still {
+            self.0 = None;
+        }
+        self.0
+    }
+
+    /// The arrangement is over: puts the window back where it was, unless the user has moved it
+    /// since. True when it was put back.
+    pub fn restore(&mut self, window: &Window) -> bool {
+        let before = self.before(window);
+        self.0 = None;
+        match before {
+            Some(before) if before.maximized => {
+                window.set_maximized(true);
+                true
+            }
+            Some(before) => set(window, before.outer),
+            None => false,
+        }
+    }
+
+    /// Whether something is remembered, without looking at the window.
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Forgets the arrangement without moving anything.
+    pub fn forget(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// What to remember when a window that is at `now` is about to be put at `tiled`: what was
+/// remembered already while the window is still where it was put then, else where it is now.
+fn remember(
+    had: Option<Before>,
+    now: Option<Rect>,
+    inner: (u32, u32),
+    maximized: bool,
+    tiled: Rect,
+) -> Option<Before> {
+    let now = now?;
+    let kept = had.filter(|before| before.untouched(now, maximized));
+    Some(match kept {
+        Some(before) => Before { tiled, ..before },
+        None => Before {
+            outer: now,
+            inner,
+            maximized,
+            tiled,
+        },
+    })
+}
+
 #[cfg(not(windows))]
 fn is_wayland(window: &Window) -> bool {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -212,6 +339,64 @@ mod kwin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_place_before_the_first_tiling_is_kept_until_the_user_moves_the_window() {
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        let (home, left, right) = (
+            rect(200, 150, 1100, 700),
+            rect(0, 0, 960, 1040),
+            rect(960, 0, 960, 1040),
+        );
+        // Nothing remembered: where the window is now.
+        let first = remember(None, Some(home), (1100, 700), false, left).unwrap();
+        assert_eq!(
+            (first.outer, first.tiled, first.maximized),
+            (home, left, false)
+        );
+        // Tiled again while still where it was put: the first place stays, the target changes.
+        let again = remember(Some(first), Some(left), (960, 1040), false, right).unwrap();
+        assert_eq!(
+            (again.outer, again.inner, again.tiled),
+            (home, (1100, 700), right)
+        );
+        // The user moved it in between: that place is the one to go back to.
+        let moved = rect(300, 40, 800, 600);
+        let after = remember(Some(first), Some(moved), (800, 600), false, right).unwrap();
+        assert_eq!((after.outer, after.tiled), (moved, right));
+        // A desktop that does not tell the position: nothing to remember.
+        assert_eq!(remember(Some(first), None, (1, 1), false, left), None);
+        // A maximised window is remembered as that.
+        assert!(
+            remember(None, Some(home), (1, 1), true, left)
+                .unwrap()
+                .maximized
+        );
+    }
+
+    #[test]
+    fn a_window_is_untouched_within_a_few_pixels_of_where_it_was_put() {
+        let tiled = Rect {
+            x: 0,
+            y: 0,
+            w: 960,
+            h: 1040,
+        };
+        let before = remember(None, Some(tiled), (1, 1), false, tiled).unwrap();
+        assert!(before.untouched(tiled, false));
+        assert!(before.untouched(
+            Rect {
+                x: -3,
+                h: 1037,
+                ..tiled
+            },
+            false
+        ));
+        assert!(!before.untouched(Rect { x: 40, ..tiled }, false));
+        assert!(!before.untouched(Rect { w: 900, ..tiled }, false));
+        // Maximised since: the user's doing.
+        assert!(!before.untouched(tiled, true));
+    }
 
     #[test]
     fn halves_tile_the_area() {

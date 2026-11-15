@@ -80,6 +80,10 @@ pub struct Request {
     /// switches to it and raises its window; such a request is not a `follow`. Without it a text
     /// never opens anything.
     pub open: bool,
+    /// Put the window back where it was before a `place` moved it: the side-by-side arrangement
+    /// is over. Implies `follow`, and needs neither a path nor a document. A receiver that
+    /// predates it does nothing. Only [`send`] carries it; no argument does.
+    pub unplace: bool,
 }
 
 /// How a request was received: see [`deliver`].
@@ -151,12 +155,16 @@ impl Request {
     ///
     /// A request for a document without a file (`doc`) has no path line at all, only `?doc=`,
     /// `?title=` and, to show it, `?open`: an older receiver finds no file in it and does nothing.
+    ///
+    /// `unplace` is `?unplace` in a `follow` request. Sent alone it has an empty `?path=`, which
+    /// an older receiver reads as a live update for a file it does not show: it does nothing,
+    /// and does not raise its window.
     pub fn encode(&self, app: &str) -> String {
         let path = self.path.display();
         let mut out = format!("{app}\n");
         let doc = self.doc.as_deref().and_then(doc_id);
         let open = self.open && doc.is_some();
-        let follow = !open && (self.follow || self.text.is_some() || self.live_off);
+        let follow = !open && (self.follow || self.text.is_some() || self.live_off || self.unplace);
         if self.path.as_os_str().is_empty() && doc.is_some() {
             if follow {
                 out.push_str(&format!("{OPTION}follow\n"));
@@ -190,6 +198,9 @@ impl Request {
         }
         if self.live_off {
             out.push_str(&format!("{OPTION}live=off\n"));
+        }
+        if self.unplace {
+            out.push_str(&format!("{OPTION}unplace\n"));
         }
         if let Some(from) = self.from.as_deref().filter(|f| !f.contains(['\n', '\r'])) {
             out.push_str(&format!("{OPTION}from={from}\n"));
@@ -247,6 +258,10 @@ impl Request {
                 "doc" => options.doc = doc_id(value).map(str::to_string),
                 "title" => options.title = Some(value.to_string()).filter(|t| !t.is_empty()),
                 "open" => options.open = true,
+                "unplace" => {
+                    options.unplace = true;
+                    options.follow = true;
+                }
                 _ => {}
             }
         }
@@ -572,6 +587,30 @@ mod tests {
             "mdview\n/home/u/a.md\n?line=200\n?col=5\n?place=-1920,40,960,1000\n?from=mdedit\n\n"
         );
         assert_eq!(Request::parse(lines(&message)), [r]);
+    }
+
+    #[test]
+    fn unplace_goes_alone_as_a_follow_with_an_empty_path() {
+        let request = Request {
+            unplace: true,
+            from: Some("mdedit".into()),
+            ..Request::default()
+        };
+        let message = request.encode("mdview");
+        assert_eq!(
+            message,
+            "mdview\n?path=\n?follow\n?unplace\n?from=mdedit\n\n"
+        );
+        let got = Request::parse(lines(&message));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].unplace && got[0].follow && got[0].path.as_os_str().is_empty());
+        // With a file it is that file's request, still a follow.
+        let with_file = Request {
+            unplace: true,
+            ..Request::new("/a/b.md")
+        };
+        let got = Request::parse(lines(&with_file.encode("mdview")));
+        assert!(got[0].unplace && got[0].follow && got[0].path == Path::new("/a/b.md"));
     }
 
     #[test]
