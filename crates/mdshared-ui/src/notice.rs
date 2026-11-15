@@ -126,7 +126,7 @@ pub fn draw_update_bar(
         ));
         right -= 12.0;
     }
-    let label = Updates::bar_label(app, stage);
+    let label = Updates::bar_label_with(app, stage, state.restart);
     p.icon(glyph::DOWNLOAD, 13.0, bar.x + 22.0, bar.cy(), pal.muted);
     p.text(
         Face::Ui,

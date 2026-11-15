@@ -499,6 +499,19 @@ impl Updates {
         }
     }
 
+    /// The bar's text for `stage` when the bar has a Restart button beside it (`restart`): the
+    /// installed version then starts when the reader says so, not the next time the
+    /// application is opened. Every other stage, and a bar without the button, reads as
+    /// [`bar_label`](Self::bar_label).
+    pub fn bar_label_with(app: &App, stage: &Stage, restart: bool) -> String {
+        match stage {
+            Stage::Installed(version) if restart => {
+                format!("{} {version} is installed. Restart to use it.", app.name)
+            }
+            _ => Self::bar_label(app, stage),
+        }
+    }
+
     /// The About dialog's update button: what it would do now.
     pub fn about_label(&self) -> String {
         match &self.stage {
@@ -893,6 +906,15 @@ mod tests {
         assert_eq!(u.finished(&APP, Ok(())), None);
         assert_eq!(u.relaunch_target(), Some(target.as_path()));
         assert_eq!(u.about_label(), "Restart");
+        // Beside the button the bar does not say that the version starts at the next opening.
+        let stage = u.bar().unwrap();
+        let said = Updates::bar_label_with(&APP, stage, true);
+        assert!(said.ends_with("is installed. Restart to use it."), "{said}");
+        assert_eq!(
+            Updates::bar_label_with(&APP, stage, false),
+            Updates::bar_label(&APP, stage)
+        );
+        assert!(Updates::bar_label(&APP, stage).contains("the next time you open"));
         // A copy with no file to start gets the plain bar and the old About button.
         let mut plain = Updates::default();
         plain.preview("installed-plain");
