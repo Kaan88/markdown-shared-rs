@@ -1,5 +1,5 @@
 //! Hand-written line scanners for Kotlin, Swift, PowerShell, Dockerfile, TypeScript, Dart, Zig,
-//! SCSS, Less, INI and CMake, which syntect's
+//! SCSS, Less, INI, CMake, Vue and Svelte, which syntect's
 //! bundled set lacks. Like the TOML scanner they cost no binary size beyond their own code (a
 //! second syntax dump would) and nothing at start-up: the colours are looked up when a block in
 //! one of these languages is first highlighted.
@@ -29,6 +29,8 @@ pub enum Lang {
     Less,
     Ini,
     CMake,
+    Vue,
+    Svelte,
 }
 
 impl Lang {
@@ -67,6 +69,10 @@ impl Lang {
             Some(Lang::Ini)
         } else if is(&["cmake"]) {
             Some(Lang::CMake)
+        } else if is(&["vue"]) {
+            Some(Lang::Vue)
+        } else if is(&["svelte"]) {
+            Some(Lang::Svelte)
         } else {
             None
         }
@@ -116,6 +122,8 @@ impl Lang {
             Lang::Less => "Less",
             Lang::Ini => "INI",
             Lang::CMake => "CMake",
+            Lang::Vue => "Vue",
+            Lang::Svelte => "Svelte",
         }
     }
 }
@@ -135,6 +143,8 @@ pub(crate) enum State {
     Continue,
     /// Inside a Dockerfile heredoc that ends at a line with this text.
     Heredoc(Box<str>),
+    /// Inside a Vue or Svelte single-file component: see [`sfc`].
+    Sfc(sfc::Sfc),
 }
 
 /// The theme's colours for each kind of token.
@@ -227,6 +237,14 @@ pub(crate) fn scan_line(
         Lang::Dockerfile => dockerfile(colors, line, state, &mut p),
         Lang::Ini => ini(colors, line, &mut p),
         Lang::CMake => cmake(colors, line, &mut p),
+        Lang::Vue | Lang::Svelte => {
+            let mut sfc = match state {
+                State::Sfc(sfc) => *sfc,
+                _ => sfc::Sfc::default(),
+            };
+            sfc::sfc_line(lang, colors, line, &mut sfc, &mut p);
+            *state = State::Sfc(sfc);
+        }
         Lang::TypeScript | Lang::Dart | Lang::Zig | Lang::Scss | Lang::Less => {
             generic(lang, colors, line, state, &mut p)
         }
@@ -1255,6 +1273,9 @@ fn docker_variable_end(b: &[u8], i: usize) -> usize {
     }
 }
 
+#[path = "sfc.rs"]
+mod sfc;
+
 #[cfg(test)]
 #[path = "scan_tests.rs"]
 mod tests;
@@ -1267,6 +1288,8 @@ struct Spec {
     types: &'static [&'static str],
     constants: &'static [&'static str],
     block_comment: bool,
+    /// `//` comments: SCSS and Less have them, plain CSS does not.
+    line_comment: bool,
     /// `'` strings, `` ` `` strings, triple-quoted strings, `$name` variables and `#rrggbb`
     /// colours (SCSS and Less), Zig's `\\` lines.
     single: bool,
@@ -1349,6 +1372,7 @@ const TS_SPEC: Spec = Spec {
     ],
     constants: &["true", "false", "null", "undefined", "NaN", "Infinity"],
     block_comment: true,
+    line_comment: true,
     single: true,
     backtick: true,
     triple: false,
@@ -1426,6 +1450,7 @@ const DART_SPEC: Spec = Spec {
     types: &["int", "double", "num", "bool", "void"],
     constants: &["true", "false", "null"],
     block_comment: true,
+    line_comment: true,
     single: true,
     backtick: false,
     triple: true,
@@ -1507,6 +1532,7 @@ const ZIG_SPEC: Spec = Spec {
     ],
     constants: &["true", "false", "null", "undefined"],
     block_comment: false,
+    line_comment: true,
     single: true,
     backtick: false,
     triple: false,
@@ -1521,6 +1547,7 @@ const STYLE_SPEC: Spec = Spec {
     types: &[],
     constants: &["true", "false", "null", "auto", "inherit", "none"],
     block_comment: true,
+    line_comment: true,
     single: true,
     backtick: false,
     triple: false,
@@ -1528,6 +1555,12 @@ const STYLE_SPEC: Spec = Spec {
     zig_lines: false,
     fn_words: &[],
     type_words: &[],
+};
+
+/// Plain CSS: the style spec without `//` comments, which `url(http://…)` would trip over.
+const CSS_SPEC: Spec = Spec {
+    line_comment: false,
+    ..STYLE_SPEC
 };
 
 /// Zig's integer types: `i` or `u` and digits.
@@ -1543,10 +1576,29 @@ fn generic(lang: Lang, c: &Colors, line: &str, state: &mut State, p: &mut Painte
         Lang::Zig => &ZIG_SPEC,
         _ => &STYLE_SPEC,
     };
+    generic_at(spec, lang, c, line, 0, state, p);
+}
+
+/// [`generic`] with its spec given, from byte `from` of `line` on: a piece of a line, such as an
+/// expression in a Vue template, is passed as `line[..end]`. `state` is read as what an earlier
+/// line carried over only when `from` is 0.
+fn generic_at(
+    spec: &Spec,
+    lang: Lang,
+    c: &Colors,
+    line: &str,
+    from: usize,
+    state: &mut State,
+    p: &mut Painter,
+) {
     let b = line.as_bytes();
     let n = b.len();
-    let mut i = 0;
-    match *state {
+    let mut i = from;
+    match if from == 0 {
+        state.clone()
+    } else {
+        State::Normal
+    } {
         State::Block(_) => match find(b, 0, b"*/") {
             Some(k) => {
                 p.paint(0, k + 2, c.comment);
@@ -1572,7 +1624,7 @@ fn generic(lang: Lang, c: &Colors, line: &str, state: &mut State, p: &mut Painte
         let ch = b[i];
         match ch {
             b' ' | b'\t' | b'\r' => i += 1,
-            b'/' if b.get(i + 1) == Some(&b'/') => {
+            b'/' if spec.line_comment && b.get(i + 1) == Some(&b'/') => {
                 p.paint(i, n, c.comment);
                 i = n;
             }

@@ -102,6 +102,7 @@ impl Language {
             Language::Scan(Lang::PowerShell | Lang::Dockerfile | Lang::Ini | Lang::CMake) => {
                 return Some("#");
             }
+            Language::Scan(Lang::Vue | Lang::Svelte) => return None,
             Language::Syntax(syntax) => syntax.name.as_str(),
         };
         Some(match name {

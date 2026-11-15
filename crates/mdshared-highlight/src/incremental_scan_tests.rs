@@ -30,7 +30,7 @@ fn spans(language: Language, dark: bool, text: &Text) -> Vec<Vec<Span>> {
     h.spans(text, 0..text.len_lines(), far()).unwrap()
 }
 
-const SAMPLES: [(&str, &str); 4] = [
+const SAMPLES: [(&str, &str); 6] = [
     (
         "kotlin",
         "package a\n/* open\n  still /* in */ comment */\nval s = \"\"\"\nraw ${x}\n\"\"\"\nfun f() = 1 // c\n",
@@ -46,6 +46,14 @@ const SAMPLES: [(&str, &str); 4] = [
     (
         "dockerfile",
         "FROM a\nRUN x \\\n  y\nRUN <<EOT\nbody\nEOT\nCMD [\"a\"] # c\n",
+    ),
+    (
+        "vue",
+        "<template>\n  <!-- c -->\n  <p :a=\"{\n    b: 1, /* x */\n  }\" id=\"y\">{{ n + 1 }}</p>\n</template>\n<script setup lang=\"ts\">\nconst s = `a\n${b}`\n</script>\n<style lang=\"scss\">\n$c: #fff; // c\n</style>\n",
+    ),
+    (
+        "svelte",
+        "<script>\n  let n = 0 /* x\n*/\n</script>\n{#if n > 1}\n  <p class=\"a {n}\" on:click={() => {\n    n++\n  }}>Hi</p>\n{/if}\n<style>\n  a { color: red } /* c */\n</style>\n",
     ),
 ];
 
@@ -65,6 +73,8 @@ fn scanned_languages_are_found_by_token_and_path() {
         ("dockerfile", "Dockerfile"),
         ("docker", "Dockerfile"),
         ("Containerfile", "Dockerfile"),
+        ("vue", "Vue"),
+        ("svelte", "Svelte"),
     ] {
         assert_eq!(Language::by_token(token).unwrap().name(), name, "{token}");
     }
@@ -81,6 +91,9 @@ fn scanned_languages_are_found_by_token_and_path() {
         ("docker/Dockerfile.dev", "Dockerfile"),
         ("Containerfile", "Dockerfile"),
         ("x.dockerfile", "Dockerfile"),
+        ("App.vue", "Vue"),
+        ("src/routes/+page.svelte", "Svelte"),
+        ("APP.VUE", "Vue"),
     ] {
         assert_eq!(by_path(path, "").unwrap().name(), name, "{path}");
         assert_eq!(by_path(path, "").unwrap().limits(), Limits::CODE);
@@ -153,6 +166,10 @@ fn scanned_languages_keep_the_incremental_guarantees() {
             (50, "<# x"),
             (200, "RUN \\"),
             (16, "@\""),
+            (60, "<!-- open"),
+            (70, "<script lang=\"ts\">"),
+            (80, "{{ a"),
+            (90, "<p :a=\"{"),
         ] {
             let mut h = fresh(&old);
             while h.advance(&old, far()) {}
@@ -192,6 +209,8 @@ fn hostile_lines_through_the_incremental_path_are_fast() {
         ("swift", "\"\\(".repeat(300)),
         ("powershell", "\"$(".repeat(300)),
         ("dockerfile", "\"${".repeat(300)),
+        ("vue", "<a :b=\"{{ `${".repeat(60)),
+        ("svelte", "{#each {a: `${".repeat(60)),
     ] {
         let language = Language::by_token(name).unwrap();
         let t = Text(vec![line.clone(); 3000]);

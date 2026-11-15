@@ -473,3 +473,199 @@ fn more_languages_are_found_by_file_name_and_coloured() {
         assert_eq!(lang.name(), name, "{file}");
     }
 }
+
+const VUE: &str = r##"<template>
+  <!-- note -->
+  <div id="app" :class="{ on: isOn }" @click="go(1)">
+    {{ count + 1 }} &amp; <MyButton v-if="ok" />
+  </div>
+  <p
+    :title="{
+      active: isActive, // multi
+    }"
+    lang="x"
+  >text</p>
+</template>
+
+<script setup lang="ts">
+import { ref } from 'vue'
+const count = ref<number>(0) // tail
+</script>
+
+<style scoped lang="scss">
+$c: #fff; // scss comment
+.a { color: $c; }
+</style>
+
+<style>
+.b { background: url(http://x/y.png); } /* css */
+</style>
+"##;
+
+#[test]
+fn vue_is_highlighted() {
+    check(
+        "vue",
+        VUE,
+        &[
+            "template",
+            "<!-- note",
+            "div",
+            "id=",
+            ":class",
+            "@click",
+            "go(1)",
+            "1)",
+            "1 }}",
+            "&amp;",
+            "MyButton",
+            "v-if",
+            "// multi",
+            "setup",
+            "\"ts\"",
+            "import",
+            "'vue'",
+            "const",
+            "// tail",
+            "$c: #fff",
+            "#fff",
+            "// scss comment",
+            "/* css */",
+            "p>
+</template>",
+        ],
+        &[
+            "text</p>",
+            "{{ count",
+            "ok\"",
+            "isActive,",
+            "url(",
+            "//x/y.png",
+        ],
+    );
+    // The expression of a directive keeps its state over lines, and the tag goes on after it.
+    assert_ne!(
+        colour_of(VUE, "vue", "lang=\"x\"", false),
+        plain(false),
+        "attribute after a multi-line value"
+    );
+    assert_eq!(
+        colour_of(VUE, "vue", "// multi", false),
+        colour_of(VUE, "vue", "/* css */", false)
+    );
+    // After `</script>` and `</style>` the template and the next block are read again.
+    assert_ne!(
+        colour_of(VUE, "vue", "style>\n.b", false),
+        plain(false),
+        "tag name"
+    );
+}
+
+const SVELTE: &str = r##"<script lang="ts">
+  export let name: string = 'x'
+  let n = 0 /* c */
+</script>
+
+{#if n > 1}
+  <p class="a {name}" on:click={() => n++} {...rest}>Hi {name}</p>
+  <div use:act={{
+    a: 1,
+  }} id="z">z</div>
+{:else}
+  {@html raw}
+{/if}
+
+<style lang="less">
+  @w: 10px; // l
+  .a { width: @w }
+</style>
+"##;
+
+#[test]
+fn svelte_is_highlighted() {
+    check(
+        "svelte",
+        SVELTE,
+        &[
+            "script", "lang=", "export", "'x'", "/* c */", "#if", "1}", "p class", "class=",
+            "\"a ", "on:click", ":else", "@html", "/if", "use:act", "1,", "id=", "\"z\"", "div>",
+            "@w", "10px", "// l",
+        ],
+        &["name}\"", "Hi ", "raw}", "a: 1"],
+    );
+    // A block that runs over lines, then the tag's next attribute.
+    assert_ne!(colour_of(SVELTE, "svelte", "id=\"z\"", false), plain(false));
+    // `lang="less"` makes `//` a comment; plain CSS in a style block does not.
+    let css = "<style>\n  a { background: url(http://x); }\n</style>\n";
+    assert_eq!(colour_of(css, "svelte", "//x", false), plain(false));
+    let less = "<style lang=\"less\">\n  a { background: url(http://x); }\n</style>\n";
+    assert_ne!(colour_of(less, "svelte", "//x", false), plain(false));
+}
+
+#[test]
+fn vue_and_svelte_have_the_expected_names_and_unusual_input_is_safe() {
+    for (token, lang) in [
+        ("vue", Lang::Vue),
+        ("Vue", Lang::Vue),
+        ("svelte", Lang::Svelte),
+    ] {
+        assert_eq!(Lang::from_token(token), Some(lang), "{token}");
+    }
+    assert_eq!(Lang::Vue.name(), "Vue");
+    assert_eq!(Lang::Svelte.name(), "Svelte");
+    // Unterminated and nested oddities: no panic, and the spans tile the source.
+    for source in [
+        "<",
+        "<a",
+        "<a b=",
+        "<a b=\"",
+        "<a :b=\"{",
+        "<a {",
+        "{{",
+        "{",
+        "{#",
+        "<!--",
+        "<script",
+        "<script>",
+        "<style lang=",
+        "</script>",
+        "<script>\n</script",
+        "é<é é=\"é\">{{ é }}",
+        "&#;&;&amp",
+        "{\"}",
+        "{'\\",
+    ] {
+        for name in ["vue", "svelte"] {
+            for dark in [false, true] {
+                let all = tokens(source, Some(name), dark).expect(name);
+                assert_eq!(all.last().unwrap().range.end, source.len(), "{source:?}");
+                for pair in all.windows(2) {
+                    assert_eq!(pair[0].range.end, pair[1].range.start);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn hostile_components_are_scanned_in_linear_time() {
+    let start = std::time::Instant::now();
+    for line in [
+        "{{ ".repeat(20_000),
+        "<a b=\"".repeat(20_000),
+        "<a :b=\"".repeat(20_000),
+        "{#each ".repeat(20_000),
+        "<script>".repeat(20_000),
+        "</script></style><!--".repeat(10_000),
+        "<a {".repeat(20_000),
+    ] {
+        for name in ["vue", "svelte"] {
+            assert!(tokens(&line, Some(name), false).is_some(), "{name}");
+        }
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
