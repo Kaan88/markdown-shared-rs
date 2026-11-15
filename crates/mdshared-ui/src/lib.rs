@@ -20,6 +20,7 @@ pub mod platform;
 pub mod scroll;
 pub mod settings;
 pub mod shadow;
+pub mod snap;
 pub mod textfield;
 pub mod theme;
 pub mod tree;

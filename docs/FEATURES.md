@@ -87,3 +87,70 @@ disabled items, duplicates, opt-out), and drawing (a menu without marks is bit-i
 the switch on or off and with underlines shown or hidden; marks change pixels only in the marked
 rows). Not verified: how the underline looks (its offset from the baseline was chosen from the
 font metrics, not seen), keyboard handling in either application, and the menus' use of it.
+
+## The snap-layouts flyout on a hand-drawn maximize button (`mdshared_ui::snap`)
+
+Built, as an opt-in, Windows-only API: `snap::set_maximize_button_rect(window: &winit::window::Window,
+rect: Option<gfx::Rect>)`. Off Windows it does nothing. **Not verified with a real pointer on
+Windows 11**: whether the flyout appears and behaves, and how the application's button feels with
+it, are untested. Only the message handling is tested (below).
+
+Where hit-testing is done. Nowhere in the shared crate or in winit: winit 0.30.13 (also the
+patched fork both applications pin) does not handle `WM_NCHITTEST` at all, so `DefWindowProc`
+answers it, and with winit's `WM_NCCALCSIZE` (the client area is the whole window) every point
+is `HTCLIENT`. The applications resize and drag themselves: a press on their own edge band or
+title row calls `drag_resize_window` or `drag_window`, which post `WM_NCLBUTTONDOWN` with
+`HTLEFT`..`HTBOTTOMRIGHT` or `HTCAPTION` to the window. The shared crate touched the window handle
+only for `DwmSetWindowAttribute` (`corners`, `platform`); nothing subclasses a window.
+
+What it does. The first call with `Some(rect)` replaces the window procedure of that window with
+one that calls winit's for everything and changes only:
+
+| Message | Handling |
+|---|---|
+| `WM_NCHITTEST` | winit's answer first; only if it is `HTCLIENT` and the point is in the rectangle, `HTMAXBUTTON`. Edges, title row, everything outside the rectangle: unchanged. |
+| `WM_NCMOUSEMOVE` on `HTMAXBUTTON` | passed on (Windows' default handling is what shows the flyout) and also sent as `WM_MOUSEMOVE` at the client position |
+| `WM_NCLBUTTONDOWN`, `WM_NCLBUTTONDBLCLK`, `WM_NCLBUTTONUP` on `HTMAXBUTTON` | sent as `WM_LBUTTONDOWN` (with `MK_LBUTTON`) and `WM_LBUTTONUP`; not passed on, since the default handling maximizes on its own |
+| `WM_MOUSELEAVE` while the pointer is on the button | dropped: Windows sends one when the pointer passes from client area to the button, and winit would turn it into `CursorLeft` |
+| `WM_NCMOUSELEAVE`, or a client `WM_MOUSEMOVE` after a visit to the button | a `WM_MOUSELEAVE` for winit first (so it reports `CursorLeft`, and `CursorEntered` with a fresh `TrackMouseEvent` on the next move), then the message |
+
+The application then sees the usual `CursorEntered`, `CursorMoved`, `CursorLeft` and `MouseInput`
+events for its button and calls `set_maximized` as before. The press holds winit's mouse capture
+as any press does, so the release arrives as a client `WM_LBUTTONUP`, also when the pointer has
+moved off the button.
+
+Why not `SetWindowSubclass`. It is exported by name only from comctl32 version 6; a program
+without that version's manifest that imports it by name does not start (the first attempt did
+exactly that: `STATUS_ENTRYPOINT_NOT_FOUND` in the test binary). The window procedure is replaced
+with `SetWindowLongPtrW(GWLP_WNDPROC)` and chained with `CallWindowProcW` instead; per-window state
+is a thread-local list (a window's messages run on its thread), dropped on `WM_NCDESTROY`. It never
+restores the old procedure, so it must not be combined with another replacement of the same
+window's procedure that restores it.
+
+Public API: `snap::set_maximize_button_rect`. The only manifest change is the `windows-sys` feature
+`Win32_System_Threading` (`GetCurrentThreadId`, to refuse a call from another thread); Cargo.lock
+is unchanged.
+
+What an application does, per window, on Windows: after laying out the caption buttons (every
+resize, maximize and change of scale, as the rectangle is in logical pixels from the client origin
+and is converted with the window's current scale), call `set_maximize_button_rect(&window,
+Some(button))`; call it with `None` when the button is not drawn or something covers it (a menu or
+dialog over the title row, a full-screen view). Keep the rectangle clear of the resize band
+(`window::EDGE`): over the rectangle the pointer is non-client, so winit does not set the resize
+cursor there. The application's own button must not also react to the non-client press, which it
+does not, as it never sees one. While the window is maximized the same rectangle applies.
+
+Run: unit tests for the rectangle (scale, rounding outwards, empty or non-finite input), the
+point packing (negative screen coordinates), and one test with a real hidden window of its own that
+sends the messages with `SendMessage` and checks what the window procedure behind receives: the
+hit-test inside, on each edge of and outside the rectangle; the move, press, double press and
+release translated; the leave held back and released; the pointer returning to the client area;
+presses on `HTCAPTION` and moves off the button untouched; `None` ending a visit; destruction.
+
+Not verified: the flyout on Windows 11 (it also needs the window to have `WS_MAXIMIZEBOX`, which
+winit sets for a maximizable window); the real order in which Windows sends `WM_NCMOUSELEAVE`,
+`WM_MOUSELEAVE` and the first client move (both orders are handled, by reasoning and not by
+observation); behaviour with touch, pen, or a high-DPI monitor change in the middle of a hover; the
+interplay with a window dragged by `drag_window` that starts on the button's row; either
+application. If the hover or the click misbehaves, calling `set_maximize_button_rect(&window,
+None)` returns the window to what it was, bar the replaced procedure that then passes everything on.
