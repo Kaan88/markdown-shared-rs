@@ -32,6 +32,8 @@ const FOOTER_H: f32 = 28.0;
 pub const MAX_ROWS: usize = 12;
 /// The most results kept for a query.
 const MAX_RESULTS: usize = 300;
+/// The most rows a literal list holds.
+const MAX_LITERAL: usize = 20_000;
 
 /// One thing the palette can choose.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +50,23 @@ pub struct Entry {
     pub group: u8,
     /// A disabled entry is listed but cannot be chosen.
     pub enabled: bool,
+    /// How the row is drawn.
+    pub row: Row,
+    /// Chars of the label (indices) drawn in the accent colour. A ranked list marks what the query
+    /// matched; a literal list (see [`Palette::set_literal`]) marks what the application says.
+    pub marks: Vec<u32>,
+}
+
+/// How an entry's row is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Row {
+    #[default]
+    Normal,
+    /// The name of what the rows below belong to (a file of search results): semibold, never
+    /// chosen, passed over by the arrow keys.
+    Heading,
+    /// A line of small print among the rows ("more results are not shown"): faint, never chosen.
+    Note,
 }
 
 impl Entry {
@@ -59,7 +78,30 @@ impl Entry {
             icon: "",
             group: 0,
             enabled: true,
+            row: Row::Normal,
+            marks: Vec::new(),
         }
+    }
+    /// A [`Row::Heading`]: cannot be chosen.
+    pub fn heading(id: u32, label: impl Into<String>) -> Entry {
+        Entry {
+            enabled: false,
+            row: Row::Heading,
+            ..Entry::new(id, label)
+        }
+    }
+    /// A [`Row::Note`]: cannot be chosen.
+    pub fn note(id: u32, label: impl Into<String>) -> Entry {
+        Entry {
+            enabled: false,
+            row: Row::Note,
+            ..Entry::new(id, label)
+        }
+    }
+    /// The label's chars (indices, ascending) to draw in the accent colour.
+    pub fn marks(mut self, marks: Vec<u32>) -> Self {
+        self.marks = marks;
+        self
     }
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = hint.into();
@@ -160,6 +202,12 @@ pub struct Palette {
     last_matches: Vec<usize>,
     /// Entries replaced since `last_matches` was made.
     entries_changed: bool,
+    /// The entries are the application's answer to the query, listed as given (no ranking).
+    literal: bool,
+    /// The left of the footer, in place of the count.
+    footer_text: Option<String>,
+    /// The next rebuild leaves the scroll where it is.
+    keep_view: bool,
 
     window: Rect,
     title_h: f32,
@@ -203,6 +251,9 @@ impl Palette {
             last_needle: String::new(),
             last_matches: Vec::new(),
             entries_changed: true,
+            literal: false,
+            footer_text: None,
+            keep_view: false,
             window: Rect::default(),
             title_h: 0.0,
             card: Rect::default(),
@@ -258,6 +309,36 @@ impl Palette {
         self.rebuild();
     }
 
+    /// A literal list shows the entries as the application gives them, in its order and without
+    /// ranking them against the query: the entries are the answer to it, such as the lines of
+    /// the files of a folder that hold it. Group headers are not drawn, a message row is plain
+    /// (it is not a choice), and "No matches" is the application's to say.
+    pub fn set_literal(&mut self, on: bool) {
+        if self.literal != on {
+            self.literal = on;
+            self.entries_changed = true;
+            self.rebuild();
+        }
+    }
+
+    /// Adds entries to the end of a list that is still coming in (a search that streams). The
+    /// selection and the scroll stay where they are; the first entry that can be chosen is
+    /// selected when nothing was. Without [`set_literal`](Self::set_literal) it is the same as
+    /// [`set_entries`](Self::set_entries) with the old entries and the new.
+    pub fn append_entries(&mut self, more: Vec<Entry>) {
+        let prev = self.selected_id();
+        self.entries.extend(more);
+        self.entries_changed = true;
+        self.keep_view = true;
+        self.rebuild_keeping(prev);
+        self.keep_view = false;
+    }
+
+    /// The left of the footer in place of the count ("Searching… 120 files"); `None` for the count.
+    pub fn set_footer(&mut self, text: Option<String>) {
+        self.footer_text = text;
+    }
+
     /// The text shown in the empty box.
     pub fn set_placeholder(&mut self, text: &str) {
         self.placeholder = text.to_string();
@@ -302,6 +383,14 @@ impl Palette {
     /// The id of the entry the keyboard (or the pointer) is on.
     pub fn selected_id(&self) -> Option<u32> {
         self.selected.map(|s| self.entries[self.shown[s].entry].id)
+    }
+
+    /// The label of the entry with this id, if it is held.
+    pub fn label_of(&self, id: u32) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.label.as_str())
     }
 
     /// How many entries the list holds now.
@@ -386,7 +475,20 @@ impl Palette {
         let needle = self.needle();
         let old_len = self.shown.len();
         self.shown.clear();
-        if needle.is_empty() {
+        if self.literal {
+            self.last_needle.clear();
+            self.last_matches.clear();
+            self.shown.extend(
+                self.entries
+                    .iter()
+                    .take(MAX_LITERAL)
+                    .enumerate()
+                    .map(|(i, e)| Shown {
+                        entry: i,
+                        positions: e.marks.clone(),
+                    }),
+            );
+        } else if needle.is_empty() {
             self.last_needle.clear();
             self.last_matches.clear();
             self.shown.extend((0..self.entries.len()).map(|i| Shown {
@@ -423,7 +525,8 @@ impl Palette {
         self.lines.clear();
         self.item_line.clear();
         let mut y = PAD;
-        let message = self.message.is_some() || (!needle.is_empty() && self.shown.is_empty());
+        let message = self.message.is_some()
+            || (!self.literal && !needle.is_empty() && self.shown.is_empty());
         if message {
             self.lines.push(Placed {
                 line: Line::Message,
@@ -435,7 +538,11 @@ impl Palette {
         let mut group = None;
         for (i, s) in self.shown.iter().enumerate() {
             let g = self.entries[s.entry].group;
-            if needle.is_empty() && group != Some(g) && self.group_name(g).is_some() {
+            if !self.literal
+                && needle.is_empty()
+                && group != Some(g)
+                && self.group_name(g).is_some()
+            {
                 self.lines.push(Placed {
                     line: Line::Header(g),
                     y,
@@ -469,7 +576,7 @@ impl Palette {
             self.scroll = 0.0;
         }
         self.fresh_query = false;
-        self.reveal = true;
+        self.reveal = !self.keep_view;
         self.relayout();
     }
 
@@ -881,7 +988,7 @@ impl Palette {
                 }
                 Line::Message => {
                     let text = self.message.clone().unwrap_or_else(|| "No matches".into());
-                    let accent = self.message.is_some() && self.selected.is_none();
+                    let accent = self.message.is_some() && self.selected.is_none() && !self.literal;
                     if accent {
                         p.rbox(r, 6.0, pal.on);
                     }
@@ -915,7 +1022,10 @@ impl Palette {
             Rect::new(f.x + 1.0, f.y, f.w - 2.0, px.max(1.0)),
             pal.popup_line,
         );
-        let count = self.footer_count();
+        let count = self
+            .footer_text
+            .clone()
+            .unwrap_or_else(|| self.footer_count());
         p.text(
             Face::Ui,
             11.5,
@@ -946,6 +1056,10 @@ impl Palette {
                 1.5,
                 pal.accent,
             );
+        }
+        if e.row != Row::Normal {
+            self.draw_plain_row(p, pal, r, e);
+            return;
         }
         let (text, muted, hi) = if e.enabled {
             (pal.text, pal.muted, pal.accent)
@@ -978,6 +1092,36 @@ impl Palette {
         }
         let max = r.right() - 12.0 - hint_w - x;
         draw_label(p, x, r.cy(), &e.label, &s.positions, max, text, hi);
+    }
+}
+
+impl Palette {
+    /// A heading or a note: no selection, the label as it is.
+    fn draw_plain_row(&self, p: &mut Painter, pal: &Colors, r: Rect, e: &Entry) {
+        let mut x = r.x + 14.0;
+        if self.has_icons {
+            if !e.icon.is_empty() {
+                p.icon(e.icon, 15.0, r.x + 24.0, r.cy(), pal.muted);
+            }
+            x = r.x + 42.0;
+        }
+        let mut hint_w = 0.0;
+        if !e.hint.is_empty() {
+            let max = (r.w * 0.42).max(60.0);
+            let shown = p.elide(Face::Ui, 12.0, &e.hint, max);
+            hint_w =
+                p.text_right(Face::Ui, 12.0, r.right() - 12.0, r.cy(), &shown, pal.faint) + 20.0;
+        }
+        let max = r.right() - 12.0 - hint_w - x;
+        match e.row {
+            Row::Heading => {
+                let label = p.elide(Face::Semibold, 13.0, &e.label, max);
+                p.text(Face::Semibold, 13.0, x, r.cy(), &label, pal.text, max);
+            }
+            _ => {
+                p.text(Face::Ui, 12.5, x, r.cy(), &e.label, pal.faint, max);
+            }
+        }
     }
 }
 
@@ -1438,6 +1582,96 @@ mod tests {
     }
 
     /// Draws into a bitmap and checks nothing panics at odd sizes, 1.0 and 1.5 scale.
+    fn results() -> Vec<Entry> {
+        vec![
+            Entry::heading(0, "a.md").hint("2"),
+            Entry::new(1, "first needle").hint("3").marks(vec![6, 7]),
+            Entry::new(2, "second").hint("9"),
+            Entry::heading(3, "b.md"),
+            Entry::new(4, "third").hint("1"),
+            Entry::note(5, "More results are not shown"),
+        ]
+    }
+
+    #[test]
+    fn a_literal_list_is_not_ranked_and_keeps_its_order_and_marks() {
+        let mut p = Palette::new();
+        p.set_literal(true);
+        p.set_query("zzz");
+        p.set_entries(results());
+        p.layout(WIN, 40.0);
+        // Nothing of the label matches "zzz", yet all six rows are listed, in order.
+        assert_eq!(p.listed_ids(), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(p.shown[1].positions, vec![6, 7]);
+        // No auto "No matches" and no message row of its own.
+        assert!(p.lines.iter().all(|l| l.line != Line::Message));
+        p.set_entries(Vec::new());
+        assert!(p.lines.iter().all(|l| l.line != Line::Message));
+        p.set_message(Some("No matches".into()));
+        assert!(p.lines.iter().any(|l| l.line == Line::Message));
+    }
+
+    #[test]
+    fn headings_and_notes_cannot_be_selected_or_clicked() {
+        let mut p = Palette::new();
+        p.set_literal(true);
+        p.set_entries(results());
+        p.layout(WIN, 40.0);
+        assert_eq!(p.selected_id(), Some(1));
+        let mut seen = vec![];
+        for _ in 0..4 {
+            p.key(&KeyName::Down, NONE, None);
+            seen.push(p.selected_id().unwrap());
+        }
+        assert_eq!(
+            seen,
+            vec![2, 4, 1, 2],
+            "wraps past the headings and the note"
+        );
+        let r = p.row_rect(0);
+        p.press(r.cx(), r.cy(), NONE, 1);
+        assert_eq!(p.release(r.cx(), r.cy()), Outcome::None);
+        let r = p.row_rect(4);
+        p.press(r.cx(), r.cy(), NONE, 1);
+        assert_eq!(p.release(r.cx(), r.cy()), Outcome::Chosen(4));
+    }
+
+    #[test]
+    fn appended_entries_do_not_move_the_selection_or_the_scroll() {
+        let mut p = Palette::new();
+        p.set_literal(true);
+        p.set_entries((0..40).map(|i| Entry::new(i, format!("row {i}"))).collect());
+        p.layout(WIN, 40.0);
+        p.key(&KeyName::Down, NONE, None);
+        assert_eq!(p.selected_id(), Some(1));
+        assert!(p.wheel(200.0));
+        let at = p.scroll();
+        p.append_entries(
+            (40..80)
+                .map(|i| Entry::new(i, format!("row {i}")))
+                .collect(),
+        );
+        assert_eq!((p.selected_id(), p.scroll(), p.len()), (Some(1), at, 80));
+        // Replacing the list with nothing and then appending selects the first row.
+        p.set_entries(Vec::new());
+        p.append_entries(vec![Entry::new(7, "x")]);
+        assert_eq!(p.selected_id(), Some(7));
+    }
+
+    #[test]
+    fn a_custom_footer_replaces_the_count() {
+        let mut p = Palette::new();
+        p.set_literal(true);
+        p.set_footer(Some("Searching…".into()));
+        p.set_entries(results());
+        let mut gfx = Gfx::new();
+        let mut bmp = Bitmap::new(900, 640);
+        let mut painter = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.draw(&mut painter, &crate::theme::LIGHT, WIN, 40.0, true);
+        p.draw(&mut painter, &crate::theme::DARK, WIN, 40.0, true);
+        assert_eq!(p.footer_text.as_deref(), Some("Searching…"));
+    }
+
     #[test]
     fn draws_at_any_size() {
         let mut gfx = Gfx::new();
