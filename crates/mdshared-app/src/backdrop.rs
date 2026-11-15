@@ -21,8 +21,7 @@ impl Backdrop {
     /// The label of the settings row.
     pub const TITLE: &'static str = "Window backdrop";
     /// The help line of the settings row.
-    pub const HELP: &'static str =
-        "Windows 11: the desktop shows softly through the title row, bars and side pane.";
+    pub const HELP: &'static str = "Windows 11. Behind the bars and the side pane.";
 
     /// The value in a settings file.
     pub fn key(self) -> &'static str {
