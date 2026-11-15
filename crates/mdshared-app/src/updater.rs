@@ -599,12 +599,9 @@ mod tests {
         ..APP
     };
 
+    /// A manifest with an entry for the platform the tests run on.
     fn manifest(version: &str, app: &[u8], engine: Option<&[u8]>) -> String {
-        let p = if cfg!(windows) {
-            "windows-x86_64"
-        } else {
-            "linux-x86_64"
-        };
+        let p = Platform::current().map_or("linux-x86_64", Platform::key_prefix);
         manifest_for(p, version, app, engine)
     }
 

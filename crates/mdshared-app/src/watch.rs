@@ -18,8 +18,46 @@ struct Shared {
     files: std::sync::Mutex<BTreeSet<PathBuf>>,
     /// The folders whose listing is followed.
     listed: std::sync::Mutex<BTreeSet<PathBuf>>,
+    /// macOS: each listed folder's modification time when last looked at. FSEvents keeps a
+    /// file's "created" flag on later events for it, so writing into a file made a moment ago
+    /// reads as a new entry; the folder's own time changes only when an entry is created,
+    /// removed or renamed, so a listing event wakes only when that time moved.
+    #[cfg(target_os = "macos")]
+    listed_times:
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>>,
     /// A wake has been sent and the shell has not called `woken` yet.
     pending: AtomicBool,
+}
+
+impl Shared {
+    /// Whether the listing of `dir` may have changed: always, except on macOS, where its
+    /// modification time must have moved since the last look (see `listed_times`).
+    #[cfg(not(target_os = "macos"))]
+    fn listing_moved(&self, _dir: &Path) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn listing_moved(&self, dir: &Path) -> bool {
+        let now = folder_time(dir);
+        let mut times = self.listed_times.lock().unwrap_or_else(|e| e.into_inner());
+        match times.get_mut(dir) {
+            Some(seen) if *seen == now => false,
+            Some(seen) => {
+                *seen = now;
+                true
+            }
+            None => {
+                times.insert(dir.to_path_buf(), now);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn folder_time(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir).and_then(|m| m.modified()).ok()
 }
 
 pub struct FileWatcher {
@@ -40,6 +78,8 @@ impl FileWatcher {
         let shared = Arc::new(Shared {
             files: Default::default(),
             listed: Default::default(),
+            #[cfg(target_os = "macos")]
+            listed_times: Default::default(),
             pending: AtomicBool::new(false),
         });
         let seen = shared.clone();
@@ -63,10 +103,10 @@ impl FileWatcher {
                             | EventKind::Remove(_)
                             | EventKind::Modify(notify::event::ModifyKind::Name(_))
                     )
-                    && event
-                        .paths
-                        .iter()
-                        .any(|path| path.parent().is_some_and(|dir| listed.contains(dir)))
+                    && event.paths.iter().any(|path| {
+                        path.parent()
+                            .is_some_and(|dir| listed.contains(dir) && seen.listing_moved(dir))
+                    })
             };
             if ours && !seen.pending.swap(true, Ordering::AcqRel) {
                 wake();
@@ -99,6 +139,18 @@ impl FileWatcher {
     /// [`set_files`](Self::set_files).
     pub fn set_folders<'a>(&mut self, folders: impl IntoIterator<Item = &'a Path>) {
         self.listed = folders.into_iter().map(Path::to_path_buf).collect();
+        #[cfg(target_os = "macos")]
+        {
+            let mut times = self
+                .shared
+                .listed_times
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            times.retain(|dir, _| self.listed.contains(dir));
+            for dir in &self.listed {
+                times.entry(dir.clone()).or_insert_with(|| folder_time(dir));
+            }
+        }
         self.rewatch();
         *self.shared.listed.lock().unwrap_or_else(|e| e.into_inner()) = self.listed.clone();
     }
@@ -135,6 +187,18 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
+    /// Lets events from before the watch went away (FSEvents delivers those of the moment before
+    /// a stream starts a little later), and clears any wake they made.
+    fn settle(receive: &std::sync::mpsc::Receiver<()>, watcher: &FileWatcher) {
+        std::thread::sleep(Duration::from_millis(if cfg!(target_os = "macos") {
+            600
+        } else {
+            50
+        }));
+        while receive.try_recv().is_ok() {}
+        watcher.woken();
+    }
+
     #[test]
     fn a_save_by_rename_wakes_and_other_files_do_not() {
         let dir = std::env::temp_dir().join(format!("mdshared-watch-{}", std::process::id()));
@@ -146,6 +210,7 @@ mod tests {
         let (send, receive) = channel();
         let mut watcher = FileWatcher::new(move || _ = send.send(())).expect("watcher");
         watcher.set_files([file.as_path()]);
+        settle(&receive, &watcher);
 
         std::fs::write(dir.join("other.md"), "x").unwrap();
         assert!(
@@ -194,6 +259,7 @@ mod tests {
         let (send, receive) = channel();
         let mut watcher = FileWatcher::new(move || _ = send.send(())).expect("watcher");
         watcher.set_folders([dir.as_path()]);
+        settle(&receive, &watcher);
 
         std::fs::write(
             &old,

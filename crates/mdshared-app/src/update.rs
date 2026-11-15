@@ -252,6 +252,11 @@ impl Platform {
         }
     }
 
+    /// The manifest's key prefix of this platform (`macos-aarch64`).
+    pub fn key_prefix(self) -> &'static str {
+        self.prefix()
+    }
+
     /// Whether this is one of the macOS builds, which do not update themselves.
     pub fn is_macos(self) -> bool {
         matches!(self, Platform::MacArm64 | Platform::MacX64)
