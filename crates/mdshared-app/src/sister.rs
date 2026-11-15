@@ -51,7 +51,9 @@ pub struct Request {
     pub path: PathBuf,
     /// Show or put the caret at this source line (1-based).
     pub line: Option<u32>,
-    /// With `line`: the column (1-based). The viewer has no use for it.
+    /// With `line`: the byte in that line, from 1. The editor puts its caret there; the viewer
+    /// shows the row that holds it when the line wraps to several (a build that predates that
+    /// shows the line's beginning).
     pub column: Option<u32>,
     /// A live update, not an opening: do not raise or focus the window, and do nothing when the
     /// file is not already the one shown. When no window runs, nothing is started.
@@ -67,6 +69,39 @@ pub struct Request {
     /// Ends the live state a `text` started for `path`: the receiver goes back to the file. Implies
     /// `follow`. Only [`send`] carries it.
     pub live_off: bool,
+    /// A document that has no file yet, by the name the sender gives it for as long as it has it
+    /// open ([`doc_id`] says what a name may be). `path` is empty then, and the receiver shows
+    /// `text` under `title`. With a `path`, it says that this document is that file from now on
+    /// (it was saved). Only [`send`] carries it; see [`Request::document`].
+    pub doc: Option<String>,
+    /// With `doc`: what to call the document, as the sender's tab does (`Untitled 1`).
+    pub title: Option<String>,
+    /// With `doc` and `text`: show the document. The receiver makes a tab for it if it has none,
+    /// switches to it and raises its window; such a request is not a `follow`. Without it a text
+    /// never opens anything.
+    pub open: bool,
+}
+
+/// How a request was received: see [`deliver`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// A window answered and knew what was asked.
+    Taken,
+    /// A window answered, but it is an older build that does not know a document without a file
+    /// (`doc`): it did nothing.
+    Older,
+    /// No window answered.
+    Nobody,
+}
+
+/// The longest name of a document without a file.
+const MAX_DOC_ID: usize = 64;
+
+/// `id` if it can name a document without a file: 1 to 64 ASCII letters, digits, `.`, `_` or `-`.
+/// A receiver may build a tab's key from it, so nothing else is let through.
+pub fn doc_id(id: &str) -> Option<&str> {
+    let fine = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    ((1..=MAX_DOC_ID).contains(&id.len()) && id.chars().all(fine)).then_some(id)
 }
 
 /// The most text one request may carry, in bytes. A sender with a larger document sends none and
@@ -81,6 +116,16 @@ impl Request {
     pub fn new(path: impl Into<PathBuf>) -> Request {
         Request {
             path: path.into(),
+            ..Request::default()
+        }
+    }
+
+    /// A request about the document without a file that the sender calls `id` and shows as
+    /// `title`. It has no path.
+    pub fn document(id: impl Into<String>, title: impl Into<String>) -> Request {
+        Request {
+            doc: Some(id.into()),
+            title: Some(title.into()),
             ..Request::default()
         }
     }
@@ -103,14 +148,33 @@ impl Request {
     /// line, which is where an older receiver already reads and skips whatever is not a file. A
     /// `follow` request has `?follow` and gives its path as `?path=` instead of a plain line, so an
     /// older receiver, which would open and raise a plain path, finds nothing to do.
+    ///
+    /// A request for a document without a file (`doc`) has no path line at all, only `?doc=`,
+    /// `?title=` and, to show it, `?open`: an older receiver finds no file in it and does nothing.
     pub fn encode(&self, app: &str) -> String {
         let path = self.path.display();
         let mut out = format!("{app}\n");
-        let follow = self.follow || self.text.is_some() || self.live_off;
-        if follow {
+        let doc = self.doc.as_deref().and_then(doc_id);
+        let open = self.open && doc.is_some();
+        let follow = !open && (self.follow || self.text.is_some() || self.live_off);
+        if self.path.as_os_str().is_empty() && doc.is_some() {
+            if follow {
+                out.push_str(&format!("{OPTION}follow\n"));
+            }
+        } else if follow {
             out.push_str(&format!("{OPTION}path={path}\n{OPTION}follow\n"));
         } else {
             out.push_str(&format!("{path}\n"));
+        }
+        if let Some(doc) = doc {
+            out.push_str(&format!("{OPTION}doc={doc}\n"));
+            let title = self.title.as_deref().filter(|t| !t.contains(['\n', '\r']));
+            if let Some(title) = title {
+                out.push_str(&format!("{OPTION}title={title}\n"));
+            }
+            if open {
+                out.push_str(&format!("{OPTION}open\n"));
+            }
         }
         if let Some(line) = self.line {
             out.push_str(&format!("{OPTION}line={line}\n"));
@@ -155,8 +219,8 @@ impl Request {
     }
 
     /// The requests in a message's lines, after the application's name and up to the empty line:
-    /// one for each path, all with the options the message carries. Unknown or malformed option
-    /// lines are skipped one by one.
+    /// one for each path, all with the options the message carries, or one without a path for a
+    /// document that has no file. Unknown or malformed option lines are skipped one by one.
     pub fn parse<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Request> {
         let mut paths = Vec::new();
         let mut options = Request::default();
@@ -180,8 +244,24 @@ impl Request {
                 }
                 "place" => options.place = Rect::parse(value),
                 "from" => options.from = Some(value.to_string()).filter(|f| !f.is_empty()),
+                "doc" => options.doc = doc_id(value).map(str::to_string),
+                "title" => options.title = Some(value.to_string()).filter(|t| !t.is_empty()),
+                "open" => options.open = true,
                 _ => {}
             }
+        }
+        // Showing a document is the one request with text that is not a live update; without a
+        // document there is nothing `open` or `title` could mean.
+        options.open &= options.doc.is_some();
+        if options.open {
+            options.follow = false;
+        }
+        if options.doc.is_none() {
+            options.title = None;
+        }
+        if paths.is_empty() && options.doc.is_some() {
+            // A document without a file: one request, with no path.
+            return vec![options];
         }
         paths
             .into_iter()
@@ -195,7 +275,8 @@ impl Request {
     /// The command-line arguments that make `target` build this request: its own second launch
     /// parses them and hands the request to the running window. The editor takes `--goto
     /// <line>[:<column>]`, the viewer `--line <line>`; both take `--follow`, `--place x,y,w,h` and
-    /// `--from <name>`. The path comes last.
+    /// `--from <name>`. The path comes last; a request without one (a bare start, before a
+    /// document without a file is sent) has none.
     pub fn args(&self, target: &str) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
         if let Some(line) = self.line {
@@ -216,7 +297,9 @@ impl Request {
         if let Some(from) = &self.from {
             args.extend(["--from".into(), from.into()]);
         }
-        args.push(self.path.clone().into_os_string());
+        if !self.path.as_os_str().is_empty() {
+            args.push(self.path.clone().into_os_string());
+        }
         args
     }
 }
@@ -410,8 +493,15 @@ fn settings_of(name: &str) -> Option<PathBuf> {
 /// Hands `request` to the running window of `name` without starting a process. True when one
 /// answered; false when none runs, which for a live link means the other window is gone.
 pub fn send(name: &str, request: &Request) -> bool {
-    settings_of(name)
-        .is_some_and(|settings| crate::single::forward_request(name, &settings, request))
+    deliver(name, request) == Delivery::Taken
+}
+
+/// [`send`], telling a window that is not there from one that answered without knowing what a
+/// document without a file is (an older build, which did nothing).
+pub fn deliver(name: &str, request: &Request) -> Delivery {
+    settings_of(name).map_or(Delivery::Nobody, |settings| {
+        crate::single::deliver_request(name, &settings, request)
+    })
 }
 
 /// Whether a window of `name` answers on its instance channel, with nothing sent to it: it is
@@ -862,5 +952,99 @@ mod tests {
             Request::new(&file)
         );
         assert!(!crate::single::forward_request("other-app", &settings, &r));
+    }
+
+    #[test]
+    fn a_document_without_a_file_has_no_path_line() {
+        // Showing it: the text, the name, a place, and no `follow`.
+        let show = Request {
+            open: true,
+            text: Some("# hi\n".into()),
+            line: Some(2),
+            from: Some("mdedit".into()),
+            ..Request::document("mdedit-41-7", "Untitled 1")
+        };
+        let message = show.encode("mdview");
+        assert_eq!(
+            message,
+            "mdview\n?doc=mdedit-41-7\n?title=Untitled 1\n?open\n?line=2\n?text=5\n?from=mdedit\n\n"
+        );
+        // Every line is an option: a receiver that reads lines as paths finds no file.
+        assert!(lines(&message).iter().all(|l| l.starts_with('?')));
+        let parsed = Request::parse(lines(&message));
+        assert_eq!(parsed.len(), 1);
+        let got = &parsed[0];
+        assert!(got.open && !got.follow && got.path.as_os_str().is_empty());
+        assert_eq!(got.doc.as_deref(), Some("mdedit-41-7"));
+        assert_eq!(got.title.as_deref(), Some("Untitled 1"));
+        assert_eq!((got.line, got.from.as_deref()), (Some(2), Some("mdedit")));
+        // A later text is a live update like a file's.
+        let update = Request {
+            text: Some("x".into()),
+            ..Request::document("mdedit-41-7", "Untitled 1")
+        };
+        let message = update.encode("mdview");
+        assert_eq!(
+            message,
+            "mdview\n?follow\n?doc=mdedit-41-7\n?title=Untitled 1\n?text=1\n\n"
+        );
+        let got = &Request::parse(lines(&message))[0];
+        assert!(got.follow && !got.open && got.doc.is_some());
+        // The end of it.
+        let off = Request {
+            live_off: true,
+            ..Request::document("mdedit-41-7", "Untitled 1")
+        };
+        let got = &Request::parse(lines(&off.encode("mdview")))[0];
+        assert!(got.live_off && got.follow && got.doc.is_some());
+    }
+
+    #[test]
+    fn a_saved_document_names_its_file_and_what_it_was() {
+        let saved = Request {
+            follow: true,
+            doc: Some("mdedit-41-7".into()),
+            line: Some(9),
+            ..Request::new("/home/u/new.md")
+        };
+        let message = saved.encode("mdview");
+        assert_eq!(
+            message,
+            "mdview\n?path=/home/u/new.md\n?follow\n?doc=mdedit-41-7\n?line=9\n\n"
+        );
+        assert_eq!(Request::parse(lines(&message)), [saved]);
+    }
+
+    #[test]
+    fn a_document_name_is_plain_and_odd_ones_are_dropped() {
+        assert_eq!(doc_id("mdedit-41-7"), Some("mdedit-41-7"));
+        assert_eq!(doc_id("a.b_c-9"), Some("a.b_c-9"));
+        for bad in ["", "a b", "a/b", "a\\b", "\u{e9}", "a\0b", &"x".repeat(65)] {
+            assert_eq!(doc_id(bad), None, "{bad:?}");
+        }
+        assert!(doc_id(&"x".repeat(64)).is_some());
+        // A name that is not one sends an ordinary request (here: an empty path, which no
+        // receiver takes), and a received one is skipped like any bad value.
+        let odd = Request {
+            open: true,
+            ..Request::document("no good", "T")
+        };
+        assert!(!odd.encode("mdview").contains("?doc") && !odd.encode("mdview").contains("?open"));
+        assert!(Request::parse(["?doc=a/b", "?title=T", "?open"]).is_empty());
+        // `open` and a title mean nothing without a document; a title with a line break is not
+        // sent, so it cannot be read as a line of its own.
+        let got = &Request::parse(["/a.md", "?open", "?title=T", "?text=3"])[0];
+        assert!(!got.open && got.follow && got.title.is_none());
+        let broken = Request::document("d1", "a\n/etc/passwd");
+        assert_eq!(broken.encode("mdview"), "mdview\n?doc=d1\n\n");
+    }
+
+    #[test]
+    fn a_request_without_a_path_starts_the_application_bare() {
+        let bare = Request {
+            from: Some("mdedit".into()),
+            ..Request::default()
+        };
+        assert_eq!(bare.args("mdview"), ["--from", "mdedit"]);
     }
 }

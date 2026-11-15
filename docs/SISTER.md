@@ -18,7 +18,7 @@ pub struct Rect { pub x: i32, pub y: i32, pub w: u32, pub h: u32 }   // physical
 pub struct Request {
     pub path: PathBuf,
     pub line: Option<u32>,      // source line, from 1
-    pub column: Option<u32>,    // with `line`, from 1; the viewer ignores it
+    pub column: Option<u32>,    // with `line`: the byte in that line, from 1
     pub follow: bool,           // a live update; see below
     pub place: Option<Rect>,    // move and resize the receiver's window
     pub from: Option<String>,   // the sender's name: "mdview" or "mdedit"
@@ -129,6 +129,62 @@ that is more than its read buffer held, so for about 2 MiB the sender gets `fals
 (up to at least 20 KB it gets `ok`). The editor must treat `false` as "no live link", never as
 an error. The old receiver has by then done nothing to the window.
 
+### A document that has no file
+
+Added on branch `f/live-preview-unsaved` (2026-11-15), for the editor's "Preview in mdview" on a
+document that was never saved. Three more fields, carried only by `send`:
+
+```rust
+pub struct Request {
+    // ...
+    pub doc: Option<String>,    // the sender's name for a document without a file
+    pub title: Option<String>,  // with `doc`: what to call it ("Untitled 1")
+    pub open: bool,             // with `doc` and `text`: show it (make the tab, switch, raise)
+}
+Request::document(id, title)    // such a request; its `path` is empty
+sister::doc_id(id)              // Some(id) if it is 1 to 64 of A-Z a-z 0-9 . _ -
+sister::deliver(name, &request) -> Delivery   // Taken | Older | Nobody
+```
+
+The name is the sender's and lasts as long as the sender has the document open; the receiver
+only compares it. It is not a path, and nothing with that name exists on disk.
+
+```
+mdview
+?doc=mdedit-4120-7
+?title=Untitled 1
+?open
+?line=3
+?place=960,0,960,1040
+?text=18
+?from=mdedit
+
+# never saved yet
+```
+
+- Showing it (`open`, with `text`): the one request with text that is not a `follow`. The
+  receiver makes a tab for the document if it has none, switches to it, moves its window if
+  `place`, and raises it. There is no path line and no `?path=`.
+- Later texts: `?follow`, `?doc=`, `?title=`, `?text=`, as for a file. A receiver that has no
+  tab for the document does nothing (it never opens one for a `follow`).
+- `?live=off` with `?doc=`: the sender no longer sends this document's text.
+- Saved: `?path=<the file>`, `?follow`, `?doc=<the name it had>`. The receiver's tab for the
+  document becomes the tab of that file.
+- No argument carries any of this: a document is started by `open(name, &Request { from, .. })`
+  with an empty path, which starts the application bare (or reaches the running window, which
+  raises itself), and the text follows over the port. `Request::args` leaves an empty path out.
+- The receiver delivers a request with `doc` whether or not anything is on disk
+  (`listen_requests_waking`; `listen_waking`, which gives paths, never sees one) and answers
+  `ok doc` instead of `ok`.
+
+Why older builds are safe. An older receiver finds only option lines, so no file: it delivers
+nothing and answers `ok`. The sender asked about a document and wants `ok doc`, so
+`deliver` returns `Delivery::Older` (and `send` false): the editor says that this mdview cannot
+show a document that has no file, and ends the link. The saved message does carry a path, as
+`?path=` with `?follow`: to an older receiver it is an ordinary live update for a file it does
+not show, which does nothing. An older *sender* never writes `?doc=`. A test against a copy of
+the old listener shows both answers.
+
 ## Finding the other application
 
 `sister::find(name) -> Option<PathBuf>`, first match wins:
@@ -172,14 +228,29 @@ monitor for the window, which Wayland does until the window has been shown on an
 
 - Not `follow`: opens the file (or switches to its tab), shows `line` (the block that line is in,
   just below the top edge), moves the window if `place`, and raises and focuses the window.
-- `follow`: nothing unless the file is the active tab. Then it scrolls to `line`, but a move of
-  less than one arrow-key step (48 logical px) is ignored. Of several waiting at once the last
+- `follow`: nothing unless the file is the active tab. Then it scrolls to `line` (and `column`), but
+  a small move is ignored (below). Of several waiting at once the last
   counts, so a frame moves the page once. No tab switch, no raise, no focus. With `place` it moves.
-- A line maps to a block through the line each block starts on (`Document::blocks[i].line`), so the
-  viewer's page and an editor with unsaved changes can disagree on what a line is. That is accepted.
-- At the top of the page, "the source line" is the line of the first text in view: the innermost
-  block there (a list item, a table cell), not the whole list.
+- A line maps to a place inside its block (since `f/finer-sync`, 2026-11-15): the block through
+  the line each block starts on (`Document::blocks[i].line`), then the line of text inside it. A
+  line of a code block is found exactly, a line of a paragraph or list item where its text
+  begins, a table by its row. With `column` (`?col=`, the byte in the line, from 1) the place is
+  that far along the line's text, so a paragraph written as one long line is shown at the row
+  the editor's caret is in. The row that holds the place goes just below the top edge. A build
+  that predates this shows the block's first line, and skips `?col=` like any key it has no use
+  for; a sender that predates it sends no column, which is the line's beginning. No new key and
+  no new answer: nothing has to be told apart.
+- The viewer's page and an editor with unsaved changes can disagree on what a line is (the
+  viewer reads the file unless it is sent the text). That is accepted.
+- A `follow` moves the page only when the place would otherwise leave the top rows: down by a
+  step (48 logical px) or more, up as soon as the row would be cut by the top edge.
+- At the top of the page, "the source line" is the line of the file whose text is in the first
+  row in view, inside a paragraph, list item, code block or table too. "Edit in mdedit" sends
+  it, with `column` when that row begins past the line's first text (a row inside a line that
+  wraps), and the editor puts its caret there.
 
+- A document without a file (`doc`): see "The preview of a document that has no file" in the
+  viewer's `docs/next/live-preview-unsaved.md` (later its DESIGN.md).
 - With `text`: the tab of that file (it must already be open; nothing is opened) shows the text
   instead of the file's, with the same parser, incremental updates and keeping its place; the
   request's `line` is the scroll target. A small "live" mark shows in the tab and status. At most
@@ -218,6 +289,8 @@ Sending ("Preview in mdview"):
 - [ ] Side by side, once, at that first hand-off: `let (left, right) = place::halves(
       place::work_area(&window)?)`; `place::set(&window, left)` for itself, `place: Some(right)` in
       the request. If `set` returns false, show a hint and send no `place`.
+- [ ] (Since `f/finer-sync`: also `column: Some(the caret's byte in its line, from 1)`, and an
+      update when the caret has moved 32 bytes or more along one line.)
 - [ ] While linked, on each caret line change: `sister::send("mdview", &Request { follow: true,
       line: Some(line), from: Some("mdedit".into()), ..Request::new(path) })`. At most 10 a second
       (send the latest line when the interval has passed, not every one), only while linked, and
