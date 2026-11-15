@@ -379,6 +379,9 @@ pub const NOT_INSTALLED: &str = if cfg!(windows) {
 pub struct Updates {
     stage: Stage,
     hidden: bool,
+    /// The file a restart starts, known when the installation began (the installed file's path,
+    /// before the swap moves anything). Kept only while the stage is `Installed`.
+    relaunch: Option<std::path::PathBuf>,
 }
 
 impl Updates {
@@ -423,6 +426,22 @@ impl Updates {
         Some(offer)
     }
 
+    /// Records what a restart would start, for the installation about to begin (see
+    /// [`crate::relaunch::target`]; it is checked again when the restart is made). The bar offers
+    /// a restart only if there is one.
+    pub fn set_relaunch(&mut self, target: Option<std::path::PathBuf>) {
+        self.relaunch = target;
+    }
+
+    /// The file to start for a restart: only once the update is installed, and only when there is
+    /// one to start.
+    pub fn relaunch_target(&self) -> Option<&std::path::Path> {
+        match self.stage {
+            Stage::Installed(_) => self.relaunch.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The installation ended. A failure puts the offer back, so the reader can try again, and
     /// returns the message to show.
     pub fn finished(&mut self, app: &App, result: Result<(), String>) -> Option<String> {
@@ -437,6 +456,7 @@ impl Updates {
             }
             Err(e) => {
                 eprintln!("{}: update failed: {e}", app.name);
+                self.relaunch = None;
                 self.stage = Stage::Available(offer);
                 Some("The update could not be installed. Nothing was changed.".to_string())
             }
@@ -484,6 +504,7 @@ impl Updates {
         match &self.stage {
             Stage::Available(offer) => format!("Update to {}", offer.version),
             Stage::Installing(_) => BUSY.to_string(),
+            Stage::Installed(_) if self.relaunch.is_some() => crate::relaunch::RESTART.to_string(),
             _ => CHECK.to_string(),
         }
     }
@@ -505,8 +526,11 @@ impl Updates {
             "available" => Stage::Available(offer),
             "installing" => Stage::Installing(offer),
             "installed" => Stage::Installed(offer.version),
+            // Installed, but nothing to start (a copy the shell cannot restart).
+            "installed-plain" => Stage::Installed(offer.version),
             _ => Stage::None,
         };
+        self.relaunch = (stage == "installed").then(|| std::path::PathBuf::from("/preview/app"));
         self.hidden = false;
     }
 }
@@ -851,6 +875,31 @@ mod tests {
         assert!(check_due(true, true, 999, 1000), "looked a second ago");
         assert!(!check_due(false, true, 0, 1000), "turned off");
         assert!(!check_due(true, false, 0, 1000), "nowhere to remember");
+    }
+
+    #[test]
+    fn a_restart_is_offered_only_once_installed_and_only_with_a_file_to_start() {
+        let target = std::path::PathBuf::from("/apps/mdtest.AppImage");
+        let mut u = Updates::default();
+        u.preview("available");
+        u.set_relaunch(Some(target.clone()));
+        assert_eq!(u.relaunch_target(), None, "not before the install");
+        assert!(u.begin().is_some());
+        assert_eq!(u.relaunch_target(), None, "not while it downloads");
+        assert!(u.finished(&APP, Err("no".into())).is_some());
+        assert_eq!(u.relaunch_target(), None, "a failure keeps nothing");
+        u.set_relaunch(Some(target.clone()));
+        assert!(u.begin().is_some());
+        assert_eq!(u.finished(&APP, Ok(())), None);
+        assert_eq!(u.relaunch_target(), Some(target.as_path()));
+        assert_eq!(u.about_label(), "Restart");
+        // A copy with no file to start gets the plain bar and the old About button.
+        let mut plain = Updates::default();
+        plain.preview("installed-plain");
+        assert_eq!(plain.relaunch_target(), None);
+        assert_eq!(plain.about_label(), CHECK);
+        plain.preview("installed");
+        assert!(plain.relaunch_target().is_some());
     }
 
     #[test]
