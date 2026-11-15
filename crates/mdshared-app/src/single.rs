@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
-use crate::sister::{MAX_TEXT, Request};
+use crate::sister::{Delivery, MAX_TEXT, Request};
 
 /// Where the running instance records its port.
 pub fn port_file(settings: &Path) -> PathBuf {
@@ -77,9 +77,31 @@ pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
 /// running instance that predates these options opens the file and ignores the rest; with
 /// `follow` it does nothing at all.
 pub fn forward_request(app: &str, settings: &Path, request: &Request) -> bool {
+    deliver_request(app, settings, request) == Delivery::Taken
+}
+
+/// What a receiver answers to a message it has taken, and to one that names a document without
+/// a file (`?doc=`). A receiver that predates such documents answers [`OK`] to those too, having
+/// found no file in them: that is how the sender knows it was not understood.
+const OK: &str = "ok";
+const OK_DOC: &str = "ok doc";
+
+/// [`forward_request`], saying which of three things happened: see [`Delivery`]. A request for a
+/// document without a file is `Taken` only by a receiver that knows such documents.
+pub fn deliver_request(app: &str, settings: &Path, request: &Request) -> Delivery {
     let mut request = request.clone();
-    request.path = std::path::absolute(&request.path).unwrap_or(request.path);
-    send(settings, &request.to_wire(app))
+    if !request.path.as_os_str().is_empty() {
+        request.path = std::path::absolute(&request.path).unwrap_or(request.path);
+    }
+    let wanted = match request.doc {
+        Some(_) => OK_DOC,
+        None => OK,
+    };
+    match exchange(settings, &request.to_wire(app)) {
+        Some(reply) if reply == wanted => Delivery::Taken,
+        Some(reply) if reply == OK => Delivery::Older,
+        _ => Delivery::Nobody,
+    }
 }
 
 /// The loopback port of the instance recorded beside `settings`, if one is known to run.
@@ -103,22 +125,23 @@ pub fn alive(settings: &Path) -> bool {
 
 /// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
 fn send(settings: &Path, message: &[u8]) -> bool {
-    let Some(port) = instance_port(settings) else {
-        return false;
-    };
+    exchange(settings, message).is_some_and(|reply| reply == OK)
+}
+
+/// Writes `message` to the instance recorded beside `settings` and returns the line it answers,
+/// trimmed; `None` when nothing listens or no answer comes.
+fn exchange(settings: &Path, message: &[u8]) -> Option<String> {
+    let port = instance_port(settings)?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
-        return false;
-    };
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
     _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
     // A message with text can be a megabyte or two, which the socket buffer takes in one go on
     // loopback; the write timeout bounds a receiver that does not read.
     _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
-    if stream.write_all(message).is_err() {
-        return false;
-    }
+    stream.write_all(message).ok()?;
     let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply).is_ok() && reply.trim() == "ok"
+    BufReader::new(stream).read_line(&mut reply).ok()?;
+    Some(reply.trim().to_string()).filter(|r| !r.is_empty())
 }
 
 /// Starts listening and records the port. `None` when the port cannot be bound or written.
@@ -181,7 +204,8 @@ fn read_text(reader: &mut impl std::io::Read, n: usize) -> Option<String> {
 }
 
 /// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
-/// existing file or folder a message names, then `wake`.
+/// existing file or folder a message names, and of a document without a file (`?doc=`, which
+/// needs nothing on disk), then `wake`. A message with such a document is answered `ok doc`.
 ///
 /// A message may be followed by the text its `?text=<bytes>` line announces: it is read here, up to
 /// [`MAX_TEXT`] bytes within [`READ_DEADLINE`], and attached to each request. A message that
@@ -219,13 +243,17 @@ fn serve(
                     None => continue,
                 },
             };
+            let mut answer = OK;
             for mut request in Request::parse(body.iter().map(String::as_str)) {
-                if request.path.is_file() || request.path.is_dir() {
+                if request.doc.is_some() {
+                    answer = OK_DOC;
+                }
+                if request.doc.is_some() || request.path.is_file() || request.path.is_dir() {
                     request.text = text.clone();
                     deliver(request);
                 }
             }
-            _ = (&stream).write_all(b"ok\n");
+            _ = (&stream).write_all(format!("{answer}\n").as_bytes());
             wake();
         }
     });
@@ -470,6 +498,99 @@ mod tests {
                 started.elapsed()
             );
         }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_without_a_file_arrives_and_is_answered_as_understood() {
+        let dir = std::env::temp_dir().join(format!("mdshared-doc-{}", std::process::id()));
+        let settings = dir.join("settings.ini");
+        let receiver = listen_requests_waking(APP, &settings, || {}).expect("listen");
+        let show = Request {
+            open: true,
+            text: Some("# never saved \u{e9}\n".into()),
+            line: Some(1),
+            ..Request::document("mdedit-1-2", "Untitled 2")
+        };
+        assert_eq!(deliver_request(APP, &settings, &show), Delivery::Taken);
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            got, show,
+            "nothing on disk is needed, and the path stays empty"
+        );
+        // An empty document is a text of no bytes.
+        let empty = Request {
+            text: Some(String::new()),
+            ..Request::document("mdedit-1-2", "Untitled 2")
+        };
+        assert!(forward_request(APP, &settings, &empty));
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.follow && got.text.as_deref() == Some(""));
+        // Saved: the file it became comes with the name it had.
+        let file = dir.join("new.md");
+        std::fs::write(&file, "# saved\n").unwrap();
+        let saved = Request {
+            follow: true,
+            doc: Some("mdedit-1-2".into()),
+            ..Request::new(&file)
+        };
+        assert_eq!(deliver_request(APP, &settings, &saved), Delivery::Taken);
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!((got.path, got.doc), (file.clone(), saved.doc.clone()));
+        // A paths-only receiver never sees a document: there is no file in it.
+        let dir2 = dir.join("paths");
+        let settings2 = dir2.join("settings.ini");
+        let paths = listen_waking(APP, &settings2, || {}).expect("listen");
+        assert_eq!(deliver_request(APP, &settings2, &show), Delivery::Taken);
+        assert!(paths.recv_timeout(Duration::from_millis(200)).is_err());
+        // Nobody there.
+        let nobody = dir.join("none").join("settings.ini");
+        assert_eq!(deliver_request(APP, &nobody, &show), Delivery::Nobody);
+        assert_eq!(
+            deliver_request(APP, &nobody, &Request::new(&file)),
+            Delivery::Nobody
+        );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_receiver_does_nothing_with_a_document_and_the_sender_can_tell() {
+        let dir = std::env::temp_dir().join(format!("mdshared-olddoc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.ini");
+        let (tx, rx) = channel();
+        let port = old_serve("test-app", tx);
+        std::fs::write(port_file(&settings), port.to_string()).unwrap();
+        let _lock = hold_lock(&settings);
+        let show = Request {
+            open: true,
+            text: Some("# never saved\n".into()),
+            ..Request::document("mdedit-1-2", "Untitled 2")
+        };
+        // It answers `ok` as it does to anything, having found no file to open.
+        assert!(ask(port, &show.to_wire("test-app")));
+        assert_eq!(
+            deliver_request("test-app", &settings, &show),
+            Delivery::Older
+        );
+        assert!(!forward_request("test-app", &settings, &show));
+        let off = Request {
+            live_off: true,
+            ..Request::document("mdedit-1-2", "Untitled 2")
+        };
+        assert_eq!(
+            deliver_request("test-app", &settings, &off),
+            Delivery::Older
+        );
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        // A request for a file is taken by it as before.
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        assert_eq!(
+            deliver_request("test-app", &settings, &Request::new(&file)),
+            Delivery::Taken
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap().path, file);
         _ = std::fs::remove_dir_all(&dir);
     }
 }
