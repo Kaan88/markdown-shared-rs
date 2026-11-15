@@ -652,7 +652,7 @@ mod tests {
     /// A release of `ALONE` whose executable reads "app 2", for the threads (a `FetchFn` cannot
     /// capture anything).
     fn release_fetch(url: &str, _: usize, _: Duration) -> Result<Vec<u8>, String> {
-        if url.ends_with("update.txt") {
+        if url.ends_with(".txt") {
             Ok(manifest("0.3.0", b"app 2", None).into_bytes())
         } else {
             Ok(b"app 2".to_vec())
