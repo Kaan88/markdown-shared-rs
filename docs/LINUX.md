@@ -226,3 +226,59 @@ GNOME (Mutter) and wlroots compositors have no KWin shadow protocol, so the kwin
 not destroyed, when `Shadow` is dropped: the app's state is usually dropped after the event loop,
 when the `wl_display` is gone, and a request then crashes. The compositor removes it with the
 surface.
+
+## Window backdrop (`mdshared_ui::blur`)
+
+Added on `f/linux-frost`. **Compiled for Linux only (the module checked in isolation against the
+same winit and wayland crate versions, with clippy `-D warnings`); never run or seen on Linux.**
+
+On Windows the "Window backdrop" setting is DWM's Mica or Acrylic behind a chrome made of
+transparent pixels (`frost`). On KDE Plasma under Wayland the same chrome logic is used and the
+compositor is asked to blur behind the window instead:
+
+- `blur::available(&Window) -> bool`: a Wayland window on a compositor that offers
+  `org_kde_kwin_blur_manager`. One registry round trip on a private queue over winit's
+  `wl_display` (the way `shadow/wl.rs` does it), kept per window. False on Windows, X11, GNOME,
+  wlroots and with `MDSHARED_NO_BLUR` set.
+- `blur::set(&Window, on) -> bool`: `manager.create(surface)`, `set_region(None)` (the whole
+  surface), `commit`; off is `manager.unset(surface)` and `release`. False when there is no
+  protocol (nothing done). Turning it on also calls `Window::set_transparent(true)` (the surface
+  then declares no opaque region) and requests a redraw, because the compositor applies the blur
+  with the surface's next commit. State is a thread-local map keyed by the `wl_surface` pointer;
+  entries are leaked on purpose, as the shadow's are (the apps drop state after the `wl_display`
+  is gone). No new crates: `wayland-protocols-plasma` already had the `blur` module; Cargo.lock
+  is unchanged.
+- `frost::BlurSystem(&Window)`: the `frost::System` that calls the two above. `Frost::sync` is
+  unchanged: it asks `available()` when the setting changes and when the window gets focus, and
+  frosts the chrome (keys the flat colour out) only while focused and the compositor took the
+  request.
+- `Frost::wants_alpha()`: true while the chrome is frosted.
+
+### Can the pixels carry alpha on Wayland? Only in part, and the apps must opt in
+
+Blur behind an opaque surface shows nothing, so three things are needed:
+
+1. The surface must not declare an opaque region: winit's `with_transparent(true)` at creation, or
+   `Window::set_transparent(true)` later. `blur::set` does the latter, so this needs nothing from
+   the app. (It is never switched back off: winit has no getter for the creation-time value, and
+   the shadow's client route needs it.)
+2. The buffers must be ARGB8888. softbuffer 0.4.8 on Wayland makes XRGB8888 buffers and ignores the
+   alpha byte; `docs/patches/softbuffer-0.4.8-wayland-alpha.patch` adds
+   `Surface::set_premultiplied_alpha(bool)`. **The window's softbuffer surface belongs to the
+   app, so the shared code cannot do this**: the app must call
+   `surface.set_premultiplied_alpha(frost.wants_alpha() || shadow.wants_alpha())`. The apps that
+   already use the shadow's client route call it with `shadow.wants_alpha()`; KDE with the KWin
+   shadow route does not, so there the frost needs the new call.
+3. The frame written with alpha: marked chrome pixels through `frost::key_out`, premultiplied
+   (which ARGB8888 on Wayland expects), everything else alpha `0xFF`. This is what the Windows
+   copy already does; the app's non-Windows copy path must do the same while `frost.key()` is
+   `Some`.
+
+Without 2 and 3 the blur is requested and nothing shows; the apps do not have 2 for the frost
+today. Apps also pass `&mut frost::BlurSystem(&window)` to `Frost::sync` off Windows.
+
+Known limits: Mica and Acrylic are both just the blur (the veil of Acrylic, 150, is still
+applied, Mica has none, so Mica over a bright window can lose contrast); the blur follows the focus
+rule of the Windows code (flat while the window is unfocused); a window destroyed and a new one given
+the same `wl_surface` address would find a stale entry (not seen: apps keep their windows); the
+setting's row is not hidden by the shared code where `available()` is false.

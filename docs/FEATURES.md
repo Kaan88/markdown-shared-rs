@@ -154,3 +154,16 @@ observation); behaviour with touch, pen, or a high-DPI monitor change in the mid
 interplay with a window dragged by `drag_window` that starts on the button's row; either
 application. If the hover or the click misbehaves, calling `set_maximize_button_rect(&window,
 None)` returns the window to what it was, bar the replaced procedure that then passes everything on.
+
+## Window backdrop on KDE Plasma (Wayland) (`mdshared_ui::blur`)
+
+Built, compiled for Linux, **never run or seen on Linux**. On KWin under Wayland the "Window
+backdrop" setting asks the compositor to blur behind the window with `org_kde_kwin_blur`
+(`blur::available(&Window)`, `blur::set(&Window, bool)`), on the window's own connection like the
+shadow. Both return false on Windows, X11, GNOME, wlroots compositors and wherever the global is
+missing. `frost::BlurSystem(&window)` is the `frost::System` for it; `Frost::wants_alpha()` says
+when the window's pixels must carry alpha. The blur shows only through pixels with alpha, so on
+Wayland the app must present with `set_premultiplied_alpha(true)` (patched softbuffer) while
+`wants_alpha()`. `Backdrop::HELP` says what happens off Windows (a different string off Windows
+only). Details, limits and what each app does: [LINUX.md](LINUX.md#window-backdrop-mdshared_uiblur)
+and [next/linux-frost.md](next/linux-frost.md).

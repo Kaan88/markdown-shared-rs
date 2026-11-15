@@ -209,6 +209,14 @@ impl Frost {
         self.key.as_ref()
     }
 
+    /// Whether the window's pixels must carry alpha right now: the chrome is frosted. On Wayland
+    /// the app then presents with `softbuffer::Surface::set_premultiplied_alpha(frost.wants_alpha()
+    /// || shadow.wants_alpha())` (patched softbuffer), alongside writing the frame with alpha
+    /// ([`key_out`]); without it the compositor blurs behind an opaque rectangle and nothing shows.
+    pub fn wants_alpha(&self) -> bool {
+        self.key.is_some()
+    }
+
     /// Whether [`Frost::sync`] has anything to do: the setting is on, or was when last looked at.
     pub fn concerns(&self, want: Backdrop) -> bool {
         want != Backdrop::Off || self.wanted != Backdrop::Off || self.asked != Backdrop::Off
@@ -266,6 +274,24 @@ impl System for WindowSystem {
     fn set(&mut self, backdrop: Backdrop) -> bool {
         self.0
             .is_some_and(|hwnd| crate::platform::set_backdrop(hwnd, backdrop))
+    }
+}
+
+/// A winit window as the [`System`] of a [`Frost`] on KDE Plasma under Wayland: the compositor
+/// is asked to blur behind the window ([`crate::blur`]). Everywhere else (Windows, X11, GNOME,
+/// other compositors) nothing is available and nothing is asked for. Cheap to make each frame:
+/// the connection is kept per window by [`crate::blur`].
+///
+/// Use it instead of [`WindowSystem`] off Windows. The window's pixels must carry alpha for the
+/// blur to show: see [`Frost::wants_alpha`].
+pub struct BlurSystem<'a>(pub &'a winit::window::Window);
+
+impl System for BlurSystem<'_> {
+    fn available(&mut self) -> bool {
+        crate::blur::available(self.0)
+    }
+    fn set(&mut self, backdrop: Backdrop) -> bool {
+        crate::blur::set(self.0, backdrop != Backdrop::Off)
     }
 }
 
@@ -469,6 +495,24 @@ mod tests {
         assert_eq!(key_colour(&LIGHT), LIGHT.bar);
         assert_eq!(veil(Backdrop::Off), 255);
         assert_eq!(veil(Backdrop::Mica), 0);
+    }
+
+    #[test]
+    fn alpha_is_wanted_exactly_while_the_chrome_is_frosted() {
+        let mut f = Frost::default();
+        let mut sys = Fake::new(true);
+        assert!(!f.wants_alpha());
+        f.sync(Backdrop::Mica, false, &DARK, &mut sys);
+        assert!(!f.wants_alpha(), "asked for, but not frosted without focus");
+        f.sync(Backdrop::Mica, true, &DARK, &mut sys);
+        assert!(f.wants_alpha());
+        f.sync(Backdrop::Off, true, &DARK, &mut sys);
+        assert!(!f.wants_alpha());
+        // A compositor without the protocol: never.
+        let mut f = Frost::default();
+        let mut none = Fake::new(false);
+        f.sync(Backdrop::Acrylic, true, &DARK, &mut none);
+        assert!(!f.wants_alpha());
     }
 
     #[test]

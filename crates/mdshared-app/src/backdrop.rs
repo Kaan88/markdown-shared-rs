@@ -21,7 +21,11 @@ impl Backdrop {
     /// The label of the settings row.
     pub const TITLE: &'static str = "Window backdrop";
     /// The help line of the settings row.
+    #[cfg(windows)]
     pub const HELP: &'static str = "Windows 11. Behind the bars and the side pane.";
+    /// Off Windows only KDE Plasma under Wayland can blur behind a window.
+    #[cfg(not(windows))]
+    pub const HELP: &'static str = "Windows 11, and KDE Plasma (Wayland): the blurred desktop behind the bars and the side pane. Does nothing on other desktops.";
 
     /// The value in a settings file.
     pub fn key(self) -> &'static str {
