@@ -34,6 +34,10 @@
 //!
 //! Off Windows the function does nothing.
 //!
+//! A restored window is also given back the 1 px strip at the top that winit keeps out of the
+//! client area of an undecorated window for its shadow (`WM_NCCALCSIZE`): with it Windows never
+//! shows the flyout for a restored window, only for a maximized one.
+//!
 //! Not verified here: the flyout itself, which needs a real pointer on Windows 11. The message
 //! handling is exercised by the tests with a window of their own and `SendMessage`.
 
@@ -122,9 +126,10 @@ mod imp {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, DefWindowProcW, GWLP_WNDPROC, GetWindowLongPtrW, GetWindowThreadProcessId,
-        HTCLIENT, HTMAXBUTTON, SetWindowLongPtrW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-        WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-        WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC,
+        HTCLIENT, HTMAXBUTTON, IsZoomed, NCCALCSIZE_PARAMS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCALCSIZE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDBLCLK,
+        WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WNDPROC,
     };
 
     /// `WM_MOUSELEAVE`, which windows-sys keeps behind another feature.
@@ -197,6 +202,19 @@ mod imp {
                         window,
                         GWLP_WNDPROC,
                         subclass_proc as *const () as usize as isize,
+                    )
+                };
+                // The client area is worked out again with the procedure in place.
+                // SAFETY: the window is live and on this thread.
+                unsafe {
+                    SetWindowPos(
+                        window,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                     )
                 };
                 entry
@@ -335,6 +353,25 @@ mod imp {
                     }
                     call(state, hwnd, msg, wparam, lparam)
                 }
+                WM_NCCALCSIZE if wparam != 0 => {
+                    // winit keeps a 1 px non-client strip at the top of an undecorated window
+                    // (the client area is moved down a pixel) so that Windows draws its shadow.
+                    // With that strip a restored window never gets the snap-layouts flyout; the
+                    // shadow does not need it. Give the pixel back to the client area.
+                    let params = lparam as *mut NCCALCSIZE_PARAMS;
+                    let before = (*params).rgrc[0];
+                    let result = call(state, hwnd, msg, wparam, lparam);
+                    let after = &mut (*params).rgrc[0];
+                    if IsZoomed(hwnd) == 0
+                        && after.left == before.left
+                        && after.right == before.right
+                        && after.top == before.top + 1
+                        && after.bottom == before.bottom + 1
+                    {
+                        *after = before;
+                    }
+                    result
+                }
                 WM_NCDESTROY => {
                     let result = call(state, hwnd, msg, wparam, lparam);
                     ENTRIES.with(|e| e.borrow_mut().retain(|x| x.hwnd != hwnd as isize));
@@ -379,6 +416,14 @@ mod imp {
             // that of a press on a caption starts a modal move loop.
             if msg == WM_NCHITTEST {
                 return HTCLIENT as LRESULT;
+            }
+            if msg == WM_NCCALCSIZE && w != 0 {
+                // What winit does for an undecorated window with a shadow.
+                // SAFETY: the test sends a valid NCCALCSIZE_PARAMS.
+                let p = unsafe { &mut *(l as *mut NCCALCSIZE_PARAMS) };
+                p.rgrc[0].top += 1;
+                p.rgrc[0].bottom += 1;
+                return 0;
             }
             if (WM_NCMOUSEMOVE..=WM_NCLBUTTONDBLCLK).contains(&msg) {
                 return 0;
@@ -546,6 +591,31 @@ mod imp {
             assert_eq!(
                 log()[1..],
                 [(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, screen(170, 10))]
+            );
+
+            // The 1 px strip winit leaves at the top is given back to the client area.
+            let mut params: NCCALCSIZE_PARAMS = unsafe { std::mem::zeroed() };
+            params.rgrc[0] = windows_sys::Win32::Foundation::RECT {
+                left: 10,
+                top: 20,
+                right: 210,
+                bottom: 120,
+            };
+            let before = params.rgrc[0];
+            send(
+                hwnd,
+                WM_NCCALCSIZE,
+                1,
+                &mut params as *mut NCCALCSIZE_PARAMS as isize,
+            );
+            assert_eq!(
+                (
+                    params.rgrc[0].left,
+                    params.rgrc[0].top,
+                    params.rgrc[0].right,
+                    params.rgrc[0].bottom
+                ),
+                (before.left, before.top, before.right, before.bottom)
             );
 
             // A new rectangle is taken, and destroying the window removes the subclass (the state

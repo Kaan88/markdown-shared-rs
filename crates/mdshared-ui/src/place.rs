@@ -113,6 +113,10 @@ pub struct Before {
     /// Its inner size then, in physical px: what a session file keeps.
     pub inner: (u32, u32),
     pub maximized: bool,
+    /// For a window that was maximized: the rectangle it goes back to when restored, as
+    /// [`normal_rect`] tells it. [`set`] un-maximizes and moves the window, which replaces that
+    /// rectangle with the one it was put at, so it is kept here and given back by [`Tiling::restore`].
+    pub normal: Option<Rect>,
     /// Where it was put.
     pub tiled: Rect,
 }
@@ -151,6 +155,7 @@ impl Tiling {
             outer(window),
             (inner.width, inner.height),
             maximized,
+            maximized.then(|| normal_rect(window)).flatten(),
             rect,
         );
         let placed = set(window, rect);
@@ -179,6 +184,9 @@ impl Tiling {
         match before {
             Some(before) if before.maximized => {
                 window.set_maximized(true);
+                if let Some(normal) = before.normal {
+                    set_normal_rect(window, normal);
+                }
                 true
             }
             Some(before) => set(window, before.outer),
@@ -204,6 +212,7 @@ fn remember(
     now: Option<Rect>,
     inner: (u32, u32),
     maximized: bool,
+    normal: Option<Rect>,
     tiled: Rect,
 ) -> Option<Before> {
     let now = now?;
@@ -214,10 +223,71 @@ fn remember(
             outer: now,
             inner,
             maximized,
+            normal,
             tiled,
         },
     })
 }
+
+/// The rectangle a maximized window goes back to when it is restored, where the system keeps one
+/// (Windows). Opaque: only [`set_normal_rect`] knows what to do with it (on Windows it is in
+/// the workspace coordinates of `GetWindowPlacement`, which are not screen coordinates when the
+/// taskbar is at the top or left).
+#[cfg(windows)]
+fn normal_rect(window: &Window) -> Option<Rect> {
+    let wp = placement(window)?;
+    let r = wp.rcNormalPosition;
+    (r.right > r.left && r.bottom > r.top).then(|| Rect {
+        x: r.left,
+        y: r.top,
+        w: (r.right - r.left) as u32,
+        h: (r.bottom - r.top) as u32,
+    })
+}
+
+/// Sets the rectangle a maximized window goes back to, leaving it maximized.
+#[cfg(windows)]
+fn set_normal_rect(window: &Window, normal: Rect) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWMAXIMIZED, SetWindowPlacement};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Some(mut wp) = placement(window) else {
+        return;
+    };
+    let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else {
+        return;
+    };
+    wp.rcNormalPosition.left = normal.x;
+    wp.rcNormalPosition.top = normal.y;
+    wp.rcNormalPosition.right = normal.x.saturating_add(normal.w as i32);
+    wp.rcNormalPosition.bottom = normal.y.saturating_add(normal.h as i32);
+    wp.showCmd = SW_SHOWMAXIMIZED as _;
+    // SAFETY: `wp` is a WINDOWPLACEMENT with its length set, from `GetWindowPlacement`; the
+    // handle is this window's.
+    unsafe { SetWindowPlacement(handle.hwnd.get() as _, &wp) };
+}
+
+#[cfg(windows)]
+fn placement(
+    window: &Window,
+) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, WINDOWPLACEMENT};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::Win32(handle) = window.window_handle().ok()?.as_raw() else {
+        return None;
+    };
+    let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    // SAFETY: `wp` is a WINDOWPLACEMENT with its length set; the handle is this window's.
+    (unsafe { GetWindowPlacement(handle.hwnd.get() as _, &mut wp) } != 0).then_some(wp)
+}
+
+#[cfg(not(windows))]
+fn normal_rect(_window: &Window) -> Option<Rect> {
+    None
+}
+
+#[cfg(not(windows))]
+fn set_normal_rect(_window: &Window, _normal: Rect) {}
 
 #[cfg(not(windows))]
 fn is_wayland(window: &Window) -> bool {
@@ -349,29 +419,48 @@ mod tests {
             rect(960, 0, 960, 1040),
         );
         // Nothing remembered: where the window is now.
-        let first = remember(None, Some(home), (1100, 700), false, left).unwrap();
+        let first = remember(None, Some(home), (1100, 700), false, None, left).unwrap();
         assert_eq!(
             (first.outer, first.tiled, first.maximized),
             (home, left, false)
         );
         // Tiled again while still where it was put: the first place stays, the target changes.
-        let again = remember(Some(first), Some(left), (960, 1040), false, right).unwrap();
+        let again = remember(Some(first), Some(left), (960, 1040), false, None, right).unwrap();
         assert_eq!(
             (again.outer, again.inner, again.tiled),
             (home, (1100, 700), right)
         );
         // The user moved it in between: that place is the one to go back to.
         let moved = rect(300, 40, 800, 600);
-        let after = remember(Some(first), Some(moved), (800, 600), false, right).unwrap();
+        let after = remember(Some(first), Some(moved), (800, 600), false, None, right).unwrap();
         assert_eq!((after.outer, after.tiled), (moved, right));
         // A desktop that does not tell the position: nothing to remember.
-        assert_eq!(remember(Some(first), None, (1, 1), false, left), None);
+        assert_eq!(remember(Some(first), None, (1, 1), false, None, left), None);
         // A maximised window is remembered as that.
         assert!(
-            remember(None, Some(home), (1, 1), true, left)
+            remember(None, Some(home), (1, 1), true, None, left)
                 .unwrap()
                 .maximized
         );
+    }
+
+    #[test]
+    fn the_normal_rectangle_of_a_maximized_window_survives_being_tiled_again() {
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        let (screen, normal) = (rect(0, 0, 3440, 1392), rect(100, 80, 900, 600));
+        let (left, right) = (rect(0, 0, 1720, 1392), rect(1720, 0, 1720, 1392));
+        // Maximized, then put on the left half: what it goes back to is kept with the rest.
+        let first = remember(None, Some(screen), (3440, 1392), true, Some(normal), left).unwrap();
+        assert_eq!((first.maximized, first.normal), (true, Some(normal)));
+        // Tiled again while still where it was put: not maximized now, and the half it was put
+        // at is not its normal rectangle; the first one stays.
+        let again = remember(Some(first), Some(left), (1720, 1392), false, None, right).unwrap();
+        assert_eq!((again.maximized, again.normal), (true, Some(normal)));
+        // The user moved it in between: the new place is the one to go back to, with no normal
+        // rectangle of a window that is not maximized.
+        let moved = rect(300, 40, 800, 600);
+        let after = remember(Some(first), Some(moved), (800, 600), false, None, right).unwrap();
+        assert_eq!((after.maximized, after.normal), (false, None));
     }
 
     #[test]
@@ -382,7 +471,7 @@ mod tests {
             w: 960,
             h: 1040,
         };
-        let before = remember(None, Some(tiled), (1, 1), false, tiled).unwrap();
+        let before = remember(None, Some(tiled), (1, 1), false, None, tiled).unwrap();
         assert!(before.untouched(tiled, false));
         assert!(before.untouched(
             Rect {
