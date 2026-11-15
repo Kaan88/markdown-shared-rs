@@ -236,6 +236,34 @@ mod imp {
         ok
     }
 
+    /// The bytes of the "HTML Format" on the clipboard, for the test of what a copy placed.
+    #[cfg(test)]
+    pub fn clipboard_html_format() -> Option<Vec<u8>> {
+        // SAFETY: a NUL-terminated UTF-16 name.
+        let format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
+        if format == 0 || !open_clipboard() {
+            return None;
+        }
+        // SAFETY: the clipboard is open; the returned handle is owned by the system.
+        let h: HANDLE = unsafe { GetClipboardData(format) };
+        let mut out = None;
+        if !h.is_null() {
+            // SAFETY: h is a valid global memory handle from the clipboard.
+            let ptr = unsafe { GlobalLock(h) } as *const u8;
+            if !ptr.is_null() {
+                // SAFETY: h is locked, so its size is valid and ptr points to that many bytes.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, GlobalSize(h)) };
+                let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                out = Some(bytes[..len].to_vec());
+                // SAFETY: matches the GlobalLock above.
+                unsafe { GlobalUnlock(h) };
+            }
+        }
+        // SAFETY: the clipboard was opened by this thread above.
+        unsafe { CloseClipboard() };
+        out
+    }
+
     /// Puts one format on the open clipboard; the system owns the memory once that succeeds.
     fn put_format(format: u32, bytes: &[u8]) -> bool {
         // SAFETY: plain allocation request.
@@ -661,8 +689,17 @@ pub fn style_window(hwnd: isize, dark: bool) {
 mod explorer_tests {
     use super::*;
 
+    /// The clipboard is one for the whole system: tests that write it and read it back take
+    /// this lock, or two of them running at once read each other's text.
+    static CLIPBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clipboard_lock() -> std::sync::MutexGuard<'static, ()> {
+        CLIPBOARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn clipboard_round_trip() {
+        let _lock = clipboard_lock();
         let s = "İstanbul ı ğ 😀 ok\nsecond line";
         assert!(set_clipboard_text(s));
         assert_eq!(clipboard_text().as_deref(), Some(s));
@@ -670,11 +707,24 @@ mod explorer_tests {
 
     #[test]
     fn html_copy_leaves_the_text_readable() {
+        let _lock = clipboard_lock();
         assert!(set_clipboard_html(
             "<p><b>bold</b> \u{e9}</p>",
             "bold \u{e9}\nnext"
         ));
         assert_eq!(clipboard_text().as_deref(), Some("bold \u{e9}\nnext"));
+        // The HTML went out beside it, in the header's own offsets.
+        let cf = imp::clipboard_html_format().expect("the HTML Format is on the clipboard");
+        let s = String::from_utf8(cf).unwrap();
+        let field = |name: &str| -> usize {
+            let at = s.find(name).unwrap() + name.len();
+            s[at..at + 10].parse().unwrap()
+        };
+        assert_eq!(
+            &s[field("StartFragment:")..field("EndFragment:")],
+            "<p><b>bold</b> \u{e9}</p>"
+        );
+        assert_eq!(field("EndHTML:"), s.len());
     }
 
     #[test]
