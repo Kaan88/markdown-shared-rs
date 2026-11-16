@@ -1,8 +1,11 @@
 //! Files the system asks the running application to open: on macOS a double-click in Finder,
 //! "Open With", a drop on the Dock icon, or `open -a` reach a bundle as an Apple Event
-//! (`kAEOpenDocuments`), not as arguments, and winit 0.30 does not pass that event on. Its
-//! handler is installed here, before the event loop runs, so the event that launched the
-//! application is caught too. Elsewhere there is no such event and [`on_open`] does nothing.
+//! (`kAEOpenDocuments`), not as arguments, and winit 0.30 does not pass that event on. AppKit puts
+//! its own handler in place while the application finishes launching (it hands the files to its
+//! document system, which knows none of ours, and says "cannot open files in the Markdown
+//! document format"), so ours is installed when the application will finish launching, the
+//! place Apple names for it: after AppKit's, and before the event that launched the application.
+//! Elsewhere there is no such event and [`on_open`] does nothing.
 
 use std::path::PathBuf;
 
@@ -36,6 +39,11 @@ mod imp {
         struct Handler;
 
         impl Handler {
+            #[unsafe(method(willFinishLaunching:))]
+            fn will_finish_launching(&self, _note: &AnyObject) {
+                set_handler(self);
+            }
+
             #[unsafe(method(handleOpen:withReply:))]
             fn handle_open(&self, event: &NSAppleEventDescriptor, _reply: &NSAppleEventDescriptor) {
                 let paths = files_of(event);
@@ -69,19 +77,38 @@ mod imp {
             .collect()
     }
 
-    pub(super) fn install(open: Open) {
-        *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(open);
-        // SAFETY: a plain NSObject subclass without instance variables, made with `init`.
-        let handler: Retained<Handler> = unsafe { msg_send![Handler::alloc(), init] };
+    /// Makes `handler` the open-documents handler.
+    fn set_handler(handler: &Handler) {
         let manager = NSAppleEventManager::sharedAppleEventManager();
         // SAFETY: the selector is the handler's own method, of the signature the manager calls;
-        // the manager does not retain its handler, so the handler is kept for the process's life.
+        // the handler is kept for the process's life.
         unsafe {
             manager.setEventHandler_andSelector_forEventClass_andEventID(
-                &handler as &AnyObject,
+                handler as &AnyObject,
                 sel!(handleOpen:withReply:),
                 CORE_EVENT_CLASS,
                 OPEN_DOCUMENTS,
+            );
+        }
+    }
+
+    pub(super) fn install(open: Open) {
+        use objc2_foundation::{NSNotificationCenter, NSString};
+        *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(open);
+        // SAFETY: a plain NSObject subclass without instance variables, made with `init`; the
+        // event manager and the notification centre do not retain it, so it is never released.
+        let handler: Retained<Handler> = unsafe { msg_send![Handler::alloc(), init] };
+        // Now, for an application already running, and again when it will finish launching,
+        // after AppKit has put its own handler in place.
+        set_handler(&handler);
+        let name = NSString::from_str("NSApplicationWillFinishLaunchingNotification");
+        // SAFETY: the selector is the handler's own one-argument method.
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                &handler as &AnyObject,
+                sel!(willFinishLaunching:),
+                Some(&name),
+                None,
             );
         }
         std::mem::forget(handler);
