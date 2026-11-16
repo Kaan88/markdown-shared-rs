@@ -1288,7 +1288,7 @@ name = "mdshared-app"
 version = "0.1.0"
 dependencies = [
  "notify",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1296,7 +1296,7 @@ name = "mdshared-fetch"
 version = "0.1.0"
 dependencies = [
  "libloading",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1332,7 +1332,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winit",
  "x11rb",
  "zbus",
@@ -2266,7 +2266,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
