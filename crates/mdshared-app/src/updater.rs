@@ -156,12 +156,71 @@ pub fn installed_files(_app: &App) -> Option<Files> {
     appimage_files(std::env::var_os("APPIMAGE").as_deref())
 }
 
-/// A macOS build never updates itself: the bar names the new version and opens the download
-/// page (the owner's decision of 2026-11-15; an unsigned bundle replaced in place would meet the
-/// first-open warning again on every update).
+/// The `.app` bundle this process runs from, when this copy can update itself: the bundle's
+/// folder can be written to. Not a copy the system runs from a read-only place (an app opened
+/// where it was downloaded, before it was moved), nor a bare executable. The engine, if the
+/// application has one, is inside the bundle. The owner's decision of 2026-11-16 (it was the
+/// download page before).
 #[cfg(target_os = "macos")]
 pub fn installed_files(_app: &App) -> Option<Files> {
-    None
+    let bundle = bundle_of(&std::env::current_exe().ok()?)?;
+    crate::appimage::folder_is_writable(bundle.parent()?).then_some(Files {
+        app: bundle,
+        engine: None,
+    })
+}
+
+/// The bundle `exe` is the executable of (`X.app/Contents/MacOS/exe`), if it is one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bundle_of(exe: &std::path::Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then(|| bundle.to_path_buf())
+}
+
+/// Unpacks a release zip (`ditto -c -k --keepParent`, the bundle at its top) and stages the
+/// bundle in it beside `bundle` for [`selfupdate::swap_in`]: only a bundle of the same name with
+/// its `Info.plist` and an executable of the running one's name is taken.
+#[cfg(target_os = "macos")]
+fn stage_bundle(zip: &[u8], bundle: &std::path::Path) -> Result<(), String> {
+    let with = |suffix: &str| {
+        let mut name = bundle.as_os_str().to_os_string();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let (archive, unpacked, staged) = (with(".zip"), with(".unzip"), selfupdate::staged(bundle));
+    for p in [&archive, &unpacked, &staged] {
+        selfupdate::remove_any(p).map_err(|e| e.to_string())?;
+    }
+    let result = (|| {
+        std::fs::write(&archive, zip).map_err(|e| e.to_string())?;
+        let status = std::process::Command::new("/usr/bin/ditto")
+            .args(["-x", "-k"])
+            .arg(&archive)
+            .arg(&unpacked)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("the download could not be unpacked".to_string());
+        }
+        let inner = unpacked.join(bundle.file_name().ok_or("no bundle name")?);
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_name = exe.file_name().ok_or("no executable name")?;
+        if !inner.join("Contents/Info.plist").is_file()
+            || !inner.join("Contents/MacOS").join(exe_name).is_file()
+        {
+            return Err("the download holds no bundle of this application".to_string());
+        }
+        std::fs::rename(&inner, &staged).map_err(|e| e.to_string())
+    })();
+    _ = selfupdate::remove_any(&archive);
+    _ = selfupdate::remove_any(&unpacked);
+    result
 }
 
 /// [`installed_files`] given the value of `$APPIMAGE`.
@@ -228,7 +287,7 @@ pub fn install(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), String>
     let result = stage_and_swap(offer, files, fetch);
     if result.is_err() {
         for target in files.targets() {
-            _ = std::fs::remove_file(selfupdate::staged(&target));
+            _ = selfupdate::remove_any(&selfupdate::staged(&target));
         }
     }
     result
@@ -249,6 +308,12 @@ fn stage_and_swap(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), Stri
                 target.file_name().unwrap_or_default().to_string_lossy()
             ));
         }
+        // A macOS bundle comes as a zip of it.
+        #[cfg(target_os = "macos")]
+        if target.is_dir() {
+            stage_bundle(&bytes, target)?;
+            continue;
+        }
         let staged = selfupdate::staged(target);
         std::fs::write(&staged, &bytes).map_err(|e| e.to_string())?;
         // An AppImage (or any file written fresh) must be executable once it is swapped in.
@@ -260,6 +325,53 @@ fn stage_and_swap(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), Stri
         }
     }
     selfupdate::swap_in(&files.targets()).map_err(|e| e.to_string())
+}
+
+/// `--install-update`: looks for a newer version, installs it as the bar's Update button would,
+/// and starts it as the Restart button would; no window. For trying the whole installation on a
+/// machine (the macOS runners do, against a manifest named by [`App::manifest_env`]). Returns
+/// the process exit code: 0 when the new version was installed or there was nothing newer.
+pub fn install_and_restart(app: &App, fetch: Fetch) -> i32 {
+    let Some(files) = installed_files(app) else {
+        eprintln!("{}: {NOT_INSTALLED}", app.name);
+        return 1;
+    };
+    eprintln!(
+        "{} {}; manifest {}",
+        app.name,
+        app.current_version(),
+        app.manifest_url()
+    );
+    let offer = match check(app, fetch) {
+        Ok(Some(offer)) => offer,
+        Ok(None) => {
+            eprintln!("nothing newer");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("could not look: {e}");
+            return 1;
+        }
+    };
+    let target = crate::relaunch::target(Some(&files));
+    if let Err(e) = install(&offer, &files, fetch) {
+        eprintln!("the update failed: {e}");
+        return 1;
+    }
+    record_version(app, &offer.version);
+    eprintln!(
+        "installed {} {} at {}",
+        app.name,
+        offer.version,
+        files.app.display()
+    );
+    if let Some(target) = target
+        && let Err(e) = crate::relaunch::spawn(&target)
+    {
+        eprintln!("could not start it: {e}");
+        return 1;
+    }
+    0
 }
 
 /// Removes what an earlier update left beside the executables.
@@ -401,7 +513,7 @@ pub fn at_launch_label(on: bool) -> &'static str {
 pub const NOT_INSTALLED: &str = if cfg!(windows) {
     "Only an installed copy can update itself."
 } else if cfg!(target_os = "macos") {
-    "This version is installed from the download page."
+    "Move the app to the Applications folder to update it in place."
 } else {
     "Only the AppImage can update itself."
 };
@@ -657,6 +769,83 @@ mod tests {
         } else {
             Ok(b"app 2".to_vec())
         }
+    }
+
+    #[test]
+    fn a_bundle_is_found_from_its_executable() {
+        let p = |s: &str| std::path::Path::new(s).to_path_buf();
+        assert_eq!(
+            bundle_of(&p("/Applications/mdview.app/Contents/MacOS/mdview")),
+            Some(p("/Applications/mdview.app"))
+        );
+        assert_eq!(bundle_of(&p("/usr/local/bin/mdview")), None);
+        assert_eq!(bundle_of(&p("/x/target/release/mdview")), None);
+        assert_eq!(bundle_of(&p("/x/mdview/Contents/MacOS/mdview")), None);
+    }
+
+    /// The whole macOS installation with the system's `ditto`: a zip of a bundle replaces the
+    /// bundle, and a zip of anything else changes nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_zipped_bundle_replaces_the_bundle() {
+        use std::process::Command;
+        let d = std::env::temp_dir().join(format!("mdshared-bundle-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&d);
+        let exe = std::env::current_exe().unwrap();
+        let exe_name = exe.file_name().unwrap();
+        let make = |root: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(root.join("Contents/MacOS")).unwrap();
+            std::fs::write(root.join("Contents/Info.plist"), "<plist/>").unwrap();
+            std::fs::write(root.join("Contents/MacOS").join(exe_name), text).unwrap();
+        };
+        let zip_of = |root: &std::path::Path| {
+            let zip = root.with_extension("zip");
+            let ok = Command::new("/usr/bin/ditto")
+                .args(["-c", "-k", "--keepParent"])
+                .arg(root)
+                .arg(&zip)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+            std::fs::read(zip).unwrap()
+        };
+        let app = d.join("mdtest.app");
+        make(&app, "version 1");
+        make(&d.join("new/mdtest.app"), "version 2");
+        make(&d.join("other/other.app"), "something else");
+        let installed = |app: &std::path::Path| {
+            std::fs::read_to_string(app.join("Contents/MacOS").join(exe_name)).unwrap()
+        };
+        let files = Files {
+            app: app.clone(),
+            engine: None,
+        };
+        let offer_of = |zip: &[u8]| Offer {
+            version: Version::parse("0.3.0").unwrap(),
+            notes: None,
+            app: Download {
+                url: "https://example.com/mdtest.zip".to_string(),
+                sha256: sha256_hex(zip),
+            },
+            engine: None,
+        };
+
+        let other = zip_of(&d.join("other/other.app"));
+        let fetch = |_: &str, _: usize, _: Duration| Ok(other.clone());
+        assert!(install(&offer_of(&other), &files, &fetch).is_err());
+        assert_eq!(installed(&app), "version 1");
+        assert!(!selfupdate::staged(&app).exists());
+
+        let new = zip_of(&d.join("new/mdtest.app"));
+        let fetch = |_: &str, _: usize, _: Duration| Ok(new.clone());
+        install(&offer_of(&new), &files, &fetch).unwrap();
+        assert_eq!(installed(&app), "version 2");
+        assert_eq!(installed(&selfupdate::retired(&app)), "version 1");
+        assert_eq!(crate::relaunch::target(Some(&files)), Some(app.clone()));
+        clean_up(&files);
+        assert!(!selfupdate::retired(&app).exists());
+        _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -438,6 +438,17 @@ impl Form {
         true
     }
 
+    /// What an input method is composing, for the text box with the focus (nothing else takes
+    /// it). Returns true when that changes what is drawn.
+    pub fn set_preedit(&mut self, preedit: Option<crate::textfield::Preedit>) -> bool {
+        match self.focus {
+            Some(f) if matches!(self.rows.get(f), Some(Row::Text { .. })) => {
+                self.fields[f].set_preedit(preedit)
+            }
+            _ => false,
+        }
+    }
+
     /// The id of the row the keyboard focus is on, or `None` on the Close button.
     pub fn focus_id(&self) -> Option<u32> {
         self.focus.and_then(|f| self.rows.get(f)).and_then(Row::id)

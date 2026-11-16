@@ -291,6 +291,11 @@ impl Palette {
         self.rebuild();
     }
 
+    /// What an input method is composing in the query box. Returns true if it changed.
+    pub fn set_preedit(&mut self, preedit: Option<crate::textfield::Preedit>) -> bool {
+        self.field.set_preedit(preedit)
+    }
+
     /// Replaces the entries (on open, or when the query changed the source) and ranks them against
     /// the query. The selection stays on the same entry when it is still there and the query did
     /// not change since the last call; otherwise it moves to the first entry that can be chosen.

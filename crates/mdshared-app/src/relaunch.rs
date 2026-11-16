@@ -8,8 +8,9 @@
 //! process would find the dying one, hand it its files, and exit, and no window would be left.
 //!
 //! [`target`] decides what to start, and it is a pure function of what the updater reported: the
-//! installed file on Windows (never a retired `.old` copy), the `$APPIMAGE` file on Linux, and
-//! nothing for a copy that cannot update itself.
+//! installed file on Windows (never a retired `.old` copy), the `$APPIMAGE` file on Linux, the
+//! `.app` bundle on macOS (started through LaunchServices, `open -n`), and nothing for a copy
+//! that cannot update itself.
 
 use crate::single;
 use crate::updater::Files;
@@ -36,7 +37,9 @@ pub fn target(files: Option<&Files>) -> Option<PathBuf> {
     let leftover = [".new", ".old"]
         .iter()
         .any(|suffix| app.as_os_str().to_string_lossy().ends_with(suffix));
-    (app.is_file() && !leftover).then(|| app.clone())
+    let bundle =
+        cfg!(target_os = "macos") && app.is_dir() && app.extension().is_some_and(|e| e == "app");
+    ((app.is_file() || bundle) && !leftover).then(|| app.clone())
 }
 
 /// The command that starts the new version: no files (the session brings back what was open),
@@ -44,7 +47,14 @@ pub fn target(files: Option<&Files>) -> Option<PathBuf> {
 /// does not take it along. Under an AppImage the variables the old runtime exported are removed,
 /// so the new runtime sets its own.
 pub fn command(target: &Path) -> Command {
-    let mut command = Command::new(target);
+    let mut command = if target.is_dir() {
+        // A macOS bundle: a new instance of it, as Finder starts it, with the flag.
+        let mut open = Command::new("/usr/bin/open");
+        open.arg("-n").arg(target).arg("--args");
+        open
+    } else {
+        Command::new(target)
+    };
     command
         .arg(FLAG)
         .stdin(Stdio::null())

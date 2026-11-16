@@ -6,6 +6,7 @@
 //! is running keeps its old image and the next launch gets the new one. If any step fails, the
 //! steps already taken are undone, so the folder never holds a mix of two versions.
 //! [`clean_up`] removes what an earlier update left behind, once the old process has gone.
+//! A target may be a folder (a macOS `.app` bundle): it is staged, swapped and retired whole.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,13 +27,26 @@ pub fn retired(target: &Path) -> PathBuf {
     with_suffix(target, ".old")
 }
 
+/// Removes a file or a folder with everything in it. Nothing there is no error.
+pub fn remove_any(path: &Path) -> io::Result<()> {
+    let result = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    };
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
 /// Puts every target's staged file in its place, all or none.
 ///
 /// Every staged file must exist. On an error the targets are as they were and the staged files
 /// are still there.
 pub fn swap_in(targets: &[PathBuf]) -> io::Result<()> {
     for target in targets {
-        if !staged(target).is_file() {
+        if !staged(target).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} is missing", staged(target).display()),
@@ -58,10 +72,16 @@ fn swap_one(target: &Path) -> io::Result<()> {
     let old = retired(target);
     // A copy retired by an earlier update: gone unless a process of that version still runs, and
     // then this update has to wait for it.
-    match std::fs::remove_file(&old) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    // A bundle's retired copy is a folder; a file's is a file, and anything else in its place is
+    // left alone (the swap fails and is undone).
+    if target.is_dir() {
+        remove_any(&old)?;
+    } else {
+        match std::fs::remove_file(&old) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     let had_target = target.exists();
     if had_target {
@@ -80,8 +100,8 @@ fn swap_one(target: &Path) -> io::Result<()> {
 /// file that a process still runs stays until a later call.
 pub fn clean_up(targets: &[PathBuf]) {
     for target in targets {
-        _ = std::fs::remove_file(retired(target));
-        _ = std::fs::remove_file(staged(target));
+        _ = remove_any(&retired(target));
+        _ = remove_any(&staged(target));
     }
 }
 
@@ -138,6 +158,27 @@ mod tests {
         assert_eq!(read(&engine), "engine 1");
         assert_eq!(read(&staged(&app)), "app 2");
         assert!(!retired(&app).exists());
+        _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_folder_is_swapped_whole_and_its_old_copy_removed_later() {
+        let d = dir("bundle");
+        let app = d.join("mdtest.app");
+        let file = |root: &Path| root.join("Contents/MacOS/mdtest");
+        for (root, text) in [(app.clone(), "app 1"), (staged(&app), "app 2")] {
+            std::fs::create_dir_all(file(&root).parent().unwrap()).unwrap();
+            std::fs::write(file(&root), text).unwrap();
+        }
+        // A retired copy of an earlier update is in the way, and goes.
+        std::fs::create_dir_all(retired(&app).join("Contents")).unwrap();
+        swap_in(std::slice::from_ref(&app)).unwrap();
+        assert_eq!(read(&file(&app)), "app 2");
+        assert_eq!(read(&file(&retired(&app))), "app 1");
+        assert!(!staged(&app).exists());
+        clean_up(std::slice::from_ref(&app));
+        assert!(!retired(&app).exists());
+        assert_eq!(read(&file(&app)), "app 2");
         _ = std::fs::remove_dir_all(&d);
     }
 

@@ -50,6 +50,31 @@ pub struct TextField {
     anchor: usize,
     /// Horizontal scroll in logical px.
     scroll: f32,
+    /// What an input method is composing, drawn at the caret until it is committed or dropped.
+    preedit: Option<Preedit>,
+}
+
+/// The text an input method is composing (winit's `Ime::Preedit`): drawn underlined where it will
+/// go, not yet part of the text. `cursor` is the input method's caret or selected clause in it,
+/// byte offsets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Preedit {
+    pub text: String,
+    pub cursor: Option<(usize, usize)>,
+}
+
+impl Preedit {
+    /// The composition winit reports, or `None` for the empty one that ends it.
+    pub fn new(text: String, cursor: Option<(usize, usize)>) -> Option<Preedit> {
+        let ok = |i: usize| i <= text.len() && text.is_char_boundary(i);
+        let cursor = cursor.filter(|&(a, b)| a <= b && ok(a) && ok(b));
+        (!text.is_empty()).then_some(Preedit { text, cursor })
+    }
+
+    /// Where the input method's caret is in the text, a byte offset (its end when it has none).
+    pub fn caret(&self) -> usize {
+        self.cursor.map_or(self.text.len(), |c| c.1)
+    }
 }
 
 impl TextField {
@@ -70,15 +95,28 @@ impl TextField {
         self.text.is_empty()
     }
 
+    /// Sets or clears what an input method is composing at the caret. Returns true if it changed.
+    pub fn set_preedit(&mut self, preedit: Option<Preedit>) -> bool {
+        let changed = self.preedit != preedit;
+        self.preedit = preedit;
+        changed
+    }
+
+    pub fn preedit(&self) -> Option<&Preedit> {
+        self.preedit.as_ref()
+    }
+
     /// Replaces the text, caret at the end, no selection.
     pub fn set_text(&mut self, text: &str) {
         self.text = clean(text);
         self.caret = self.text.len();
         self.anchor = self.caret;
         self.scroll = 0.0;
+        self.preedit = None;
     }
 
     pub fn clear(&mut self) {
+        self.preedit = None;
         self.text.clear();
         self.caret = 0;
         self.anchor = 0;
@@ -107,6 +145,7 @@ impl TextField {
     /// dropped; newlines and tabs become spaces. Returns true if the text changed.
     pub fn insert(&mut self, text: &str) -> bool {
         let clean = clean(text);
+        self.preedit = None;
         if clean.is_empty() && !self.has_selection() {
             return false;
         }
@@ -387,13 +426,25 @@ impl TextField {
         focused: bool,
         caret_on: bool,
     ) {
-        let stops = p.caret_stops(face, size, &self.text);
+        // While an input method composes, its text is drawn in place at the caret, underlined,
+        // with the input method's caret; the selection is not shown.
+        let composing = self.preedit.as_ref().filter(|_| focused);
+        let shown: std::borrow::Cow<str> = match composing {
+            Some(pre) => {
+                let mut s = self.text.clone();
+                s.insert_str(self.caret, &pre.text);
+                s.into()
+            }
+            None => self.text.as_str().into(),
+        };
+        let (caret_b, anchor_b) = match composing {
+            Some(pre) => (self.caret + pre.caret(), self.caret + pre.caret()),
+            None => (self.caret, self.anchor),
+        };
+        let stops = p.caret_stops(face, size, &shown);
         let total = stops.last().copied().unwrap_or(0.0);
-        let caret_idx = self.text[..self.caret].chars().count().min(stops.len() - 1);
-        let anchor_idx = self.text[..self.anchor]
-            .chars()
-            .count()
-            .min(stops.len() - 1);
+        let caret_idx = shown[..caret_b].chars().count().min(stops.len() - 1);
+        let anchor_idx = shown[..anchor_b].chars().count().min(stops.len() - 1);
         let cx = stops[caret_idx];
 
         // Keep the caret in view, then keep the scroll within the text.
@@ -411,7 +462,7 @@ impl TextField {
         let top = cy - h / 2.0;
         let old = p.clip(area);
         let ox = area.x - self.scroll;
-        if self.text.is_empty() {
+        if shown.is_empty() {
             p.text(
                 face,
                 size,
@@ -429,14 +480,32 @@ impl TextField {
                 );
                 p.fill_a(Rect::new(ox + a, top, b - a, h), colors.selection, 0.35);
             }
-            p.text(face, size, ox, cy, &self.text, colors.text, f32::INFINITY);
+            p.text(face, size, ox, cy, &shown, colors.text, f32::INFINITY);
+            if let Some(pre) = composing {
+                let at = self.caret;
+                p.underline_range(
+                    face,
+                    size,
+                    ox,
+                    cy,
+                    &shown,
+                    at..at + pre.text.len(),
+                    colors.text,
+                );
+                // The clause the input method has selected, a second line under it.
+                if let Some((a, b)) = pre.cursor.filter(|c| c.0 < c.1) {
+                    let a_x = p.measure(face, size, &shown[..at + a]);
+                    let b_x = p.measure(face, size, &shown[..at + b]);
+                    p.fill_a(
+                        Rect::new(ox + a_x, top, b_x - a_x, h),
+                        colors.selection,
+                        0.25,
+                    );
+                }
+            }
         }
         if focused && caret_on {
-            let x = if self.text.is_empty() {
-                area.x
-            } else {
-                ox + cx
-            };
+            let x = if shown.is_empty() { area.x } else { ox + cx };
             p.fill(Rect::new(x, top, 1.0f32.max(p.px()), h), colors.caret);
         }
         p.restore(old);
@@ -458,6 +527,25 @@ fn clean(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_composition_shows_until_it_is_committed() {
+        assert_eq!(Preedit::new(String::new(), None), None);
+        // A cursor off a character boundary is dropped, not trusted.
+        let p = Preedit::new("çay".into(), Some((0, 1))).unwrap();
+        assert_eq!(p.cursor, None);
+        assert_eq!(p.caret(), 4);
+        let mut f = field("ab");
+        assert!(f.set_preedit(Preedit::new("か".into(), Some((3, 3)))));
+        assert!(!f.set_preedit(Preedit::new("か".into(), Some((3, 3)))));
+        assert_eq!(f.text(), "ab", "a composition is not text yet");
+        f.insert("家");
+        assert_eq!(f.text(), "ab家");
+        assert_eq!(f.preedit(), None);
+        f.set_preedit(Preedit::new("x".into(), None));
+        f.clear();
+        assert_eq!(f.preedit(), None);
+    }
 
     fn field(s: &str) -> TextField {
         let mut f = TextField::new();
