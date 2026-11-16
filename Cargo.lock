@@ -1288,6 +1288,7 @@ name = "mdshared-app"
 version = "0.1.0"
 dependencies = [
  "notify",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
