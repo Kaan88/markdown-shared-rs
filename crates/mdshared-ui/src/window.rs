@@ -89,9 +89,117 @@ pub fn created(window: &winit::window::Window) {
     let _ = window;
 }
 
+/// What a double click on the title row does: maximize (zoom on a Mac) or restore, minimise, or
+/// nothing. macOS has the setting (Desktop & Dock, "Double-click a window's title bar to");
+/// elsewhere it is always maximize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleDoubleClick {
+    Maximize,
+    Minimize,
+    Nothing,
+}
+
+impl TitleDoubleClick {
+    /// The system's choice, from the global `AppleActionOnDoubleClick` on macOS ("Maximize",
+    /// "Minimize", "None"; unset is Maximize, the default).
+    pub fn system() -> TitleDoubleClick {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_foundation::{NSString, NSUserDefaults};
+            let value = NSUserDefaults::standardUserDefaults()
+                .stringForKey(&NSString::from_str("AppleActionOnDoubleClick"))
+                .map(|v| v.to_string());
+            Self::from_setting(value.as_deref())
+        }
+        #[cfg(not(target_os = "macos"))]
+        TitleDoubleClick::Maximize
+    }
+
+    /// The action a value of `AppleActionOnDoubleClick` names.
+    pub fn from_setting(value: Option<&str>) -> TitleDoubleClick {
+        match value {
+            Some(v) if v.eq_ignore_ascii_case("minimize") => TitleDoubleClick::Minimize,
+            Some(v) if v.eq_ignore_ascii_case("none") => TitleDoubleClick::Nothing,
+            _ => TitleDoubleClick::Maximize,
+        }
+    }
+}
+
+/// Does what a double click on the title row does ([`TitleDoubleClick::system`]).
+pub fn title_double_click(window: &winit::window::Window) {
+    match TitleDoubleClick::system() {
+        TitleDoubleClick::Maximize => window.set_maximized(!window.is_maximized()),
+        TitleDoubleClick::Minimize => window.set_minimized(true),
+        TitleDoubleClick::Nothing => {}
+    }
+}
+
+/// macOS: the dot in the window's close button that says a document has unsaved changes (and
+/// makes the system ask before the window closes with a gesture of its own). Nothing elsewhere.
+pub fn set_edited(window: &winit::window::Window, edited: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        window.set_document_edited(edited);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (window, edited);
+}
+
+/// A trackpad pinch turned into zoom steps: winit gives the pinch in small deltas (+0.01 is 1 %
+/// larger), which add up until they make a step of [`PinchZoom::STEP`] either way. A pinch that
+/// ends drops what was left over.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinchZoom {
+    sum: f64,
+}
+
+impl PinchZoom {
+    /// The pinch that makes one zoom step.
+    pub const STEP: f64 = 0.08;
+
+    /// Adds a pinch delta; the whole zoom steps it completes, positive to zoom in.
+    pub fn add(&mut self, delta: f64) -> i32 {
+        if !delta.is_finite() {
+            return 0;
+        }
+        self.sum += delta;
+        let steps = (self.sum / Self::STEP).trunc();
+        self.sum -= steps * Self::STEP;
+        steps as i32
+    }
+
+    /// The pinch ended or was cancelled.
+    pub fn end(&mut self) {
+        self.sum = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pinch_makes_whole_steps_and_keeps_the_rest() {
+        let mut p = PinchZoom::default();
+        assert_eq!(p.add(0.05), 0);
+        assert_eq!(p.add(0.05), 1, "0.10 is one step and 0.02 left");
+        assert_eq!(p.add(0.15), 2);
+        assert_eq!(p.add(-0.2), -2);
+        p.end();
+        assert_eq!(p.add(-0.07), 0);
+        assert_eq!(p.add(f64::NAN), 0);
+    }
+
+    #[test]
+    fn the_title_double_click_setting() {
+        use TitleDoubleClick::*;
+        assert_eq!(TitleDoubleClick::from_setting(None), Maximize);
+        assert_eq!(TitleDoubleClick::from_setting(Some("Maximize")), Maximize);
+        assert_eq!(TitleDoubleClick::from_setting(Some("Minimize")), Minimize);
+        assert_eq!(TitleDoubleClick::from_setting(Some("None")), Nothing);
+        assert_eq!(TitleDoubleClick::from_setting(Some("bogus")), Maximize);
+    }
 
     #[test]
     fn bands() {

@@ -4,7 +4,7 @@
 //! event) and logging out reach the application as [`AppCommand::Quit`], which it answers as its
 //! own Exit command. About and Settings go to the application too. Hide, Services, the Edit menu
 //! (which also makes Command+C and the like work in the system's file panels) and the Window menu
-//! are the system's own.
+//! are the system's own; the Window menu also has the window's full screen (Control+Command+F).
 //!
 //! The Edit items have no target: they act on the first responder, and winit's view answers none
 //! of them, so over the window they are disabled and the keys reach the window as key events.
@@ -229,6 +229,15 @@ mod imp {
                     None,
                 ),
                 item(mtm, "Zoom", Some(sel!(performZoom:)), "", none, None),
+                // The window's own full screen; AppKit keeps the title ("Exit Full Screen").
+                item(
+                    mtm,
+                    "Enter Full Screen",
+                    Some(sel!(toggleFullScreen:)),
+                    "f",
+                    NSEventModifierFlags::Control,
+                    None,
+                ),
                 sep(),
                 item(
                     mtm,

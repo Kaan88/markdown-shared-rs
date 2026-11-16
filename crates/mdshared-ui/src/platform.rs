@@ -778,10 +778,30 @@ mod imp {
         }
         u32::try_from(value).ok()
     }
+    /// macOS: the interval set in Settings (`NSEvent.doubleClickInterval`). Elsewhere 500 ms.
     pub fn double_click_time() -> Duration {
+        #[cfg(target_os = "macos")]
+        {
+            let s = objc2_app_kit::NSEvent::doubleClickInterval();
+            if s.is_finite() && s > 0.05 && s < 5.0 {
+                return Duration::from_secs_f64(s);
+            }
+        }
         Duration::from_millis(500)
     }
+    /// macOS: `NSTextInsertionPointBlinkPeriodOn` when someone set it (in ms; 0 or less is no
+    /// blinking), else the 530 ms used everywhere off Windows.
     pub fn caret_blink_time() -> Option<Duration> {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_foundation::{NSString, NSUserDefaults};
+            let key = NSString::from_str("NSTextInsertionPointBlinkPeriodOn");
+            let defaults = NSUserDefaults::standardUserDefaults();
+            if defaults.objectForKey(&key).is_some() {
+                let ms = defaults.integerForKey(&key);
+                return (ms > 0).then(|| Duration::from_millis(ms.min(5000) as u64));
+            }
+        }
         Some(Duration::from_millis(530))
     }
     pub fn style_window(_hwnd: isize, _dark: bool) {}
@@ -843,6 +863,37 @@ pub fn open_file(path: &Path, extensions: &[&str]) -> bool {
 pub fn reveal_in_file_manager(path: &Path) -> bool {
     imp::reveal_in_file_manager(path)
 }
+/// Whether the system asks for less motion (macOS: Accessibility, Display, Reduce motion), so
+/// animations stay still. False elsewhere, where the applications ask the system themselves.
+pub fn reduces_motion() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+/// Tells the system a document was opened, for its lists of recent items: on macOS the Dock
+/// icon's menu and Apple menu, Recent Items. Call it on the main thread. Elsewhere nothing.
+pub fn note_recent_document(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::NSDocumentController;
+        use objc2_foundation::{NSString, NSURL};
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            return;
+        };
+        let Some(path) = path.to_str() else {
+            return;
+        };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        NSDocumentController::sharedDocumentController(mtm).noteNewRecentDocumentURL(&url);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
+}
+
 /// Whether apps should use the dark theme.
 pub fn system_is_dark() -> bool {
     imp::system_is_dark()

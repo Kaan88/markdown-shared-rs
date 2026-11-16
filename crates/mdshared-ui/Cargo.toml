@@ -52,7 +52,7 @@ x11rb = { version = "0.13.2", optional = true, default-features = false, feature
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 # The menu bar (src/menu_bar.rs). The version arboard and rfd already bring in.
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSResponder", "NSScreen", "NSGraphics"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSResponder", "NSScreen", "NSGraphics", "NSWorkspace", "NSAccessibility", "NSDocumentController"] }
 rfd = { version = "0.15.4", default-features = false }
 arboard = { version = "3", default-features = false }
 # The appearance setting (dark mode) from the user defaults. The version winit's AppKit side and
