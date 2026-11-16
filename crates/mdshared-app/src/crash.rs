@@ -10,6 +10,10 @@
 //! source location of a panic survives stripping.
 //!
 //! [`install`] costs a few microseconds at start; nothing runs until a crash.
+//!
+//! A panic that is caught (`catch_unwind`, a thread that ends while the process goes on) writes a
+//! report too, since the hook cannot know. An application that ends normally calls
+//! [`closed_normally`] last, which deletes the reports this run wrote: it lived through them.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -27,6 +31,8 @@ struct Setup {
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
 static CONTEXT: Mutex<String> = Mutex::new(String::new());
+/// The reports this run wrote, for [`closed_normally`].
+static WRITTEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Starts writing reports for `app` at `version` into `dir` (made when a report is written).
 /// Call once, first thing in `main`; a second call changes nothing. The panic hook that was set
@@ -56,6 +62,18 @@ pub fn set_context(text: &str) {
     {
         c.clear();
         c.push_str(text);
+    }
+}
+
+/// The application is ending normally: deletes the reports written by this run, whose panics
+/// were caught and lived through. Call it last, after the window and the work are gone.
+pub fn closed_normally() {
+    let written = match WRITTEN.lock() {
+        Ok(mut w) => std::mem::take(&mut *w),
+        Err(_) => return,
+    };
+    for report in written {
+        let _ = std::fs::remove_file(report);
     }
 }
 
@@ -129,7 +147,11 @@ fn write_report(what: &str, place: Option<&str>) {
         &context,
         when,
     );
-    let _ = save(&setup.dir, &text, when);
+    if let Ok(path) = save(&setup.dir, &text, when)
+        && let Ok(mut w) = WRITTEN.try_lock()
+    {
+        w.push(path);
+    }
 }
 
 /// Writes `crash-<seconds>.txt` (a suffix when that name is taken) and deletes the oldest
@@ -335,6 +357,10 @@ mod tests {
         );
         assert!(text.contains("thread:  worker\n"), "{text}");
         assert!(text.contains("doing:   Markdown, 3 KB\n"), "{text}");
+        // The process lived through it and ends normally: the report goes.
+        closed_normally();
+        assert!(!report.exists());
+        assert_eq!(pending(&dir), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
