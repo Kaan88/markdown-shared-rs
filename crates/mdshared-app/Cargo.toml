@@ -7,6 +7,15 @@ publish.workspace = true
 [dependencies]
 notify = { version = "=8.2.1", default-features = false }
 
+# Windows: the unhandled-exception filter of the crash reports.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+] }
+
 # macOS: the FSEvents backend (Linux uses inotify, Windows ReadDirectoryChangesW, with no feature).
 [target.'cfg(target_os = "macos")'.dependencies]
 notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }

@@ -122,8 +122,8 @@ impl Files {
     }
 }
 
-/// This process's executable (and the engine beside it), when this copy can update itself: the
-/// files are there, and the folder is not a cargo build's output.
+/// This process's executable (and the engine beside it, there or not), when this copy can update
+/// itself: the folder is not a cargo build's output.
 #[cfg(windows)]
 pub fn installed_files(app: &App) -> Option<Files> {
     let exe = std::env::current_exe().ok()?;
@@ -135,16 +135,12 @@ pub fn installed_files(app: &App) -> Option<Files> {
     if built {
         return None;
     }
-    let engine = match app.engine {
-        Some(stem) => {
-            let path = dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
-            if !path.is_file() {
-                return None;
-            }
-            Some(path)
-        }
-        None => None,
-    };
+    // A missing engine is still this copy's file to replace: an update from a version without
+    // one (mdedit before 0.8) brought only the executable, and the next update, or
+    // [`restore_engine`] at launch, puts the engine in place.
+    let engine = app
+        .engine
+        .map(|stem| dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)));
     Some(Files { app: exe, engine })
 }
 
@@ -269,6 +265,41 @@ fn offer_for(
         },
         engine,
     }))
+}
+
+/// For a copy whose engine is missing (`files.engine` names a file that is not there): when the
+/// manifest is of this very version and lists the engine for `platform`, downloads it, checks it
+/// against its hash and puts it in place. True when it did. An update from a version that had no
+/// engine brings only the executable; this completes it at the next launch.
+pub fn restore_engine(
+    app: &App,
+    files: &Files,
+    manifest: &[u8],
+    platform: Platform,
+    fetch: Fetch,
+) -> Result<bool, String> {
+    let Some(target) = files.engine.as_ref().filter(|p| !p.exists()) else {
+        return Ok(false);
+    };
+    let manifest = UpdateManifest::parse(manifest).map_err(|e| e.to_string())?;
+    if manifest.version != app.current_version() {
+        return Ok(false);
+    }
+    let Some(download) = manifest.asset(platform).and_then(|a| a.engine.clone()) else {
+        return Ok(false);
+    };
+    let bytes = fetch(&download.url, MAX_FILE_BYTES, FILE_TIMEOUT)?;
+    if !update::verify_sha256(&bytes, &download.sha256) {
+        return Err("the engine does not match its SHA-256".to_string());
+    }
+    let staged = selfupdate::staged(target);
+    let written = std::fs::write(&staged, &bytes)
+        .and_then(|()| selfupdate::swap_in(std::slice::from_ref(target)));
+    if let Err(e) = written {
+        _ = selfupdate::remove_any(&staged);
+        return Err(e.to_string());
+    }
+    Ok(true)
 }
 
 /// Fetches the manifest and reads it.
@@ -448,7 +479,8 @@ fn spawn(app: &App, work: impl FnOnce() + Send + 'static) {
 }
 
 /// At launch, for a copy that can update itself (`files`): clears what an earlier update left
-/// behind and, when `due`, looks for a newer version and posts the answer as an automatic look.
+/// behind and, when `due`, looks for a newer version and posts the answer as an automatic look;
+/// the same look puts a missing engine of this version in place ([`restore_engine`]).
 pub fn spawn_at_launch(
     app: App,
     files: Files,
@@ -459,7 +491,17 @@ pub fn spawn_at_launch(
     spawn(&app, move || {
         clean_up(&files);
         if due {
-            let result = check(&app, &fetch);
+            let result = fetch(
+                &app.manifest_url(),
+                update::MAX_MANIFEST_BYTES,
+                MANIFEST_TIMEOUT,
+            )
+            .and_then(|bytes| {
+                if let Some(platform) = Platform::current() {
+                    _ = restore_engine(&app, &files, &bytes, platform, &fetch);
+                }
+                offer(&app, &bytes, &app.current_version())
+            });
             post(Event::Checked {
                 manual: false,
                 result,
@@ -769,6 +811,46 @@ mod tests {
         } else {
             Ok(b"app 2".to_vec())
         }
+    }
+
+    #[test]
+    fn a_missing_engine_of_this_version_is_put_in_place() {
+        let files = files("restore", true);
+        let engine = files.engine.clone().unwrap();
+        let fetch = |url: &str, _: usize, _: Duration| -> Result<Vec<u8>, String> {
+            assert!(url.ends_with("/engine"), "{url}");
+            Ok(b"engine 2".to_vec())
+        };
+        let this = win_manifest("0.2.0", b"app 1", Some(b"engine 2"));
+        let w = Platform::WindowsX64;
+        // There: nothing to do, nothing fetched.
+        assert_eq!(
+            restore_engine(&APP, &files, this.as_bytes(), w, &fetch),
+            Ok(false)
+        );
+        assert_eq!(read(&engine), "engine 1");
+        std::fs::remove_file(&engine).unwrap();
+        // A manifest of another version, or one without the engine: left to the update.
+        let newer = win_manifest("0.3.0", b"app 2", Some(b"engine 2"));
+        assert_eq!(
+            restore_engine(&APP, &files, newer.as_bytes(), w, &fetch),
+            Ok(false)
+        );
+        let bare = win_manifest("0.2.0", b"app 1", None);
+        assert_eq!(
+            restore_engine(&APP, &files, bare.as_bytes(), w, &fetch),
+            Ok(false)
+        );
+        // A wrong hash leaves nothing behind.
+        let wrong = win_manifest("0.2.0", b"app 1", Some(b"something else"));
+        assert!(restore_engine(&APP, &files, wrong.as_bytes(), w, &fetch).is_err());
+        assert!(!engine.exists() && !selfupdate::staged(&engine).exists());
+        assert_eq!(
+            restore_engine(&APP, &files, this.as_bytes(), w, &fetch),
+            Ok(true)
+        );
+        assert_eq!(read(&engine), "engine 2");
+        _ = std::fs::remove_dir_all(files.app.parent().unwrap());
     }
 
     #[test]
