@@ -1,5 +1,6 @@
-//! Bars across the top of the page: a text button for them, and the bar that offers a newer
-//! version of the application. Pure drawing; the caller records the hits.
+//! Bars across the top of the page: a text button for them, the bar that offers a newer version
+//! of the application, and the bar that offers the report of a crash. Pure drawing; the caller
+//! records the hits.
 
 use crate::gfx::{Face, Painter, Rect, mix};
 use crate::glyph;
@@ -134,6 +135,91 @@ pub fn draw_update_bar(
         bar.x + 38.0,
         bar.cy(),
         &label,
+        pal.text,
+        (right - (bar.x + 38.0)).max(0.0),
+    );
+    hits
+}
+
+/// The crash bar's buttons.
+pub const OPEN_REPORT: &str = "Open report";
+pub const COPY_REPORT: &str = "Copy";
+
+/// Which of the crash bar's controls the pointer is over or holds down.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrashBarState {
+    pub open_hovered: bool,
+    pub open_pressed: bool,
+    pub copy_hovered: bool,
+    pub copy_pressed: bool,
+    pub close_hovered: bool,
+}
+
+/// Where the crash bar's controls were drawn, for the caller's hits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrashBarHits {
+    pub open: Option<Rect>,
+    pub copy: Option<Rect>,
+    pub close: Option<Rect>,
+}
+
+/// What the crash bar says for `app` (its display name).
+pub fn crash_bar_label(app: &str) -> String {
+    format!("{app} closed because of an error last time. A report was saved; you can send it.")
+}
+
+/// The bar that says the application ended on an error last time and offers the report
+/// ([`mdshared_app::crash`]): open it, copy it, or close the bar.
+pub fn draw_crash_bar(
+    p: &mut Painter,
+    pal: &Palette,
+    bar: Rect,
+    app: &str,
+    state: CrashBarState,
+) -> CrashBarHits {
+    let mut hits = CrashBarHits::default();
+    p.fill(bar, pal.bar);
+    p.fill(
+        Rect::new(bar.x, bar.bottom() - p.px(), bar.w, p.px()),
+        pal.line,
+    );
+    let close = Rect::new(bar.right() - 34.0, bar.cy() - 12.0, 24.0, 24.0);
+    if state.close_hovered {
+        p.rbox(close, 5.0, mix(pal.bar, pal.text, 0.10));
+    }
+    p.icon(glyph::CLOSE, 10.0, close.cx(), close.cy(), pal.muted);
+    hits.close = Some(close);
+    let mut right = close.x - 10.0;
+    right -= bar_button_w(p, COPY_REPORT);
+    hits.copy = Some(bar_button(
+        p,
+        pal,
+        right,
+        bar.cy(),
+        COPY_REPORT,
+        false,
+        state.copy_hovered,
+        state.copy_pressed,
+    ));
+    right -= 8.0 + bar_button_w(p, OPEN_REPORT);
+    hits.open = Some(bar_button(
+        p,
+        pal,
+        right,
+        bar.cy(),
+        OPEN_REPORT,
+        true,
+        state.open_hovered,
+        state.open_pressed,
+    ));
+    right -= 12.0;
+    p.icon(glyph::WARN, 13.0, bar.x + 22.0, bar.cy(), pal.muted);
+    p.text(
+        Face::Ui,
+        12.5,
+        bar.x + 38.0,
+        bar.cy(),
+        &crash_bar_label(app),
         pal.text,
         (right - (bar.x + 38.0)).max(0.0),
     );
