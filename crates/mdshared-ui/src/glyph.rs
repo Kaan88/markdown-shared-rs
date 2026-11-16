@@ -56,6 +56,8 @@ pub const NEW_FILE: &str =
 pub const SAVE: &str = "M3 2.5h8.3l2.2 2.2V13a.5 .5 0 0 1-.5 .5H3a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5zM5 2.5V6h5V2.5M5 13.5v-4h6v4";
 pub const SAVE_AS: &str = "M7.5 13.5H3a.5 .5 0 0 1-.5-.5V3a.5 .5 0 0 1 .5-.5h8.3l2.2 2.2V7M5 2.5V6h5V2.5M10 14.5l.4-1.9 3.2-3.2 1.5 1.5-3.2 3.2z";
 pub const CLOSE_ALL: &str = "M2 5.5l5 5M7 5.5l-5 5M9 5.5l5 5M14 5.5l-5 5";
+/// A push pin, point down: a pinned tab.
+pub const PIN: &str = "M5.5 2.5h5M6.5 2.5v3.5L4.5 9.5h7L9.5 6V2.5M8 9.5v4";
 pub const CLOSE_OTHERS: &str = "M2.5 4l4 4M6.5 4l-4 4M9.5 3.5h4a.5 .5 0 0 1 .5 .5v8a.5 .5 0 0 1-.5 .5h-8a.5 .5 0 0 1-.5-.5v-1.5";
 pub const REPLACE: &str = "M2.5 5.5h10M10 3l2.5 2.5L10 8M13.5 10.5h-10M6 8l-2.5 2.5L6 13";
 pub const GO_TO_LINE: &str = "M2.5 3.5h11M2.5 12.5h11M2.5 8h7.5M7.5 5.5L10 8l-2.5 2.5";
@@ -167,6 +169,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("SAVE_AS", SAVE_AS),
     ("CLOSE_ALL", CLOSE_ALL),
     ("CLOSE_OTHERS", CLOSE_OTHERS),
+    ("PIN", PIN),
     ("REPLACE", REPLACE),
     ("GO_TO_LINE", GO_TO_LINE),
     ("VIEW", VIEW),

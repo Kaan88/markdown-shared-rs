@@ -155,6 +155,9 @@ pub struct TabState {
     pub close_hovered: bool,
     /// A press that started on this tab's close button is held.
     pub close_pressed: bool,
+    /// The tab is pinned: a pin stands where the close button would, always shown, and
+    /// pressing it unpins the tab.
+    pub pinned: bool,
 }
 
 /// Where one drawn tab can be hit: the tab, and its close button when shown.
@@ -200,7 +203,7 @@ pub fn draw_tab(
         p.fill(Rect::new(x + w - px, 15.0, px, 16.0), pal.line);
     }
     let cy = 23.0;
-    let show_close = (s.active || s.hovered) && w >= 64.0;
+    let show_close = (s.active || s.hovered || s.pinned) && w >= 64.0;
     let tiny = w < 64.0;
     let icon_x = if tiny { x + w / 2.0 } else { x + 19.0 };
     let (g, gc) = if s.missing {
@@ -233,9 +236,14 @@ pub fn draw_tab(
         if let Some(fill) = button_fill(pal, s.close_hovered, s.close_pressed, false, false) {
             p.rbox(b, 4.0, fill);
         }
+        let (g, size) = if s.pinned {
+            (glyph::PIN, 12.0)
+        } else {
+            (glyph::CLOSE, 8.5)
+        };
         p.icon(
-            glyph::CLOSE,
-            8.5,
+            g,
+            size,
             b.cx(),
             b.cy(),
             if s.close_hovered { pal.text } else { pal.muted },
