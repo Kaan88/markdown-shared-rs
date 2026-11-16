@@ -46,7 +46,7 @@ wayland-protocols-plasma = { version = "0.3.12", features = ["client"] }
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 # The X11 route of the client-drawn margin (src/shadow/x11.rs): a second connection that sets
 # `_GTK_FRAME_EXTENTS` and the input shape. The same x11rb winit already brings in.
-x11rb = { version = "0.13.2", optional = true, default-features = false, features = ["shape"] }
+x11rb = { version = "0.14.0", optional = true, default-features = false, features = ["shape"] }
 
 # macOS: AppKit through winit and rfd; the colour scheme comes from winit's theme.
 [target.'cfg(target_os = "macos")'.dependencies]
