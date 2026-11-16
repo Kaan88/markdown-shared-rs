@@ -9,7 +9,7 @@ notify = { version = "=8.2.1", default-features = false }
 
 # Windows: the unhandled-exception filter of the crash reports.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
