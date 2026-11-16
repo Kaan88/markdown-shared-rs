@@ -278,6 +278,7 @@ fn settings_sheets() {
         ctrl: false,
         shift: false,
         alt: false,
+        control: false,
     };
     for (scale, sfx) in [(1.0, ""), (1.5, "-150")] {
         for (pal, theme) in [(&LIGHT, "light"), (&DARK, "dark")] {

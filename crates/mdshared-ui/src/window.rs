@@ -52,14 +52,41 @@ pub fn identify(
     attrs.with_window_icon(icon)
 }
 
+/// macOS: the window keeps the system's frame with the title bar made transparent and drawn over
+/// the content (the title row is ours, under the system's close, minimise and zoom buttons at its
+/// left; see `chrome::NATIVE_FRAME`), and no title text. The name and icon come from the bundle.
+#[cfg(target_os = "macos")]
+pub fn identify(
+    attrs: winit::window::WindowAttributes,
+    _name: &str,
+    _icon_png: Option<&[u8]>,
+) -> winit::window::WindowAttributes {
+    use winit::platform::macos::WindowAttributesExtMacOS;
+    attrs
+        .with_decorations(true)
+        .with_titlebar_transparent(true)
+        .with_title_hidden(true)
+        .with_fullsize_content_view(true)
+}
+
 /// See the Linux version: here the attributes are returned as they are.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn identify(
     attrs: winit::window::WindowAttributes,
     _name: &str,
     _icon_png: Option<&[u8]>,
 ) -> winit::window::WindowAttributes {
     attrs
+}
+
+/// What a window needs once it exists. macOS: input methods are on, so a dead key (Option+E,
+/// then E) and the accent menu of a held key reach the text as `Ime::Commit`. Elsewhere nothing
+/// yet: there they have not been tried.
+pub fn created(window: &winit::window::Window) {
+    #[cfg(target_os = "macos")]
+    window.set_ime_allowed(true);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
 }
 
 #[cfg(test)]

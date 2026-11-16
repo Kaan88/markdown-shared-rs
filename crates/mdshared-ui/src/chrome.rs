@@ -17,6 +17,14 @@ pub const TAB_MAX: f32 = 220.0;
 pub const TAB_FLOOR: f32 = 36.0;
 /// Where the tabs start, after the logo.
 pub const TABS_X: f32 = 50.0;
+/// macOS: the window keeps the system's title bar, transparent and under the title row
+/// ([`crate::window::identify`]), so the system draws the close, minimise and zoom buttons at the
+/// row's left, resizes the window, and gives it its shadow and corners. The application draws no
+/// window buttons, no logo and no resize band of its own there, and starts the tabs at
+/// [`TABS_LEFT`].
+pub const NATIVE_FRAME: bool = cfg!(target_os = "macos");
+/// Where the tabs start: after the logo, or on macOS after the system's three buttons.
+pub const TABS_LEFT: f32 = if NATIVE_FRAME { 80.0 } else { TABS_X };
 /// The new-tab button after the last tab, and the drag area kept free beside it.
 pub const NEW_TAB_W: f32 = 34.0;
 pub const DRAG_MIN: f32 = 56.0;

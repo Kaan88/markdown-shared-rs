@@ -69,8 +69,13 @@ pub enum Face {
     Semibold,
 }
 
-const UI_FAMILY: &str =
-    "Segoe UI Variable Text, Segoe UI, Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif";
+/// The interface's family list. On macOS the system's own (SF, which fontique reaches as the
+/// generic `system-ui`), then Helvetica Neue.
+const UI_FAMILY: &str = if cfg!(target_os = "macos") {
+    "system-ui, Helvetica Neue, sans-serif"
+} else {
+    "Segoe UI Variable Text, Segoe UI, Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif"
+};
 
 /// An icon stroked at one size: coverage, one byte per device pixel, and where its top left
 /// corner sits from the corner of the icon's square.

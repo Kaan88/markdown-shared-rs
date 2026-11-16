@@ -248,6 +248,8 @@ impl TextField {
         typed: Option<&str>,
         clipboard: bool,
     ) -> Option<bool> {
+        let (key, mods) = crate::keys::text_key(key.clone(), mods);
+        let key = &key;
         let (word, extend) = (mods.ctrl, mods.shift);
         Some(match key {
             KeyName::Left => self.key(EditKey::Left, word, extend),
@@ -289,9 +291,9 @@ impl TextField {
             | KeyName::PageDown
             | KeyName::F(_) => return None,
             _ => {
-                // Ctrl alone is a shortcut; Ctrl+Alt is AltGr on Windows.
+                // A shortcut, or text (see `keys::types_text`: AltGr on Windows, Option on a Mac).
                 let t = typed.filter(|t| !t.chars().any(char::is_control))?;
-                if mods.ctrl && !mods.alt {
+                if !crate::keys::types_text(mods) {
                     return None;
                 }
                 self.insert(t)

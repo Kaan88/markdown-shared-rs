@@ -1669,11 +1669,13 @@ mod tests {
         ctrl: false,
         shift: false,
         alt: false,
+        control: false,
     };
     const SHIFT: Mods = Mods {
         ctrl: false,
         shift: true,
         alt: false,
+        control: false,
     };
 
     const WRAP: u32 = 1;

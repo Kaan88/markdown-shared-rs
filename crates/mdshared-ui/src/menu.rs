@@ -34,8 +34,10 @@ impl<T> Item<T> {
             separator_before: false,
         }
     }
+    /// The shortcut shown at the item's right, as the table writes it ("Ctrl+S"); printed the
+    /// platform's way (`keys::label`: "⌘S" on a Mac).
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = hint.into();
+        self.hint = crate::keys::label(&hint.into()).to_string();
         self
     }
     pub fn icon(mut self, icon: &'static str) -> Self {
@@ -169,7 +171,7 @@ impl<T: Clone> Menu<T> {
             content: 0.0,
             reveal: None,
             access: false,
-            access_visible: true,
+            access_visible: !crate::keys::MAC,
         }
     }
 
@@ -185,8 +187,10 @@ impl<T: Clone> Menu<T> {
     /// Whether the marked letters are drawn underlined (default: yes, always). An application
     /// that wants the Windows convention sets it to true only while the menu was opened with the
     /// keyboard or Alt is held, and calls this again when that changes.
+    /// Never on a Mac, which has no access keys: the marks are still read, so a label's `&` is not
+    /// drawn, and typing the letter still picks the item.
     pub fn set_access_visible(&mut self, on: bool) {
-        self.access_visible = on;
+        self.access_visible = on && !crate::keys::MAC;
     }
 
     /// The label as drawn and its marked character: the label itself, borrowed, unless this menu

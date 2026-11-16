@@ -103,8 +103,15 @@ impl Entry {
         self.marks = marks;
         self
     }
+    /// The shortcut or the path at the entry's right. A shortcut is printed the platform's way
+    /// (`keys::label`); anything else is kept as it is.
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = hint.into();
+        let hint = hint.into();
+        self.hint = if crate::keys::MAC {
+            crate::keys::label(&hint).to_string()
+        } else {
+            hint
+        };
         self
     }
     pub fn icon(mut self, icon: &'static str) -> Self {
@@ -1187,6 +1194,7 @@ mod tests {
         ctrl: false,
         shift: false,
         alt: false,
+        control: false,
     };
 
     fn entries(n: u32) -> Vec<Entry> {
