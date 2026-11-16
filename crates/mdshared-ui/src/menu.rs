@@ -733,6 +733,11 @@ mod tests {
         quiet.set_access_visible(false);
         let without_line = drawn(&mut quiet);
         assert_eq!(without_line, reference, "no mark is visible when hidden");
+        // A Mac has no access keys: the marks are read but never drawn.
+        if crate::keys::MAC {
+            assert_eq!(with_line, reference, "a Mac draws no underline");
+            return;
+        }
         assert_ne!(with_line, reference, "the marks are underlined");
         // Menu width and row positions are the same, so the underline is all that differs, and
         // it is on the marked letters' rows only (rows 0 and 2).

@@ -62,9 +62,59 @@ fn work_of_monitor(window: &Window) -> Option<Rect> {
     })
 }
 
-#[cfg(not(windows))]
+/// macOS: the screen's `visibleFrame`, which leaves out the menu bar and the Dock. AppKit gives it
+/// in points from the bottom left; winit's monitor is in pixels from the top left, so the frame's
+/// insets on each side are taken off the monitor's rectangle ([`inset`]).
+#[cfg(target_os = "macos")]
+fn work_of_monitor(window: &Window) -> Option<Rect> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSScreen;
+    use objc2_foundation::{NSNumber, NSString};
+    use winit::platform::macos::MonitorHandleExtMacOS;
+    let monitor = window.current_monitor()?;
+    let id = monitor.native_id();
+    let mtm = MainThreadMarker::new()?;
+    let key = NSString::from_str("NSScreenNumber");
+    let screen = NSScreen::screens(mtm).iter().find(|s| {
+        s.deviceDescription()
+            .objectForKey(&key)
+            .and_then(|n| n.downcast_ref::<NSNumber>().map(|n| n.unsignedIntValue()))
+            == Some(id)
+    })?;
+    let (frame, visible) = (screen.frame(), screen.visibleFrame());
+    let (at, size) = (monitor.position(), monitor.size());
+    let whole = Rect {
+        x: at.x,
+        y: at.y,
+        w: size.width,
+        h: size.height,
+    };
+    let left = visible.origin.x - frame.origin.x;
+    let bottom = visible.origin.y - frame.origin.y;
+    let right = frame.origin.x + frame.size.width - (visible.origin.x + visible.size.width);
+    let top = frame.origin.y + frame.size.height - (visible.origin.y + visible.size.height);
+    inset(whole, [left, top, right, bottom], monitor.scale_factor())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn work_of_monitor(_window: &Window) -> Option<Rect> {
     None
+}
+
+/// `whole` less `insets` (left, top, right, bottom, in points) at `scale` pixels per point; `None`
+/// when nothing would be left.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn inset(whole: Rect, insets: [f64; 4], scale: f64) -> Option<Rect> {
+    let px = |v: f64| (v.max(0.0) * scale).round() as i64;
+    let [l, t, r, b] = insets.map(px);
+    let w = i64::from(whole.w) - l - r;
+    let h = i64::from(whole.h) - t - b;
+    (w > 0 && h > 0).then(|| Rect {
+        x: whole.x + l as i32,
+        y: whole.y + t as i32,
+        w: w as u32,
+        h: h as u32,
+    })
 }
 
 /// Moves and resizes `window` to `rect`, un-maximising it first. True when the window was moved or
@@ -409,6 +459,29 @@ mod kwin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_menu_bar_and_the_dock_are_taken_off_in_pixels() {
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: 2880,
+            h: 1800,
+        };
+        // A 25 pt menu bar at the top and a 70 pt Dock at the bottom, on a Retina screen.
+        let work = inset(whole, [0.0, 25.0, 0.0, 70.0], 2.0).unwrap();
+        assert_eq!((work.x, work.y, work.w, work.h), (0, 50, 2880, 1610));
+        // A Dock at the left of a second screen to the left of the first.
+        let second = Rect {
+            x: -1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        let work = inset(second, [64.0, 0.0, 0.0, 0.0], 1.0).unwrap();
+        assert_eq!((work.x, work.w), (-1856, 1856));
+        assert_eq!(inset(second, [0.0, 600.0, 0.0, 600.0], 1.0), None);
+    }
 
     #[test]
     fn the_place_before_the_first_tiling_is_kept_until_the_user_moves_the_window() {
