@@ -225,3 +225,83 @@ pub fn draw_crash_bar(
     );
     hits
 }
+
+/// Which of an offer bar's controls the pointer is over or holds down.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OfferBarState {
+    pub yes_hovered: bool,
+    pub yes_pressed: bool,
+    pub no_hovered: bool,
+    pub no_pressed: bool,
+    pub close_hovered: bool,
+}
+
+/// Where an offer bar's controls were drawn, for the caller's hits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OfferBarHits {
+    pub yes: Option<Rect>,
+    pub no: Option<Rect>,
+    pub close: Option<Rect>,
+}
+
+/// A bar that offers something: `text` after `icon`, a primary button `yes`, a quiet one `no`
+/// and a close button (for "not now"). The stale-tab offer ([`crate::stale`]) is one.
+#[allow(clippy::too_many_arguments)] // a bar: where, what it says, its two buttons and state
+pub fn draw_offer_bar(
+    p: &mut Painter,
+    pal: &Palette,
+    bar: Rect,
+    icon: &str,
+    text: &str,
+    yes: &str,
+    no: &str,
+    state: OfferBarState,
+) -> OfferBarHits {
+    let mut hits = OfferBarHits::default();
+    p.fill(bar, pal.bar);
+    p.fill(
+        Rect::new(bar.x, bar.bottom() - p.px(), bar.w, p.px()),
+        pal.line,
+    );
+    let close = Rect::new(bar.right() - 34.0, bar.cy() - 12.0, 24.0, 24.0);
+    if state.close_hovered {
+        p.rbox(close, 5.0, mix(pal.bar, pal.text, 0.10));
+    }
+    p.icon(glyph::CLOSE, 10.0, close.cx(), close.cy(), pal.muted);
+    hits.close = Some(close);
+    let mut right = close.x - 10.0;
+    right -= bar_button_w(p, no);
+    hits.no = Some(bar_button(
+        p,
+        pal,
+        right,
+        bar.cy(),
+        no,
+        false,
+        state.no_hovered,
+        state.no_pressed,
+    ));
+    right -= 8.0 + bar_button_w(p, yes);
+    hits.yes = Some(bar_button(
+        p,
+        pal,
+        right,
+        bar.cy(),
+        yes,
+        true,
+        state.yes_hovered,
+        state.yes_pressed,
+    ));
+    right -= 12.0;
+    p.icon(icon, 13.0, bar.x + 22.0, bar.cy(), pal.muted);
+    p.text(
+        Face::Ui,
+        12.5,
+        bar.x + 38.0,
+        bar.cy(),
+        text,
+        pal.text,
+        (right - (bar.x + 38.0)).max(0.0),
+    );
+    hits
+}

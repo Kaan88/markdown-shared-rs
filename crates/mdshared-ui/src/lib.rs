@@ -25,6 +25,7 @@ pub mod scroll;
 pub mod settings;
 pub mod shadow;
 pub mod snap;
+pub mod stale;
 pub mod textfield;
 pub mod theme;
 pub mod tree;
