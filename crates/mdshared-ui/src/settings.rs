@@ -241,7 +241,7 @@ const MAX_CARD_H: f32 = 640.0;
 /// a dozen rows needs no scrolling in an ordinary window.
 const SINGLE_HEADER_H: f32 = 32.0;
 const SINGLE_HEADER_FIRST_H: f32 = 28.0;
-const SINGLE_MAX_CARD_H: f32 = 720.0;
+const SINGLE_MAX_CARD_H: f32 = 760.0;
 /// The card gets a category list at least this wide.
 const NAV_MIN_CARD: f32 = 700.0;
 const TOGGLE_W: f32 = 40.0;
