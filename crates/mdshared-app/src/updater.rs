@@ -37,6 +37,10 @@ pub struct App {
     /// The file stem of a second executable that ships beside the application's and is replaced
     /// with it (`mdview-engine`), if there is one. The manifest's `engine.*` keys describe it.
     pub engine: Option<&'static str>,
+    /// The file stems of further executables beside the application's, replaced with it
+    /// (`mdedit-ai`). Only a format-2 manifest lists them (`P.<stem>.url`, `P.<stem>.sha256`), so
+    /// an application with any reads a manifest of that format: [`App::manifest_url`] names it.
+    pub extras: &'static [&'static str],
     /// The application's entry in Windows' list of installed apps, as `reg.exe` names it
     /// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{…}_is1`), if an installer
     /// makes one.
@@ -80,6 +84,8 @@ pub struct Offer {
     pub app: Download,
     /// The second executable, for an application that has one.
     pub engine: Option<Download>,
+    /// The further executables, in the order of [`App::extras`] (Windows only).
+    pub extras: Vec<Download>,
 }
 
 /// Where the reader's update stands, for the bar over the page.
@@ -112,12 +118,15 @@ pub type Fetch<'a> = &'a dyn Fn(&str, usize, Duration) -> Result<Vec<u8>, String
 pub struct Files {
     pub app: PathBuf,
     pub engine: Option<PathBuf>,
+    /// The further executables, in the order of [`App::extras`] (Windows only).
+    pub extras: Vec<PathBuf>,
 }
 
 impl Files {
     fn targets(&self) -> Vec<PathBuf> {
         std::iter::once(self.app.clone())
             .chain(self.engine.clone())
+            .chain(self.extras.iter().cloned())
             .collect()
     }
 }
@@ -141,7 +150,17 @@ pub fn installed_files(app: &App) -> Option<Files> {
     let engine = app
         .engine
         .map(|stem| dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)));
-    Some(Files { app: exe, engine })
+    // The same for the further executables (mdedit before 1.1 had no mdedit-ai).
+    let extras = app
+        .extras
+        .iter()
+        .map(|stem| dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX)))
+        .collect();
+    Some(Files {
+        app: exe,
+        engine,
+        extras,
+    })
 }
 
 /// The AppImage this process runs from, when this copy can update itself: `$APPIMAGE` names an
@@ -163,6 +182,7 @@ pub fn installed_files(_app: &App) -> Option<Files> {
     crate::appimage::folder_is_writable(bundle.parent()?).then_some(Files {
         app: bundle,
         engine: None,
+        extras: Vec::new(),
     })
 }
 
@@ -224,7 +244,11 @@ fn stage_bundle(zip: &[u8], bundle: &std::path::Path) -> Result<(), String> {
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn appimage_files(value: Option<&std::ffi::OsStr>) -> Option<Files> {
     let app = crate::appimage::path_from(value)?;
-    crate::appimage::folder_is_writable(app.parent()?).then_some(Files { app, engine: None })
+    crate::appimage::folder_is_writable(app.parent()?).then_some(Files {
+        app,
+        engine: None,
+        extras: Vec::new(),
+    })
 }
 
 /// Reads a manifest: the offer if it names a version newer than `current` with every file this
@@ -253,9 +277,20 @@ fn offer_for(
         (_, Platform::LinuxX64 | Platform::MacArm64 | Platform::MacX64) => None,
         // On Windows a release without the engine cannot be installed in place; it is not an offer.
         (Some(_), _) if asset.engine.is_none() => return Ok(None),
-        (Some(_), _) => asset.engine,
+        (Some(_), _) => asset.engine.clone(),
         (None, _) => None,
     };
+    // The further executables likewise: inside the AppImage or bundle elsewhere; on Windows each
+    // must be listed, or the release is not an offer.
+    let mut extras = Vec::new();
+    if platform == Platform::WindowsX64 {
+        for stem in app.extras {
+            match asset.extra(stem) {
+                Some(d) => extras.push(d.clone()),
+                None => return Ok(None),
+            }
+        }
+    }
     Ok(Some(Offer {
         version: manifest.version,
         notes: manifest.notes,
@@ -264,13 +299,15 @@ fn offer_for(
             sha256: asset.sha256,
         },
         engine,
+        extras,
     }))
 }
 
-/// For a copy whose engine is missing (`files.engine` names a file that is not there): when the
-/// manifest is of this very version and lists the engine for `platform`, downloads it, checks it
-/// against its hash and puts it in place. True when it did. An update from a version that had no
-/// engine brings only the executable; this completes it at the next launch.
+/// For a copy whose engine or a further executable is missing (`files` names a file that is not
+/// there): when the manifest is of this very version and lists that file for `platform`, downloads
+/// it, checks it against its hash and puts it in place. True when it put any in place. An update
+/// from a version that had no such file brings only what that version knew of; this completes it
+/// at the next launch.
 pub fn restore_engine(
     app: &App,
     files: &Files,
@@ -278,28 +315,51 @@ pub fn restore_engine(
     platform: Platform,
     fetch: Fetch,
 ) -> Result<bool, String> {
-    let Some(target) = files.engine.as_ref().filter(|p| !p.exists()) else {
+    let engine = files.engine.as_ref().filter(|p| !p.exists());
+    let extras: Vec<(usize, &PathBuf)> = files
+        .extras
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.exists())
+        .collect();
+    if engine.is_none() && extras.is_empty() {
         return Ok(false);
-    };
+    }
     let manifest = UpdateManifest::parse(manifest).map_err(|e| e.to_string())?;
     if manifest.version != app.current_version() {
         return Ok(false);
     }
-    let Some(download) = manifest.asset(platform).and_then(|a| a.engine.clone()) else {
+    let Some(asset) = manifest.asset(platform) else {
         return Ok(false);
     };
-    let bytes = fetch(&download.url, MAX_FILE_BYTES, FILE_TIMEOUT)?;
-    if !update::verify_sha256(&bytes, &download.sha256) {
-        return Err("the engine does not match its SHA-256".to_string());
+    let mut wanted: Vec<(&Download, &PathBuf)> = Vec::new();
+    if let (Some(target), Some(download)) = (engine, asset.engine.as_ref()) {
+        wanted.push((download, target));
     }
-    let staged = selfupdate::staged(target);
-    let written = std::fs::write(&staged, &bytes)
-        .and_then(|()| selfupdate::swap_in(std::slice::from_ref(target)));
-    if let Err(e) = written {
-        _ = selfupdate::remove_any(&staged);
-        return Err(e.to_string());
+    for (i, target) in extras {
+        if let Some(download) = app.extras.get(i).and_then(|stem| asset.extra(stem)) {
+            wanted.push((download, target));
+        }
     }
-    Ok(true)
+    let mut restored = false;
+    for (download, target) in wanted {
+        let bytes = fetch(&download.url, MAX_FILE_BYTES, FILE_TIMEOUT)?;
+        if !update::verify_sha256(&bytes, &download.sha256) {
+            return Err(format!(
+                "{} does not match its SHA-256",
+                target.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+        let staged = selfupdate::staged(target);
+        let written = std::fs::write(&staged, &bytes)
+            .and_then(|()| selfupdate::swap_in(std::slice::from_ref(target)));
+        if let Err(e) = written {
+            _ = selfupdate::remove_any(&staged);
+            return Err(e.to_string());
+        }
+        restored = true;
+    }
+    Ok(restored)
 }
 
 /// Fetches the manifest and reads it.
@@ -331,6 +391,10 @@ fn stage_and_swap(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), Stri
         (None, None) => {}
         _ => return Err("the release and this copy disagree about the engine".to_string()),
     }
+    if offer.extras.len() != files.extras.len() {
+        return Err("the release and this copy disagree about their files".to_string());
+    }
+    pairs.extend(offer.extras.iter().zip(&files.extras));
     for (download, target) in pairs {
         let bytes = fetch(&download.url, MAX_FILE_BYTES, FILE_TIMEOUT)?;
         if !update::verify_sha256(&bytes, &download.sha256) {
@@ -720,6 +784,7 @@ impl Updates {
             notes: Some("Faster scrolling in long documents.".to_string()),
             app: download("app.exe"),
             engine: Some(download("engine.exe")),
+            extras: Vec::new(),
         };
         self.stage = match stage {
             "available" => Stage::Available(offer),
@@ -746,6 +811,7 @@ mod tests {
         manifest_url: "https://example.com/update.txt",
         manifest_env: "MDSHARED_TEST_UPDATE_MANIFEST",
         engine: Some("mdtest-engine"),
+        extras: &[],
         uninstall_key: None,
     };
     const ALONE: App = App {
@@ -791,6 +857,7 @@ mod tests {
         let files = Files {
             app: dir.join("app.exe"),
             engine: engine.then(|| dir.join("engine.exe")),
+            extras: Vec::new(),
         };
         std::fs::write(&files.app, "app 1").unwrap();
         if let Some(engine) = &files.engine {
@@ -902,6 +969,7 @@ mod tests {
         let files = Files {
             app: app.clone(),
             engine: None,
+            extras: Vec::new(),
         };
         let offer_of = |zip: &[u8]| Offer {
             version: Version::parse("0.3.0").unwrap(),
@@ -911,6 +979,7 @@ mod tests {
                 sha256: sha256_hex(zip),
             },
             engine: None,
+            extras: Vec::new(),
         };
 
         let other = zip_of(&d.join("other/other.app"));
@@ -1058,6 +1127,108 @@ mod tests {
         _ = std::fs::remove_dir_all(files.app.parent().unwrap());
     }
 
+    const WITH_AI: App = App {
+        manifest_url: "https://example.com/update-2.txt",
+        extras: &["mdtest-ai"],
+        ..APP
+    };
+
+    /// A format-2 Windows manifest: the app, the engine and, when given, the further file.
+    fn win_manifest_2(version: &str, ai: Option<&[u8]>) -> String {
+        let mut m = win_manifest(version, b"app 2", Some(b"engine 2"))
+            .replace("manifest: 1", "manifest: 2");
+        if let Some(ai) = ai {
+            m.push_str(&format!(
+                "windows-x86_64.mdtest-ai.url: https://example.com/ai\n\
+                 windows-x86_64.mdtest-ai.sha256: {}\n",
+                sha256_hex(ai)
+            ));
+        }
+        m
+    }
+
+    fn release_2(url: &str, _: usize, _: Duration) -> Result<Vec<u8>, String> {
+        Ok(match url.rsplit('/').next().unwrap_or("") {
+            "app" => b"app 2".to_vec(),
+            "engine" => b"engine 2".to_vec(),
+            "ai" => b"ai 2".to_vec(),
+            _ => return Err(format!("no such file: {url}")),
+        })
+    }
+
+    #[test]
+    fn further_files_are_needed_installed_and_restored() {
+        let current = WITH_AI.current_version();
+        // Windows: a release without the further file is not an offer; with it, it is.
+        let bare = win_manifest_2("9.0.0", None);
+        assert_eq!(win_offer(&WITH_AI, &bare, &current), Ok(None));
+        let full = win_manifest_2("9.0.0", Some(b"ai 2"));
+        let o = win_offer(&WITH_AI, &full, &current).unwrap().unwrap();
+        assert_eq!(o.extras.len(), 1);
+        assert_eq!(o.extras[0].url, "https://example.com/ai");
+        // An application without further files ignores them.
+        let o1 = win_offer(&APP, &full, &current).unwrap().unwrap();
+        assert!(o1.extras.is_empty());
+        // Elsewhere they are inside the AppImage or the bundle.
+        let linux = full.replace("windows-x86_64", "linux-x86_64");
+        let ol = offer_for(&WITH_AI, linux.as_bytes(), &current, Platform::LinuxX64)
+            .unwrap()
+            .unwrap();
+        assert!(ol.extras.is_empty() && ol.engine.is_none());
+
+        // Install replaces all three; a damaged further file replaces nothing.
+        let mut files = files("extras", true);
+        let ai = files.app.parent().unwrap().join("ai.exe");
+        std::fs::write(&ai, "ai 1").unwrap();
+        files.extras = vec![ai.clone()];
+        let damaged = |url: &str, n: usize, t: Duration| {
+            if url.ends_with("/ai") {
+                Ok(b"ai 2, damaged".to_vec())
+            } else {
+                release_2(url, n, t)
+            }
+        };
+        let err = install(&o, &files, &damaged).unwrap_err();
+        assert!(err.contains("ai.exe"), "{err}");
+        assert_eq!(read(&files.app), "app 1");
+        assert_eq!(read(&ai), "ai 1");
+        assert!(!selfupdate::staged(&ai).exists());
+        // A copy that does not know the further file cannot take this offer.
+        let mut short = files.clone();
+        short.extras.clear();
+        assert!(install(&o, &short, &release_2).is_err());
+        assert_eq!(read(&files.app), "app 1");
+        install(&o, &files, &release_2).unwrap();
+        assert_eq!(read(&files.app), "app 2");
+        assert_eq!(read(files.engine.as_ref().unwrap()), "engine 2");
+        assert_eq!(read(&ai), "ai 2");
+        clean_up(&files);
+
+        // Restore: a copy updated by an older build has no further file; a manifest of its own
+        // version puts it in place, and leaves the engine that is there alone.
+        std::fs::remove_file(&ai).unwrap();
+        let this = win_manifest_2("0.2.0", Some(b"ai 2"));
+        let w = Platform::WindowsX64;
+        let asked = RefCell::new(Vec::new());
+        let fetch = |url: &str, n: usize, t: Duration| {
+            asked.borrow_mut().push(url.to_string());
+            release_2(url, n, t)
+        };
+        assert_eq!(
+            restore_engine(&WITH_AI, &files, this.as_bytes(), w, &fetch),
+            Ok(true)
+        );
+        assert_eq!(read(&ai), "ai 2");
+        assert_eq!(*asked.borrow(), ["https://example.com/ai"]);
+        // Nothing missing: nothing fetched.
+        assert_eq!(
+            restore_engine(&WITH_AI, &files, this.as_bytes(), w, &fetch),
+            Ok(false)
+        );
+        assert_eq!(asked.borrow().len(), 1);
+        _ = std::fs::remove_dir_all(files.app.parent().unwrap());
+    }
+
     #[test]
     fn an_application_with_one_executable_installs_one_file() {
         let files = files("alone", false);
@@ -1139,7 +1310,8 @@ mod tests {
             appimage_files(Some(files.app.as_os_str())),
             Some(Files {
                 app: canonical,
-                engine: None
+                engine: None,
+                extras: Vec::new(),
             })
         );
         assert_eq!(appimage_files(None), None);

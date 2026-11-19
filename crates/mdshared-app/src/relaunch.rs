@@ -102,7 +102,11 @@ mod tests {
     }
 
     fn files(app: PathBuf) -> Files {
-        Files { app, engine: None }
+        Files {
+            app,
+            engine: None,
+            extras: Vec::new(),
+        }
     }
 
     #[test]

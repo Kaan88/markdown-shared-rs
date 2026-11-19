@@ -23,6 +23,12 @@
 //!     `P.engine.url` and `P.engine.sha256` (same rules; both or neither) describe the engine
 //!     executable that ships beside it. A build that updates itself in place needs both files, so
 //!     it ignores a platform entry without them.
+//! * A manifest whose header is `manifest: 2` may also list further executables per platform:
+//!   `P.<stem>.url` and `P.<stem>.sha256` (both; same rules as above), where `<stem>` is the
+//!   file stem (`mdedit-ai`): lower-case letters, digits and `-`. At most [`MAX_EXTRAS`] per
+//!   platform. Builds before this format refuse such keys and the `2` header, so an application
+//!   that has further executables publishes them in a manifest file of its own (mdedit:
+//!   `mdedit-update-2.txt`) beside the format-1 one the older builds read.
 //! * At least one platform must be present.
 //! * A key for a platform this build does not know (`os-arch.field`, such as a later
 //!   `linux-aarch64.url`) is skipped, so a manifest can grow new platforms without stopping older
@@ -86,7 +92,7 @@ impl fmt::Display for UpdateError {
             Self::NotUtf8 => write!(f, "manifest is not UTF-8"),
             Self::TooManyLines => write!(f, "manifest has too many lines"),
             Self::BadLine(n) => write!(f, "malformed line {n}"),
-            Self::BadHeader => write!(f, "missing or unsupported `manifest: 1` header"),
+            Self::BadHeader => write!(f, "missing or unsupported `manifest: 1` (or `2`) header"),
             Self::UnknownKey(k) => write!(f, "unknown key `{k}`"),
             Self::DuplicateKey(k) => write!(f, "duplicate key `{k}`"),
             Self::BadValue(k) => write!(f, "invalid value for `{k}`"),
@@ -306,7 +312,23 @@ pub struct Asset {
     /// Lower-case 64-digit hex.
     pub sha256: String,
     pub engine: Option<Download>,
+    /// Further executables beside the application's, by file stem (`mdedit-ai`), in the order
+    /// the manifest lists them. Only a format-2 manifest has them.
+    pub extras: Vec<(String, Download)>,
 }
+
+impl Asset {
+    /// The further executable of this stem, if the manifest lists it.
+    pub fn extra(&self, stem: &str) -> Option<&Download> {
+        self.extras.iter().find(|(s, _)| s == stem).map(|(_, d)| d)
+    }
+}
+
+/// A further executable while the manifest is read: stem, url, sha256.
+type PartFile = (String, Option<String>, Option<String>);
+
+/// At most this many further executables per platform.
+pub const MAX_EXTRAS: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateManifest {
@@ -332,7 +354,10 @@ impl UpdateManifest {
         }
         let mut seen: Vec<&str> = Vec::new();
         let mut header = false;
+        let mut format2 = false;
         let mut version = None;
+        // Per platform: stem, url, sha256 of each further executable (format 2).
+        let mut extras: [Vec<PartFile>; 4] = Default::default();
         let mut notes = None;
         let mut fields: [[Option<String>; 5]; 4] = Default::default();
         for (i, raw) in text.lines().enumerate() {
@@ -345,10 +370,11 @@ impl UpdateManifest {
             };
             let (k, v) = (k.trim(), v.trim());
             if !header {
-                if k != "manifest" || v != "1" {
+                if k != "manifest" || !matches!(v, "1" | "2") {
                     return Err(UpdateError::BadHeader);
                 }
                 header = true;
+                format2 = v == "2";
                 continue;
             }
             if seen.contains(&k) {
@@ -384,7 +410,38 @@ impl UpdateManifest {
                         "engine.url" => return Err(UpdateError::BadValue("engine.url")),
                         "engine.sha256" if valid_sha(v) => (4, v.to_ascii_lowercase()),
                         "engine.sha256" => return Err(UpdateError::BadValue("engine.sha256")),
-                        _ => return Err(UpdateError::UnknownKey(k.chars().take(40).collect())),
+                        _ => {
+                            let extra = field
+                                .rsplit_once('.')
+                                .filter(|(stem, _)| format2 && valid_stem(stem));
+                            let Some((stem, which)) = extra else {
+                                return Err(UpdateError::UnknownKey(k.chars().take(40).collect()));
+                            };
+                            let list = &mut extras[pi];
+                            let at = match list.iter().position(|(s, _, _)| s == stem) {
+                                Some(at) => at,
+                                None if list.len() < MAX_EXTRAS => {
+                                    list.push((stem.to_string(), None, None));
+                                    list.len() - 1
+                                }
+                                None => return Err(UpdateError::BadValue("too many files")),
+                            };
+                            match which {
+                                "url" if valid_url(v) => list[at].1 = Some(v.to_string()),
+                                "url" => return Err(UpdateError::BadValue("url")),
+                                "sha256" if valid_sha(v) => {
+                                    list[at].2 = Some(v.to_ascii_lowercase())
+                                }
+                                "sha256" => return Err(UpdateError::BadValue("sha256")),
+                                _ => {
+                                    return Err(UpdateError::UnknownKey(
+                                        k.chars().take(40).collect(),
+                                    ));
+                                }
+                            }
+                            seen.push(k);
+                            continue;
+                        }
                     };
                     fields[pi][slot] = Some(val);
                 }
@@ -396,8 +453,15 @@ impl UpdateManifest {
         }
         let version = version.ok_or(UpdateError::MissingField("version"))?;
         let mut assets: [Option<Asset>; 4] = Default::default();
-        for (pi, f) in fields.into_iter().enumerate() {
+        for (pi, (f, more)) in fields.into_iter().zip(extras).enumerate() {
             let [name, url, sha256, engine_url, engine_sha256] = f;
+            let mut extras = Vec::new();
+            for (stem, url, sha256) in more {
+                match (url, sha256) {
+                    (Some(url), Some(sha256)) => extras.push((stem, Download { url, sha256 })),
+                    _ => return Err(UpdateError::MissingField("platform file url/sha256")),
+                }
+            }
             let engine = match (engine_url, engine_sha256) {
                 (None, None) => None,
                 (Some(url), Some(sha256)) => Some(Download { url, sha256 }),
@@ -408,13 +472,14 @@ impl UpdateManifest {
                 }
             };
             match (name, url, sha256) {
-                (None, None, None) if engine.is_none() => {}
+                (None, None, None) if engine.is_none() && extras.is_empty() => {}
                 (Some(name), Some(url), Some(sha256)) => {
                     assets[pi] = Some(Asset {
                         name,
                         url,
                         sha256,
                         engine,
+                        extras,
                     })
                 }
                 _ => return Err(UpdateError::MissingField("platform asset/url/sha256")),
@@ -429,6 +494,16 @@ impl UpdateManifest {
             assets,
         })
     }
+}
+
+/// The file stem of a further executable: lower-case letters, digits and `-`, not one of the
+/// three fields of every platform.
+fn valid_stem(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 40
+        && !matches!(v, "asset" | "url" | "sha256" | "engine")
+        && v.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 fn valid_asset(v: &str) -> bool {
@@ -788,8 +863,13 @@ linux-x86_64.engine.sha256: {SHA}
             ),
             (ok.replace("manifest: 1\n", ""), UpdateError::BadHeader),
             (
-                ok.replace("manifest: 1", "manifest: 2"),
+                ok.replace("manifest: 1", "manifest: 3"),
                 UpdateError::BadHeader,
+            ),
+            (
+                // Further files are format 2 only.
+                format!("{ok}windows-x86_64.mdedit-ai.url: https://example.com/a\n"),
+                UpdateError::UnknownKey("windows-x86_64.mdedit-ai.url".into()),
             ),
             (
                 ok.replace("version: 0.2.0", "version: nope"),
@@ -1012,5 +1092,85 @@ linux-x86_64.engine.sha256: {SHA}
         assert!(!verify_sha256_file(&p, SHA).unwrap());
         std::fs::remove_file(&p).unwrap();
         assert!(verify_sha256_file(&p, good).is_err());
+    }
+
+    #[test]
+    fn format_2_lists_further_files() {
+        let sha = "ab".repeat(32);
+        let base = format!(
+            "manifest: 2\nversion: 1.1.0\nwindows-x86_64.asset: mdedit.exe\n\
+             windows-x86_64.url: https://example.com/mdedit.exe\nwindows-x86_64.sha256: {sha}\n\
+             windows-x86_64.engine.url: https://example.com/mdview-engine.exe\n\
+             windows-x86_64.engine.sha256: {sha}\n"
+        );
+        let full = format!(
+            "{base}windows-x86_64.mdedit-ai.url: https://example.com/mdedit-ai.exe\n\
+             windows-x86_64.mdedit-ai.sha256: {}\n",
+            "CD".repeat(32)
+        );
+        let m = UpdateManifest::parse(full.as_bytes()).unwrap();
+        let a = m.asset(Platform::WindowsX64).unwrap();
+        assert_eq!(a.extras.len(), 1);
+        let ai = a.extra("mdedit-ai").unwrap();
+        assert_eq!(ai.url, "https://example.com/mdedit-ai.exe");
+        assert_eq!(ai.sha256, "cd".repeat(32));
+        assert_eq!(a.extra("other"), None);
+        // A format-2 manifest without further files is a plain one.
+        let plain = UpdateManifest::parse(base.as_bytes()).unwrap();
+        assert!(plain.asset(Platform::WindowsX64).unwrap().extras.is_empty());
+
+        let bad = [
+            // Half a file.
+            (
+                format!("{base}windows-x86_64.mdedit-ai.url: https://example.com/x\n"),
+                UpdateError::MissingField("platform file url/sha256"),
+            ),
+            (
+                format!("{base}windows-x86_64.mdedit-ai.url: http://example.com/x\n"),
+                UpdateError::BadValue("url"),
+            ),
+            (
+                format!("{base}windows-x86_64.mdedit-ai.sha256: 12\n"),
+                UpdateError::BadValue("sha256"),
+            ),
+            // Not a stem: upper case, a reserved word, another field.
+            (
+                format!("{base}windows-x86_64.Mdedit.url: https://example.com/x\n"),
+                UpdateError::UnknownKey("windows-x86_64.Mdedit.url".into()),
+            ),
+            (
+                format!("{base}windows-x86_64.asset.url: https://example.com/x\n"),
+                UpdateError::UnknownKey("windows-x86_64.asset.url".into()),
+            ),
+            (
+                format!("{base}windows-x86_64.mdedit-ai.size: 12\n"),
+                UpdateError::UnknownKey("windows-x86_64.mdedit-ai.size".into()),
+            ),
+            // A file alone does not make a platform.
+            (
+                format!(
+                    "{base}linux-x86_64.mdedit-ai.url: https://example.com/x\n\
+                     linux-x86_64.mdedit-ai.sha256: {sha}\n"
+                ),
+                UpdateError::MissingField("platform asset/url/sha256"),
+            ),
+        ];
+        for (text, want) in bad {
+            assert_eq!(
+                UpdateManifest::parse(text.as_bytes()).unwrap_err(),
+                want,
+                "{text}"
+            );
+        }
+        let mut many = base.clone();
+        for i in 0..=MAX_EXTRAS {
+            many.push_str(&format!(
+                "windows-x86_64.f{i}.url: https://example.com/{i}\nwindows-x86_64.f{i}.sha256: {sha}\n"
+            ));
+        }
+        assert_eq!(
+            UpdateManifest::parse(many.as_bytes()).unwrap_err(),
+            UpdateError::BadValue("too many files")
+        );
     }
 }
