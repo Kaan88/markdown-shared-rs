@@ -52,7 +52,12 @@ pub struct TextField {
     scroll: f32,
     /// What an input method is composing, drawn at the caret until it is committed or dropped.
     preedit: Option<Preedit>,
+    /// A secret (an API key): drawn as dots, never copied or cut.
+    secret: bool,
 }
+
+/// What a secret field draws for each char.
+const MASK: char = '•';
 
 /// The text an input method is composing (winit's `Ime::Preedit`): drawn underlined where it will
 /// go, not yet part of the text. `cursor` is the input method's caret or selected clause in it,
@@ -93,6 +98,27 @@ impl TextField {
 
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
+    }
+
+    /// Makes the field a secret one: its text is drawn as dots and cannot be copied or cut.
+    pub fn set_secret(&mut self, on: bool) {
+        self.secret = on;
+    }
+
+    pub fn is_secret(&self) -> bool {
+        self.secret
+    }
+
+    /// The text as it is drawn: the text itself, or one dot per char for a secret. Caret stops
+    /// are measured on this.
+    pub fn display(&self) -> std::borrow::Cow<'_, str> {
+        if self.secret {
+            std::iter::repeat_n(MASK, self.text.chars().count())
+                .collect::<String>()
+                .into()
+        } else {
+            self.text.as_str().into()
+        }
     }
 
     /// Sets or clears what an input method is composing at the caret. Returns true if it changed.
@@ -302,13 +328,13 @@ impl TextField {
                 false
             }
             KeyName::Char('c') if mods.ctrl && !mods.alt => {
-                if clipboard && self.has_selection() {
+                if clipboard && self.has_selection() && !self.secret {
                     crate::platform::set_clipboard_text(self.selected_text());
                 }
                 false
             }
             KeyName::Char('x') if mods.ctrl && !mods.alt => {
-                if clipboard && self.has_selection() {
+                if clipboard && self.has_selection() && !self.secret {
                     crate::platform::set_clipboard_text(self.selected_text());
                     self.delete_selection()
                 } else {
@@ -380,6 +406,11 @@ impl TextField {
         if self.text.is_empty() {
             return;
         }
+        // A secret's words are not shown, so a double click takes all of it.
+        if self.secret {
+            self.select_all();
+            return;
+        }
         let x = x + self.scroll;
         let count = self.text.chars().count();
         let stops = &stops[..stops.len().min(count + 1)];
@@ -428,17 +459,21 @@ impl TextField {
     ) {
         // While an input method composes, its text is drawn in place at the caret, underlined,
         // with the input method's caret; the selection is not shown.
-        let composing = self.preedit.as_ref().filter(|_| focused);
+        // A secret shows neither its text nor what is being composed for it.
+        let composing = self.preedit.as_ref().filter(|_| focused && !self.secret);
         let shown: std::borrow::Cow<str> = match composing {
             Some(pre) => {
                 let mut s = self.text.clone();
                 s.insert_str(self.caret, &pre.text);
                 s.into()
             }
+            // Owned, so the scroll below can still change.
+            None if self.secret => self.display().into_owned().into(),
             None => self.text.as_str().into(),
         };
         let (caret_b, anchor_b) = match composing {
             Some(pre) => (self.caret + pre.caret(), self.caret + pre.caret()),
+            None if self.secret => (self.masked(self.caret), self.masked(self.anchor)),
             None => (self.caret, self.anchor),
         };
         let stops = p.caret_stops(face, size, &shown);
@@ -512,6 +547,13 @@ impl TextField {
     }
 }
 
+impl TextField {
+    /// Where byte offset `at` of the text falls in the dots a secret draws.
+    fn masked(&self, at: usize) -> usize {
+        self.text[..at].chars().count() * MASK.len_utf8()
+    }
+}
+
 /// Drops control characters; newlines and tabs become spaces.
 fn clean(text: &str) -> String {
     text.replace("\r\n", "\n")
@@ -561,6 +603,20 @@ mod tests {
     fn at(f: &mut TextField, caret: usize) {
         f.caret = caret;
         f.anchor = caret;
+    }
+
+    #[test]
+    fn a_secret_draws_one_dot_per_char_and_selects_whole() {
+        let mut f = field("sk-ğü");
+        assert_eq!(f.display(), "sk-ğü");
+        f.set_secret(true);
+        assert_eq!(f.display(), "•••••");
+        assert_eq!(f.text(), "sk-ğü");
+        // The caret after "sk-ğ" (5 bytes) is after the fourth dot.
+        at(&mut f, 5);
+        assert_eq!(f.masked(f.caret), 4 * MASK.len_utf8());
+        f.select_word_at(1.0, &stops("•••••"));
+        assert_eq!(f.selected_text(), "sk-ğü");
     }
 
     #[test]

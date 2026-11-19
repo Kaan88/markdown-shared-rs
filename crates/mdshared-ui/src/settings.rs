@@ -71,6 +71,8 @@ pub enum Row {
         help: String,
         value: String,
         placeholder: String,
+        /// Drawn as dots and never copied: an API key.
+        secret: bool,
     },
     /// A button; pressing it gives [`Outcome::Action`].
     Action {
@@ -120,6 +122,7 @@ impl Row {
             help: String::new(),
             value: value.into(),
             placeholder: String::new(),
+            secret: false,
         }
     }
     pub fn action(id: u32, label: impl Into<String>, button: impl Into<String>) -> Row {
@@ -157,6 +160,13 @@ impl Row {
     pub fn placeholder(mut self, text: impl Into<String>) -> Row {
         if let Row::Text { placeholder, .. } = &mut self {
             *placeholder = text.into();
+        }
+        self
+    }
+    /// A text row whose value is a secret (an API key): drawn as dots, never copied or cut.
+    pub fn secret(mut self) -> Row {
+        if let Row::Text { secret, .. } = &mut self {
+            *secret = true;
         }
         self
     }
@@ -380,14 +390,22 @@ impl Form {
         self.fields = rows
             .iter()
             .map(|r| match r {
-                Row::Text { id, value, .. } => match old_ids.iter().position(|o| *o == Some(*id)) {
-                    Some(k) if old_fields[k].text() == value => std::mem::take(&mut old_fields[k]),
-                    _ => {
-                        let mut f = TextField::new();
-                        f.set_text(value);
-                        f
-                    }
-                },
+                Row::Text {
+                    id, value, secret, ..
+                } => {
+                    let mut f = match old_ids.iter().position(|o| *o == Some(*id)) {
+                        Some(k) if old_fields[k].text() == value => {
+                            std::mem::take(&mut old_fields[k])
+                        }
+                        _ => {
+                            let mut f = TextField::new();
+                            f.set_text(value);
+                            f
+                        }
+                    };
+                    f.set_secret(*secret);
+                    f
+                }
                 _ => TextField::new(),
             })
             .collect();
@@ -524,11 +542,12 @@ impl Form {
         self.content = y + 8.0;
         self.looks = (0..self.rows.len()).map(|i| self.look(p, i)).collect();
         for i in 0..self.rows.len() {
-            if matches!(self.rows[i], Row::Text { .. })
-                && self.stops_text[i] != self.fields[i].text()
-            {
-                self.stops[i] = p.caret_stops(Face::Ui, 13.0, self.fields[i].text());
-                self.stops_text[i] = self.fields[i].text().to_string();
+            if matches!(self.rows[i], Row::Text { .. }) {
+                let shown = self.fields[i].display();
+                if self.stops_text[i] != shown {
+                    self.stops[i] = p.caret_stops(Face::Ui, 13.0, &shown);
+                    self.stops_text[i] = shown.into_owned();
+                }
             }
         }
 
