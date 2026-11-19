@@ -352,7 +352,9 @@ mod tests {
         );
         assert!(text.contains("what:    panic: boom 42\n"), "{text}");
         assert!(
-            text.contains("where:   crates/mdshared-app/src/crash.rs:"),
+            // Windows writes the path with backslashes.
+            text.replace('\\', "/")
+                .contains("where:   crates/mdshared-app/src/crash.rs:"),
             "{text}"
         );
         assert!(text.contains("thread:  worker\n"), "{text}");

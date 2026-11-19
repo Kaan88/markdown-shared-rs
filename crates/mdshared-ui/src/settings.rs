@@ -310,6 +310,8 @@ pub struct Form {
     menu_pressed: Option<usize>,
     /// The category the user jumped to, and the scroll that put it at the top.
     pin: Option<(usize, f32)>,
+    /// A category asked for before the form was laid out: jumped to by the next layout.
+    pending_jump: Option<usize>,
     /// One page: the groups are headings in the scrolling body, with no category list.
     single_page: bool,
 
@@ -345,6 +347,7 @@ impl Form {
             menu: None,
             menu_pressed: None,
             pin: None,
+            pending_jump: None,
             single_page: false,
             laid: false,
             window: Rect::default(),
@@ -590,7 +593,15 @@ impl Form {
         self.body = Rect::new(bx, top, r.right() - 8.0 - bx, (bottom - top).max(0.0));
         self.laid = true;
         self.scroll = self.scroll.clamp(0.0, self.max_scroll()).round();
+        if let Some(c) = self.pending_jump.take() {
+            self.jump_to_category(c);
+        }
         self.card
+    }
+
+    /// The row geometry is that of the current rows: laid out since they were last set.
+    fn geometry_ready(&self) -> bool {
+        self.laid && self.offs.len() >= self.rows.len()
     }
 
     fn max_scroll(&self) -> f32 {
@@ -1248,7 +1259,13 @@ impl Form {
 
     /// Scrolls so that group `c` starts at the top of the body (as far as the end of the content
     /// allows) and marks it as the current category.
+    /// Before the form is laid out the jump waits for the layout.
     pub fn jump_to_category(&mut self, c: usize) {
+        if !self.geometry_ready() {
+            self.pending_jump = Some(c);
+            self.pin = None;
+            return;
+        }
         let heads = self.header_rows();
         let Some(&h) = heads.get(c) else {
             return;
@@ -1260,10 +1277,16 @@ impl Form {
 
     /// The category the body shows at its top.
     pub fn current_category(&self) -> usize {
+        if let Some(c) = self.pending_jump {
+            return c;
+        }
         if let Some((c, s)) = self.pin
             && s == self.scroll
         {
             return c;
+        }
+        if !self.geometry_ready() {
+            return 0;
         }
         let heads = self.header_rows();
         let mut cur = 0;
@@ -1910,6 +1933,37 @@ mod tests {
         assert_eq!(t.f.current_category(), 0);
         t.f.wheel(500.0, 200.0, 300.0);
         assert!(t.f.current_category() >= 1);
+    }
+
+    #[test]
+    fn a_jump_before_layout_waits_for_it() {
+        let mut v = vec![Row::header("A")];
+        v.extend((0..8).map(|i| Row::toggle(10 + i, format!("A{i}"), false)));
+        v.push(Row::header("B"));
+        v.extend((0..8).map(|i| Row::toggle(30 + i, format!("B{i}"), false)));
+        v.push(Row::header("C"));
+        v.extend((0..3).map(|i| Row::toggle(50 + i, format!("C{i}"), false)));
+        let mut t = T {
+            f: Form::new("Settings", v.clone()),
+            gfx: Gfx::new(),
+            bmp: Bitmap::new(1000, 420),
+        };
+        // Never laid out: no panic, and the category asked for is the one shown.
+        assert_eq!(t.f.current_category(), 0);
+        t.f.jump_to_category(1);
+        assert_eq!(t.f.current_category(), 1);
+        t.lay(1000.0, 420.0);
+        let header = t.f.rect_of_row(9);
+        assert!((header.y - t.f.body_rect().y).abs() <= 5.0, "{header:?}");
+        assert_eq!(t.f.current_category(), 1);
+        // New rows drop the layout again: the jump waits once more.
+        v.push(Row::toggle(60, "C9", false));
+        t.f.set_rows(v);
+        t.f.jump_to_category(2);
+        assert_eq!(t.f.current_category(), 2);
+        t.lay(1000.0, 420.0);
+        assert_eq!(t.f.scroll(), t.f.max_scroll());
+        assert_eq!(t.f.current_category(), 2);
     }
 
     #[test]
