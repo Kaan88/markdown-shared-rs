@@ -423,6 +423,9 @@ impl Form {
         };
         self.pin = None;
         self.laid = false;
+        // A jump still waiting may name a category the new rows do not have.
+        let heads = self.header_rows().len();
+        self.pending_jump = self.pending_jump.filter(|&c| c < heads);
     }
 
     /// The current value of the setting `id`.
@@ -1261,6 +1264,10 @@ impl Form {
     /// allows) and marks it as the current category.
     /// Before the form is laid out the jump waits for the layout.
     pub fn jump_to_category(&mut self, c: usize) {
+        // A category that does not exist is no jump, now or later.
+        if c >= self.header_rows().len() {
+            return;
+        }
         if !self.geometry_ready() {
             self.pending_jump = Some(c);
             self.pin = None;
@@ -1277,7 +1284,7 @@ impl Form {
 
     /// The category the body shows at its top.
     pub fn current_category(&self) -> usize {
-        if let Some(c) = self.pending_jump {
+        if let Some(c) = self.pending_jump.filter(|&c| c < self.header_rows().len()) {
             return c;
         }
         if let Some((c, s)) = self.pin
@@ -1933,6 +1940,29 @@ mod tests {
         assert_eq!(t.f.current_category(), 0);
         t.f.wheel(500.0, 200.0, 300.0);
         assert!(t.f.current_category() >= 1);
+    }
+
+    /// Audit 1, round 2: a jump to a category that does not exist is no jump, before layout as
+    /// after, and a waiting jump goes when new rows drop its category.
+    #[test]
+    fn a_jump_to_a_missing_category_is_ignored() {
+        let cats = |n: usize| -> Vec<Row> {
+            (0..n)
+                .flat_map(|i| {
+                    [
+                        Row::header(format!("H{i}")),
+                        Row::toggle(i as u32 + 1, "x", false),
+                    ]
+                })
+                .collect()
+        };
+        let mut f = Form::new("Settings", cats(3));
+        f.jump_to_category(9);
+        assert_eq!(f.current_category(), 0);
+        f.jump_to_category(2);
+        assert_eq!(f.current_category(), 2);
+        f.set_rows(cats(2));
+        assert_eq!(f.current_category(), 0);
     }
 
     #[test]
