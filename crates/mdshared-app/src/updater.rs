@@ -351,7 +351,7 @@ pub fn restore_engine(
             ));
         }
         let staged = selfupdate::staged(target);
-        let written = std::fs::write(&staged, &bytes)
+        let written = write_synced(&staged, &bytes)
             .and_then(|()| selfupdate::swap_in(std::slice::from_ref(target)));
         if let Err(e) = written {
             _ = selfupdate::remove_any(&staged);
@@ -370,6 +370,15 @@ pub fn check(app: &App, fetch: Fetch) -> Result<Option<Offer>, String> {
         MANIFEST_TIMEOUT,
     )?;
     offer(app, &bytes, &app.current_version())
+}
+
+/// Writes a staged file and has it on the disk before it is swapped in: after a power loss the
+/// rename could otherwise be there while the bytes are not (audit 2).
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// Downloads every file beside its target, checks each against its hash, and swaps them in. On
@@ -410,7 +419,7 @@ fn stage_and_swap(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), Stri
             continue;
         }
         let staged = selfupdate::staged(target);
-        std::fs::write(&staged, &bytes).map_err(|e| e.to_string())?;
+        write_synced(&staged, &bytes).map_err(|e| e.to_string())?;
         // An AppImage (or any file written fresh) must be executable once it is swapped in.
         #[cfg(unix)]
         {
