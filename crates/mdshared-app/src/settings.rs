@@ -62,15 +62,29 @@ impl Writer {
 }
 
 /// Writes through a temporary file and rename, so a crash cannot leave half a settings file.
+/// The temporary file is on the disk before the rename, so a power cut just after cannot leave
+/// the new name on an empty or older file (files listed in it may already be gone by then).
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    // The rename itself, on systems where a folder can be synced.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 fn escape_bytes(bytes: &[u8]) -> String {
