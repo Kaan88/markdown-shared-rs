@@ -15,9 +15,7 @@ pub const SECONDS: &str = "Looked at for less than";
 pub const SECONDS_HELP: &str = "Only while the tab is in front and the window has focus.";
 /// The switch that makes the rule count the tab that was showing as well.
 pub const LAST: &str = "Leave out the tab you were last on too";
-pub const LAST_HELP: &str =
-    "Otherwise the tab in front when the window closed always comes back. Pinned tabs and \
-     unsaved text always do.";
+pub const LAST_HELP: &str = "Pinned tabs and unsaved text still always come back.";
 pub const SECS_DEFAULT: u32 = 10;
 pub const SECS_MIN: u32 = 1;
 pub const SECS_MAX: u32 = 600;
