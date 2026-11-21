@@ -98,12 +98,17 @@ fn usable_without_verbatim(name: &str) -> bool {
         return true;
     }
     let stem = name.split('.').next().unwrap_or(name).trim_end();
+    // `stem` is a name a person typed, so it is cut by bytes only where the bytes are known to be
+    // ASCII: a device name is `COM1`, four ASCII bytes, and `ABé` is four bytes whose last
+    // character is two of them. Slicing first and asking afterwards crashed the editor.
+    let b = stem.as_bytes();
+    let device = b.len() == 4
+        && b[3].is_ascii_digit()
+        && (b[..3].eq_ignore_ascii_case(b"COM") || b[..3].eq_ignore_ascii_case(b"LPT"));
     let reserved = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
         .iter()
         .any(|r| stem.eq_ignore_ascii_case(r))
-        || (stem.len() == 4
-            && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit());
+        || device;
     !reserved
         && name != "."
         && name != ".."
@@ -171,6 +176,36 @@ pub fn tab_labels(paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file whose name is four bytes and does not end in an ASCII one — `ABé.md`, `aé.md` — is
+    /// not a device name, and asking whether it is one must not cut it in the middle of a
+    /// character. It did, and the editor aborted: `end byte index 3 is not a char boundary`,
+    /// recorded in a real crash file.
+    #[test]
+    fn a_four_byte_name_that_is_not_ascii_is_not_mistaken_for_a_device() {
+        for name in [
+            "ABé.md",
+            "aé.md",
+            "éé",
+            "COMé",
+            "LPTé.txt",
+            "日本.md",
+            "Ωm1",
+        ] {
+            assert!(
+                usable_without_verbatim(name),
+                "{name} is an ordinary name, and asking must not panic"
+            );
+        }
+        // The device names it is really looking for still answer.
+        for name in ["COM1", "LPT9.txt", "com4.md", "CON", "nul.txt", "CONOUT$"] {
+            assert!(!usable_without_verbatim(name), "{name} is a device name");
+        }
+        // Four ASCII bytes that are not a device.
+        for name in ["COMA", "LPT.1", "COM10", "ABC1"] {
+            assert!(usable_without_verbatim(name), "{name}");
+        }
+    }
 
     /// A library link is written with forward slashes, so on Windows it resolves to a path with
     /// both kinds of separator in it. That is the same file as the one a file dialog hands back,
