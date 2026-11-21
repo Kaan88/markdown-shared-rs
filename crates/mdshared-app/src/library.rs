@@ -78,6 +78,9 @@ pub struct Group {
     pub file: PathBuf,
     /// What the file looked like when it was read, for "has it been saved since".
     pub stamp: FileStamp,
+    /// Its headings below the first level, in the order they are written, each once, including
+    /// the ones with no note under them yet: where a note can be put.
+    pub sections: Vec<String>,
     pub entries: Vec<Entry>,
 }
 
@@ -146,7 +149,11 @@ pub fn read(dir: &Path) -> Library {
         let text = files::read_stable(&file, MAX_FILE_BYTES)
             .map(|l| files::decode(&l.bytes).0.into_owned())
             .unwrap_or_default();
-        let (name, mut entries) = parse(&text, dir);
+        let Parsed {
+            name,
+            sections,
+            mut entries,
+        } = parse(&text, dir);
         let name = name.unwrap_or_else(|| {
             file.file_stem()
                 .and_then(|s| s.to_str())
@@ -163,6 +170,7 @@ pub fn read(dir: &Path) -> Library {
             name,
             file,
             stamp,
+            sections,
             entries,
         });
     }
@@ -241,12 +249,23 @@ fn closes(marker: &str, open: &str) -> bool {
     marker.starts_with(open) && marker.len() >= open.len()
 }
 
-/// Reads one library file: its group name (its first level-1 heading) and its notes, in the
-/// order they are written. `base` is the folder a path with no root is taken from. Nothing is
-/// read from disk here, so [`Entry::missing`] is false and a note with no title written keeps
-/// an empty one; [`read`] fills both in.
-pub fn parse(text: &str, base: &Path) -> (Option<String>, Vec<Entry>) {
+/// What one library file holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Parsed {
+    /// The file's first level-1 heading, if it has one.
+    pub name: Option<String>,
+    /// Its other headings, in order, each once.
+    pub sections: Vec<String>,
+    pub entries: Vec<Entry>,
+}
+
+/// Reads one library file: its group name (its first level-1 heading), its headings and its
+/// notes, in the order they are written. `base` is the folder a path with no root is taken
+/// from. Nothing is read from disk here, so [`Entry::missing`] is false and a note with no
+/// title written keeps an empty one; [`read`] fills both in.
+pub fn parse(text: &str, base: &Path) -> Parsed {
     let mut name: Option<String> = None;
+    let mut sections: Vec<String> = Vec::new();
     let mut section = String::new();
     let mut entries: Vec<Entry> = Vec::new();
     let mut fence: Option<String> = None;
@@ -266,7 +285,12 @@ pub fn parse(text: &str, base: &Path) -> (Option<String>, Vec<Entry>) {
             match heading {
                 (1, text) if name.is_none() && !text.is_empty() => name = Some(text.to_string()),
                 (1, _) => {}
-                (_, text) => section = text.to_string(),
+                (_, text) => {
+                    section = text.to_string();
+                    if !section.is_empty() && !sections.contains(&section) {
+                        sections.push(section.clone());
+                    }
+                }
             }
             continue;
         }
@@ -284,7 +308,11 @@ pub fn parse(text: &str, base: &Path) -> (Option<String>, Vec<Entry>) {
             });
         }
     }
-    (name, entries)
+    Parsed {
+        name,
+        sections,
+        entries,
+    }
 }
 
 /// A heading line as its level and its text.
@@ -445,7 +473,11 @@ mod tests {
             ```\n\
             - [Not a note](D:/no.md)\n\
             ```\n";
-        let (name, entries) = parse(text, base);
+        let Parsed {
+            name,
+            sections,
+            entries,
+        } = parse(text, base);
         assert_eq!(name.as_deref(), Some("Personal"));
         let seen: Vec<(&str, String, &str)> = entries
             .iter()
@@ -468,6 +500,11 @@ mod tests {
         );
         assert_eq!(entries[0].line, 7);
         assert!(entries.iter().all(|e| !e.missing));
+        assert_eq!(sections, vec!["Money".to_string(), "Trips".to_string()]);
+        // A heading with no note under it yet is still a place a note can go.
+        let empty = parse("# Notes\n\n## Later\n", base);
+        assert_eq!(empty.sections, vec!["Later".to_string()]);
+        assert!(empty.entries.is_empty());
     }
 
     #[test]
@@ -525,20 +562,20 @@ mod tests {
             "Receipts",
             Path::new("D:/misc/receipts.md"),
         );
-        let (_, entries) = parse(&out, base);
+        let entries = parse(&out, base).entries;
         let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["Taxes", "Receipts", "Japan"]);
         assert_eq!(entries[1].section, "Money");
 
         // A section that is not there yet is made at the end; a file with none takes it plainly.
         let out = add_note(&out, Some("Reading"), "A book", Path::new("D:/book.md"));
-        let (_, entries) = parse(&out, base);
+        let entries = parse(&out, base).entries;
         assert_eq!(entries.last().unwrap().section, "Reading");
         let out = add_note("# Notes\n\nprose\n", None, "One", Path::new("D:/one.md"));
         assert_eq!(out, "# Notes\n\nprose\n\n- [One](D:/one.md)\n");
         // A path with a space is written so that it reads back whole.
         let out = add_note(&out, None, "Two", Path::new("D:/my notes/two.md"));
-        let (_, entries) = parse(&out, base);
+        let entries = parse(&out, base).entries;
         assert_eq!(
             entries
                 .last()
