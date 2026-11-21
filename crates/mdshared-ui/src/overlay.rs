@@ -209,22 +209,22 @@ pub fn draw_dialog_button(
     }
 }
 
-/// A dialog button that cannot be pressed: a quiet fill and a faint label, with no hover or press
-/// look, since neither would mean anything. A primary button keeps a hint of the accent so that
-/// the footer's hierarchy still reads, but nothing about it looks pressable. The caller draws it
-/// and records no hit for it; [`draw_dialog_button`] is untouched and draws as it did.
+/// A dialog button that cannot be pressed: a quiet frame and a faint label, with no hover or
+/// press look, since neither would mean anything. It draws exactly what mdedit's approved dialogs
+/// draw: `replace_ui::dialog_button` gives a disabled button the same 6 px corners and `field`
+/// fill whether it is primary or not, and ignores the role once it is disabled. So does this. It
+/// refuses to hint that one button leads while it cannot be pressed; the role parameter is still
+/// taken so that a caller passes the button's role and its call site does not change, and is named
+/// `_primary` because the drawing does not use it. The caller draws it and records no hit for it;
+/// [`draw_dialog_button`] is untouched and draws as it did.
 pub fn draw_dialog_button_disabled(
     p: &mut Painter,
     pal: &Palette,
     r: Rect,
     label: &str,
-    primary: bool,
+    _primary: bool,
 ) {
-    if primary {
-        p.rbox(r, 5.0, mix(pal.field, pal.accent, 0.35));
-    } else {
-        p.frame(r, 5.0, pal.field, pal.line);
-    }
+    p.frame(r, 6.0, pal.field, pal.line);
     p.text_center(Face::Semibold, 13.0, r, label, pal.faint);
 }
 
@@ -329,14 +329,14 @@ mod tests {
                     pal.accent,
                     "primary {primary}: a disabled button looks pressable"
                 );
-                // A disabled primary still reads as the leading button and a disabled secondary
-                // does not.
+                // Both roles are the one disabled look, as mdedit draws them: the accent can no
+                // longer show which button leads.
                 let other = shot(pal, |p| {
                     draw_dialog_button_disabled(p, pal, BUTTON, "Replace", !primary)
                 });
-                assert_ne!(
+                assert_eq!(
                     quiet.pixels, other.pixels,
-                    "the two disabled looks are the same"
+                    "a disabled button has one look whatever its role (primary {primary})"
                 );
             }
             let accent = shot(pal, |p| {
@@ -403,6 +403,32 @@ mod tests {
                         "primary {primary}, hovered {hovered}, pressed {pressed}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The disabled branch of mdedit's `replace_ui::dialog_button`, copied whole as it stands in
+    /// that app: a plain 6 px frame in `field` and `line`, and a faint Semibold label, whatever
+    /// the button's role. The shared disabled button must draw exactly these pixels.
+    fn disabled_before(p: &mut Painter, pal: &Palette, r: Rect, label: &str, _primary: bool) {
+        p.frame(r, 6.0, pal.field, pal.line);
+        p.text_center(Face::Semibold, 13.0, r, label, pal.faint);
+    }
+
+    #[test]
+    fn a_disabled_dialog_button_draws_as_mdedits_replace_dialog_draws_it() {
+        for pal in [&LIGHT, &DARK] {
+            for primary in [false, true] {
+                let was = shot(pal, |p| disabled_before(p, pal, BUTTON, "Replace", primary));
+                let now = shot(pal, |p| {
+                    draw_dialog_button_disabled(p, pal, BUTTON, "Replace", primary)
+                });
+                assert_eq!(
+                    was.pixels,
+                    now.pixels,
+                    "primary {primary}, {} theme",
+                    if pal.dark { "dark" } else { "light" }
+                );
             }
         }
     }

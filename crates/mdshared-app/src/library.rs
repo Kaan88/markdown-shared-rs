@@ -43,8 +43,10 @@ pub const DEFAULT_FILE: &str = "notes.md";
 /// A library file is read at most this far; a larger one is listed empty.
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 
-/// Library files read at most, in name order.
-pub const MAX_FILES: usize = 64;
+/// Groups read at most, in name order: the count is of groups kept, not of files looked at. Only
+/// a `.md` file in the folder is a library file, so anything else there is never a group and never
+/// uses one of these up.
+pub const MAX_FILES: usize = 512;
 
 /// Notes kept per group.
 pub const MAX_ENTRIES: usize = 2_000;
@@ -99,6 +101,11 @@ pub struct Group {
 pub struct Library {
     pub dir: PathBuf,
     pub groups: Vec<Group>,
+    /// How many groups [`read`] left out because the folder holds more than [`MAX_FILES`] of
+    /// them: 0 when it read every library file, so a pane can say "70 of 512 groups" or draw a
+    /// warning without listing the folder again. It is a count, not the names: what was left out
+    /// is every library file after the ones in `groups`, in name order.
+    pub omitted: usize,
 }
 
 impl Library {
@@ -118,10 +125,12 @@ impl Library {
         self.len() == 0
     }
 
-    /// Whether any library file has been saved, added or removed since it was read.
+    /// Whether any library file has been saved, added or removed since it was read. A folder
+    /// with more groups than [`MAX_FILES`] is not "changed" for merely still having them: the
+    /// [`Library::omitted`] count is part of what was read.
     pub fn changed(&self) -> bool {
         let files = library_files(&self.dir);
-        files.len() != self.groups.len()
+        files.len() != self.groups.len() + self.omitted
             || files
                 .iter()
                 .zip(&self.groups)
@@ -129,7 +138,9 @@ impl Library {
     }
 }
 
-/// The `.md` files of a library folder, in name order, at most [`MAX_FILES`].
+/// The `.md` files of a library folder, in name order: every candidate, before [`read`] caps the
+/// groups it keeps. Only a `.md` file is a library file, so anything else in the folder is not
+/// listed and costs no budget. A folder that is not there is empty, not an error.
 fn library_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -145,16 +156,25 @@ fn library_files(dir: &Path) -> Vec<PathBuf> {
         })
         .collect();
     files.sort();
-    files.truncate(MAX_FILES);
     files
 }
 
 /// Reads the whole library under `dir` (the `library` folder itself, not the settings folder):
 /// every file, the title of every note that has none written for it, and which notes are not on
-/// disk. A folder that is not there is an empty library, not an error.
+/// disk. A folder that is not there is an empty library, not an error. More than [`MAX_FILES`]
+/// groups is not an unbounded read: the first ones in name order are kept and the rest are
+/// counted in [`Library::omitted`], so a folder someone pointed at cannot cost the app more than
+/// that many files and the next read picks the same ones.
 pub fn read(dir: &Path) -> Library {
     let mut groups = Vec::new();
+    let mut omitted = 0;
     for file in library_files(dir) {
+        // The cap is on groups kept, not on the files looked at. A file beyond it is not read
+        // and is only counted: it would be one group more.
+        if groups.len() >= MAX_FILES {
+            omitted += 1;
+            continue;
+        }
         let stamp = files::stamp(&file);
         let text = files::read_stable(&file, MAX_FILE_BYTES)
             .map(|l| files::decode(&l.bytes).0.into_owned())
@@ -189,6 +209,7 @@ pub fn read(dir: &Path) -> Library {
     Library {
         dir: dir.to_path_buf(),
         groups,
+        omitted,
     }
 }
 
@@ -2097,5 +2118,82 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library folder holding `count` groups, named `g000` and up, written in the order given
+    /// so that a test can prove the reader sorts the folder itself rather than trusting it.
+    fn groups_folder(name: &str, count: usize, backwards: bool) -> PathBuf {
+        let dir = scratch(name);
+        let lib = dir.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let mut order: Vec<usize> = (0..count).collect();
+        if backwards {
+            order.reverse();
+        }
+        for n in order {
+            std::fs::write(
+                lib.join(format!("g{n:03}.md")),
+                format!("# Group {n:03}\n\n- [Note {n:03}](D:/notes/{n:03}.md)\n"),
+            )
+            .unwrap();
+        }
+        lib
+    }
+
+    #[test]
+    fn a_library_of_six_hundred_files_reads_the_first_five_hundred_and_twelve_and_counts_the_rest()
+    {
+        let lib = groups_folder("cap", 600, false);
+        let library = read(&lib);
+        assert_eq!(MAX_FILES, 512, "the cap the pane words the count with");
+        assert_eq!(library.groups.len(), MAX_FILES);
+        assert_eq!(library.omitted, 600 - MAX_FILES, "left out, and counted");
+        assert_eq!(library.groups[0].name, "Group 000", "the first by name");
+        assert_eq!(library.groups[MAX_FILES - 1].name, "Group 511");
+        assert_eq!(library.len(), MAX_FILES, "one note in each group");
+        // It is still the same library: the extra files are not a change to read again for.
+        assert!(!library.changed());
+        let _ = std::fs::remove_dir_all(lib.parent().unwrap());
+    }
+
+    #[test]
+    fn a_library_of_seventy_files_reads_all_of_them_and_counts_nothing() {
+        let lib = groups_folder("seventy", 70, false);
+        let library = read(&lib);
+        assert_eq!(library.groups.len(), 70);
+        assert_eq!(library.omitted, 0, "nothing is left out under the cap");
+        assert_eq!(library.groups[69].name, "Group 069");
+        assert!(!library.changed());
+        let _ = std::fs::remove_dir_all(lib.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_library_file_does_not_use_up_the_cap() {
+        let lib = groups_folder("others", 70, false);
+        // Six hundred other files, sorting before every group, and a folder that merely ends in
+        // `.md`: neither is a library file, so neither may take a group's place.
+        for n in 0..600 {
+            std::fs::write(lib.join(format!("a{n:03}.txt")), "not a library file\n").unwrap();
+        }
+        std::fs::create_dir(lib.join("z-folder.md")).unwrap();
+        let library = read(&lib);
+        assert_eq!(library.groups.len(), 70, "every group is still read");
+        assert_eq!(library.omitted, 0);
+        assert_eq!(library.groups[0].name, "Group 000");
+        let _ = std::fs::remove_dir_all(lib.parent().unwrap());
+    }
+
+    #[test]
+    fn two_reads_of_one_folder_give_the_same_groups_in_the_same_order() {
+        // Written back to front: the order has to come from the reader's sort, not the folder.
+        let lib = groups_folder("same-twice", 600, true);
+        let first = read(&lib);
+        let second = read(&lib);
+        assert_eq!(first, second);
+        let names: Vec<&str> = second.groups.iter().map(|g| g.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "the groups are in name order");
+        let _ = std::fs::remove_dir_all(lib.parent().unwrap());
     }
 }
