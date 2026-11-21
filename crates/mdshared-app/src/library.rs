@@ -401,13 +401,211 @@ fn resolve(path: &str, base: &Path) -> PathBuf {
 
 /// The line a note is written on: a link, with the path in `<>` when it holds a space.
 pub fn link_line(title: &str, path: &Path) -> String {
+    format!(
+        "- [{}]({})",
+        title.trim().replace(['[', ']'], ""),
+        written_target(path)
+    )
+}
+
+/// A path as a link's target: forward slashes, and `<>` around one a space would otherwise
+/// break.
+fn written_target(path: &Path) -> String {
     let written = path.to_string_lossy().replace('\\', "/");
-    let target = if written.contains(' ') {
+    if written.contains(' ') {
         format!("<{written}>")
     } else {
         written
+    }
+}
+
+/// A name as a writer writes it: trimmed, and nothing when it has no text or more than one
+/// line.
+fn clean(name: &str) -> Option<&str> {
+    let name = name.trim();
+    (!name.is_empty() && !name.contains(['\r', '\n'])).then_some(name)
+}
+
+/// A title as a link holds it: one line, with no bracket to end the link early.
+fn link_title(title: &str) -> Option<String> {
+    let title = clean(title)?.replace(['[', ']'], "");
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// What a writer finds on one line of a library file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Row {
+    /// A heading, at the level it is written.
+    Section { level: usize },
+    /// A note.
+    Note(NoteLine),
+    /// A fence's own line, or a line inside one: never a heading and never a note.
+    Code,
+    /// Prose, a blank line, anything else.
+    Other,
+}
+
+/// A note line taken apart, so a writer can change one part of it and leave the rest as it was
+/// written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NoteLine {
+    /// What comes before it on the line: the indentation, and the list marker when it has one.
+    lead: String,
+    /// The link's text as written; empty for a path on its own.
+    title: String,
+    /// The target as written, `<>` and `%20` included; the path itself for a path on its own.
+    target: String,
+    /// It is written as a link rather than as a path on its own.
+    link: bool,
+}
+
+/// A note line taken apart, or `None` when the line is not a note.
+fn note_parts(line: &str) -> Option<NoteLine> {
+    note_line(line)?;
+    let start = line.len() - line.trim_start().len();
+    let rest = &line[start..];
+    let marker = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        2
+    } else {
+        0
     };
-    format!("- [{}]({})", title.trim().replace(['[', ']'], ""), target)
+    let body = rest[marker..].trim();
+    let lead = format!("{}{}", &line[..start], &rest[..marker]);
+    if let Some(inner) = body.strip_prefix('[')
+        && let Some((title, after)) = inner.split_once("](")
+        && let Some(target) = after.strip_suffix(')')
+    {
+        return Some(NoteLine {
+            lead,
+            title: title.trim().to_string(),
+            target: target.to_string(),
+            link: true,
+        });
+    }
+    Some(NoteLine {
+        lead,
+        title: String::new(),
+        target: body.to_string(),
+        link: false,
+    })
+}
+
+/// A library file's text as its lines, each read once, and the line ending to write it back
+/// with.
+struct Text {
+    lines: Vec<String>,
+    rows: Vec<Row>,
+    eol: &'static str,
+}
+
+impl Text {
+    fn new(text: &str) -> Text {
+        let mut rows = Vec::new();
+        let mut fence: Option<String> = None;
+        for line in text.lines() {
+            if let Some(marker) = fence_marker(line) {
+                fence = match &fence {
+                    Some(open) if closes(&marker, open) => None,
+                    None => Some(marker),
+                    _ => fence,
+                };
+                rows.push(Row::Code);
+            } else if fence.is_some() {
+                rows.push(Row::Code);
+            } else if let Some((level, _)) = heading(line) {
+                rows.push(Row::Section { level });
+            } else {
+                rows.push(match note_parts(line) {
+                    Some(note) => Row::Note(note),
+                    None => Row::Other,
+                });
+            }
+        }
+        Text {
+            lines: text.lines().map(str::to_string).collect(),
+            rows,
+            eol: if text.contains("\r\n") { "\r\n" } else { "\n" },
+        }
+    }
+
+    /// The whole file again, with the line ending it came with.
+    fn into_text(self) -> String {
+        let mut out = self.lines.join(self.eol);
+        if !out.is_empty() {
+            out.push_str(self.eol);
+        }
+        out
+    }
+
+    /// Writes `line` under the heading path `section` (the end of the file when it is empty or
+    /// not there yet) and gives the new text. A line goes after the last note written directly
+    /// under that heading, before any heading below it, so the subsections keep their own notes.
+    fn place(mut self, section: &[String], line: &str) -> String {
+        let want: Vec<String> = section
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let found = (!want.is_empty())
+            .then(|| heading_line(&self.lines, &want))
+            .flatten();
+        match found {
+            Some((start, _)) => {
+                let at = after_notes(&self.rows, start);
+                self.lines.insert(at, line.to_string());
+            }
+            None if !want.is_empty() => {
+                // The part of the path that is there already; the rest is written under it, and
+                // the whole path at the end of the file when none of it is.
+                let known = (1..want.len()).rev().find_map(|n| {
+                    heading_line(&self.lines, &want[..n]).map(|(i, level)| (n, i, level))
+                });
+                let (from, mut at, mut level) = match known {
+                    Some((n, i, level)) => (n, after_notes(&self.rows, i), level),
+                    None => {
+                        while self.lines.last().is_some_and(|l| l.trim().is_empty()) {
+                            self.lines.pop();
+                        }
+                        (0, self.lines.len(), 1)
+                    }
+                };
+                for name in &want[from..] {
+                    level += 1;
+                    self.lines.insert(at, String::new());
+                    self.lines
+                        .insert(at + 1, format!("{} {name}", "#".repeat(level)));
+                    at += 2;
+                }
+                self.lines.insert(at, String::new());
+                self.lines.insert(at + 1, line.to_string());
+            }
+            None => {
+                if self.lines.last().is_some_and(|l| !l.trim().is_empty())
+                    && self.lines.last().is_some_and(|l| note_line(l).is_none())
+                {
+                    self.lines.push(String::new());
+                }
+                self.lines.push(line.to_string());
+            }
+        }
+        self.into_text()
+    }
+}
+
+/// Where a line written directly under the heading on line `start` goes: after that heading's
+/// own notes, before any heading below it, and never inside a code fence.
+fn after_notes(rows: &[Row], start: usize) -> usize {
+    let end = rows
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, row)| matches!(row, Row::Section { .. }))
+        .map_or(rows.len(), |(i, _)| i);
+    (start + 1..end)
+        .rev()
+        .find(|&i| matches!(rows[i], Row::Note(_)))
+        .map_or(start + 1, |i| i + 1)
 }
 
 /// The line of the heading `want` names, with the level it is written at: the headings are
@@ -459,72 +657,175 @@ fn heading_line(lines: &[String], want: &[String]) -> Option<(usize, usize)> {
 /// note written directly under that heading, before any heading below it, so the subsections
 /// keep their own notes. The file's line ending is kept.
 pub fn add_note(text: &str, section: &[String], title: &str, path: &Path) -> String {
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let line = link_line(title, path);
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let want: Vec<String> = section
+    Text::new(text).place(section, &link_line(title, path))
+}
+
+/// Removes the note written on `line` and gives the new text; `None` when that line is not one
+/// note, so a heading or a line inside a code fence is left alone. Only that line goes: the
+/// blank lines around it stay where they are.
+pub fn remove_note(text: &str, line: usize) -> Option<String> {
+    let mut doc = Text::new(text);
+    if !matches!(doc.rows.get(line.checked_sub(1)?), Some(Row::Note(_))) {
+        return None;
+    }
+    doc.lines.remove(line - 1);
+    doc.rows.remove(line - 1);
+    Some(doc.into_text())
+}
+
+/// Rewrites the text of the link written on `line`, leaving its target exactly as it was
+/// written; a line that is only a path becomes `- [Title](path)`. `None` when the line is not a
+/// note, the title has no text, or the text would not change.
+pub fn rename_note(text: &str, line: usize, title: &str) -> Option<String> {
+    let title = link_title(title)?;
+    let mut doc = Text::new(text);
+    let Some(Row::Note(note)) = doc.rows.get(line.checked_sub(1)?) else {
+        return None;
+    };
+    let new = format!("{}[{}]({})", note.lead, title, note.target);
+    if doc.lines[line - 1] == new {
+        return None;
+    }
+    doc.lines[line - 1] = new;
+    Some(doc.into_text())
+}
+
+/// Rewrites the target of the note written on `line`, keeping its title and the way the line is
+/// written otherwise. `None` when the line is not a note, or when it already names that path,
+/// under whatever brackets and separators it was written with.
+pub fn set_note_path(text: &str, line: usize, path: &Path) -> Option<String> {
+    let mut doc = Text::new(text);
+    let Some(Row::Note(note)) = doc.rows.get(line.checked_sub(1)?) else {
+        return None;
+    };
+    let target = written_target(path);
+    let said = unwrap_path(&note.target).0.replace('\\', "/");
+    if said == unwrap_path(&target).0.replace('\\', "/") {
+        return None;
+    }
+    let new = if note.link {
+        format!("{}[{}]({})", note.lead, note.title, target)
+    } else {
+        format!("{}{}", note.lead, target)
+    };
+    doc.lines[line - 1] = new;
+    Some(doc.into_text())
+}
+
+/// Rewrites the text of the section heading written on `line`, keeping its `#` count so its
+/// nesting does not change. `None` when that line is not a section heading (a group's own `#`
+/// heading is [`set_group_name`]'s), the name has no text, or the name would not change.
+pub fn rename_section(text: &str, line: usize, name: &str) -> Option<String> {
+    let name = clean(name)?;
+    let mut doc = Text::new(text);
+    let level = match doc.rows.get(line.checked_sub(1)?) {
+        Some(Row::Section { level, .. }) if *level > 1 => *level,
+        _ => return None,
+    };
+    let new = format!("{} {name}", "#".repeat(level));
+    if doc.lines[line - 1] == new {
+        return None;
+    }
+    doc.lines[line - 1] = new;
+    Some(doc.into_text())
+}
+
+/// Writes a section heading under the heading path `parent` (the group itself when it is empty)
+/// one level deeper than that heading, after its notes and before its subsections, and gives the
+/// new text. `None` when that heading is not in the file or the name has no text.
+pub fn add_section(text: &str, parent: &[String], name: &str) -> Option<String> {
+    let name = clean(name)?;
+    let mut doc = Text::new(text);
+    let want: Vec<String> = parent
         .iter()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    // Where a note written directly under the heading on line `start` goes: after that
-    // heading's own notes, before any heading below it.
-    let after_notes = |lines: &[String], start: usize| {
-        let end = lines
+    let (at, level) = if want.is_empty() {
+        match doc
+            .rows
             .iter()
-            .enumerate()
-            .skip(start + 1)
-            .find(|(_, l)| heading(l).is_some())
-            .map_or(lines.len(), |(i, _)| i);
-        (start + 1..end)
-            .rev()
-            .find(|&i| note_line(&lines[i]).is_some())
-            .map_or(start + 1, |i| i + 1)
-    };
-    let found = (!want.is_empty())
-        .then(|| heading_line(&lines, &want))
-        .flatten();
-    match found {
-        Some((start, _)) => {
-            let at = after_notes(&lines, start);
-            lines.insert(at, line);
-        }
-        None if !want.is_empty() => {
-            // The part of the path that is there already; the rest is written under it, and the
-            // whole path at the end of the file when none of it is.
-            let known = (1..want.len())
-                .rev()
-                .find_map(|n| heading_line(&lines, &want[..n]).map(|(i, level)| (n, i, level)));
-            let (from, mut at, mut level) = match known {
-                Some((n, i, level)) => (n, after_notes(&lines, i), level),
-                None => {
-                    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-                        lines.pop();
-                    }
-                    (0, lines.len(), 1)
+            .position(|row| matches!(row, Row::Section { level: 1, .. }))
+        {
+            Some(start) => (after_notes(&doc.rows, start), 1),
+            None => {
+                while doc.lines.last().is_some_and(|l| l.trim().is_empty()) {
+                    doc.lines.pop();
                 }
-            };
-            for name in &want[from..] {
-                level += 1;
-                lines.insert(at, String::new());
-                lines.insert(at + 1, format!("{} {name}", "#".repeat(level)));
-                at += 2;
+                (doc.lines.len(), 1)
             }
-            lines.insert(at, String::new());
-            lines.insert(at + 1, line);
         }
-        None => {
-            if lines.last().is_some_and(|l| !l.trim().is_empty())
-                && lines.last().is_some_and(|l| note_line(l).is_none())
-            {
-                lines.push(String::new());
-            }
-            lines.push(line);
+    } else {
+        let (start, level) = heading_line(&doc.lines, &want)?;
+        (after_notes(&doc.rows, start), level)
+    };
+    // A blank line above the heading unless one is already there to be the gap.
+    let mut add = Vec::new();
+    if at > 0 && doc.lines[..at].last().is_none_or(|l| !l.trim().is_empty()) {
+        add.push(String::new());
+    }
+    add.push(format!("{} {name}", "#".repeat(level + 1)));
+    doc.lines.splice(at..at, add);
+    Some(doc.into_text())
+}
+
+/// Removes the section heading written on `line` and everything under it, its subsections and
+/// their notes included, and gives the new text. `None` when that line is not a section heading:
+/// a group's own `#` heading is not one, and a group goes by removing its file.
+pub fn remove_section(text: &str, line: usize) -> Option<String> {
+    let mut doc = Text::new(text);
+    let level = match doc.rows.get(line.checked_sub(1)?) {
+        Some(Row::Section { level, .. }) if *level > 1 => *level,
+        _ => return None,
+    };
+    let start = line - 1;
+    let end = (start + 1..doc.rows.len())
+        .find(|&i| matches!(doc.rows[i], Row::Section { level: l, .. } if l <= level))
+        .unwrap_or(doc.rows.len());
+    doc.lines.drain(start..end);
+    if end == doc.rows.len() {
+        while doc.lines.last().is_some_and(|l| l.trim().is_empty()) {
+            doc.lines.pop();
         }
     }
-    let mut out = lines.join(eol);
-    out.push_str(eol);
-    out
+    Some(doc.into_text())
+}
+
+/// Rewrites the file's first `#` heading, which is the group's name, and gives the new text.
+/// `None` when the file has no `#` heading, the name has no text, or the name would not change.
+pub fn set_group_name(text: &str, name: &str) -> Option<String> {
+    let name = clean(name)?;
+    let mut doc = Text::new(text);
+    let at = doc
+        .rows
+        .iter()
+        .position(|row| matches!(row, Row::Section { level: 1, .. }))?;
+    let new = format!("# {name}");
+    if doc.lines[at] == new {
+        return None;
+    }
+    doc.lines[at] = new;
+    Some(doc.into_text())
+}
+
+/// The text of a new group file: [`TEMPLATE`] with its own name on it. `None` when the name has
+/// no text.
+pub fn new_group(name: &str) -> Option<String> {
+    let name = clean(name)?;
+    Some(TEMPLATE.replacen("# Notes", &format!("# {name}"), 1))
+}
+
+/// Moves the note written on `line` to the heading path `to_path` of the same file, the line
+/// exactly as it is written, and gives the new text. `None` when that line is not a note. Two
+/// files are the caller's two calls.
+pub fn move_note(text: &str, line: usize, to_path: &[String]) -> Option<String> {
+    let doc = Text::new(text);
+    if !matches!(doc.rows.get(line.checked_sub(1)?), Some(Row::Note(_))) {
+        return None;
+    }
+    let moved = doc.lines[line - 1].clone();
+    let without = remove_note(text, line)?;
+    Some(Text::new(&without).place(to_path, &moved))
 }
 
 #[cfg(test)]
@@ -790,5 +1091,419 @@ mod tests {
             vec![at(&["Reading"]), at(&["Reading", "2026"])]
         );
         assert_eq!(parsed.entries[0].sections, at(&["Reading", "2026"]));
+    }
+
+    /// A group with a section of its own, a subsection under it, and a second section.
+    const SAMPLE: &str = "# Personal\n\
+        \n\
+        ## Money\n\
+        \n\
+        - [Taxes](D:/taxes.md)\n\
+        \n\
+        ### 2025\n\
+        \n\
+        - [Last year](D:/2025.md)\n\
+        \n\
+        ## Trips\n\
+        \n\
+        - [Japan](D:/japan.md)\n";
+
+    #[test]
+    fn a_note_is_removed_by_its_line_and_nothing_else_moves() {
+        let text = "# Notes\n\n## A\n\n- [One](D:/one.md)\n- [Two](D:/two.md)\n";
+        assert_eq!(
+            remove_note(text, 5).unwrap(),
+            "# Notes\n\n## A\n\n- [Two](D:/two.md)\n"
+        );
+        // The line numbers are the ones the parser gives, from the file's own text.
+        assert_eq!(parse(text, Path::new("/lib")).entries[1].line, 6);
+    }
+
+    #[test]
+    fn a_note_is_renamed_in_the_link_and_its_path_is_left_as_written() {
+        assert_eq!(
+            rename_note(SAMPLE, 5, "Taxes 2026").unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes 2026](D:/taxes.md)\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        // A path on its own becomes a link, with its brackets as they were.
+        let text = "# Notes\n\n- <D:/my notes/a%20b.md>\n";
+        assert_eq!(
+            rename_note(text, 3, "A note").unwrap(),
+            "# Notes\n\n- [A note](<D:/my notes/a%20b.md>)\n"
+        );
+        // A title is written without the brackets that would end the link early.
+        assert_eq!(
+            rename_note(text, 3, "a [bad] name").unwrap(),
+            "# Notes\n\n- [a bad name](<D:/my notes/a%20b.md>)\n"
+        );
+    }
+
+    #[test]
+    fn a_note_path_is_rewritten_and_its_title_is_kept() {
+        assert_eq!(
+            set_note_path(SAMPLE, 5, Path::new("D:/misc/new taxes.md")).unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes](<D:/misc/new taxes.md>)\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        // A path on its own stays one: no title is invented for it.
+        assert_eq!(
+            set_note_path("# Notes\n\n- D:/old.md\n", 3, Path::new("D:/new.md")).unwrap(),
+            "# Notes\n\n- D:/new.md\n"
+        );
+    }
+
+    #[test]
+    fn a_section_is_renamed_at_its_own_level_and_its_nesting_is_kept() {
+        assert_eq!(
+            rename_section(SAMPLE, 7, "2024").unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2024\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        let parsed = parse(
+            &rename_section(SAMPLE, 7, "2024").unwrap(),
+            Path::new("/lib"),
+        );
+        assert_eq!(
+            parsed.sections,
+            vec![at(&["Money"]), at(&["Money", "2024"]), at(&["Trips"])],
+            "the renamed heading is still under Money"
+        );
+        // A `##` stays a `##`, so the notes under it stay one level down.
+        let out = rename_section(SAMPLE, 3, "Cash").unwrap();
+        assert_eq!(
+            out,
+            "# Personal\n\n## Cash\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        let parsed = parse(&out, Path::new("/lib"));
+        assert_eq!(parsed.entries[1].sections, at(&["Cash", "2025"]));
+    }
+
+    #[test]
+    fn a_section_is_added_after_its_parents_notes_and_before_its_subsections() {
+        assert_eq!(
+            add_section(SAMPLE, &at(&["Money"]), "2026").unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2026\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        // The group itself is the parent of a top-level section.
+        assert_eq!(
+            add_section(SAMPLE, &[], "Later").unwrap(),
+            "# Personal\n\n## Later\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        let parsed = parse(
+            &add_section(SAMPLE, &at(&["Money", "2025"]), "March").unwrap(),
+            Path::new("/lib"),
+        );
+        assert_eq!(
+            parsed.sections[2],
+            at(&["Money", "2025", "March"]),
+            "March is written under 2025, before Trips"
+        );
+    }
+
+    #[test]
+    fn a_section_is_removed_with_the_notes_and_subsections_under_it() {
+        // Money takes its subsection and that subsection's note with it.
+        assert_eq!(
+            remove_section(SAMPLE, 3).unwrap(),
+            "# Personal\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        // A subsection takes only what is its own.
+        assert_eq!(
+            remove_section(SAMPLE, 7).unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        // The last section leaves no blank tail behind.
+        assert_eq!(
+            remove_section(SAMPLE, 11).unwrap(),
+            "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last year](D:/2025.md)\n"
+        );
+    }
+
+    #[test]
+    fn the_group_is_renamed_in_the_files_first_heading() {
+        assert_eq!(
+            set_group_name(SAMPLE, "Household").unwrap(),
+            "# Household\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last year](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n"
+        );
+        let parsed = parse(
+            &set_group_name(SAMPLE, "Household").unwrap(),
+            Path::new("/lib"),
+        );
+        assert_eq!(parsed.name.as_deref(), Some("Household"));
+        assert_eq!(parsed.entries[0].sections, at(&["Money"]), "nothing moved");
+    }
+
+    #[test]
+    fn a_new_group_file_is_the_template_with_its_own_name() {
+        let text = new_group("Work").unwrap();
+        assert_eq!(text, TEMPLATE.replacen("# Notes", "# Work", 1));
+        assert_eq!(
+            parse(&text, Path::new("/lib")).name.as_deref(),
+            Some("Work")
+        );
+        assert!(parse(&text, Path::new("/lib")).entries.is_empty());
+        assert_eq!(new_group(" Notes "), Some(TEMPLATE.to_string()));
+    }
+
+    #[test]
+    fn a_note_is_moved_between_the_sections_of_one_file() {
+        let text = "# Notes\n\n## A\n\n- [One](D:/one.md)\n- [Two](D:/two.md)\n\n## B\n\n- [Three](D:/three.md)\n";
+        let out = move_note(text, 5, &at(&["B"])).unwrap();
+        assert_eq!(
+            out,
+            "# Notes\n\n## A\n\n- [Two](D:/two.md)\n\n## B\n\n- [Three](D:/three.md)\n- [One](D:/one.md)\n"
+        );
+        let entries = parse(&out, Path::new("/lib")).entries;
+        assert_eq!(entries[2].title, "One", "last of B, where it was put");
+        assert_eq!(entries[2].sections, at(&["B"]));
+        // The line goes across exactly as it was written.
+        let text = "# Notes\n\n## A\n\n- <D:/my notes/a%20b.md>\n\n## B\n";
+        assert_eq!(
+            move_note(text, 5, &at(&["B"])).unwrap(),
+            "# Notes\n\n## A\n\n\n## B\n- <D:/my notes/a%20b.md>\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_file_stays_crlf() {
+        let text = "# Notes\r\n\r\n## A\r\n\r\n- [One](D:/one.md)\r\n- [Two](D:/two.md)\r\n";
+        let out = rename_note(text, 5, "Uno").unwrap();
+        assert_eq!(
+            out,
+            "# Notes\r\n\r\n## A\r\n\r\n- [Uno](D:/one.md)\r\n- [Two](D:/two.md)\r\n"
+        );
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "no bare line feed: {out:?}"
+        );
+        // A heading added to it is written the same way.
+        assert_eq!(
+            add_section(text, &at(&["A"]), "B").unwrap(),
+            "# Notes\r\n\r\n## A\r\n\r\n- [One](D:/one.md)\r\n- [Two](D:/two.md)\r\n\r\n### B\r\n"
+        );
+        assert_eq!(
+            set_group_name(text, "Home").unwrap(),
+            "# Home\r\n\r\n## A\r\n\r\n- [One](D:/one.md)\r\n- [Two](D:/two.md)\r\n"
+        );
+    }
+
+    #[test]
+    fn nothing_inside_a_code_fence_is_taken_for_a_note_or_a_heading() {
+        let text = "# Notes\n\
+            \n\
+            ## Money\n\
+            \n\
+            ```\n\
+            - [Fake](D:/fake.md)\n\
+            ## Fake heading\n\
+            ```\n\
+            \n\
+            ### 2025\n";
+
+        // A fenced line is refused by the writers that work on one line.
+        assert_eq!(remove_note(text, 6), None);
+        assert_eq!(rename_note(text, 6, "Real"), None);
+        assert_eq!(set_note_path(text, 6, Path::new("D:/real.md")), None);
+        assert_eq!(move_note(text, 6, &at(&["Money"])), None);
+        assert_eq!(rename_section(text, 7, "Real"), None);
+        assert_eq!(remove_section(text, 7), None);
+
+        // And a new section goes above the fence rather than between its lines.
+        assert_eq!(
+            add_section(text, &at(&["Money"]), "2026").unwrap(),
+            "# Notes\n\n## Money\n\n### 2026\n\n```\n- [Fake](D:/fake.md)\n## Fake heading\n```\n\n### 2025\n"
+        );
+        let parsed = parse(
+            &add_section(text, &at(&["Money"]), "2026").unwrap(),
+            Path::new("/lib"),
+        );
+        assert_eq!(parsed.entries.len(), 0);
+        assert_eq!(
+            parsed.sections,
+            vec![
+                at(&["Money"]),
+                at(&["Money", "2026"]),
+                at(&["Money", "2025"])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_writer_refuses_a_line_that_is_not_what_it_expects() {
+        // A heading where a note was wanted, a note where a heading was, no line at all.
+        assert_eq!(remove_note(SAMPLE, 1), None);
+        assert_eq!(remove_note(SAMPLE, 0), None);
+        assert_eq!(remove_note(SAMPLE, 99), None);
+        assert_eq!(rename_note(SAMPLE, 3, "x"), None);
+        assert_eq!(set_note_path(SAMPLE, 3, Path::new("D:/x.md")), None);
+        assert_eq!(move_note(SAMPLE, 3, &at(&["Trips"])), None);
+        assert_eq!(rename_section(SAMPLE, 5, "x"), None);
+        assert_eq!(remove_section(SAMPLE, 5), None);
+        assert_eq!(add_section(SAMPLE, &at(&["Nope"]), "x"), None);
+        // The group's own heading belongs to set_group_name, not to the section writers.
+        assert_eq!(rename_section(SAMPLE, 1, "x"), None);
+        assert_eq!(remove_section(SAMPLE, 1), None);
+        // Nothing to change, or nothing to name it.
+        assert_eq!(rename_note(SAMPLE, 5, "Taxes"), None);
+        assert_eq!(rename_note(SAMPLE, 5, "  "), None);
+        assert_eq!(set_note_path(SAMPLE, 5, Path::new("D:/taxes.md")), None);
+        // The same note written another way is still the same note.
+        assert_eq!(
+            set_note_path(
+                "# Notes\n\n- <D:/my notes/a.md>\n",
+                3,
+                Path::new("D:/my notes/a.md")
+            ),
+            None
+        );
+        assert_eq!(
+            set_note_path("# Notes\n\n- D:\\one.md\n", 3, Path::new("D:/one.md")),
+            None
+        );
+        assert_eq!(rename_section(SAMPLE, 7, "2025"), None);
+        assert_eq!(rename_section(SAMPLE, 7, ""), None);
+        assert_eq!(add_section(SAMPLE, &[], " "), None);
+        assert_eq!(set_group_name(SAMPLE, "Personal"), None);
+        assert_eq!(set_group_name("- no heading here\n", "x"), None);
+        assert_eq!(new_group(""), None);
+    }
+
+    #[test]
+    fn every_writer_reads_back_as_the_library_it_wrote() {
+        let dir = scratch("writers");
+        let lib = dir.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let file = lib.join("notes.md");
+        let base = lib.as_path();
+
+        let notes = |text: &str| -> Vec<(String, Vec<String>)> {
+            parse(text, base)
+                .entries
+                .iter()
+                .map(|e| (e.title.clone(), e.sections.clone()))
+                .collect()
+        };
+        let line_of = |text: &str, title: &str| -> usize {
+            parse(text, base)
+                .entries
+                .iter()
+                .find(|e| e.title == title)
+                .unwrap()
+                .line
+        };
+        let section_line = |text: &str, want: &[String]| -> usize {
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            heading_line(&lines, want).unwrap().0 + 1
+        };
+
+        let mut text = new_group("Personal").unwrap();
+        text = add_section(&text, &[], "Money").unwrap();
+        text = add_note(
+            &text,
+            &at(&["Money"]),
+            "Taxes",
+            Path::new("D:/misc/taxes.md"),
+        );
+        text = add_note(
+            &text,
+            &at(&["Money"]),
+            "Receipts",
+            Path::new("D:/misc/receipts.md"),
+        );
+        text = add_section(&text, &at(&["Money"]), "2025").unwrap();
+        text = add_note(
+            &text,
+            &at(&["Money", "2025"]),
+            "Last year",
+            Path::new("D:/misc/2025.md"),
+        );
+        assert_eq!(
+            notes(&text),
+            vec![
+                ("Taxes".to_string(), at(&["Money"])),
+                ("Receipts".to_string(), at(&["Money"])),
+                ("Last year".to_string(), at(&["Money", "2025"])),
+            ]
+        );
+        std::fs::write(&file, &text).unwrap();
+        let library = read(&lib);
+        assert_eq!(library.groups.len(), 1);
+        assert_eq!(library.groups[0].name, "Personal");
+        assert_eq!(library.groups[0].entries.len(), 3);
+
+        // Every write is checked the way the app checks it: the new text is parsed again and
+        // read back.
+        text = rename_note(&text, line_of(&text, "Taxes"), "Taxes 2026").unwrap();
+        assert_eq!(
+            notes(&text),
+            vec![
+                ("Taxes 2026".to_string(), at(&["Money"])),
+                ("Receipts".to_string(), at(&["Money"])),
+                ("Last year".to_string(), at(&["Money", "2025"])),
+            ]
+        );
+
+        text = set_note_path(
+            &text,
+            line_of(&text, "Receipts"),
+            Path::new("D:/misc/2025 receipts.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            parse(&text, base).entries[1].path,
+            Path::new("D:/misc/2025 receipts.md")
+        );
+
+        text = move_note(&text, line_of(&text, "Last year"), &at(&["Money"])).unwrap();
+        assert_eq!(
+            notes(&text),
+            vec![
+                ("Taxes 2026".to_string(), at(&["Money"])),
+                ("Receipts".to_string(), at(&["Money"])),
+                ("Last year".to_string(), at(&["Money"])),
+            ]
+        );
+
+        let at_2025 = section_line(&text, &at(&["Money", "2025"]));
+        text = rename_section(&text, at_2025, "2024").unwrap();
+        assert_eq!(
+            parse(&text, base).sections,
+            vec![at(&["Money"]), at(&["Money", "2024"])]
+        );
+
+        text = add_section(&text, &at(&["Money"]), "2026").unwrap();
+        text = remove_section(&text, section_line(&text, &at(&["Money", "2024"]))).unwrap();
+        assert_eq!(
+            parse(&text, base).sections,
+            vec![at(&["Money"]), at(&["Money", "2026"])]
+        );
+
+        text = remove_note(&text, line_of(&text, "Receipts")).unwrap();
+        text = set_group_name(&text, "Household").unwrap();
+        std::fs::write(&file, &text).unwrap();
+
+        let library = read(&lib);
+        assert_eq!(library.groups[0].name, "Household");
+        let seen: Vec<(&str, String, Vec<String>)> = library.groups[0]
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.title.as_str(),
+                    e.path.to_string_lossy().replace('\\', "/"),
+                    e.sections.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Taxes 2026", "D:/misc/taxes.md".to_string(), at(&["Money"])),
+                ("Last year", "D:/misc/2025.md".to_string(), at(&["Money"])),
+            ]
+        );
+        assert_eq!(
+            library.groups[0].sections,
+            vec![at(&["Money"]), at(&["Money", "2026"])]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
