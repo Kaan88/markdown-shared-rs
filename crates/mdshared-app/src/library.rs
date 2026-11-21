@@ -62,8 +62,10 @@ pub struct Entry {
     /// The note. Absolute, unless the library file gave a path with no root and the library
     /// folder is not known.
     pub path: PathBuf,
-    /// The section heading it is under; empty for the notes before the first one.
-    pub section: String,
+    /// The headings it is under, outermost first: `["Money", "2026"]` for a note under
+    /// `### 2026` inside `## Money`. Empty for the notes written before any heading. Headings
+    /// nest by their level, so a library file is a tree as deep as it is written.
+    pub sections: Vec<String>,
     /// Its line in the library file, counted from 1, so a command can lead to it.
     pub line: usize,
     /// There is no file at `path`. Set by [`read`]; [`parse`] leaves it false.
@@ -78,9 +80,9 @@ pub struct Group {
     pub file: PathBuf,
     /// What the file looked like when it was read, for "has it been saved since".
     pub stamp: FileStamp,
-    /// Its headings below the first level, in the order they are written, each once, including
-    /// the ones with no note under them yet: where a note can be put.
-    pub sections: Vec<String>,
+    /// Every heading path below the first level, in the order they are written, including the
+    /// headings with no note under them yet: where a note can be put, and the tree a pane draws.
+    pub sections: Vec<Vec<String>>,
     pub entries: Vec<Entry>,
 }
 
@@ -254,8 +256,9 @@ fn closes(marker: &str, open: &str) -> bool {
 pub struct Parsed {
     /// The file's first level-1 heading, if it has one.
     pub name: Option<String>,
-    /// Its other headings, in order, each once.
-    pub sections: Vec<String>,
+    /// Its other headings as paths, in the order they are written: `["Money"]`,
+    /// `["Money", "2026"]`, `["Trips"]`.
+    pub sections: Vec<Vec<String>>,
     pub entries: Vec<Entry>,
 }
 
@@ -265,8 +268,9 @@ pub struct Parsed {
 /// title written keeps an empty one; [`read`] fills both in.
 pub fn parse(text: &str, base: &Path) -> Parsed {
     let mut name: Option<String> = None;
-    let mut sections: Vec<String> = Vec::new();
-    let mut section = String::new();
+    let mut sections: Vec<Vec<String>> = Vec::new();
+    // The headings open at this line, with the level each was written at.
+    let mut open: Vec<(usize, String)> = Vec::new();
     let mut entries: Vec<Entry> = Vec::new();
     let mut fence: Option<String> = None;
     for (n, line) in text.lines().enumerate() {
@@ -284,11 +288,17 @@ pub fn parse(text: &str, base: &Path) -> Parsed {
         if let Some(heading) = heading(line) {
             match heading {
                 (1, text) if name.is_none() && !text.is_empty() => name = Some(text.to_string()),
-                (1, _) => {}
-                (_, text) => {
-                    section = text.to_string();
-                    if !section.is_empty() && !sections.contains(&section) {
-                        sections.push(section.clone());
+                // A second level-1 heading closes the sections of the first.
+                (1, _) => open.clear(),
+                (_, text) if text.is_empty() => {}
+                (level, text) => {
+                    while open.last().is_some_and(|(l, _)| *l >= level) {
+                        open.pop();
+                    }
+                    open.push((level, text.to_string()));
+                    let path: Vec<String> = open.iter().map(|(_, t)| t.clone()).collect();
+                    if !sections.contains(&path) {
+                        sections.push(path);
                     }
                 }
             }
@@ -302,7 +312,7 @@ pub fn parse(text: &str, base: &Path) -> Parsed {
             entries.push(Entry {
                 title,
                 path,
-                section: section.clone(),
+                sections: open.iter().map(|(_, t)| t.clone()).collect(),
                 line: n + 1,
                 missing: false,
             });
@@ -400,38 +410,110 @@ pub fn link_line(title: &str, path: &Path) -> String {
     format!("- [{}]({})", title.trim().replace(['[', ']'], ""), target)
 }
 
-/// Writes a note into a library file's text under `section` (the end of the file when it is
-/// `None` or not there yet) and gives the new text. The file's line ending is kept.
-pub fn add_note(text: &str, section: Option<&str>, title: &str, path: &Path) -> String {
+/// The line of the heading `want` names, with the level it is written at: the headings are
+/// followed as a path, so `["Money", "2026"]` finds `### 2026` inside `## Money` and not a
+/// `### 2026` under another section.
+fn heading_line(lines: &[String], want: &[String]) -> Option<(usize, usize)> {
+    let mut open: Vec<(usize, String)> = Vec::new();
+    let mut fence: Option<String> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(marker) = fence_marker(line) {
+            fence = match &fence {
+                Some(o) if closes(&marker, o) => None,
+                None => Some(marker),
+                _ => fence,
+            };
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        let Some((level, text)) = heading(line) else {
+            continue;
+        };
+        if level == 1 {
+            open.clear();
+            continue;
+        }
+        if text.is_empty() {
+            continue;
+        }
+        while open.last().is_some_and(|(l, _)| *l >= level) {
+            open.pop();
+        }
+        open.push((level, text.to_string()));
+        if open.len() == want.len()
+            && open
+                .iter()
+                .zip(want)
+                .all(|((_, t), w)| t.eq_ignore_ascii_case(w.trim()))
+        {
+            return Some((i, level));
+        }
+    }
+    None
+}
+
+/// Writes a note into a library file's text under the heading path `section` (the end of the
+/// file when it is empty or not there yet) and gives the new text. A note goes after the last
+/// note written directly under that heading, before any heading below it, so the subsections
+/// keep their own notes. The file's line ending is kept.
+pub fn add_note(text: &str, section: &[String], title: &str, path: &Path) -> String {
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let line = link_line(title, path);
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let at = section.and_then(|want| {
-        let start = lines.iter().position(|l| {
-            heading(l).is_some_and(|(level, t)| level > 1 && t.eq_ignore_ascii_case(want.trim()))
-        })?;
-        // After the section's last note, or after its heading when it has none yet.
+    let want: Vec<String> = section
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Where a note written directly under the heading on line `start` goes: after that
+    // heading's own notes, before any heading below it.
+    let after_notes = |lines: &[String], start: usize| {
         let end = lines
             .iter()
             .enumerate()
             .skip(start + 1)
             .find(|(_, l)| heading(l).is_some())
             .map_or(lines.len(), |(i, _)| i);
-        let last = (start + 1..end)
+        (start + 1..end)
             .rev()
-            .find(|&i| note_line(&lines[i]).is_some());
-        Some(last.map_or(start + 1, |i| i + 1))
-    });
-    match at {
-        Some(i) => lines.insert(i, line),
-        None => {
-            if let Some(want) = section.map(str::trim).filter(|s| !s.is_empty()) {
-                while lines.last().is_some_and(|l| l.trim().is_empty()) {
-                    lines.pop();
+            .find(|&i| note_line(&lines[i]).is_some())
+            .map_or(start + 1, |i| i + 1)
+    };
+    let found = (!want.is_empty())
+        .then(|| heading_line(&lines, &want))
+        .flatten();
+    match found {
+        Some((start, _)) => {
+            let at = after_notes(&lines, start);
+            lines.insert(at, line);
+        }
+        None if !want.is_empty() => {
+            // The part of the path that is there already; the rest is written under it, and the
+            // whole path at the end of the file when none of it is.
+            let known = (1..want.len())
+                .rev()
+                .find_map(|n| heading_line(&lines, &want[..n]).map(|(i, level)| (n, i, level)));
+            let (from, mut at, mut level) = match known {
+                Some((n, i, level)) => (n, after_notes(&lines, i), level),
+                None => {
+                    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                        lines.pop();
+                    }
+                    (0, lines.len(), 1)
                 }
-                lines.push(String::new());
-                lines.push(format!("## {want}"));
+            };
+            for name in &want[from..] {
+                level += 1;
+                lines.insert(at, String::new());
+                lines.insert(at + 1, format!("{} {name}", "#".repeat(level)));
+                at += 2;
             }
+            lines.insert(at, String::new());
+            lines.insert(at + 1, line);
+        }
+        None => {
             if lines.last().is_some_and(|l| !l.trim().is_empty())
                 && lines.last().is_some_and(|l| note_line(l).is_none())
             {
@@ -470,6 +552,10 @@ mod tests {
             - D:/misc/receipts.md\n\
             - just a sentence about money\n\
             \n\
+            ### 2025\n\
+            \n\
+            - [Last year](D:/misc/2025.md)\n\
+            \n\
             ## Trips\n\
             \n\
             * [Japan](<D:/my notes/japan.md>)\n\
@@ -484,31 +570,44 @@ mod tests {
             entries,
         } = parse(text, base);
         assert_eq!(name.as_deref(), Some("Personal"));
-        let seen: Vec<(&str, String, &str)> = entries
+        let seen: Vec<(&str, String, Vec<&str>)> = entries
             .iter()
             .map(|e| {
                 (
                     e.title.as_str(),
                     e.path.to_string_lossy().replace('\\', "/"),
-                    e.section.as_str(),
+                    e.sections.iter().map(String::as_str).collect(),
                 )
             })
             .collect();
         assert_eq!(
             seen,
             vec![
-                ("Taxes 2026", "D:/misc/taxes.md".to_string(), "Money"),
-                ("", "D:/misc/receipts.md".to_string(), "Money"),
-                ("Japan", "D:/my notes/japan.md".to_string(), "Trips"),
-                ("", "/lib/nearby.md".to_string(), "Trips"),
+                ("Taxes 2026", "D:/misc/taxes.md".to_string(), vec!["Money"]),
+                ("", "D:/misc/receipts.md".to_string(), vec!["Money"]),
+                // A deeper heading nests inside the one above it.
+                (
+                    "Last year",
+                    "D:/misc/2025.md".to_string(),
+                    vec!["Money", "2025"]
+                ),
+                ("Japan", "D:/my notes/japan.md".to_string(), vec!["Trips"]),
+                ("", "/lib/nearby.md".to_string(), vec!["Trips"]),
             ]
         );
         assert_eq!(entries[0].line, 7);
         assert!(entries.iter().all(|e| !e.missing));
-        assert_eq!(sections, vec!["Money".to_string(), "Trips".to_string()]);
+        assert_eq!(
+            sections,
+            vec![
+                vec!["Money".to_string()],
+                vec!["Money".to_string(), "2025".to_string()],
+                vec!["Trips".to_string()],
+            ]
+        );
         // A heading with no note under it yet is still a place a note can go.
         let empty = parse("# Notes\n\n## Later\n", base);
-        assert_eq!(empty.sections, vec!["Later".to_string()]);
+        assert_eq!(empty.sections, vec![vec!["Later".to_string()]]);
         assert!(empty.entries.is_empty());
     }
 
@@ -557,29 +656,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A heading path from the names given.
+    fn at(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn a_note_is_added_under_its_section_and_reads_back() {
         let base = Path::new("/lib");
         let text = "# Personal\n\n## Money\n\n- [Taxes](D:/misc/taxes.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n";
         let out = add_note(
             text,
-            Some("Money"),
+            &at(&["Money"]),
             "Receipts",
             Path::new("D:/misc/receipts.md"),
         );
         let entries = parse(&out, base).entries;
         let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
         assert_eq!(titles, vec!["Taxes", "Receipts", "Japan"]);
-        assert_eq!(entries[1].section, "Money");
+        assert_eq!(entries[1].sections, at(&["Money"]));
 
         // A section that is not there yet is made at the end; a file with none takes it plainly.
-        let out = add_note(&out, Some("Reading"), "A book", Path::new("D:/book.md"));
+        let out = add_note(&out, &at(&["Reading"]), "A book", Path::new("D:/book.md"));
         let entries = parse(&out, base).entries;
-        assert_eq!(entries.last().unwrap().section, "Reading");
-        let out = add_note("# Notes\n\nprose\n", None, "One", Path::new("D:/one.md"));
+        assert_eq!(entries.last().unwrap().sections, at(&["Reading"]));
+        let out = add_note("# Notes\n\nprose\n", &[], "One", Path::new("D:/one.md"));
         assert_eq!(out, "# Notes\n\nprose\n\n- [One](D:/one.md)\n");
         // A path with a space is written so that it reads back whole.
-        let out = add_note(&out, None, "Two", Path::new("D:/my notes/two.md"));
+        let out = add_note(&out, &[], "Two", Path::new("D:/my notes/two.md"));
         let entries = parse(&out, base).entries;
         assert_eq!(
             entries
@@ -593,11 +697,98 @@ mod tests {
         // CRLF is kept.
         let out = add_note(
             "# Notes\r\n\r\n- [One](D:/one.md)\r\n",
-            None,
+            &[],
             "Two",
             Path::new("D:/two.md"),
         );
         assert!(out.ends_with("- [Two](D:/two.md)\r\n"), "{out:?}");
         assert!(!out.contains("\n\n"), "no bare line feed: {out:?}");
+    }
+
+    #[test]
+    fn a_note_goes_under_a_nested_heading_and_a_missing_one_is_written_under_its_parent() {
+        let base = Path::new("/lib");
+        let text = "# Personal\n\
+            \n\
+            ## Money\n\
+            \n\
+            - [Taxes](D:/taxes.md)\n\
+            \n\
+            ### 2025\n\
+            \n\
+            - [Last year](D:/2025.md)\n\
+            \n\
+            ## Trips\n\
+            \n\
+            ### 2025\n\
+            \n\
+            - [Rome](D:/rome.md)\n";
+
+        // The path picks the right "2025": the one inside Trips, not the one inside Money.
+        let out = add_note(
+            text,
+            &at(&["Trips", "2025"]),
+            "Vienna",
+            Path::new("D:/v.md"),
+        );
+        let entries = parse(&out, base).entries;
+        let seen: Vec<(&str, Vec<String>)> = entries
+            .iter()
+            .map(|e| (e.title.as_str(), e.sections.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Taxes", at(&["Money"])),
+                ("Last year", at(&["Money", "2025"])),
+                ("Rome", at(&["Trips", "2025"])),
+                ("Vienna", at(&["Trips", "2025"])),
+            ]
+        );
+
+        // A note under a heading that has subsections goes with that heading's own notes, not
+        // at the end of its subsections.
+        let out = add_note(text, &at(&["Money"]), "Receipts", Path::new("D:/r.md"));
+        let entries = parse(&out, base).entries;
+        assert_eq!(entries[1].title, "Receipts");
+        assert_eq!(entries[1].sections, at(&["Money"]));
+
+        // A heading that is not there yet is written under the part of the path that is.
+        let out = add_note(
+            text,
+            &at(&["Money", "2026"]),
+            "This year",
+            Path::new("D:/n.md"),
+        );
+        let entries = parse(&out, base).entries;
+        let this = entries.iter().find(|e| e.title == "This year").unwrap();
+        assert_eq!(this.sections, at(&["Money", "2026"]));
+        assert!(out.contains("### 2026"), "{out}");
+        // Written inside Money, so the sections that follow are untouched.
+        let sections = parse(&out, base).sections;
+        assert_eq!(
+            sections,
+            vec![
+                at(&["Money"]),
+                at(&["Money", "2026"]),
+                at(&["Money", "2025"]),
+                at(&["Trips"]),
+                at(&["Trips", "2025"]),
+            ]
+        );
+
+        // None of the path there: the whole chain is written at the end.
+        let out = add_note(
+            "# Notes\n",
+            &at(&["Reading", "2026"]),
+            "A book",
+            Path::new("D:/book.md"),
+        );
+        let parsed = parse(&out, base);
+        assert_eq!(
+            parsed.sections,
+            vec![at(&["Reading"]), at(&["Reading", "2026"])]
+        );
+        assert_eq!(parsed.entries[0].sections, at(&["Reading", "2026"]));
     }
 }
