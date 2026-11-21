@@ -58,16 +58,17 @@ pub fn left_out(on: bool, secs: u32, counted: Option<u64>, keep: bool) -> bool {
     on && !keep && counted.is_some_and(|s| s < secs as u64)
 }
 
-/// The value of a `focus` line: `<seconds> <path>`.
+/// The value of a `focus` line: `<seconds> <path>`, the path as [`crate::settings::encode_path`]
+/// writes it.
 pub fn to_setting(secs: u64, path: &std::path::Path) -> String {
-    format!("{secs} {}", path.display())
+    format!("{secs} {}", crate::settings::encode_path(path))
 }
 
 /// Reads a `focus` line's value; `None` when it is not `<seconds> <path>`.
 pub fn parse(value: &str) -> Option<(std::path::PathBuf, u64)> {
     let (secs, path) = value.split_once(' ')?;
     let secs = secs.parse().ok()?;
-    (!path.is_empty()).then(|| (path.into(), secs))
+    (!path.is_empty()).then(|| (crate::settings::decode_path(path), secs))
 }
 
 #[cfg(test)]
