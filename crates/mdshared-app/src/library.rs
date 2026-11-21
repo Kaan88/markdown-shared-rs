@@ -744,6 +744,67 @@ impl Text {
         }
         self.into_text()
     }
+
+    /// Writes `line` under the heading path `section` as [`Text::place`] does, except that a line
+    /// with no section goes in the group's own notes: after the file's first `#` heading and its
+    /// `home:` line, after the notes already written there, and before the first section heading.
+    /// A file with no section heading takes it at the end, exactly as [`Text::place`] does.
+    fn place_in_group(mut self, section: &[String], line: &str) -> String {
+        let want: Vec<String> = section
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !want.is_empty() {
+            return self.place(&want, line);
+        }
+        let Some(first) = self
+            .rows
+            .iter()
+            .position(|row| matches!(*row, Row::Section { level } if level > 1))
+        else {
+            return self.place(&[], line);
+        };
+        // Never above the group's `#` heading, nor above its `home:` line. A `home:` line below
+        // a section heading is left where it is: the line still goes before the first section,
+        // as a note with no section belongs, and not under that section with the `home:` line.
+        let mut start = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Section { level: 1 }))
+            .filter(|&heading| heading < first)
+            .map_or(0, |heading| heading + 1);
+        if let Some(home) = self.home_row().filter(|&home| home < first) {
+            start = start.max(home + 1);
+        }
+        // The end of the group's own notes: the first section heading, with the blank lines
+        // just above it left below the new line.
+        let mut at = first;
+        while at > start
+            && matches!(self.rows[at - 1], Row::Other)
+            && self.lines[at - 1].trim().is_empty()
+        {
+            at -= 1;
+        }
+        let mut add = Vec::new();
+        if at > 0
+            && !self.lines[at - 1].trim().is_empty()
+            && !matches!(self.rows[at - 1], Row::Note(_))
+        {
+            add.push(String::new());
+        }
+        add.push(line.to_string());
+        // A blank line between the group's notes and the heading that follows them.
+        let before_heading = match self.rows.get(at) {
+            Some(Row::Section { level }) => *level > 1,
+            _ => false,
+        };
+        if before_heading {
+            add.push(String::new());
+        }
+        self.lines.splice(at..at, add);
+        self.into_text()
+    }
 }
 
 /// Where a line written directly under the heading on line `start` goes: after that heading's
@@ -815,6 +876,16 @@ fn heading_line(lines: &[String], want: &[String]) -> Option<(usize, usize)> {
 /// keep their own notes. The file's line ending is kept.
 pub fn add_note(text: &str, section: &[String], title: &str, path: &Path) -> String {
     Text::new(text).place(section, &link_line(title, path))
+}
+
+/// Writes a note into a library file's text under the heading path `section` and gives the new
+/// text: [`add_note`] in every case but one. A note with no section is written in the group's own
+/// notes — after the file's `#` heading and its `home:` line, after the notes already written
+/// there, and before the first section heading — where [`add_note`] would put it at the end of
+/// the file, under the last heading. A file with no section heading takes it exactly as
+/// [`add_note`] writes it. The file's line ending is kept.
+pub fn add_note_in_group(text: &str, section: &[String], title: &str, path: &Path) -> String {
+    Text::new(text).place_in_group(section, &link_line(title, path))
 }
 
 /// Removes the note written on `line` and gives the new text; `None` when that line is not one
@@ -1040,6 +1111,20 @@ pub fn move_note(text: &str, line: usize, to_path: &[String]) -> Option<String> 
     Some(Text::new(&without).place(to_path, &moved))
 }
 
+/// Moves the note written on `line` into the group's own notes, the line exactly as it is
+/// written, and gives the new text: [`move_note`] with no section heading, except that the line
+/// is placed as [`add_note_in_group`] places a note and not at the end of the file. `None` when
+/// that line is not a note.
+pub fn move_note_in_group(text: &str, line: usize) -> Option<String> {
+    let doc = Text::new(text);
+    if !matches!(doc.rows.get(line.checked_sub(1)?), Some(Row::Note(_))) {
+        return None;
+    }
+    let moved = doc.lines[line - 1].clone();
+    let without = remove_note(text, line)?;
+    Some(Text::new(&without).place_in_group(&[], &moved))
+}
+
 /// The line, counted from 1, of the section heading the path `section` names (`["Money",
 /// "2026"]` is `### 2026` inside `## Money`), so a writer that takes a line can be given a
 /// section by its path, and a command can lead to it. `None` when no such heading is written;
@@ -1230,6 +1315,202 @@ mod tests {
         );
         assert!(out.ends_with("- [Two](D:/two.md)\r\n"), "{out:?}");
         assert!(!out.contains("\n\n"), "no bare line feed: {out:?}");
+    }
+
+    /// What `add_note` wrote for each of these on 2026-11-22, before the variant beside it was
+    /// added: the old writer's output, fixed, so that a change in it cannot pass unnoticed.
+    #[test]
+    fn add_note_writes_exactly_what_it_wrote_before() {
+        let cases: &[(&str, &[&str], &str, &str, &str)] = &[
+            (
+                "# Personal\n\n## Money\n\n- [Taxes](D:/misc/taxes.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n",
+                &["Money"],
+                "Receipts",
+                "D:/misc/receipts.md",
+                "# Personal\n\n## Money\n\n- [Taxes](D:/misc/taxes.md)\n- [Receipts](D:/misc/receipts.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n",
+            ),
+            (
+                "# Personal\n\n## Money\n\n- [Taxes](D:/misc/taxes.md)\n\n### 2025\n\n- [Last](D:/2025.md)\n\n## Trips\n",
+                &["Money", "2026"],
+                "This year",
+                "D:/n.md",
+                "# Personal\n\n## Money\n\n- [Taxes](D:/misc/taxes.md)\n\n### 2026\n\n- [This year](D:/n.md)\n\n### 2025\n\n- [Last](D:/2025.md)\n\n## Trips\n",
+            ),
+            (
+                "# Notes\n\nprose\n",
+                &[],
+                "One",
+                "D:/one.md",
+                "# Notes\n\nprose\n\n- [One](D:/one.md)\n",
+            ),
+            (
+                "# Notes\n\nprose",
+                &[],
+                "Two",
+                "D:/my notes/two.md",
+                "# Notes\n\nprose\n\n- [Two](<D:/my notes/two.md>)\n",
+            ),
+            (
+                "# Notes\r\n\r\n- [One](D:/one.md)\r\n",
+                &[],
+                "Two",
+                "D:/two.md",
+                "# Notes\r\n\r\n- [One](D:/one.md)\r\n- [Two](D:/two.md)\r\n",
+            ),
+            (
+                "# Trip\nhome: Trip\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n",
+                &[],
+                "Rest",
+                "Trip/Rest.md",
+                "# Trip\nhome: Trip\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n- [Rest](Trip/Rest.md)\n",
+            ),
+            (
+                "## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n",
+                &[],
+                "Rest",
+                "Trip/Rest.md",
+                "## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n- [Rest](Trip/Rest.md)\n",
+            ),
+            (
+                "# Notes",
+                &[],
+                "One",
+                "D:/one.md",
+                "# Notes\n\n- [One](D:/one.md)\n",
+            ),
+            (
+                "# Notes\n\n## A\n\n```\n## not a heading\n```\n\n- [x](D:/x.md)\n",
+                &["A"],
+                "y",
+                "D:/y.md",
+                "# Notes\n\n## A\n\n```\n## not a heading\n```\n\n- [x](D:/x.md)\n- [y](D:/y.md)\n",
+            ),
+            (
+                "# Notes\n\n- [old](D:/old.md)\n",
+                &[],
+                "a [bad] name",
+                "D:/my notes/a b.md",
+                "# Notes\n\n- [old](D:/old.md)\n- [a bad name](<D:/my notes/a b.md>)\n",
+            ),
+        ];
+        for (i, (text, section, title, path, expected)) in cases.iter().enumerate() {
+            let section: Vec<String> = section.iter().map(|s| s.to_string()).collect();
+            let out = add_note(text, &section, title, Path::new(path));
+            assert_eq!(&out, expected, "case {i} changed");
+        }
+    }
+
+    #[test]
+    fn a_note_with_no_section_goes_in_the_groups_own_notes() {
+        let base = Path::new("/lib");
+        let rest = Path::new("Trip/Rest.md");
+        // A `home:` line and a section: the note goes under the `home:` line, before the section,
+        // and reads back with no section at all.
+        let text = "# Trip\nhome: Trip\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n";
+        let out = add_note_in_group(text, &[], "Rest", rest);
+        assert_eq!(
+            out,
+            "# Trip\nhome: Trip\n\n- [Rest](Trip/Rest.md)\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n"
+        );
+        let parsed = parse(&out, base);
+        assert_eq!(parsed.home.as_deref(), Some(Path::new("/lib/Trip")));
+        let rest_entry = parsed.entries.iter().find(|e| e.title == "Rest").unwrap();
+        assert!(rest_entry.sections.is_empty(), "{:?}", rest_entry.sections);
+        assert_eq!(rest_entry.line, 4, "under the `home:` line's blank line");
+        // After the group's own notes already there, before the sections.
+        let text =
+            "# Trip\nhome: Trip\n\n- [One](Trip/One.md)\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n";
+        assert_eq!(
+            add_note_in_group(text, &[], "Rest", rest),
+            "# Trip\nhome: Trip\n\n- [One](Trip/One.md)\n- [Rest](Trip/Rest.md)\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n"
+        );
+        // A file with no section heading takes it exactly as `add_note` does, with or without a
+        // trailing newline, and with CRLF as the file has it.
+        for text in [
+            "# Trip\nhome: Trip\n",
+            "# Trip\nhome: Trip",
+            "# Trip\r\nhome: Trip\r\n",
+        ] {
+            assert_eq!(
+                add_note_in_group(text, &[], "Rest", rest),
+                add_note(text, &[], "Rest", rest),
+                "{text:?}"
+            );
+        }
+        // The file's line ending is kept, and none is made up.
+        let text = "# Trip\r\nhome: Trip\r\n\r\n## Tokyo\r\n\r\n- [A](Trip/Tokyo/A.md)\r\n";
+        let out = add_note_in_group(text, &[], "Rest", rest);
+        assert_eq!(
+            out,
+            "# Trip\r\nhome: Trip\r\n\r\n- [Rest](Trip/Rest.md)\r\n\r\n## Tokyo\r\n\r\n- [A](Trip/Tokyo/A.md)\r\n"
+        );
+        assert!(!out.contains("\n\n"), "no bare line feed: {out:?}");
+        // A first heading deeper than `#`: the note still goes before it, with a line between.
+        let text = "## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n";
+        let out = add_note_in_group(text, &[], "Rest", rest);
+        assert_eq!(
+            out,
+            "- [Rest](Trip/Rest.md)\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n"
+        );
+        assert!(parse(&out, base).entries[0].sections.is_empty());
+        // A heading inside a fence is not a heading: the note goes after the fence, before the
+        // file's first real section, and never inside the code.
+        let text = "# Trip\nhome: Trip\n\n```\n## Not a section\n```\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n";
+        let out = add_note_in_group(text, &[], "Rest", rest);
+        assert_eq!(
+            out,
+            "# Trip\nhome: Trip\n\n```\n## Not a section\n```\n\n- [Rest](Trip/Rest.md)\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n"
+        );
+        assert!(parse(&out, base).entries[0].sections.is_empty());
+        // The `home:` line is never written above.
+        assert!(out.find("home:").unwrap() < out.find("[Rest]").unwrap());
+    }
+
+    #[test]
+    fn a_note_with_a_section_is_written_exactly_as_add_note_writes_it() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last](D:/2025.md)\n\n## Trips\n\n- [Japan](D:/japan.md)\n",
+                &["Money"],
+            ),
+            (
+                "# Personal\n\n## Money\n\n- [Taxes](D:/taxes.md)\n\n### 2025\n\n- [Last](D:/2025.md)\n\n## Trips\n",
+                &["Money", "2026"],
+            ),
+            ("# Notes\n", &["Reading"]),
+            ("# Notes\n", &["Reading", "2026"]),
+        ];
+        for (text, section) in cases {
+            let section: Vec<String> = section.iter().map(|s| s.to_string()).collect();
+            let path = Path::new("D:/a b/new.md");
+            assert_eq!(
+                add_note_in_group(text, &section, "New", path),
+                add_note(text, &section, "New", path),
+                "{text:?} {section:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_note_moved_into_the_group_goes_before_its_first_section() {
+        let base = Path::new("/lib");
+        let text = "# Trip\nhome: Trip\n\n## Tokyo\n\n- [A](Trip/Tokyo/A.md)\n\n## Nara\n\n- [B](Trip/Nara/B.md)\n";
+        let out = move_note_in_group(text, 6).expect("the note moves");
+        assert_eq!(
+            out,
+            "# Trip\nhome: Trip\n\n- [A](Trip/Tokyo/A.md)\n\n## Tokyo\n\n\n## Nara\n\n- [B](Trip/Nara/B.md)\n"
+        );
+        let parsed = parse(&out, base);
+        let a = parsed.entries.iter().find(|e| e.title == "A").unwrap();
+        assert!(a.sections.is_empty(), "{:?}", a.sections);
+        assert_eq!(parsed.entries.len(), 2, "both notes stay");
+        // Only a note line moves: a heading, a `home:` line or a line past the end is not one.
+        assert_eq!(move_note_in_group(text, 1), None);
+        assert_eq!(move_note_in_group(text, 4), None);
+        assert_eq!(move_note_in_group(text, 5), None);
+        assert_eq!(move_note_in_group(text, 2), None);
+        assert_eq!(move_note_in_group(text, 99), None);
+        assert_eq!(move_note_in_group(text, 0), None);
     }
 
     #[test]
