@@ -828,6 +828,14 @@ pub fn move_note(text: &str, line: usize, to_path: &[String]) -> Option<String> 
     Some(Text::new(&without).place(to_path, &moved))
 }
 
+/// The line, counted from 1, of the section heading the path `section` names (`["Money",
+/// "2026"]` is `### 2026` inside `## Money`), so a writer that takes a line can be given a
+/// section by its path, and a command can lead to it. `None` when no such heading is written;
+/// the first when the same path is written twice.
+pub fn section_line(text: &str, section: &[String]) -> Option<usize> {
+    let doc = Text::new(text);
+    heading_line(&doc.lines, section).map(|(i, _)| i + 1)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1505,5 +1513,39 @@ mod tests {
             vec![at(&["Money"]), at(&["Money", "2026"])]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_section_is_found_by_its_path_and_its_line_leads_to_the_writers() {
+        let text = "# G\n\n## Money\n\n### 2026\n\n- [A](D:/a.md)\n\n## Trips\n\n### 2026\n\n```\n## Not\n```\n";
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(section_line(text, &path(&["Money"])), Some(3));
+        assert_eq!(section_line(text, &path(&["Money", "2026"])), Some(5));
+        assert_eq!(section_line(text, &path(&["Trips", "2026"])), Some(11));
+        assert_eq!(
+            section_line(text, &path(&["money"])),
+            Some(3),
+            "as the writers match"
+        );
+        assert_eq!(
+            section_line(text, &path(&["2026"])),
+            None,
+            "a path, not a name"
+        );
+        assert_eq!(
+            section_line(text, &path(&["Not"])),
+            None,
+            "a fence holds no heading"
+        );
+        assert_eq!(section_line(text, &[]), None);
+        // The line is what the section writers take.
+        let renamed = rename_section(
+            text,
+            section_line(text, &path(&["Trips"])).unwrap(),
+            "Travel",
+        );
+        assert!(renamed.unwrap().contains("## Travel\n"));
+        let crlf = text.replace('\n', "\r\n");
+        assert_eq!(section_line(&crlf, &path(&["Trips", "2026"])), Some(11));
     }
 }
