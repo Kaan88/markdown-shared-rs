@@ -476,10 +476,7 @@ const RESERVED_NAMES: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// A group or section name turned into a folder name: trimmed, the characters Windows forbids
-/// replaced by `_`, a trailing dot or space taken off, a reserved device name made safe with a
-/// trailing `_`, and the length capped so a note's file name fits in the path beside it. It reads
-/// and writes nothing: a name always comes out with something in it, an empty one as `Untitled`.
+/// A name turned into the name of a folder or of a file's stem: a group, a section or a note. It is\n/// the one rule for all of them. Trimmed, the characters Windows forbids replaced by `_` (a `%`\n/// too, which the reader would take for the start of `%20`), a trailing dot or space taken off, a\n/// reserved device name made safe with a `_` after it (`COM7` is `COM7_`, `CON.txt` is\n/// `CON_.txt`), and the length capped so a note's file name fits in the path beside it. It reads\n/// and writes nothing: a name always comes out with something in it, an empty one as `Untitled`.
 ///
 /// Two names may come out the same. Telling them apart needs the disk, so that is the app's job.
 pub fn folder_name(name: &str) -> String {
@@ -487,7 +484,12 @@ pub fn folder_name(name: &str) -> String {
         .trim()
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '%'
+                )
+            {
                 '_'
             } else {
                 c
@@ -504,9 +506,14 @@ pub fn folder_name(name: &str) -> String {
     if out.is_empty() {
         return "Untitled".to_string();
     }
-    let stem = out.split('.').next().unwrap_or_default();
-    if RESERVED_NAMES.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
-        out.push('_');
+    // Windows reads `CON.txt` as the device too, and ignores spaces before the dot, so the mark
+    // goes straight after the device's own name.
+    let (stem, rest) = out.split_at(out.find('.').unwrap_or(out.len()));
+    if RESERVED_NAMES
+        .iter()
+        .any(|r| stem.trim_end().eq_ignore_ascii_case(r))
+    {
+        return format!("{}_{rest}", stem.trim_end());
     }
     out
 }
@@ -1954,6 +1961,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_percent_sign_is_replaced_because_the_reader_takes_percent_20_for_a_space() {
+        assert_eq!(folder_name("50%20off"), "50_20off");
+        assert_eq!(folder_name("100%"), "100_");
+        // The name as a link's file reads back as the file that was written: nothing in it is
+        // decoded into another name.
+        let name = folder_name("50%20off");
+        let line = link_line("Sale", Path::new(&format!("D:/notes/{name}.md")));
+        let parsed = parse(&format!("# G\n\n{line}\n"), Path::new("D:/lib"));
+        assert_eq!(
+            parsed.entries[0].path.file_name().and_then(|n| n.to_str()),
+            Some("50_20off.md")
+        );
+    }
+
+    #[test]
+    fn every_device_name_is_made_safe_in_any_case_and_with_any_extension() {
+        for name in RESERVED_NAMES {
+            assert_eq!(folder_name(name), format!("{name}_"), "{name}");
+            let lower = name.to_ascii_lowercase();
+            assert_eq!(folder_name(&lower), format!("{lower}_"), "{lower}");
+            // Windows reads CON.txt as the device too, so the mark goes after the device's name.
+            assert_eq!(
+                folder_name(&format!("{name}.txt")),
+                format!("{name}_.txt"),
+                "{name}.txt"
+            );
+            assert_eq!(
+                folder_name(&format!("{name} ")),
+                format!("{name}_"),
+                "{name} "
+            );
+        }
+        assert_eq!(folder_name("COM10"), "COM10", "COM10 is not a device name");
+        assert_eq!(folder_name("COM"), "COM");
+        assert_eq!(folder_name("Console.txt"), "Console.txt");
+    }
     #[test]
     fn a_note_folder_follows_the_heading_path_from_the_home() {
         let home = Path::new("D:/notes/Personal");
