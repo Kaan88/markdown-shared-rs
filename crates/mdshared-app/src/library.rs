@@ -22,6 +22,11 @@
 //! taken from the library folder. A note that is not on disk is listed as missing rather than
 //! dropped, so a moved file is visible instead of silently gone.
 //!
+//! A group may name the folder its notes are written in with one `home:` line, `home: Personal`
+//! or `home: D:/notes/work`: a path with no root is taken from the library folder as a note's
+//! is. It is neither a heading nor a note, so a reader that does not know the line lists the
+//! same notes as one that does; the first such line counts and a second is prose.
+//!
 //! [`read`] does the whole of it: the folder, each file, the titles and what is missing. It
 //! touches the notes only for the titles it has to find, and never more than [`TITLE_BYTES`] of
 //! one, so it stays off the launch path by being called when the library is first shown.
@@ -77,6 +82,9 @@ pub struct Entry {
 pub struct Group {
     /// The file's first level-1 heading, or its file name without the extension.
     pub name: String,
+    /// The folder its `home:` line names, resolved as a note's path is, or `None` when the file
+    /// has no such line. Where new notes of the group are written is the app's business.
+    pub home: Option<PathBuf>,
     pub file: PathBuf,
     /// What the file looked like when it was read, for "has it been saved since".
     pub stamp: FileStamp,
@@ -153,6 +161,7 @@ pub fn read(dir: &Path) -> Library {
             .unwrap_or_default();
         let Parsed {
             name,
+            home,
             sections,
             mut entries,
         } = parse(&text, dir);
@@ -170,6 +179,7 @@ pub fn read(dir: &Path) -> Library {
         }
         groups.push(Group {
             name,
+            home,
             file,
             stamp,
             sections,
@@ -256,18 +266,21 @@ fn closes(marker: &str, open: &str) -> bool {
 pub struct Parsed {
     /// The file's first level-1 heading, if it has one.
     pub name: Option<String>,
+    /// Its `home:` folder, resolved against the library folder, if it has one.
+    pub home: Option<PathBuf>,
     /// Its other headings as paths, in the order they are written: `["Money"]`,
     /// `["Money", "2026"]`, `["Trips"]`.
     pub sections: Vec<Vec<String>>,
     pub entries: Vec<Entry>,
 }
 
-/// Reads one library file: its group name (its first level-1 heading), its headings and its
-/// notes, in the order they are written. `base` is the folder a path with no root is taken
-/// from. Nothing is read from disk here, so [`Entry::missing`] is false and a note with no
-/// title written keeps an empty one; [`read`] fills both in.
+/// Reads one library file: its group name (its first level-1 heading), the folder its first
+/// `home:` line names, its headings and its notes, in the order they are written. `base` is the
+/// folder a path with no root is taken from. Nothing is read from disk here, so [`Entry::missing`]
+/// is false and a note with no title written keeps an empty one; [`read`] fills both in.
 pub fn parse(text: &str, base: &Path) -> Parsed {
     let mut name: Option<String> = None;
+    let mut home: Option<PathBuf> = None;
     let mut sections: Vec<Vec<String>> = Vec::new();
     // The headings open at this line, with the level each was written at.
     let mut open: Vec<(usize, String)> = Vec::new();
@@ -304,6 +317,13 @@ pub fn parse(text: &str, base: &Path) -> Parsed {
             }
             continue;
         }
+        // The group's own folder, and only the first line that names one.
+        if home.is_none()
+            && let Some(folder) = home_line(line)
+        {
+            home = Some(resolve(&folder, base));
+            continue;
+        }
         if entries.len() >= MAX_ENTRIES {
             continue;
         }
@@ -320,6 +340,7 @@ pub fn parse(text: &str, base: &Path) -> Parsed {
     }
     Parsed {
         name,
+        home,
         sections,
         entries,
     }
@@ -332,6 +353,17 @@ fn heading(line: &str) -> Option<(usize, &str)> {
     let level = 1 + more;
     let text = rest[more..].trim().trim_end_matches('#').trim();
     (level == 1 || rest[more..].starts_with(' ') || text.is_empty()).then_some((level, text))
+}
+
+/// The folder a `home:` line names, as the line gives it. The key reads in any case, and the
+/// value may be written in `<>` with `%20` in it, as a note's path may.
+fn home_line(line: &str) -> Option<String> {
+    let (key, value) = line.trim_start().split_once(':')?;
+    if !key.trim().eq_ignore_ascii_case("home") {
+        return None;
+    }
+    let (value, _) = unwrap_path(value);
+    (!value.is_empty()).then_some(value)
 }
 
 /// A note line as its title (empty when it is only a path) and the path written on it: a list
@@ -419,6 +451,76 @@ fn written_target(path: &Path) -> String {
     }
 }
 
+/// A `home:` value as it is written: forward slashes, trimmed, and nothing when it has no text
+/// or more than one line.
+fn written_home(home: &Path) -> Option<String> {
+    let written = home.to_string_lossy().replace('\\', "/");
+    let written = written.trim();
+    (!written.is_empty() && !written.contains(['\r', '\n'])).then(|| written.to_string())
+}
+
+/// Whether two paths, as a file writes them, are the same one: the same text under whichever
+/// separator was used for a folder.
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim().replace('\\', "/") == b.trim().replace('\\', "/")
+}
+
+/// The longest a folder name is made: a component, not the path, and a note's own file name
+/// still has to fit beside it.
+const FOLDER_NAME_MAX: usize = 64;
+
+/// The names Windows keeps for a device, in any case and with any extension: no folder may be
+/// called one.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// A group or section name turned into a folder name: trimmed, the characters Windows forbids
+/// replaced by `_`, a trailing dot or space taken off, a reserved device name made safe with a
+/// trailing `_`, and the length capped so a note's file name fits in the path beside it. It reads
+/// and writes nothing: a name always comes out with something in it, an empty one as `Untitled`.
+///
+/// Two names may come out the same. Telling them apart needs the disk, so that is the app's job.
+pub fn folder_name(name: &str) -> String {
+    let replaced: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut out: String = replaced
+        .trim_end_matches([' ', '.'])
+        .chars()
+        .take(FOLDER_NAME_MAX)
+        .collect();
+    // The cap may leave a space or a dot at the end, which Windows would then take off itself.
+    out.truncate(out.trim_end_matches([' ', '.']).len());
+    if out.is_empty() {
+        return "Untitled".to_string();
+    }
+    let stem = out.split('.').next().unwrap_or_default();
+    if RESERVED_NAMES.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        out.push('_');
+    }
+    out
+}
+
+/// The folder a note written under the heading path `section` belongs in, for a group whose
+/// `home:` is `home`: that folder, then one [`folder_name`] per heading. It creates nothing.
+pub fn note_folder(home: &Path, section: &[String]) -> PathBuf {
+    let mut folder = home.to_path_buf();
+    for name in section {
+        folder.push(folder_name(name));
+    }
+    folder
+}
+
 /// A name as a writer writes it: trimmed, and nothing when it has no text or more than one
 /// line.
 fn clean(name: &str) -> Option<&str> {
@@ -440,6 +542,8 @@ enum Row {
     Section { level: usize },
     /// A note.
     Note(NoteLine),
+    /// A `home:` line: the group's folder, never a note.
+    Home,
     /// A fence's own line, or a line inside one: never a heading and never a note.
     Code,
     /// Prose, a blank line, anything else.
@@ -515,6 +619,8 @@ impl Text {
                 rows.push(Row::Code);
             } else if let Some((level, _)) = heading(line) {
                 rows.push(Row::Section { level });
+            } else if home_line(line).is_some() {
+                rows.push(Row::Home);
             } else {
                 rows.push(match note_parts(line) {
                     Some(note) => Row::Note(note),
@@ -536,6 +642,25 @@ impl Text {
             out.push_str(self.eol);
         }
         out
+    }
+
+    /// The first line that declares the group's home folder, if the file has one.
+    fn home_row(&self) -> Option<usize> {
+        self.rows.iter().position(|row| matches!(row, Row::Home))
+    }
+
+    /// Removes the line `at`, and a blank line either side of it that it leaves doubled.
+    fn remove_row(&mut self, at: usize) {
+        self.lines.remove(at);
+        self.rows.remove(at);
+        if at > 0
+            && at < self.lines.len()
+            && self.lines[at - 1].trim().is_empty()
+            && self.lines[at].trim().is_empty()
+        {
+            self.lines.remove(at);
+            self.rows.remove(at);
+        }
     }
 
     /// Writes `line` under the heading path `section` (the end of the file when it is empty or
@@ -594,7 +719,8 @@ impl Text {
 }
 
 /// Where a line written directly under the heading on line `start` goes: after that heading's
-/// own notes, before any heading below it, and never inside a code fence.
+/// own notes, before any heading below it, and never inside a code fence. Nothing is written
+/// above the group's `home:` line, which stays directly under the heading.
 fn after_notes(rows: &[Row], start: usize) -> usize {
     let end = rows
         .iter()
@@ -602,10 +728,13 @@ fn after_notes(rows: &[Row], start: usize) -> usize {
         .skip(start + 1)
         .find(|(_, row)| matches!(row, Row::Section { .. }))
         .map_or(rows.len(), |(i, _)| i);
-    (start + 1..end)
+    let from = (start + 1..end)
+        .find(|&i| matches!(rows[i], Row::Home))
+        .map_or(start + 1, |i| i + 1);
+    (from..end)
         .rev()
         .find(|&i| matches!(rows[i], Row::Note(_)))
-        .map_or(start + 1, |i| i + 1)
+        .map_or(from, |i| i + 1)
 }
 
 /// The line of the heading `want` names, with the level it is written at: the headings are
@@ -808,11 +937,66 @@ pub fn set_group_name(text: &str, name: &str) -> Option<String> {
     Some(doc.into_text())
 }
 
+/// Writes the group's `home:` line directly under the file's first `#` heading, or rewrites the
+/// line already there, and gives the new text; the file's line ending is kept. A path is written
+/// with forward slashes, as a link's is. `None` when the file has no `#` heading, the path has no
+/// text, or the file already says that path.
+pub fn set_group_home(text: &str, home: &Path) -> Option<String> {
+    let value = written_home(home)?;
+    let mut doc = Text::new(text);
+    if let Some(at) = doc.home_row() {
+        if home_line(&doc.lines[at]).is_some_and(|said| same_path(&said, &value)) {
+            return None;
+        }
+        doc.lines[at] = format!("home: {value}");
+        return Some(doc.into_text());
+    }
+    let heading = doc
+        .rows
+        .iter()
+        .position(|row| matches!(row, Row::Section { level: 1, .. }))?;
+    // Directly under the heading, and the blank line a heading already has stays as the gap
+    // after the new line; a file with none gets one.
+    let mut add = vec![format!("home: {value}")];
+    if doc
+        .lines
+        .get(heading + 1)
+        .is_some_and(|l| !l.trim().is_empty())
+    {
+        add.push(String::new());
+    }
+    doc.lines.splice(heading + 1..heading + 1, add);
+    Some(doc.into_text())
+}
+
+/// Removes the group's `home:` line, and any second one that would otherwise become it, and
+/// gives the new text. `None` when the file has none.
+pub fn clear_group_home(text: &str) -> Option<String> {
+    let mut doc = Text::new(text);
+    let mut removed = false;
+    while let Some(at) = doc.home_row() {
+        doc.remove_row(at);
+        removed = true;
+    }
+    removed.then(|| doc.into_text())
+}
+
 /// The text of a new group file: [`TEMPLATE`] with its own name on it. `None` when the name has
 /// no text.
 pub fn new_group(name: &str) -> Option<String> {
     let name = clean(name)?;
     Some(TEMPLATE.replacen("# Notes", &format!("# {name}"), 1))
+}
+
+/// The text of a new group file that declares the folder its notes are written in, the line
+/// written as [`set_group_home`] writes it. [`new_group`] is this with no folder, for a caller
+/// that does not choose one.
+pub fn new_group_with_home(name: &str, home: Option<&Path>) -> Option<String> {
+    let text = new_group(name)?;
+    Some(match home {
+        Some(home) => set_group_home(&text, home).unwrap_or(text),
+        None => text,
+    })
 }
 
 /// Moves the note written on `line` to the heading path `to_path` of the same file, the line
@@ -875,6 +1059,7 @@ mod tests {
             ```\n";
         let Parsed {
             name,
+            home: _,
             sections,
             entries,
         } = parse(text, base);
@@ -968,6 +1153,11 @@ mod tests {
     /// A heading path from the names given.
     fn at(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A path as a test compares it: forward slashes, whatever the platform writes.
+    fn written(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
     }
 
     #[test]
@@ -1547,5 +1737,321 @@ mod tests {
         assert!(renamed.unwrap().contains("## Travel\n"));
         let crlf = text.replace('\n', "\r\n");
         assert_eq!(section_line(&crlf, &path(&["Trips", "2026"])), Some(11));
+    }
+
+    #[test]
+    fn a_group_home_is_read_from_the_file_and_taken_from_the_library_folder() {
+        let base = Path::new("/lib");
+        let parsed = parse(
+            "# Personal\n\nhome: Personal\n\n- [Taxes](D:/misc/taxes.md)\n",
+            base,
+        );
+        assert_eq!(
+            parsed.home.as_deref().map(written),
+            Some("/lib/Personal".to_string())
+        );
+        assert_eq!(parsed.name.as_deref(), Some("Personal"), "not in the name");
+        assert_eq!(parsed.entries.len(), 1, "and not a note");
+        assert_eq!(parsed.entries[0].title, "Taxes");
+        assert!(parsed.entries[0].sections.is_empty(), "and not a section");
+    }
+
+    #[test]
+    fn a_group_home_with_a_root_is_kept_as_it_is() {
+        let parsed = parse("# Work\n\nhome: D:/notes/work\n", Path::new("/lib"));
+        assert_eq!(
+            parsed.home.as_deref().map(written),
+            Some("D:/notes/work".to_string())
+        );
+        assert!(
+            parsed.entries.is_empty(),
+            "a path on its own is not taken for a note on this line"
+        );
+        // The same folder, written with the other separator, is the same folder.
+        let parsed = parse("# Work\nhome: D:\\notes\\work\n", Path::new("/lib"));
+        assert_eq!(
+            parsed.home.as_deref().map(written),
+            Some("D:/notes/work".to_string())
+        );
+    }
+
+    #[test]
+    fn only_the_first_home_line_counts() {
+        let parsed = parse("# P\n\nhome: First\n\nhome: Second\n", Path::new("/lib"));
+        assert_eq!(
+            parsed.home.as_deref().map(written),
+            Some("/lib/First".to_string())
+        );
+        assert!(parsed.entries.is_empty(), "the second is prose");
+    }
+
+    #[test]
+    fn a_home_line_inside_a_code_fence_is_not_read() {
+        let fenced = "# P\n\n```\nhome: Fenced\n```\n";
+        assert_eq!(parse(fenced, Path::new("/lib")).home, None);
+        let both = "# P\n\n```\nhome: Fenced\n```\n\nhome: Real\n";
+        assert_eq!(
+            parse(both, Path::new("/lib")).home.as_deref().map(written),
+            Some("/lib/Real".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_home_line_reads_as_the_same_notes_and_sections() {
+        let base = Path::new("/lib");
+        let without = "# Personal\n\
+            \n\
+            ## Money\n\
+            \n\
+            - [Taxes](D:/taxes.md)\n\
+            \n\
+            ### 2025\n\
+            \n\
+            - [Last year](D:/2025.md)\n\
+            \n\
+            ## Trips\n\
+            \n\
+            - [Japan](D:/japan.md)\n";
+        // A reader that does not know the line is the same reader otherwise: it is ignored as
+        // content, so the notes, the sections and the name are the ones the file has without it.
+        let with = without.replacen("# Personal\n\n", "# Personal\n\nhome: Personal\n\n", 1);
+        let a = parse(&with, base);
+        let b = parse(without, base);
+        assert_eq!(
+            a.home.as_deref().map(written),
+            Some("/lib/Personal".to_string())
+        );
+        assert_eq!(b.home, None);
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.sections, b.sections);
+        let seen = |parsed: &Parsed| -> Vec<(String, String, Vec<String>)> {
+            parsed
+                .entries
+                .iter()
+                .map(|e| (e.title.clone(), written(&e.path), e.sections.clone()))
+                .collect()
+        };
+        assert_eq!(seen(&a), seen(&b));
+        assert_eq!(a.entries.len(), 3);
+    }
+
+    #[test]
+    fn the_group_home_is_written_under_the_heading_and_rewritten_there() {
+        assert_eq!(
+            set_group_home("# Personal\n", Path::new("Personal")).unwrap(),
+            "# Personal\nhome: Personal\n"
+        );
+        // The blank line the heading already has stays as the gap after the new line.
+        assert_eq!(
+            set_group_home("# Personal\n\n## Money\n", Path::new("Personal")).unwrap(),
+            "# Personal\nhome: Personal\n\n## Money\n"
+        );
+        // A line that is there is rewritten where it is, and nothing else moves.
+        assert_eq!(
+            set_group_home(
+                "# Personal\nhome: Old\n\n## Money\n",
+                Path::new("New/Place")
+            )
+            .unwrap(),
+            "# Personal\nhome: New/Place\n\n## Money\n"
+        );
+        // Line endings the file did not have are not invented.
+        assert_eq!(
+            set_group_home("# Notes\nprose\n", Path::new("Notes")).unwrap(),
+            "# Notes\nhome: Notes\n\nprose\n"
+        );
+        // An absolute path is written with forward slashes, as a link's is.
+        assert_eq!(
+            set_group_home("# Work\n", Path::new("D:\\notes\\work")).unwrap(),
+            "# Work\nhome: D:/notes/work\n"
+        );
+        // Notes and sections written under the group stay below the line.
+        let text = set_group_home("# P\n", Path::new("P")).unwrap();
+        assert_eq!(
+            add_note(&text, &[], "One", Path::new("D:/one.md")),
+            "# P\nhome: P\n\n- [One](D:/one.md)\n"
+        );
+        assert_eq!(
+            add_section(&text, &[], "Money").unwrap(),
+            "# P\nhome: P\n\n## Money\n"
+        );
+    }
+
+    #[test]
+    fn setting_a_group_home_refuses_an_unchanged_path_or_no_heading() {
+        assert_eq!(set_group_home("# P\nhome: P\n", Path::new("P")), None);
+        assert_eq!(
+            set_group_home("# P\nhome: <D:/my notes/x>\n", Path::new("D:/my notes/x")),
+            None
+        );
+        assert_eq!(
+            set_group_home("# P\nhome: D:\\notes\\work\n", Path::new("D:/notes/work")),
+            None
+        );
+        assert_eq!(set_group_home("- no heading\n", Path::new("P")), None);
+        assert_eq!(set_group_home("# P\nhome: x\n", Path::new("")), None);
+    }
+
+    #[test]
+    fn the_group_home_is_cleared_and_leaves_no_double_gap() {
+        assert_eq!(
+            clear_group_home("# P\nhome: X\n\n## M\n").unwrap(),
+            "# P\n\n## M\n"
+        );
+        assert_eq!(
+            clear_group_home("# P\n\nhome: X\n\n## M\n").unwrap(),
+            "# P\n\n## M\n"
+        );
+        // A second line would otherwise become the home; both go.
+        assert_eq!(
+            clear_group_home("# P\nhome: A\nhome: B\n\n## M\n").unwrap(),
+            "# P\n\n## M\n"
+        );
+        assert_eq!(clear_group_home("# P\n\n## M\n"), None);
+        // What was under the line stays under it.
+        assert_eq!(
+            clear_group_home("# P\nhome: X\n\n- [One](D:/one.md)\n").unwrap(),
+            "# P\n\n- [One](D:/one.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_crlf_file_keeps_its_line_endings_with_a_home_line() {
+        let text = "# Notes\r\n\r\n## A\r\n\r\n- [One](D:/one.md)\r\n";
+        let out = set_group_home(text, Path::new("Notes")).unwrap();
+        assert_eq!(
+            out,
+            "# Notes\r\nhome: Notes\r\n\r\n## A\r\n\r\n- [One](D:/one.md)\r\n"
+        );
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "no bare line feed: {out:?}"
+        );
+        assert_eq!(clear_group_home(&out).unwrap(), text);
+    }
+
+    #[test]
+    fn a_folder_name_replaces_what_windows_forbids_and_is_never_empty() {
+        assert_eq!(folder_name(" Money: 2026? "), "Money_ 2026_");
+        assert_eq!(folder_name("a/b\\c<d>e\"f|g*h?i"), "a_b_c_d_e_f_g_h_i");
+        assert_eq!(folder_name("a\tb\nc"), "a_b_c");
+        // A device name is made safe, in any case and with a trailing dot.
+        assert_eq!(folder_name("CON"), "CON_");
+        assert_eq!(folder_name("con."), "con_");
+        assert_eq!(folder_name("com1"), "com1_");
+        assert_eq!(folder_name("lpt9"), "lpt9_");
+        assert_eq!(folder_name("Console"), "Console", "not a device name");
+        // Only dots, only spaces, nothing: a folder still needs a name.
+        assert_eq!(folder_name("..."), "Untitled");
+        assert_eq!(folder_name(" .. "), "Untitled");
+        assert_eq!(folder_name(""), "Untitled");
+        assert_eq!(folder_name("2026."), "2026");
+        // A long name is capped, and the cap leaves no dot or space at the end.
+        assert_eq!(folder_name(&"a".repeat(200)), "a".repeat(64));
+        assert_eq!(
+            folder_name(&format!("{}.", "x".repeat(100))),
+            "x".repeat(64)
+        );
+    }
+
+    #[test]
+    fn a_note_folder_follows_the_heading_path_from_the_home() {
+        let home = Path::new("D:/notes/Personal");
+        assert_eq!(written(&note_folder(home, &[])), "D:/notes/Personal");
+        assert_eq!(
+            written(&note_folder(home, &at(&["Money"]))),
+            "D:/notes/Personal/Money"
+        );
+        assert_eq!(
+            written(&note_folder(home, &at(&["Money", "2025", "Taxes?"]))),
+            "D:/notes/Personal/Money/2025/Taxes_"
+        );
+        // No home known is still a folder path, and nothing is created.
+        assert_eq!(
+            note_folder(Path::new(""), &at(&["Money"])),
+            PathBuf::from("Money")
+        );
+    }
+
+    #[test]
+    fn a_new_group_file_can_declare_its_folder() {
+        let text = new_group_with_home("Work", Some(Path::new("Work"))).unwrap();
+        assert!(text.starts_with("# Work\nhome: Work\n\n"), "{text:?}");
+        let parsed = parse(&text, Path::new("/lib"));
+        assert_eq!(parsed.name.as_deref(), Some("Work"));
+        assert_eq!(
+            parsed.home.as_deref().map(written),
+            Some("/lib/Work".to_string())
+        );
+        assert!(parsed.entries.is_empty());
+        assert_eq!(
+            new_group_with_home("Work", None).unwrap(),
+            new_group("Work").unwrap(),
+            "no folder is today's new group"
+        );
+        assert_eq!(new_group_with_home(" ", Some(Path::new("x"))), None);
+    }
+
+    #[test]
+    fn a_group_written_with_a_home_and_two_nested_notes_reads_back_as_the_library() {
+        let dir = scratch("home");
+        let lib = dir.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let home = lib.join("Personal");
+
+        let mut text = new_group_with_home("Personal", Some(Path::new("Personal"))).unwrap();
+        assert!(
+            text.starts_with("# Personal\nhome: Personal\n\n"),
+            "{text:?}"
+        );
+        text = add_section(&text, &[], "Money").unwrap();
+        text = add_section(&text, &at(&["Money"]), "2025").unwrap();
+        text = add_note(
+            &text,
+            &at(&["Money"]),
+            "Receipts",
+            &note_folder(&home, &at(&["Money"])).join("receipts.md"),
+        );
+        text = add_note(
+            &text,
+            &at(&["Money", "2025"]),
+            "Last year",
+            &note_folder(&home, &at(&["Money", "2025"])).join("last year.md"),
+        );
+        std::fs::write(lib.join("personal.md"), &text).unwrap();
+
+        let library = read(&lib);
+        assert_eq!(library.groups.len(), 1);
+        let group = &library.groups[0];
+        assert_eq!(group.name, "Personal");
+        assert_eq!(group.home.as_deref(), Some(home.as_path()));
+        let seen: Vec<(&str, String, Vec<String>)> = group
+            .entries
+            .iter()
+            .map(|e| (e.title.as_str(), written(&e.path), e.sections.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "Receipts",
+                    written(&home.join("Money").join("receipts.md")),
+                    at(&["Money"]),
+                ),
+                (
+                    "Last year",
+                    written(&home.join("Money").join("2025").join("last year.md")),
+                    at(&["Money", "2025"]),
+                ),
+            ]
+        );
+        // Each note sits in the folder its heading path names.
+        for entry in &group.entries {
+            assert_eq!(
+                written(entry.path.parent().unwrap()),
+                written(&note_folder(&home, &entry.sections))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
