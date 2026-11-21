@@ -374,9 +374,14 @@ fn looks_like_path(text: &str, bracketed: bool) -> bool {
         && (text.contains('/') || text.contains('\\') || extension)
 }
 
-/// A path with no root, taken from the library folder.
+/// A path with no root, taken from the library folder. A Markdown link is written with forward
+/// slashes; on Windows they become the separator the rest of the application spells paths with.
 fn resolve(path: &str, base: &Path) -> PathBuf {
-    let p = PathBuf::from(path);
+    let p = if cfg!(windows) {
+        PathBuf::from(path.replace('/', "\\"))
+    } else {
+        PathBuf::from(path)
+    };
     if p.is_absolute() || base.as_os_str().is_empty() {
         p
     } else {
