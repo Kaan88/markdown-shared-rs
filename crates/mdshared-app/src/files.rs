@@ -1,9 +1,9 @@
-//! Reading files from disk: change stamps, a read that waits out a half-finished save, and text
-//! decoding.
+//! Reading files from disk: change stamps, a read that waits out a half-finished save, text
+//! decoding, and writing a new file that never replaces one.
 
 use std::fmt;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// What the change detector compares: a missing file is a state of its own.
@@ -137,6 +137,123 @@ fn decode_utf16(bytes: &[u8], read: fn([u8; 2]) -> u16) -> (std::borrow::Cow<'_,
     (text.into(), invalid)
 }
 
+/// How many temporary names are tried before giving up when each is already taken.
+const TEMP_TRIES: u32 = 8;
+
+/// Creates `path` holding `bytes`, and refuses if the name is taken, so no file is ever replaced.
+///
+/// The bytes go to a temporary name beside the target first — `name.part`, or a name with the
+/// process id in it when that one is already taken — and are flushed and synced to the disk
+/// there. Only then is the temporary renamed onto the target, so a crash or a power cut leaves
+/// either no file at the target or the whole of it, never half of it. The temporary is removed
+/// on every way out of this function, a refusal included; a process killed while it writes
+/// leaves its `.part` behind, as nothing of ours runs then, and the next attempt takes the next
+/// name rather than that one.
+///
+/// When the name is taken it returns [`io::ErrorKind::AlreadyExists`], and the file that is
+/// there is not opened, changed or read.
+///
+/// The last step is a check that the name is still free and then a rename, and the pair is not
+/// atomic against another process creating the same name at that instant: a file that appears
+/// between the check and the rename is replaced by this one, on Windows and on Unix alike. No
+/// standard-library call closes that window on every platform — a hard link does, but only on
+/// file systems that have them — so two programs that choose the same new name at the same
+/// moment may lose one of the two files. Two calls of this function in one process cannot
+/// collide with each other: each writes a temporary of its own.
+///
+/// The folder is not made: a missing parent is [`io::ErrorKind::NotFound`]. The bytes are
+/// written as given, with no BOM added and no line ending changed.
+pub fn create_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    // Refuse before writing anything, so a taken name costs no temporary file at all.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err(already_exists(path)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let (mut file, temp) = create_temporary(path)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    // The real refusal: the check above is only an early one, and the name may have been taken
+    // while the bytes were being written.
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(already_exists(path));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    // The rename itself, on systems where a folder can be synced.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+fn already_exists(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("the file already exists: {}", path.display()),
+    )
+}
+
+/// Opens a temporary file beside `path` that did not exist, or says why none could be made.
+fn create_temporary(path: &Path) -> io::Result<(std::fs::File, PathBuf)> {
+    let mut last = None;
+    for attempt in 0..TEMP_TRIES {
+        let Some(temp) = temporary_name(path, attempt) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the path has no file name to write the temporary beside",
+            ));
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => return Ok((file, temp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no temporary name beside the file was free",
+        )
+    }))
+}
+
+/// `name.part`, then a name carrying the process id, so two writers do not take each other's.
+fn temporary_name(path: &Path, attempt: u32) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    if attempt == 0 {
+        name.push(".part");
+    } else {
+        name.push(format!(".{}.{attempt}.part", std::process::id()));
+    }
+    Some(path.with_file_name(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +278,66 @@ mod tests {
             read_stable(&dir.join("gone.txt"), 5),
             Err(LoadError::Io(_))
         ));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder of this test's own, so tests running at the same time do not share files.
+    fn scratch(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mdshared-create-new-{}-{n}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The names directly in `dir`, sorted, to show what was left behind.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn create_new_writes_the_file() {
+        let dir = scratch("writes");
+        let path = dir.join("note.md");
+        create_new(&path, b"one\ntwo\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\n");
+        assert_eq!(names(&dir), vec!["note.md"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_refuses_a_taken_name_without_touching_the_file_there() {
+        let dir = scratch("taken");
+        let path = dir.join("note.md");
+        std::fs::write(&path, "the one that is there").unwrap();
+        let err = create_new(&path, b"the new one").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"the one that is there");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_leaves_no_temporary_file_behind_on_either_path() {
+        let dir = scratch("temp");
+        let free = dir.join("free.md");
+        create_new(&free, b"x").unwrap();
+        let taken = dir.join("taken.md");
+        std::fs::write(&taken, "kept").unwrap();
+        assert_eq!(
+            create_new(&taken, b"y").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(names(&dir), vec!["free.md", "taken.md"]);
         _ = std::fs::remove_dir_all(&dir);
     }
 }
