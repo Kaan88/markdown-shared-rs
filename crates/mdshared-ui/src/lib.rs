@@ -3,6 +3,7 @@
 //! tabs, panes, scrollbar, tooltips, toasts, dialog frames). No window loop; the application owns that.
 
 pub mod blur;
+pub mod brief;
 pub mod cf_html;
 pub mod chrome;
 pub mod corners;
