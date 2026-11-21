@@ -27,12 +27,12 @@ impl<Id> Default for Clock<Id> {
     }
 }
 
-impl<Id: Copy + PartialEq> Clock<Id> {
+impl<Id: Clone + PartialEq> Clock<Id> {
     /// Called on every turn of the loop: `showing` is the tab in front while the window has the
     /// focus (`None` while it has not, or is minimized). When it changes, the tab counted until
     /// now gets its time through `add(id, ms)` and the clock runs for `showing`.
     pub fn tick(&mut self, showing: Option<Id>, now: Instant, add: impl FnMut(Id, u64)) {
-        if self.running.map(|(id, _)| id) == showing {
+        if self.running.as_ref().map(|(id, _)| id) == showing.as_ref() {
             return;
         }
         self.flush(now, add);
@@ -42,8 +42,11 @@ impl<Id: Copy + PartialEq> Clock<Id> {
     /// Gives the running tab the time counted so far, the clock still running (before a session
     /// write).
     pub fn flush(&mut self, now: Instant, mut add: impl FnMut(Id, u64)) {
-        if let Some((id, since)) = self.running {
-            add(id, now.saturating_duration_since(since).as_millis() as u64);
+        if let Some((id, since)) = self.running.take() {
+            add(
+                id.clone(),
+                now.saturating_duration_since(since).as_millis() as u64,
+            );
             self.running = Some((id, now));
         }
     }

@@ -6,6 +6,7 @@
 #[cfg(not(windows))]
 pub mod appimage;
 pub mod backdrop;
+pub mod brief;
 pub mod crash;
 pub mod files;
 pub mod foldersearch;
