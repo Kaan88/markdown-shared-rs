@@ -12,6 +12,7 @@ pub mod files;
 pub mod folder_lock;
 pub mod foldersearch;
 pub mod fuzzy;
+pub mod library;
 pub mod notes;
 pub mod paths;
 pub mod places;
