@@ -209,6 +209,25 @@ pub fn draw_dialog_button(
     }
 }
 
+/// A dialog button that cannot be pressed: a quiet fill and a faint label, with no hover or press
+/// look, since neither would mean anything. A primary button keeps a hint of the accent so that
+/// the footer's hierarchy still reads, but nothing about it looks pressable. The caller draws it
+/// and records no hit for it; [`draw_dialog_button`] is untouched and draws as it did.
+pub fn draw_dialog_button_disabled(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    label: &str,
+    primary: bool,
+) {
+    if primary {
+        p.rbox(r, 5.0, mix(pal.field, pal.accent, 0.35));
+    } else {
+        p.frame(r, 5.0, pal.field, pal.line);
+    }
+    p.text_center(Face::Semibold, 13.0, r, label, pal.faint);
+}
+
 /// The width a dialog button with this label gets.
 pub fn dialog_button_w(p: &mut Painter, label: &str) -> f32 {
     (p.measure(Face::Semibold, 13.0, label) + 40.0)
@@ -269,6 +288,124 @@ pub fn draw_keycaps(p: &mut Painter, pal: &Palette, row: Rect, keys: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gfx::Gfx;
+    use crate::theme::{DARK, LIGHT};
+    use mdshared_text::Bitmap;
+
+    const PAGE: Rect = Rect::new(0.0, 0.0, 200.0, 60.0);
+    const BUTTON: Rect = Rect::new(20.0, 12.0, 96.0, 32.0);
+
+    /// A popup page with `draw` on it.
+    fn shot(pal: &Palette, draw: impl FnOnce(&mut Painter<'_>)) -> Bitmap {
+        let mut bmp = Bitmap::new(200, 60);
+        let mut gfx = Gfx::new();
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(PAGE, pal.popup);
+            draw(&mut p);
+        }
+        bmp
+    }
+
+    fn at(bmp: &Bitmap, x: f32, y: f32) -> [u8; 3] {
+        let o = (y as usize * bmp.width as usize + x as usize) * 4;
+        [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]]
+    }
+
+    #[test]
+    fn a_disabled_dialog_button_draws_differently_from_an_enabled_one() {
+        for pal in [&LIGHT, &DARK] {
+            for primary in [false, true] {
+                let enabled = shot(pal, |p| {
+                    draw_dialog_button(p, pal, BUTTON, "Replace", primary, false, false)
+                });
+                let quiet = shot(pal, |p| {
+                    draw_dialog_button_disabled(p, pal, BUTTON, "Replace", primary)
+                });
+                assert_ne!(enabled.pixels, quiet.pixels, "primary {primary}");
+                // Nothing about it looks pressable: no accent fill under the label.
+                assert_ne!(
+                    at(&quiet, BUTTON.x + 6.0, BUTTON.cy()),
+                    pal.accent,
+                    "primary {primary}: a disabled button looks pressable"
+                );
+                // A disabled primary still reads as the leading button and a disabled secondary
+                // does not.
+                let other = shot(pal, |p| {
+                    draw_dialog_button_disabled(p, pal, BUTTON, "Replace", !primary)
+                });
+                assert_ne!(
+                    quiet.pixels, other.pixels,
+                    "the two disabled looks are the same"
+                );
+            }
+            let accent = shot(pal, |p| {
+                draw_dialog_button(p, pal, BUTTON, "Replace", true, false, false)
+            });
+            let quiet = shot(pal, |p| {
+                draw_dialog_button_disabled(p, pal, BUTTON, "Replace", true)
+            });
+            assert_eq!(at(&accent, BUTTON.x + 6.0, BUTTON.cy()), pal.accent);
+            assert_ne!(at(&quiet, BUTTON.x + 6.0, BUTTON.cy()), pal.accent);
+        }
+    }
+
+    /// `draw_dialog_button` as it was when this test was written, copied whole: the enabled button
+    /// must keep drawing exactly these pixels, in every pointer state.
+    fn before(
+        p: &mut Painter,
+        pal: &Palette,
+        r: Rect,
+        label: &str,
+        primary: bool,
+        hovered: bool,
+        pressed: bool,
+    ) {
+        let press = pressed && hovered;
+        if primary {
+            let fill = if press {
+                mix(pal.accent, pal.popup, 0.2)
+            } else if hovered {
+                mix(pal.accent, pal.popup, 0.1)
+            } else {
+                pal.accent
+            };
+            p.rbox(r, 5.0, fill);
+            p.text_center(Face::Semibold, 13.0, r, label, pal.on_accent);
+        } else {
+            let fill = if press {
+                pal.press
+            } else if hovered {
+                pal.hover
+            } else {
+                mix(pal.popup, pal.text, 0.04)
+            };
+            p.frame(r, 5.0, fill, pal.popup_line);
+            p.text_center(Face::Ui, 13.0, r, label, pal.text);
+        }
+    }
+
+    #[test]
+    fn the_dialog_button_draws_as_it_did_before_the_disabled_one_was_added() {
+        for pal in [&LIGHT, &DARK] {
+            for primary in [false, true] {
+                for (hovered, pressed) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let was = shot(pal, |p| {
+                        before(p, pal, BUTTON, "Replace", primary, hovered, pressed)
+                    });
+                    let now = shot(pal, |p| {
+                        draw_dialog_button(p, pal, BUTTON, "Replace", primary, hovered, pressed)
+                    });
+                    assert_eq!(
+                        was.pixels, now.pixels,
+                        "primary {primary}, hovered {hovered}, pressed {pressed}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn keycaps() {

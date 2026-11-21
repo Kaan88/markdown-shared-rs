@@ -67,6 +67,10 @@ impl Rect {
 pub enum Face {
     Ui,
     Semibold,
+    /// Interface text in a fixed-width family ([`MONO_FAMILY`]): code, paths and anything that
+    /// must line up in columns. It is the regular weight, and it is measured and elided like the
+    /// other faces.
+    Mono,
 }
 
 /// The interface's family list. On macOS the system's own (SF, which fontique reaches as the
@@ -75,6 +79,18 @@ const UI_FAMILY: &str = if cfg!(target_os = "macos") {
     "system-ui, Helvetica Neue, sans-serif"
 } else {
     "Segoe UI Variable Text, Segoe UI, Inter, Noto Sans, Cantarell, DejaVu Sans, sans-serif"
+};
+
+/// The fixed-width family list of [`Face::Mono`], chosen the way the interface one is: the first
+/// family installed wins, and the system's generic comes last. A family list that ends in a
+/// generic names the colour emoji families before it, as [`mdshared_text::add_fallbacks`] asks;
+/// no font file is shipped: these are the systems' own.
+const MONO_FAMILY: &str = if cfg!(target_os = "macos") {
+    "SF Mono, Menlo, Apple Color Emoji, monospace"
+} else if cfg!(target_os = "windows") {
+    "Cascadia Mono, Consolas, Courier New, Segoe UI Emoji, monospace"
+} else {
+    "DejaVu Sans Mono, Noto Sans Mono, Liberation Mono, Noto Color Emoji, monospace"
 };
 
 /// An icon stroked at one size: coverage, one byte per device pixel, and where its top left
@@ -142,7 +158,12 @@ impl Gfx {
         let mut b = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        b.push_default(StyleProperty::FontFamily(FontFamily::from(UI_FAMILY)));
+        let family = if face == Face::Mono {
+            MONO_FAMILY
+        } else {
+            UI_FAMILY
+        };
+        b.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
         b.push_default(StyleProperty::FontSize(size));
         let weight = if face == Face::Semibold { 600.0 } else { 400.0 };
         b.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
@@ -152,7 +173,7 @@ impl Gfx {
             )));
         }
         b.push_default(StyleProperty::Brush([color[0], color[1], color[2], 255]));
-        mdshared_text::push_emoji_runs(&mut b, text, UI_FAMILY);
+        mdshared_text::push_emoji_runs(&mut b, text, family);
         let mut layout = b.build(text);
         layout.break_all_lines(if wrap > 0.0 { Some(wrap) } else { None });
         layout.align(Alignment::Start, AlignmentOptions::default());
@@ -562,6 +583,43 @@ impl<'a> Painter<'a> {
         self.fill(Rect::new(x + before, y, width, 1.0 / self.scale), c);
     }
 
+    /// A 1 device px line through the characters `range` (byte offsets) of `text`, which was or
+    /// would be drawn by [`text`](Self::text) at `x` and `cy` with the same `face` and `size`: the
+    /// mirror of [`underline_range`](Self::underline_range), for struck-out text. The line sits
+    /// half the lower case's height above the baseline, taken as three tenths of the font size
+    /// (the layout's metrics carry no x-height); the extent of the characters is measured as a
+    /// prefix, so kerning across the boundary may move it by a fraction of a pixel. As with the
+    /// underline, a range that is empty or past the end of `text` draws nothing, and its ends
+    /// must be character boundaries.
+    #[allow(clippy::too_many_arguments)] // drawing call: as `text`
+    pub fn strikethrough_range(
+        &mut self,
+        face: Face,
+        size: f32,
+        x: f32,
+        cy: f32,
+        text: &str,
+        range: std::ops::Range<usize>,
+        c: Rgb,
+    ) {
+        if range.start >= range.end || range.end > text.len() {
+            return;
+        }
+        let before = self.measure(face, size, &text[..range.start]);
+        let width = self.measure(face, size, &text[range.clone()]);
+        let layout = self.gfx.layout(face, size * self.scale, c, 0.0, text);
+        let top = (cy * self.scale - layout.height() / 2.0).round();
+        let baseline = layout
+            .lines()
+            .next()
+            .map_or(layout.height() * 0.8, |l| l.metrics().baseline);
+        let y = (top + baseline.round() - 0.3 * size * self.scale).round();
+        self.fill(
+            Rect::new(x + before, y / self.scale, width, 1.0 / self.scale),
+            c,
+        );
+    }
+
     /// An icon from [`glyph`](crate::glyph), `size` logical px across, centred on a point.
     pub fn icon(&mut self, glyph: &str, size: f32, cx: f32, cy: f32, c: Rgb) {
         let side = size * self.scale;
@@ -694,5 +752,100 @@ mod tests {
             let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
             bmp.write_png(&out.join(file)).unwrap();
         }
+    }
+
+    /// A white page with `draw` on it, at the scale of one.
+    fn marked(draw: impl FnOnce(&mut Painter<'_>)) -> Bitmap {
+        let mut bmp = Bitmap::new(120, 48);
+        let mut gfx = Gfx::new();
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(Rect::new(0.0, 0.0, 120.0, 48.0), [255, 255, 255]);
+            draw(&mut p);
+        }
+        bmp
+    }
+
+    /// The rows of `bmp` that hold `c` exactly, and on each the first and last column that does.
+    fn rows_of(bmp: &Bitmap, c: [u8; 3]) -> Vec<(usize, usize, usize)> {
+        let wanted = [c[2], c[1], c[0]];
+        (0..bmp.height as usize)
+            .filter_map(|y| {
+                let cols: Vec<usize> = (0..bmp.width as usize)
+                    .filter(|&x| {
+                        let at = (y * bmp.width as usize + x) * 4;
+                        bmp.pixels[at..at + 3] == wanted
+                    })
+                    .collect();
+                Some((y, *cols.first()?, *cols.last()?))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_strikethrough_draws_a_line_where_the_underline_is_not() {
+        let text = "struck out";
+        let red = [255, 0, 0];
+        let plain = |p: &mut Painter| {
+            p.text(Face::Ui, 14.0, 12.0, 24.0, text, [0, 0, 0], 200.0);
+        };
+        let underline = marked(|p| {
+            plain(p);
+            p.underline_range(Face::Ui, 14.0, 12.0, 24.0, text, 0..text.len(), red);
+        });
+        let strike = marked(|p| {
+            plain(p);
+            p.strikethrough_range(Face::Ui, 14.0, 12.0, 24.0, text, 0..text.len(), red);
+        });
+        let under = rows_of(&underline, red);
+        let through = rows_of(&strike, red);
+        assert_eq!(under.len(), 1, "the underline is one device px: {under:?}");
+        assert_eq!(through.len(), 1, "the strike is one device px: {through:?}");
+        assert!(
+            through[0].0 < under[0].0,
+            "the strike is above the baseline: {through:?} against {under:?}"
+        );
+        // The same characters, so the same span: only its height differs.
+        assert_eq!(
+            (through[0].1, through[0].2),
+            (under[0].1, under[0].2),
+            "the strike crosses exactly what the underline runs under"
+        );
+        // An empty range draws nothing, as the underline does.
+        let none = marked(|p| {
+            p.strikethrough_range(Face::Ui, 14.0, 12.0, 24.0, text, 4..4, red);
+        });
+        assert!(rows_of(&none, red).is_empty());
+    }
+
+    #[test]
+    fn the_monospace_face_measures_every_character_alike_and_the_interface_face_does_not() {
+        let mut bmp = Bitmap::new(8, 8);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let four = p.measure(Face::Mono, 13.0, "WWMW");
+        for s in ["iiii", "....", "0000", "abcd"] {
+            let w = p.measure(Face::Mono, 13.0, s);
+            assert!(
+                (w - four).abs() < 0.01,
+                "{s} measures {w} where four wide ones measure {four}"
+            );
+        }
+        assert_ne!(
+            p.measure(Face::Ui, 13.0, "iiii"),
+            p.measure(Face::Ui, 13.0, "WWWW"),
+            "the interface face is not fixed width"
+        );
+        // The family reaches the drawing: one word is not the same pixels in the two faces.
+        let mono = marked(|p| {
+            p.text(Face::Mono, 13.0, 12.0, 24.0, "code", [0, 0, 0], 200.0);
+        });
+        let ui = marked(|p| {
+            p.text(Face::Ui, 13.0, 12.0, 24.0, "code", [0, 0, 0], 200.0);
+        });
+        assert_ne!(
+            mono.pixels, ui.pixels,
+            "the monospace family drew nothing new"
+        );
     }
 }

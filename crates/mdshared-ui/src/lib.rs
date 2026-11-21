@@ -4,6 +4,7 @@
 
 pub mod blur;
 pub mod cf_html;
+pub mod check;
 pub mod chrome;
 pub mod corners;
 pub mod desktop_entry;
@@ -21,7 +22,9 @@ pub mod pane;
 pub mod pins;
 pub mod place;
 pub mod platform;
+pub mod rows;
 pub mod scroll;
+pub mod segments;
 pub mod settings;
 pub mod shadow;
 pub mod snap;
