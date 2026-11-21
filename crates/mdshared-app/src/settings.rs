@@ -61,6 +61,29 @@ impl Writer {
     }
 }
 
+/// Reads a settings file: `None` when there is none yet. Any other failure is an error, never
+/// an empty file: a session read as empty would be written back over the real one (audit 2).
+pub fn read(path: &Path) -> io::Result<Option<String>> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(Some(String::from_utf8_lossy(&b).into_owned())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`read`], tried again for up to two seconds while it fails: another program (a scanner, a
+/// sync client, a window of the family writing it) may have the file open a moment.
+pub fn read_patiently(path: &Path) -> io::Result<Option<String>> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match read(path) {
+            Ok(s) => return Ok(s),
+            Err(e) if std::time::Instant::now() >= end => return Err(e),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
 /// Writes through a temporary file and rename, so a crash cannot leave half a settings file.
 /// The temporary file is on the disk before the rename, so a power cut just after cannot leave
 /// the new name on an empty or older file (files listed in it may already be gone by then).
@@ -172,6 +195,29 @@ pub fn decode_path(s: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_an_error_not_an_empty_file() {
+        let d = std::env::temp_dir().join(format!("mdshared-read-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(matches!(read(&d.join("none.ini")), Ok(None)));
+        std::fs::write(
+            d.join("s.ini"),
+            "a: 1
+",
+        )
+        .unwrap();
+        assert_eq!(
+            read(&d.join("s.ini")).unwrap().as_deref(),
+            Some(
+                "a: 1
+"
+            )
+        );
+        // A folder in the file's place: it cannot be read, and that is not "no file".
+        assert!(read(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use super::*;
 
     #[test]

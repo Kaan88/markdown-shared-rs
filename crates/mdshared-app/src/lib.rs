@@ -9,6 +9,7 @@ pub mod backdrop;
 pub mod brief;
 pub mod crash;
 pub mod files;
+pub mod folder_lock;
 pub mod foldersearch;
 pub mod fuzzy;
 pub mod notes;
