@@ -3,7 +3,9 @@
 //! runs and kept in the session as `focus=<seconds> <path>` lines ([`to_setting`], [`parse`]).
 //! A tab counted for less than the setting's seconds is not reopened ([`left_out`]). Which tabs
 //! always come back (the one that was showing, a pinned one, one with unsaved text) is each
-//! application's to say; a tab with no count (from before the count) always comes back.
+//! application's to say; a tab with no count (from before the count) always comes back. A
+//! second switch ([`LAST`]) says the tab that was showing counts like the rest, for someone who
+//! opens a file, glances at it and closes the window on it.
 
 use std::time::Instant;
 
@@ -11,6 +13,11 @@ use std::time::Instant;
 pub const SWITCH: &str = "Don't reopen tabs barely looked at";
 pub const SECONDS: &str = "Looked at for less than";
 pub const SECONDS_HELP: &str = "Only while the tab is in front and the window has focus.";
+/// The switch that makes the rule count the tab that was showing as well.
+pub const LAST: &str = "Leave out the tab you were last on too";
+pub const LAST_HELP: &str =
+    "Otherwise the tab in front when the window closed always comes back. Pinned tabs and \
+     unsaved text always do.";
 pub const SECS_DEFAULT: u32 = 10;
 pub const SECS_MIN: u32 = 1;
 pub const SECS_MAX: u32 = 600;
