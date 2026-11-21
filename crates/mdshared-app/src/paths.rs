@@ -9,7 +9,26 @@ pub const NAMES_IGNORE_CASE: bool = cfg!(any(windows, target_os = "macos"));
 
 /// Whether two paths name the same file as far as spelling goes: case-insensitive on Windows and
 /// macOS ([`NAMES_IGNORE_CASE`]).
+///
+/// Compared part by part, not as one string, so the separators a path happens to be spelled with
+/// do not decide the answer: on Windows a library link resolves to `C:\library\Trip/One.md`,
+/// because the link itself is written with forward slashes, and that is the same file as
+/// `C:\library\Trip\One.md`. A `.` in the middle is not a part and so folds away; a `..` is a
+/// part and stays one, because folding it by text crosses a symlink the disk has not been asked
+/// about. It asks nothing of the disk at all: two spellings that reach one file through a link
+/// are still two paths here.
 pub fn same_path(a: &Path, b: &Path) -> bool {
+    let (mut a, mut b) = (a.components(), b.components());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if same_part(x.as_os_str(), y.as_os_str()) => {}
+            _ => return false,
+        }
+    }
+}
+
+fn same_part(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     if NAMES_IGNORE_CASE {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
@@ -152,6 +171,38 @@ pub fn tab_labels(paths: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A library link is written with forward slashes, so on Windows it resolves to a path with
+    /// both kinds of separator in it. That is the same file as the one a file dialog hands back,
+    /// and the only thing that ever said otherwise was comparing the two as text.
+    #[test]
+    fn one_file_spelled_with_either_separator_is_one_path() {
+        let joined = Path::new(r"C:\library").join("Trip/One.md");
+        assert!(same_path(&joined, Path::new(r"C:\library\Trip\One.md")) == cfg!(windows));
+        assert!(same_path(
+            Path::new("/home/k/library/Trip/One.md"),
+            Path::new("/home/k/library/Trip/One.md")
+        ));
+        // Still two different files, whatever the separators.
+        assert!(!same_path(
+            Path::new(r"C:\library\Trip\One.md"),
+            Path::new(r"C:\library\Trip\Two.md")
+        ));
+        assert!(!same_path(
+            Path::new(r"C:\library\One.md"),
+            Path::new(r"C:\library\Trip\One.md")
+        ));
+        // Case folds where the file system folds it, and the trailing slash is not a part.
+        assert_eq!(
+            same_path(Path::new("/x/Notes.md"), Path::new("/x/notes.md")),
+            NAMES_IGNORE_CASE
+        );
+        assert!(same_path(Path::new("/x/notes/"), Path::new("/x/notes")));
+        // A `.` in the middle is not a part at all, so it folds; `..` is a part and stays one,
+        // because folding it by text would cross a symlink the disk has not been asked about.
+        assert!(same_path(Path::new("/x/./a.md"), Path::new("/x/a.md")));
+        assert!(!same_path(Path::new("/x/y/../a.md"), Path::new("/x/a.md")));
+    }
 
     #[test]
     fn duplicate_parent_tab_labels_differ() {
