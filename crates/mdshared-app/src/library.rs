@@ -290,7 +290,7 @@ pub fn parse(text: &str, base: &Path) -> Parsed {
                 (1, text) if name.is_none() && !text.is_empty() => name = Some(text.to_string()),
                 // A second level-1 heading closes the sections of the first.
                 (1, _) => open.clear(),
-                (_, text) if text.is_empty() => {}
+                (_, "") => {}
                 (level, text) => {
                     while open.last().is_some_and(|(l, _)| *l >= level) {
                         open.pop();
