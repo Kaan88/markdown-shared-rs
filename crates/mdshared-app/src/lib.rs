@@ -2,7 +2,8 @@
 //! creating a new file without replacing one, the recent-files list, the place left in each
 //! file, the key=value settings file layer, one-window-per-user hand-over, the hand-off between
 //! the two applications, file watching, a worker thread's handle, and updating the application
-//! in place, crash reports. No window system and no Markdown.
+//! in place, crash reports, and the cut of a document into notes at its headings (`split`). No
+//! window system and no Markdown parser.
 
 #[cfg(not(windows))]
 pub mod appimage;
@@ -26,6 +27,7 @@ pub mod selfupdate;
 pub mod settings;
 pub mod single;
 pub mod sister;
+pub mod split;
 pub mod update;
 pub mod updater;
 pub mod watch;
