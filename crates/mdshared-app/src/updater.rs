@@ -11,6 +11,17 @@
 //! which sends it to its event loop. The binaries are not code-signed, so the hash in the
 //! manifest, fetched over TLS, is the only integrity check there is.
 
+/// `eprintln!` for this module, shadowing `std`'s: a stderr that is gone (a closed pipe: os error
+/// 232 on Windows, EPIPE elsewhere) is ignored instead of being a panic, which the applications'
+/// release builds (`panic = "abort"`) turn into the end of the program. The bytes written are
+/// `std`'s. `tests::a_closed_stderr_is_not_a_panic` holds it.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 use crate::selfupdate;
 use crate::update::{self, Download, Platform, UpdateManifest, Version};
 use std::path::PathBuf;
@@ -1460,5 +1471,48 @@ mod tests {
         // A later look does not step back from an installed update.
         u.checked(&APP, false, Ok(Some(offer)));
         assert!(matches!(u.stage(), Stage::Installed(_)));
+    }
+
+    const CLOSED_STDERR_CHILD: &str = "MDSHARED_TEST_CLOSED_STDERR_CHILD";
+
+    /// A failed look and a failed installation print a line, and `std`'s `eprintln!` panics when
+    /// stderr is a closed pipe; an application's release build aborts on that panic (found on
+    /// 2026-11-22, 0xC0000409 in mdedit). This test runs [`closed_stderr_child`] in a copy of the
+    /// test binary whose stderr is a pipe with no reader, and fails if the copy panics.
+    #[test]
+    fn a_closed_stderr_is_not_a_panic() {
+        let (reader, writer) = std::io::pipe().expect("a pipe");
+        drop(reader);
+        let status = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "updater::tests::closed_stderr_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLOSED_STDERR_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(writer)
+            .status()
+            .expect("the copy runs");
+        assert!(
+            status.success(),
+            "the updater's prints ended a run whose stderr was closed: {status}"
+        );
+    }
+
+    /// Prints each of the window's failure lines; it does something only when
+    /// [`a_closed_stderr_is_not_a_panic`] starts it.
+    #[test]
+    fn closed_stderr_child() {
+        if std::env::var_os(CLOSED_STDERR_CHILD).is_none() {
+            return;
+        }
+        let mut u = Updates::default();
+        assert!(u.checked(&APP, true, Err("Timeout".into())).is_some());
+        u.preview("available");
+        assert!(u.begin().is_some());
+        assert!(u.finished(&APP, Err("no match".into())).is_some());
     }
 }
