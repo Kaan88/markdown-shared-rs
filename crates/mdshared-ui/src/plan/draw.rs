@@ -5,8 +5,8 @@
 //! `super::geo`, so a hit and a drawing cannot disagree about where a row is.
 
 use super::{
-    Edit, EditKind, GUTTER, Geo, LINE_H, PHit, Pane, PlanScreen, STRIP_H, lines_text, separated,
-    size_text, thousands,
+    AiAct, Edit, EditKind, GUTTER, Geo, LINE_H, PHit, Pane, PlanScreen, STRIP_H, lines_text,
+    separated, size_text, thousands,
 };
 use crate::check::{TICK, Tick, draw_tick};
 use crate::gfx::{Face, Painter, Rect, Rgb, mix};
@@ -22,6 +22,13 @@ use mdshared_app::library::folder_name;
 use mdshared_app::split;
 
 const PAD: f32 = DIALOG_PAD;
+const ASK: &str = "Ask the AI\u{2026}";
+const AT_HEADINGS: &str = "At headings";
+
+/// An instruction as the header quotes it: its lines joined by spaces.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 const MONO: f32 = 12.5;
 
 /// The colour of a line the app adds, and its mark, in each theme (the review's).
@@ -132,47 +139,121 @@ impl PlanScreen {
             p.text(Face::Ui, 12.0, x1, y + 88.0, enc, pal.muted, c1);
         }
 
-        // How it was cut: the level switch.
+        // How it was cut: the level switch, or the instruction the AI was given.
         label(p, x2, "HOW IT WAS CUT", c2);
         let cy = y + 54.0;
-        let at = p.text(Face::Ui, 13.0, x2, cy, "at", pal.muted, 40.0);
-        let labels = ["#", "##", "###"];
-        let sw = switch_width(p, &labels);
-        let sr = Rect::new(x2 + at + 8.0, cy - SEGMENT_H / 2.0, sw, SEGMENT_H);
-        let selected = split::SPLIT_LEVELS
-            .iter()
-            .position(|&l| l == self.plan.level());
-        let hovered = (0..labels.len()).find(|&k| self.hovered(PHit::Level(k)));
-        let rects = draw_segments(p, pal, sr, &labels, selected, hovered);
-        for (k, r) in rects.into_iter().enumerate() {
-            self.spots.push((PHit::Level(k), r));
-        }
-        p.text(
-            Face::Ui,
-            13.0,
-            sr.right() + 8.0,
-            cy,
-            "headings",
-            pal.muted,
-            (x2 + c2 - sr.right() - 8.0).max(0.0),
-        );
-        let cut = format!(
-            "{} \u{00B7} {} at this level",
-            if self.plan.notes().len() == 1 {
-                "1 note".to_string()
-            } else {
-                format!("{} notes", thousands(self.plan.notes().len()))
-            },
-            if self.levels.count(self.plan.level()) == 1 {
-                "1 heading".to_string()
-            } else {
-                format!(
-                    "{} headings",
-                    thousands(self.levels.count(self.plan.level()))
-                )
+        // "Ask the AI…", at the column's right, when the application offers it.
+        let ask = self.ai_offer.then(|| {
+            let w = dialog_button_w(p, ASK);
+            Rect::new(x2 + c2 - w, cy - SEGMENT_H / 2.0, w, SEGMENT_H)
+        });
+        let room = ask.map_or(x2 + c2, |r| r.x - 12.0);
+        if let Some(cut) = self.ai_cut.clone() {
+            p.text(
+                Face::Semibold,
+                13.0,
+                x2,
+                cy,
+                &format!("\u{201C}{}\u{201D}", one_line(&cut.instruction)),
+                pal.text,
+                (room - x2).max(0.0),
+            );
+            let n = self.plan.notes().len();
+            let said = format!(
+                "{} \u{00B7} by {}{}",
+                if n == 1 {
+                    "1 note".to_string()
+                } else {
+                    format!("{} notes", thousands(n))
+                },
+                cut.via,
+                if cut.headings_only {
+                    " \u{00B7} sent the headings only"
+                } else {
+                    ""
+                }
+            );
+            let link_w = p.measure(Face::Semibold, 12.5, AT_HEADINGS) + 12.0;
+            let said_w = p.text(
+                Face::Ui,
+                12.5,
+                x2,
+                y + 82.0,
+                &said,
+                pal.muted,
+                (c2 - link_w - 8.0).max(0.0),
+            );
+            if self.levels.default_level().is_some() {
+                let link = Rect::new(x2 + said_w + 8.0, y + 70.0, link_w, 24.0);
+                let hit = PHit::Ai(AiAct::AtHeadings);
+                p.text(
+                    Face::Semibold,
+                    12.5,
+                    link.x + 6.0,
+                    link.cy(),
+                    AT_HEADINGS,
+                    if self.hovered(hit) {
+                        pal.text
+                    } else {
+                        pal.accent
+                    },
+                    link_w,
+                );
+                self.spots.push((hit, link));
             }
-        );
-        p.text(Face::Ui, 12.5, x2, y + 82.0, &cut, pal.muted, c2);
+        } else {
+            let at = p.text(Face::Ui, 13.0, x2, cy, "at", pal.muted, 40.0);
+            let labels = ["#", "##", "###"];
+            let sw = switch_width(p, &labels);
+            let sr = Rect::new(x2 + at + 8.0, cy - SEGMENT_H / 2.0, sw, SEGMENT_H);
+            let selected = split::SPLIT_LEVELS
+                .iter()
+                .position(|&l| l == self.plan.level());
+            let hovered = (0..labels.len()).find(|&k| self.hovered(PHit::Level(k)));
+            let rects = draw_segments(p, pal, sr, &labels, selected, hovered);
+            for (k, r) in rects.into_iter().enumerate() {
+                self.spots.push((PHit::Level(k), r));
+            }
+            p.text(
+                Face::Ui,
+                13.0,
+                sr.right() + 8.0,
+                cy,
+                "headings",
+                pal.muted,
+                (room - sr.right() - 8.0).max(0.0),
+            );
+            let cut = format!(
+                "{} \u{00B7} {} at this level",
+                if self.plan.notes().len() == 1 {
+                    "1 note".to_string()
+                } else {
+                    format!("{} notes", thousands(self.plan.notes().len()))
+                },
+                if self.levels.count(self.plan.level()) == 1 {
+                    "1 heading".to_string()
+                } else {
+                    format!(
+                        "{} headings",
+                        thousands(self.levels.count(self.plan.level()))
+                    )
+                }
+            );
+            p.text(Face::Ui, 12.5, x2, y + 82.0, &cut, pal.muted, c2);
+        }
+        if let Some(r) = ask {
+            let hit = PHit::Ai(AiAct::Ask);
+            draw_dialog_button(
+                p,
+                pal,
+                r,
+                ASK,
+                false,
+                self.hovered(hit),
+                self.pressed == Some(hit),
+            );
+            self.spots.push((hit, r));
+        }
 
         // Where the notes go.
         label(p, x3, "THE NOTES GO TO", c3);
@@ -264,6 +345,11 @@ impl PlanScreen {
         } else {
             0.0
         };
+        let links_w: f32 = n
+            .links
+            .iter()
+            .map(|(_, l)| p.measure(Face::Semibold, 12.5, l) + 16.0)
+            .sum();
         let text_w = p.text(
             Face::Ui,
             12.5,
@@ -271,7 +357,7 @@ impl PlanScreen {
             r.cy(),
             &n.text,
             pal.text,
-            (r.w - 2.0 * PAD - 24.0 - show_w - 8.0).max(0.0),
+            (r.w - 2.0 * PAD - 24.0 - show_w - links_w - 8.0).max(0.0),
         );
         if n.show.is_some() {
             let link = Rect::new(r.x + PAD + 24.0 + text_w + 8.0, r.y, show_w, r.h);
@@ -286,6 +372,27 @@ impl PlanScreen {
                 show_w,
             );
             self.spots.push((PHit::Show, link));
+        }
+        let mut lx = r.x + PAD + 24.0 + text_w + 8.0 + show_w;
+        for (act, label) in &n.links {
+            let w = p.measure(Face::Semibold, 12.5, label) + 12.0;
+            let link = Rect::new(lx, r.y, w, r.h);
+            let hit = PHit::Ai(*act);
+            p.text(
+                Face::Semibold,
+                12.5,
+                link.x + 6.0,
+                link.cy(),
+                label,
+                if self.hovered(hit) {
+                    pal.text
+                } else {
+                    pal.accent
+                },
+                w,
+            );
+            self.spots.push((hit, link));
+            lx += w + 4.0;
         }
         p.fill(
             Rect::new(r.x, r.bottom() - p.px(), r.w, p.px()),

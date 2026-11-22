@@ -23,8 +23,9 @@ use crate::rows::{Nav, Rows};
 use crate::scroll::offset_for_thumb;
 use crate::textfield::TextField;
 use mdshared_app::library::{self, folder_name, note_folder};
+use mdshared_app::split::answer::Dropped;
 use mdshared_app::split::{
-    self, Heading, Levels, Lines, NoteLine, Plan, Rest, SPLIT_LEVELS, Totals, Warning,
+    self, Fix, Heading, Levels, Lines, NoteLine, Plan, Rest, SPLIT_LEVELS, Totals, Warning,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -183,6 +184,8 @@ pub enum Mark {
     Already,
     Renamed(String),
     Moved,
+    /// What the checks of an AI's answer changed about the note (5.2).
+    Fixed(Fix),
 }
 
 impl Mark {
@@ -190,7 +193,14 @@ impl Mark {
         match self {
             Mark::Already => "already there".to_string(),
             Mark::Renamed(name) => format!("will be written as \u{2018}{name}\u{2019}"),
-            Mark::Moved => "boundary moved to keep a code block whole".to_string(),
+            Mark::Moved | Mark::Fixed(Fix::CodeBlock) => {
+                "boundary moved to keep a code block whole".to_string()
+            }
+            Mark::Fixed(Fix::Table) => "boundary moved to keep a table whole".to_string(),
+            Mark::Fixed(Fix::Paragraph) => {
+                "boundary moved to a paragraph\u{2019}s edge".to_string()
+            }
+            Mark::Fixed(Fix::Overlap) => "overlapped the note above: starts after it".to_string(),
         }
     }
 }
@@ -484,6 +494,8 @@ pub enum PHit {
     Thumb(Pane),
     Track(Pane),
     Field,
+    /// A button or a link of the AI (5.2): the header's, or the notice's.
+    Ai(AiAct),
 }
 
 /// What an event asks of the window.
@@ -492,6 +504,40 @@ pub enum Act {
     Nothing,
     Close,
     Write,
+    /// The window asks the AI, stops it, or asks again (5.2). Only an application that offers
+    /// the AI ([`PlanScreen::ai_offer`], or a notice it set with links) is ever given one.
+    Ai(AiAct),
+}
+
+/// What the AI's buttons and links ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AiAct {
+    /// "Ask the AI…": the window opens its instruction panel.
+    Ask,
+    /// Stop the request in flight.
+    Stop,
+    /// Send the same request again.
+    RunAgain,
+    /// Back to the cut at headings. The screen does this itself; the window is told.
+    AtHeadings,
+}
+
+/// A plan that came from a model: what it was asked, and through what, for the header and the
+/// record; and what the checks dropped, for the line above the list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AiCut {
+    pub instruction: String,
+    /// "Claude API · Claude Opus 5.5".
+    pub via: String,
+    /// The connection and the model, as the record keeps them.
+    pub connection: String,
+    pub model: String,
+    /// What was sent: bytes, and in how many requests.
+    pub bytes: u64,
+    pub requests: u64,
+    /// Only the headings were sent (the outline with the paragraphs was over the limit).
+    pub headings_only: bool,
+    pub dropped: Dropped,
 }
 
 /// What the text field in front of a row or the button is for.
@@ -546,6 +592,8 @@ pub struct Notice {
     pub warn: bool,
     /// The note its "Show" link selects.
     pub show: Option<usize>,
+    /// Links after it, each an [`Act::Ai`] for the window: "Stop", "Run again".
+    pub links: Vec<(AiAct, String)>,
 }
 
 pub struct PlanScreen {
@@ -593,6 +641,14 @@ pub struct PlanScreen {
     drag: Option<Drag>,
     /// The row that was selected when the press began: a second click on it renames.
     press_sel: usize,
+    /// The header offers "Ask the AI…" (5.2). Off unless the application turns it on, so the
+    /// card of an application with no AI draws as it always did.
+    pub ai_offer: bool,
+    /// The plan came from a model; `None` for a cut at headings.
+    pub ai_cut: Option<AiCut>,
+    /// A line the application puts above the list, before any warning: a request in flight, an
+    /// answer that could not be read, a refusal.
+    pub ai_notice: Option<Notice>,
 }
 
 /// How many names are tried for a note before the first is used anyway.
@@ -662,6 +718,9 @@ impl PlanScreen {
             bands_w: -1.0,
             drag: None,
             press_sel: 0,
+            ai_offer: false,
+            ai_cut: None,
+            ai_notice: None,
         };
         s.untick_what_is_there();
         s.refresh();
@@ -776,6 +835,22 @@ impl PlanScreen {
 
     fn make_notice(&self) -> Option<Notice> {
         let notes = self.plan.notes();
+        if let Some(n) = &self.ai_notice {
+            return Some(n.clone());
+        }
+        if let Some(text) = self.ai_cut.as_ref().and_then(|c| c.dropped.text()) {
+            let more = self.warnings.len();
+            return Some(Notice {
+                text: if more > 0 {
+                    format!("{text} (and {more} more)")
+                } else {
+                    text
+                },
+                warn: true,
+                show: None,
+                links: Vec::new(),
+            });
+        }
         if let Some(w) = self.warnings.first() {
             let (text, show) = match w {
                 Warning::NoSplit { notes: 0 } => (
@@ -798,10 +873,14 @@ impl PlanScreen {
                     n.first().copied(),
                 ),
                 Warning::NotAtAHeading { notes: n } => (
-                    format!(
-                        "{} notes do not start at a heading, as the others do.",
-                        n.len()
-                    ),
+                    if n.len() == 1 {
+                        "1 note does not start at a heading, as the others do.".to_string()
+                    } else {
+                        format!(
+                            "{} notes do not start at a heading, as the others do.",
+                            n.len()
+                        )
+                    },
                     n.first().copied(),
                 ),
                 Warning::SameTitle { title, notes: n } => (
@@ -822,6 +901,7 @@ impl PlanScreen {
                 text,
                 warn: true,
                 show,
+                links: Vec::new(),
             });
         }
         let there = self.targets.iter().filter(|t| t.already).count();
@@ -842,6 +922,7 @@ impl PlanScreen {
                 text,
                 warn: false,
                 show: self.targets.iter().position(|t| t.already),
+                links: Vec::new(),
             });
         }
         None
@@ -874,6 +955,9 @@ impl PlanScreen {
         }
         if let Some(name) = &t.renamed {
             return Some(Mark::Renamed(name.clone()));
+        }
+        if let Some(fix) = self.plan.note(i).and_then(|n| n.fix()) {
+            return Some(Mark::Fixed(fix));
         }
         self.plan
             .note(i)
@@ -986,9 +1070,10 @@ impl PlanScreen {
     /// Cuts the document at another level: the notes are made again, and what was changed in
     /// the old ones is gone.
     pub fn set_level(&mut self, level: u8) {
-        if level == self.plan.level() {
+        if level == self.plan.level() && self.ai_cut.is_none() {
             return;
         }
+        self.ai_cut = None;
         self.plan = split::plan(
             self.plan.document().clone(),
             &self.source.name,
@@ -1001,6 +1086,35 @@ impl PlanScreen {
         self.untick_what_is_there();
         self.edited = true;
         self.refresh();
+    }
+
+    /// The document's headings, as the plan was opened with them.
+    pub fn headings(&self) -> &[Heading] {
+        &self.headings
+    }
+
+    /// Shows the plan a model's answer made (`split::answer::plan`) in place of the one shown:
+    /// the same document, the same group. Notes already in the group's folder come unticked, as
+    /// they do for a cut at headings, and the plan counts as changed, so Escape keeps it.
+    pub fn set_ai_plan(&mut self, plan: Plan, cut: AiCut) {
+        self.plan = plan;
+        self.ai_cut = Some(cut);
+        self.ai_notice = None;
+        self.edit = None;
+        self.menu = None;
+        self.sel = 0;
+        self.scroll = 0.0;
+        self.pscroll = 0.0;
+        self.untick_what_is_there();
+        self.edited = true;
+        self.refresh();
+    }
+
+    /// Sets the line the application puts above the list, or takes it away.
+    pub fn set_ai_notice(&mut self, notice: Option<Notice>) {
+        self.ai_notice = notice;
+        self.notice = self.make_notice();
+        self.tick += 1;
     }
 
     /// Sends the notes to another group.
@@ -1272,6 +1386,13 @@ impl PlanScreen {
             }
             PHit::Cancel => return Act::Close,
             PHit::Write => return self.write(),
+            PHit::Ai(AiAct::AtHeadings) => {
+                // The level the cut at headings had: an AI plan keeps it (`answer::plan`).
+                let level = self.plan.level();
+                self.set_level(level);
+                return Act::Ai(AiAct::AtHeadings);
+            }
+            PHit::Ai(act) => return Act::Ai(act),
             _ => {}
         }
         Act::Nothing
@@ -2502,6 +2623,171 @@ mod tests {
             inside.target_text(0).starts_with(library::DIR),
             "{}",
             inside.target_text(0)
+        );
+    }
+
+    // ---- the AI (5.2, phase 4b) ----
+
+    /// The plan the answer `json` makes of the Japan journal, on its screen.
+    fn ai_screen(json: &str) -> PlanScreen {
+        let mut s = screen_of(&japan(), Some(2));
+        let answer = split::answer::read(json).expect("the answer reads");
+        let (plan, dropped) = split::answer::plan(
+            s.plan.document().clone(),
+            "Doc.md",
+            s.headings(),
+            2,
+            &answer,
+            &[],
+        );
+        s.set_ai_plan(
+            plan,
+            AiCut {
+                instruction: "one note per part".into(),
+                via: "Claude API".into(),
+                dropped,
+                ..AiCut::default()
+            },
+        );
+        s
+    }
+
+    fn spot(s: &PlanScreen, hit: PHit) -> Option<Rect> {
+        s.spots.iter().find(|(h, _)| *h == hit).map(|(_, r)| *r)
+    }
+
+    fn click(s: &mut PlanScreen, r: Rect) -> Act {
+        s.press(r.cx(), r.cy());
+        s.release(r.cx(), r.cy())
+    }
+
+    #[test]
+    fn ask_the_ai_is_offered_only_when_the_application_turns_it_on() {
+        let mut off = screen_of(&japan(), Some(2));
+        let before = render(&mut off, &LIGHT, 1280, 800);
+        assert!(spot(&off, PHit::Ai(AiAct::Ask)).is_none());
+        let mut on = screen_of(&japan(), Some(2));
+        on.ai_offer = true;
+        let after = render(&mut on, &LIGHT, 1280, 800);
+        assert_ne!(before.pixels, after.pixels, "the button is drawn");
+        let ask = spot(&on, PHit::Ai(AiAct::Ask)).expect("the button");
+        assert_eq!(click(&mut on, ask), Act::Ai(AiAct::Ask));
+        // The level switch is still there, left of it.
+        let hash = spot(&on, PHit::Level(2)).expect("the ### segment");
+        assert!(hash.right() < ask.x);
+    }
+
+    #[test]
+    fn a_plan_from_the_ai_replaces_the_cut_and_escape_keeps_it() {
+        // Parts: Planning (line 10), Tokyo (17), the rest; ask for two notes over them.
+        let mut s = ai_screen(r#"{"notes":[{"from":10,"to":30,"title":"x"},{"from":40,"to":60}]}"#);
+        assert_eq!(s.plan.notes().len(), 2);
+        assert!(s.edited, "a model's plan is kept by Escape");
+        assert_eq!(s.sel, 0);
+        assert_eq!(s.plan.check(), Ok(()));
+        render(&mut s, &LIGHT, 1280, 800);
+        // The header quotes the instruction and offers the cut at headings back.
+        let back = spot(&s, PHit::Ai(AiAct::AtHeadings)).expect("At headings");
+        assert_eq!(click(&mut s, back), Act::Ai(AiAct::AtHeadings));
+        assert!(s.ai_cut.is_none());
+        assert_eq!(s.plan.notes().len(), 23);
+        assert_eq!(s.plan.level(), 2);
+    }
+
+    #[test]
+    fn a_moved_or_overlapping_note_says_so_on_its_row() {
+        let text = japan();
+        let doc = Text::new(text.as_str());
+        // A start in the middle of a paragraph, and a note that overlaps the one before.
+        let para = (0..doc.len_lines())
+            .find(|&i| {
+                i > 20
+                    && !doc_line_blank(&doc, i)
+                    && !doc_line_blank(&doc, i - 1)
+                    && !doc_line_blank(&doc, i + 1)
+            })
+            .expect("a line inside a paragraph");
+        let json = format!(
+            r#"{{"notes":[{{"from":{},"to":{}}},{{"from":{},"to":{}}}]}}"#,
+            para + 1,
+            para + 30,
+            para + 20,
+            para + 60
+        );
+        let s = ai_screen(&json);
+        let marks: Vec<Option<Mark>> = (0..s.plan.notes().len()).map(|i| s.mark(i)).collect();
+        assert_eq!(
+            marks,
+            [
+                Some(Mark::Fixed(Fix::Paragraph)),
+                Some(Mark::Fixed(Fix::Overlap))
+            ]
+        );
+        assert_eq!(
+            Mark::Fixed(Fix::Overlap).text(),
+            "overlapped the note above: starts after it"
+        );
+        assert_eq!(
+            Mark::Fixed(Fix::Paragraph).text(),
+            "boundary moved to a paragraph\u{2019}s edge"
+        );
+        assert_eq!(
+            Mark::Fixed(Fix::CodeBlock).text(),
+            Mark::Moved.text(),
+            "one sentence for one thing"
+        );
+        assert_eq!(s.marked(), [0, 1], "F7 visits them");
+    }
+
+    #[test]
+    fn the_notes_dropped_are_the_line_above_the_list() {
+        let mut json = String::from(r#"{"notes":["#);
+        for k in 0..230 {
+            if k > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#"{{"from":{},"to":{}}}"#, k * 2 + 1, k * 2 + 1));
+        }
+        json.push_str(r#",{"from":"x","to":2}]}"#);
+        let s = ai_screen(&json);
+        let n = s.notice.clone().expect("a notice");
+        assert!(n.warn);
+        assert!(
+            n.text.starts_with("Dropped ") && n.text.contains("31 past the first 200"),
+            "{}",
+            n.text
+        );
+        assert!(n.links.is_empty());
+    }
+
+    #[test]
+    fn a_notice_the_application_sets_comes_first_and_its_links_act() {
+        let mut s = screen_of(&log(), Some(2));
+        assert!(s.notice.as_ref().is_some_and(|n| n.warn), "a warning first");
+        s.set_ai_notice(Some(Notice {
+            text: "The AI\u{2019}s answer could not be read.".into(),
+            warn: true,
+            show: None,
+            links: vec![
+                (AiAct::RunAgain, "Run again".into()),
+                (AiAct::AtHeadings, "Split at headings instead".into()),
+            ],
+        }));
+        assert_eq!(
+            s.notice.as_ref().map(|n| n.text.as_str()),
+            Some("The AI\u{2019}s answer could not be read.")
+        );
+        render(&mut s, &DARK, 1280, 800);
+        let again = spot(&s, PHit::Ai(AiAct::RunAgain)).expect("Run again");
+        let instead = spot(&s, PHit::Ai(AiAct::AtHeadings)).expect("the other link");
+        assert!(again.right() <= instead.x);
+        assert_eq!(click(&mut s, again), Act::Ai(AiAct::RunAgain));
+        s.set_ai_notice(None);
+        assert!(
+            s.notice
+                .as_ref()
+                .is_some_and(|n| n.text.starts_with("One note holds")),
+            "the warning is back"
         );
     }
 }
