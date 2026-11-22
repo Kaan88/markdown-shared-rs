@@ -5,8 +5,8 @@
 //! `super::geo`, so a hit and a drawing cannot disagree about where a row is.
 
 use super::{
-    AiAct, Edit, EditKind, GUTTER, Geo, LINE_H, PHit, Pane, PlanScreen, STRIP_H, lines_text,
-    separated, size_text, thousands,
+    AiAct, Edit, EditKind, GUTTER, Geo, KEEP_THE_REST, LINE_H, PHit, Pane, PlanScreen,
+    RECYCLE_TICKED, RecycleWhy, STRIP_H, lines_text, separated, size_text, thousands,
 };
 use crate::check::{TICK, Tick, draw_tick};
 use crate::gfx::{Face, Painter, Rect, Rgb, mix};
@@ -92,6 +92,7 @@ impl PlanScreen {
         if g.preview.is_some() {
             self.draw_preview(p, pal, &g);
         }
+        self.draw_options(p, pal, &g);
         self.draw_footer(p, pal, &g, footer);
         if let Some(pop) = self.menu.as_mut() {
             pop.menu.draw_in(p, pal, Rect::new(0.0, 0.0, w, h));
@@ -414,11 +415,19 @@ impl PlanScreen {
             120.0,
         );
         let (ticked, track, selected) = strip_colors(pal);
+        // Lines in no note take the warning colour only while it has a consequence: the Recycle
+        // Bin box is ticked and they are what stands against it (5.3, D-038).
+        let warned = self.recycle_blocked();
+        let gap = if warned {
+            mix(pal.popup, pal.warn, 0.75)
+        } else {
+            track
+        };
         // The legend, from the right.
         let mut x = c.right() - PAD;
         for (color, text) in [
             (selected, "selected"),
-            (track, "in no note"),
+            (gap, "in no note"),
             (ticked, "in a ticked note"),
         ] {
             let w = p.measure(Face::Ui, 11.5, text);
@@ -446,6 +455,8 @@ impl PlanScreen {
                 Some(ticked)
             } else if rest_selected && b.note && !b.ticked {
                 Some(selected)
+            } else if warned {
+                Some(gap)
             } else {
                 None
             };
@@ -868,11 +879,92 @@ impl PlanScreen {
         let left = g.card.x + PAD;
         let max = (limit - left).max(0.0);
         p.text(Face::Ui, 13.0, left, footer.y + 26.0, &line, pal.text, max);
-        let what = format!(
-            "Writes one .md per ticked note into {}. The source document is not changed.",
-            self.dest_text()
-        );
+        let what = self.footer_sentence();
         p.text(Face::Ui, 12.0, left, footer.y + 48.0, &what, pal.muted, max);
+    }
+
+    // ---- the options row (5.4) ---------------------------------------------------------------------
+
+    /// The Recycle Bin box: enabled, or disabled with its reason beside it and, for lines in no
+    /// note, the one-click answer.
+    fn draw_options(&mut self, p: &mut Painter, pal: &Palette, g: &Geo) {
+        let (Some(row), Some(b)) = (g.options, self.recycle.clone()) else {
+            return;
+        };
+        p.fill(Rect::new(g.card.x, row.y, g.card.w, p.px()), pal.popup_line);
+        let why = self.recycle_why();
+        let on = self.recycle_on();
+        let enabled = why.is_none();
+        let cy = row.cy();
+        let x0 = row.x;
+        let tick = if enabled {
+            Tick::new(on)
+        } else {
+            Tick::disabled(false)
+        };
+        if enabled && self.hovered(PHit::Recycle) {
+            p.rbox(
+                Rect::new(x0 - 3.0, cy - TICK / 2.0 - 3.0, TICK + 6.0, TICK + 6.0),
+                5.0,
+                pal.hover,
+            );
+        }
+        draw_tick(p, pal, Rect::new(x0, cy - TICK / 2.0, TICK, TICK), tick);
+        let label = format!("Put {} in the Recycle Bin", self.source.name);
+        let room = (row.right() - x0 - 26.0).max(0.0);
+        let label_w = p.text(
+            Face::Ui,
+            13.0,
+            x0 + 26.0,
+            cy,
+            &label,
+            if enabled { pal.text } else { pal.faint },
+            room.min(row.w * 0.5),
+        );
+        if enabled {
+            let hit = Rect::new(x0 - 4.0, row.y + 6.0, label_w + 34.0, row.h - 12.0);
+            self.spots.push((PHit::Recycle, hit));
+        }
+        let mut x = x0 + 26.0 + label_w + 16.0;
+        let end = row.right();
+        match &why {
+            None if on => {
+                p.text(
+                    Face::Ui,
+                    12.5,
+                    x,
+                    cy,
+                    RECYCLE_TICKED,
+                    pal.muted,
+                    (end - x).max(0.0),
+                );
+            }
+            None => {}
+            Some(why) => {
+                let color = if b.wanted { pal.warn } else { pal.muted };
+                let text = why.text();
+                let w = p.text(Face::Ui, 12.5, x, cy, &text, color, (end - x).max(0.0));
+                x += w + 8.0;
+                if matches!(why, RecycleWhy::Lines(_)) && x < end {
+                    let link_w = p.measure(Face::Semibold, 12.5, KEEP_THE_REST) + 12.0;
+                    let link = Rect::new(x - 6.0, row.y + 6.0, link_w, row.h - 12.0);
+                    p.text(
+                        Face::Semibold,
+                        12.5,
+                        x,
+                        cy,
+                        KEEP_THE_REST,
+                        if self.hovered(PHit::KeepRest) {
+                            pal.text
+                        } else {
+                            pal.accent
+                        },
+                        (end - x).max(0.0),
+                    );
+                    self.spots.push((PHit::KeepRest, link));
+                }
+            }
+        }
     }
 }
 

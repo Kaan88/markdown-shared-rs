@@ -5,6 +5,11 @@ pub use mdshared_text::Subpixel;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(feature = "recycle")]
+mod recycle;
+#[cfg(feature = "recycle")]
+pub use recycle::{BinRefusal, open_recycle_bin, recycle, recycle_refusal};
+
 fn has_safe_scheme(url: &str) -> bool {
     let b = url.as_bytes();
     let has = |p: &str| b.len() >= p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes());

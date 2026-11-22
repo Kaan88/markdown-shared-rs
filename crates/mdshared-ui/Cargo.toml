@@ -10,6 +10,10 @@ mdshared-text = { path = "../mdshared-text" }
 parley = "=0.12.0"
 # The rasterizer swash already brings in; it strokes the icons.
 zeno = "=0.3.3"
+# The Recycle Bin (`platform::recycle`, D-046), only for an application that turns on the feature
+# `recycle`. Without its default features: its date crate `jiff` is left out, and everything else
+# it needs is already in the lock at versions it accepts.
+trash = { version = "=5.4.0", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
@@ -70,3 +74,7 @@ softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", 
 # margin on the Wayland window) and, in the app, the patched softbuffer (alpha on Wayland); see
 # docs/LINUX.md. Off: the crate builds against stock winit and uses KWin's protocol only.
 client-margin = ["dep:x11rb"]
+# The Recycle Bin: `platform::recycle`, `platform::recycle_refusal` and `platform::open_recycle_bin`
+# (D-046). Off: the crate is not built, and nothing of it is in the application. mdview leaves it
+# off; mdedit turns it on.
+recycle = ["dep:trash", "windows-sys/Win32_Storage_FileSystem"]

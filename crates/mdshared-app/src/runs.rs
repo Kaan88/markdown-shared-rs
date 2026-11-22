@@ -1478,8 +1478,8 @@ pub fn write_at(req: &Request, gate: &mut dyn Gate, secs: u64, started: &str) ->
     }
 
     // 5. The read-back: each note read again and compared with the lines it was made from. A
-    // note that does not read back is neither linked nor counted, and would stop the Recycle
-    // Bin step (not built: phase T).
+    // note that does not read back is neither linked nor counted, and stops the Recycle Bin
+    // step ([`recycle_source`]).
     let mut sound: Vec<usize> = Vec::new();
     for &i in &written {
         let note = &req.notes[i];
@@ -1913,6 +1913,106 @@ pub(crate) fn sections_eq(a: &[String], b: &[String]) -> bool {
 /// A link's path as the library file resolves it.
 pub(crate) fn link_target(path: &Path, base: &Path) -> PathBuf {
     resolved(&path.to_string_lossy(), base)
+}
+
+// ---- step 8: the original in the Recycle Bin (5.4) ----------------------------------------------
+
+/// What puts a file in the Recycle Bin. The application's is the system's bin
+/// (`mdshared_ui::platform::recycle`, behind its feature `recycle`); a test's records the call
+/// and touches no bin.
+pub trait Bin {
+    /// Puts the file at `path` in the bin; `Err` says why it did not go, and it is then where it
+    /// was.
+    fn recycle(&mut self, path: &Path) -> Result<(), String>;
+}
+
+/// The "bin" that removes the file: what undo did before the Recycle Bin was built (D-071), and
+/// what [`undo`] still does.
+pub struct Delete;
+
+impl Bin for Delete {
+    fn recycle(&mut self, path: &Path) -> Result<(), String> {
+        std::fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
+
+/// Step 8 of 4.3: the source of a written split goes to the Recycle Bin, last, and only when the
+/// run is whole and the source is still the file that was read. Every ticked note was written or
+/// was there already, read back the same and was linked; the record is closed as "done"; and the
+/// source has the length and SHA-256 the record holds. Then `bin` takes it, and the record says
+/// `recycled`, so undo asks for it back before it removes a note (4.5, rule 1).
+///
+/// `Err` is the reason in words that follow "could not be put in the Recycle Bin: ", and the
+/// source is then where it was. A record that could not be written again after the bin took the
+/// source is reported in `report.close_error`; undo still refuses, because the source is gone.
+pub fn recycle_source(
+    report: &mut Report,
+    req: &Request,
+    library: &Path,
+    bin: &mut dyn Bin,
+) -> Result<(), String> {
+    let (Some(record), Some(record_path)) = (report.record.as_mut(), report.record_path.clone())
+    else {
+        return Err("the run did not start".to_string());
+    };
+    let whole = report.start_error.is_none()
+        && report.note_failures.is_empty()
+        && report.picture_failures.is_empty()
+        && report.check_failures.is_empty()
+        && report.folder_failures.is_empty()
+        && report.group_failure.is_none()
+        && report.link_failures.is_empty()
+        && report.notes_written.len() + report.notes_present.len() == req.notes.len()
+        && !req.notes.is_empty()
+        && report.linked.iter().any(|f| same_path(f, &req.group.file));
+    if !whole {
+        return Err("not every note was written, read back and listed".to_string());
+    }
+    if record.kind != Kind::Split || record.state != State::Done || !report.closed {
+        return Err("the run's record is not closed as done".to_string());
+    }
+    if !same_path(&record.source.path, &req.source) {
+        return Err("the run's record names another file".to_string());
+    }
+    match source_state(&record.source) {
+        SourceState::Same => {}
+        SourceState::Gone => return Err("it is not where it was".to_string()),
+        SourceState::Changed => {
+            return Err("it has changed since the notes were cut from it".to_string());
+        }
+        SourceState::TooLarge => return Err("it is too large to be checked".to_string()),
+    }
+    bin.recycle(&record.source.path)?;
+    record.source.recycled = true;
+    if let Err(e) = record.close(&record_path, library) {
+        report.close_error = Some(e.to_string());
+    }
+    record.note_done(&record_path, "recycled");
+    Ok(())
+}
+
+/// The groups whose library files list `path` now, by their names: read from the files, as undo
+/// reads them. The report says a recycled source that is itself a note "will show as missing".
+pub fn listed_in(library: &Path, path: &Path) -> Vec<String> {
+    let listed = list_library(library);
+    let mut groups: Vec<String> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for l in named_in(&listed, path) {
+        if seen.iter().any(|f| same_path(f, &l.file)) {
+            continue;
+        }
+        seen.push(l.file.clone());
+        let name = read_regular(&l.file, library::MAX_FILE_BYTES as u64, true)
+            .and_then(|bytes| library::parse(&crate::files::decode(&bytes).0, library).name)
+            .unwrap_or_else(|| {
+                l.file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        groups.push(name);
+    }
+    groups
 }
 
 // ---- undo ------------------------------------------------------------------------------------------
@@ -2515,6 +2615,8 @@ pub struct UndoReport {
     pub folders_kept: Vec<PathBuf>,
     /// Library files that could not be updated, and why.
     pub failures: Vec<Failure>,
+    /// Notes and pictures the bin would not take ([`undo_with`]), and why: they are kept.
+    pub bin_failures: Vec<Failure>,
     /// The record was marked "undone".
     pub marked: bool,
     pub mark_error: Option<String>,
@@ -2541,6 +2643,19 @@ pub fn with_removals(
 /// A note is removed only when, after the links step, no library file lists it: the library is
 /// read again for that, so whatever kept a line (an edit, a move, a refusal) keeps its note.
 pub fn undo(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate) -> UndoReport {
+    undo_with(path, record, library, gate, &mut Delete)
+}
+
+/// [`undo`], with the notes and the pictures it removes handed to `bin`: the Recycle Bin, once
+/// it is built (4.5, rule 3; D-071). A file the bin refuses is kept, and listed with the reason
+/// in `bin_failures`.
+pub fn undo_with(
+    path: &Path,
+    record: &Record,
+    library: &Path,
+    gate: &mut dyn Gate,
+    bin: &mut dyn Bin,
+) -> UndoReport {
     let mut report = UndoReport::default();
     let (plan, reach) = plan_of(record, library);
     let Some(reach) = reach.filter(|_| plan.refusal.is_none()) else {
@@ -2584,10 +2699,16 @@ pub fn undo(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate) -
                 && has_extension(note, &["md"])
                 && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
         });
-        if matches && std::fs::remove_file(note).is_ok() {
-            report.removed_notes.push(note.clone());
-        } else {
+        if !matches {
             report.kept.push(note.clone());
+            continue;
+        }
+        match bin.recycle(note) {
+            Ok(()) => report.removed_notes.push(note.clone()),
+            Err(why) => {
+                report.bin_failures.push(Failure::new(note, why));
+                report.kept.push(note.clone());
+            }
         }
     }
     for picture in &plan.pictures {
@@ -2600,10 +2721,16 @@ pub fn undo(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate) -
                     && has_extension(picture, &PICTURE_EXTENSIONS)
                     && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
             });
-        if matches && std::fs::remove_file(picture).is_ok() {
-            report.removed_pictures.push(picture.clone());
-        } else {
+        if !matches {
             report.kept.push(picture.clone());
+            continue;
+        }
+        match bin.recycle(picture) {
+            Ok(()) => report.removed_pictures.push(picture.clone()),
+            Err(why) => {
+                report.bin_failures.push(Failure::new(picture, why));
+                report.kept.push(picture.clone());
+            }
         }
     }
     // 4. The group's library file, only when this run made it and nothing but its heading and
@@ -3211,6 +3338,237 @@ mod tests {
         assert!(done.refusal.is_some());
         assert!(library.join("Trip/One.md").is_file(), "the note stays");
         assert!(read(&library.join("Trip.md")).contains("[One]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bin of the test's own: a folder it moves files into, and the calls it was given. No
+    /// system bin is touched.
+    struct TestBin {
+        into: PathBuf,
+        calls: Vec<PathBuf>,
+        refuse: Option<String>,
+    }
+
+    impl TestBin {
+        fn new(dir: &Path) -> TestBin {
+            let into = dir.join("bin");
+            std::fs::create_dir_all(&into).expect("the bin");
+            TestBin {
+                into,
+                calls: Vec::new(),
+                refuse: None,
+            }
+        }
+        /// Where `path` went.
+        fn held(&self, path: &Path) -> PathBuf {
+            self.into.join(path.file_name().unwrap_or_default())
+        }
+    }
+
+    impl Bin for TestBin {
+        fn recycle(&mut self, path: &Path) -> Result<(), String> {
+            self.calls.push(path.to_path_buf());
+            if let Some(why) = &self.refuse {
+                return Err(why.clone());
+            }
+            std::fs::rename(path, self.held(path)).map_err(|e| e.to_string())
+        }
+    }
+
+    /// A written run of one note, ready for step 8.
+    fn written(tag: &str) -> (PathBuf, PathBuf, PathBuf, Request, Report) {
+        let dir = scratch(tag);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", &[]), ("Two", "# Two\n", &["Tokyo"])],
+        );
+        let mut gate = TestGate::new();
+        let report = write_at(&req, &mut gate, 9, "2026-11-21T14:03:11Z");
+        assert_eq!(report.state(), Some(State::Done));
+        (dir, library, source, req, report)
+    }
+
+    #[test]
+    fn step_eight_puts_the_source_in_the_bin_last_and_the_record_says_so() {
+        let (dir, library, source, req, mut report) = written("step8");
+        let mut bin = TestBin::new(&dir);
+        assert_eq!(
+            recycle_source(&mut report, &req, &library, &mut bin),
+            Ok(())
+        );
+        assert_eq!(bin.calls, vec![source.clone()]);
+        assert!(!source.exists(), "the original is in the bin");
+        assert!(bin.held(&source).is_file());
+        // The record on disk says so, and undo asks for it back before anything goes.
+        let record_path = report.record_path.clone().expect("a record");
+        let record = load(&record_path, &library).expect("the record");
+        assert!(record.source.recycled);
+        assert_eq!(record.state, State::Done);
+        assert!(read(&record_path.with_extension("done")).contains("recycled"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_eight_is_cancelled_by_a_note_that_was_not_written() {
+        let dir = scratch("step8-note");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", &[]), ("Two", "# Two\n", &[])],
+        );
+        // The owner's file where the second note would go: that note is not written.
+        write_file(&library.join("Trip/Two.md"), "# Mine\n");
+        let mut gate = TestGate::new();
+        let mut report = write_at(&req, &mut gate, 10, "2026-11-21T14:03:11Z");
+        assert_eq!(report.note_failures.len(), 1);
+        let mut bin = TestBin::new(&dir);
+        let why = recycle_source(&mut report, &req, &library, &mut bin).expect_err("cancelled");
+        assert_eq!(why, "not every note was written, read back and listed");
+        assert!(bin.calls.is_empty(), "the bin is never asked");
+        assert!(source.is_file(), "the original is where it was");
+        let record =
+            load(&report.record_path.clone().expect("a record"), &library).expect("the record");
+        assert!(!record.source.recycled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_eight_is_cancelled_by_a_note_that_does_not_read_back() {
+        let dir = scratch("step8-check");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let mut req = plan(&library, &source, &[("One", "# Written\n", &[])]);
+        req.notes[0].from_source = "# Made from the source\n".to_string();
+        let mut gate = TestGate::new();
+        let mut report = write_at(&req, &mut gate, 11, "2026-11-21T14:03:11Z");
+        let mut bin = TestBin::new(&dir);
+        assert!(recycle_source(&mut report, &req, &library, &mut bin).is_err());
+        assert!(bin.calls.is_empty());
+        assert!(source.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_eight_is_cancelled_when_the_library_file_was_not_updated() {
+        let dir = scratch("step8-links");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(&library, &source, &[("One", "# One\n", &[])]);
+        let mut gate = TestGate::new();
+        gate.refusals.push(library.join("Trip.md"));
+        let mut report = write_at(&req, &mut gate, 12, "2026-11-21T14:03:11Z");
+        let mut bin = TestBin::new(&dir);
+        assert!(recycle_source(&mut report, &req, &library, &mut bin).is_err());
+        assert!(bin.calls.is_empty());
+        assert!(source.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_eight_is_cancelled_by_a_source_changed_between_reading_and_writing() {
+        let (dir, library, source, req, mut report) = written("step8-changed");
+        // The owner saved the document while the notes were being written.
+        write_file(&source, "# Japan\n\none, and a line more\n");
+        let mut bin = TestBin::new(&dir);
+        let why = recycle_source(&mut report, &req, &library, &mut bin).expect_err("cancelled");
+        assert_eq!(why, "it has changed since the notes were cut from it");
+        assert!(bin.calls.is_empty());
+        assert_eq!(read(&source), "# Japan\n\none, and a line more\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_eight_that_the_bin_refuses_leaves_the_source_and_the_record_as_they_were() {
+        let (dir, library, source, req, mut report) = written("step8-refused");
+        let mut bin = TestBin::new(&dir);
+        bin.refuse = Some("the item is too large for the Recycle Bin".to_string());
+        let why = recycle_source(&mut report, &req, &library, &mut bin).expect_err("refused");
+        assert_eq!(why, "the item is too large for the Recycle Bin");
+        assert!(source.is_file());
+        let record =
+            load(&report.record_path.clone().expect("a record"), &library).expect("the record");
+        assert!(!record.source.recycled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_is_refused_while_the_recycled_source_is_away_and_runs_once_it_is_back() {
+        let (dir, library, source, req, mut report) = written("step8-undo");
+        let mut bin = TestBin::new(&dir);
+        recycle_source(&mut report, &req, &library, &mut bin).expect("recycled");
+        let record_path = report.record_path.clone().expect("a record");
+        let record = load(&record_path, &library).expect("the record");
+        // Away: refused, and every note stays.
+        let mut gate = TestGate::new();
+        let done = undo(&record_path, &record, &library, &mut gate);
+        assert_eq!(
+            done.refusal.as_deref(),
+            Some("Put \u{2018}Trip journal.md\u{2019} back from the Recycle Bin first, then undo.")
+        );
+        assert!(library.join("Trip/One.md").is_file());
+        // Restored by the owner: undo runs.
+        std::fs::rename(bin.held(&source), &source).expect("restored");
+        let mut gate = TestGate::new();
+        let done = undo(&record_path, &record, &library, &mut gate);
+        assert_eq!(done.refusal, None);
+        assert_eq!(done.removed_notes.len(), 2);
+        assert!(!library.join("Trip/One.md").exists());
+        assert!(source.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_with_a_bin_hands_it_the_notes_and_keeps_one_it_refuses() {
+        let (dir, library, _source, _req, report) = written("undo-bin");
+        let record_path = report.record_path.clone().expect("a record");
+        let record = load(&record_path, &library).expect("the record");
+        let mut bin = TestBin::new(&dir);
+        let mut gate = TestGate::new();
+        let done = undo_with(&record_path, &record, &library, &mut gate, &mut bin);
+        assert_eq!(done.refusal, None);
+        assert_eq!(done.removed_notes.len(), 2);
+        assert_eq!(bin.calls.len(), 2, "both notes went through the bin");
+        assert!(bin.held(&library.join("Trip/One.md")).is_file());
+        assert!(!library.join("Trip/One.md").exists());
+
+        // A bin that refuses keeps the note, and says why.
+        let (dir2, library2, _s, _r, report2) = written("undo-bin-refused");
+        let record_path2 = report2.record_path.clone().expect("a record");
+        let record2 = load(&record_path2, &library2).expect("the record");
+        let mut bin2 = TestBin::new(&dir2);
+        bin2.refuse = Some("blocked by policy".to_string());
+        let mut gate = TestGate::new();
+        let done = undo_with(&record_path2, &record2, &library2, &mut gate, &mut bin2);
+        assert!(done.removed_notes.is_empty());
+        assert_eq!(done.bin_failures.len(), 2);
+        assert_eq!(done.bin_failures[0].why, "blocked by policy");
+        assert!(library2.join("Trip/One.md").is_file(), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn listed_in_names_the_groups_that_list_a_file() {
+        let dir = scratch("listed-in");
+        let library = dir.join("library");
+        let note = dir.join("Trip journal.md");
+        write_file(&note, "# Japan\n");
+        write_file(
+            &library.join("Trips.md"),
+            &format!("# Trips\n\n- [Journal]({})\n", note.display()),
+        );
+        write_file(&library.join("Other.md"), "# Other\n\n- [Else](else.md)\n");
+        assert_eq!(listed_in(&library, &note), vec!["Trips".to_string()]);
+        assert!(listed_in(&library, &dir.join("nowhere.md")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

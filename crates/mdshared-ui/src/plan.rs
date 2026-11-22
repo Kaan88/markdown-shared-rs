@@ -50,9 +50,11 @@ pub const PREVIEW_MIN_CARD: f32 = 860.0;
 pub const ROW_H: f32 = 44.0;
 pub const LIST_HEAD: f32 = 40.0;
 pub const PREVIEW_HEAD: f32 = 72.0;
-/// The options row. It holds the Recycle Bin box (phase T) and the pictures box (5.6), neither of
-/// which exists yet, so it takes no room: the row appears when something is put in it.
+/// The options row of a card with nothing in it: it takes no room, so an application that puts
+/// no box in it draws the card as it always did.
 pub const OPTIONS_H: f32 = 0.0;
+/// The options row with the Recycle Bin box in it (5.4), when the application offers the box.
+pub const OPTIONS_ROW_H: f32 = 44.0;
 /// A line of the preview.
 pub const LINE_H: f32 = 19.0;
 /// The width of the preview's gutter of line numbers.
@@ -370,17 +372,25 @@ pub struct Geo {
     pub preview: Option<Rect>,
     pub preview_head: Rect,
     pub preview_body: Rect,
+    /// The options row, when the card has something in it (the Recycle Bin box).
+    pub options: Option<Rect>,
 }
 
 /// The parts of `card`; `notice` makes room for the line under the header.
 pub fn geo(card: Rect, notice: bool) -> Geo {
+    geo_with(card, notice, false)
+}
+
+/// [`geo`], and `options` makes room for the options row above the footer.
+pub fn geo_with(card: Rect, notice: bool, options: bool) -> Geo {
     let pad = DIALOG_PAD;
     let footer = Rect::new(card.x, card.bottom() - DIALOG_FOOTER, card.w, DIALOG_FOOTER);
+    let options_h = if options { OPTIONS_ROW_H } else { OPTIONS_H };
     let options = Rect::new(
         card.x + pad,
-        footer.y - OPTIONS_H,
+        footer.y - options_h,
         (card.w - 2.0 * pad).max(0.0),
-        OPTIONS_H,
+        options_h,
     );
     let header = Rect::new(card.x, card.y, card.w, HEAD_H);
     let mut y = header.bottom();
@@ -427,6 +437,7 @@ pub fn geo(card: Rect, notice: bool) -> Geo {
         preview,
         preview_head,
         preview_body,
+        options: (options.h > 0.0).then_some(options),
     }
 }
 
@@ -496,6 +507,10 @@ pub enum PHit {
     Field,
     /// A button or a link of the AI (5.2): the header's, or the notice's.
     Ai(AiAct),
+    /// The Recycle Bin box and its label (5.4).
+    Recycle,
+    /// "Keep them in a note called 'The rest'", beside a box that is disabled for want of it.
+    KeepRest,
 }
 
 /// What an event asks of the window.
@@ -584,6 +599,54 @@ pub struct Drag {
     grab: f32,
 }
 
+/// "This drive has no Recycle Bin": the source is not on a local fixed drive (5.4).
+pub const RECYCLE_NO_BIN: &str = "This drive has no Recycle Bin";
+/// "Only for one document at a time": a plan over several files (5.4).
+pub const RECYCLE_ONE_DOCUMENT: &str = "Only for one document at a time";
+/// The one-click answer to lines in no note (5.4).
+pub const KEEP_THE_REST: &str = "Keep them in a note called \u{2018}The rest\u{2019}";
+/// What the options row says beside the box when it is ticked and allowed (5.4).
+pub const RECYCLE_TICKED: &str =
+    "Every line is in a note, so nothing is lost. It can be restored from the Recycle Bin.";
+
+/// "The Recycle Bin is not available here: {why}": the system refuses (5.4).
+pub fn recycle_unavailable(why: &str) -> String {
+    format!("The Recycle Bin is not available here: {why}")
+}
+
+/// The Recycle Bin box of the options row (5.4): put the original in the bin after the notes are
+/// written. The card shows it only when the application puts one here; it holds what the owner
+/// asked for and what the application found against it, and the card works out the rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecycleBox {
+    /// The owner ticked it. Kept while the box is disabled, so the strip can say what stands in
+    /// the way (5.3: the warning colour, "while the Recycle Bin box is wanted").
+    pub wanted: bool,
+    /// Why the application will not offer it whatever is ticked, in the card's words: the drive
+    /// has no bin, the plan is over several files, the system refuses. `None` when nothing does.
+    pub refused: Option<String>,
+}
+
+/// Why the Recycle Bin box is disabled (5.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecycleWhy {
+    /// The application's reason ([`RecycleBox::refused`]); no click answers it.
+    Refused(String),
+    /// This many non-blank lines are in no ticked note; ticking the rest answers it.
+    Lines(usize),
+}
+
+impl RecycleWhy {
+    /// The reason as the options row says it, without its link.
+    pub fn text(&self) -> String {
+        match self {
+            RecycleWhy::Refused(why) => why.clone(),
+            RecycleWhy::Lines(1) => "1 line is in no note.".to_string(),
+            RecycleWhy::Lines(n) => format!("{} lines are in no note.", thousands(*n)),
+        }
+    }
+}
+
 /// The line under the header: what the plan says about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
@@ -649,6 +712,9 @@ pub struct PlanScreen {
     /// A line the application puts above the list, before any warning: a request in flight, an
     /// answer that could not be read, a refusal.
     pub ai_notice: Option<Notice>,
+    /// The Recycle Bin box (5.4). `None` unless the application puts one here, so the card of an
+    /// application that does not offer it draws as it always did, with no options row.
+    pub recycle: Option<RecycleBox>,
 }
 
 /// How many names are tried for a note before the first is used anyway.
@@ -721,6 +787,7 @@ impl PlanScreen {
             ai_offer: false,
             ai_cut: None,
             ai_notice: None,
+            recycle: None,
         };
         s.untick_what_is_there();
         s.refresh();
@@ -1017,6 +1084,65 @@ impl PlanScreen {
         self.blocked.clone()
     }
 
+    // ---- the Recycle Bin box (5.4) ----
+
+    /// Why the box is disabled, or `None` when it can be ticked: the application's reason
+    /// first, since no click answers it; then the lines in no ticked note.
+    pub fn recycle_why(&self) -> Option<RecycleWhy> {
+        let b = self.recycle.as_ref()?;
+        if let Some(why) = &b.refused {
+            return Some(RecycleWhy::Refused(why.clone()));
+        }
+        (!self.totals.covered()).then_some(RecycleWhy::Lines(self.totals.lines_in_no_note))
+    }
+
+    /// Whether the write puts the original in the Recycle Bin: the box is there, ticked, and
+    /// nothing stands against it now.
+    pub fn recycle_on(&self) -> bool {
+        self.recycle.as_ref().is_some_and(|b| b.wanted) && self.recycle_why().is_none()
+    }
+
+    /// The box is ticked and something stands against it: the gaps are drawn in the warning
+    /// colour (5.3), and so is the reason.
+    pub fn recycle_blocked(&self) -> bool {
+        self.recycle.as_ref().is_some_and(|b| b.wanted) && self.recycle_why().is_some()
+    }
+
+    /// A click on the box: ticks or unticks it, only while it can be ticked.
+    pub fn toggle_recycle(&mut self) {
+        if self.recycle_why().is_some() {
+            return;
+        }
+        if let Some(b) = self.recycle.as_mut() {
+            b.wanted = !b.wanted;
+            self.tick += 1;
+        }
+    }
+
+    /// "Keep them in a note called 'The rest'": ticks the rest, so every line is in a note.
+    pub fn keep_the_rest(&mut self) {
+        if !self.plan.rest_ticked() {
+            self.plan.set_rest_ticked(true);
+            self.changed();
+        }
+    }
+
+    /// The footer's sentence: what pressing the button does, in one sentence (5.3, 5.4).
+    pub fn footer_sentence(&self) -> String {
+        if self.recycle_on() {
+            format!(
+                "Writes one .md per ticked note into {}, then puts {} in the Recycle Bin.",
+                self.dest_text(),
+                self.source.name
+            )
+        } else {
+            format!(
+                "Writes one .md per ticked note into {}. The source document is not changed.",
+                self.dest_text()
+            )
+        }
+    }
+
     // ---- the plan, changed ----
 
     pub fn toggle(&mut self, row: usize) {
@@ -1127,7 +1253,11 @@ impl PlanScreen {
     // ---- the list ----
 
     pub fn geo(&self) -> Geo {
-        geo(card(self.win.0, self.win.1), self.notice.is_some())
+        geo_with(
+            card(self.win.0, self.win.1),
+            self.notice.is_some(),
+            self.recycle.is_some(),
+        )
     }
 
     pub fn rows(&self) -> Rows {
@@ -1386,6 +1516,8 @@ impl PlanScreen {
             }
             PHit::Cancel => return Act::Close,
             PHit::Write => return self.write(),
+            PHit::Recycle => self.toggle_recycle(),
+            PHit::KeepRest => self.keep_the_rest(),
             PHit::Ai(AiAct::AtHeadings) => {
                 // The level the cut at headings had: an AI plan keeps it (`answer::plan`).
                 let level = self.plan.level();
@@ -2789,5 +2921,176 @@ mod tests {
                 .is_some_and(|n| n.text.starts_with("One note holds")),
             "the warning is back"
         );
+    }
+
+    // ---- the Recycle Bin box (5.4) ----
+
+    /// The Japan journal cut at `##`: lines in no note until the rest is ticked.
+    fn with_box(refused: Option<&str>) -> PlanScreen {
+        let mut s = screen_of(&japan(), Some(2));
+        s.recycle = Some(RecycleBox {
+            wanted: false,
+            refused: refused.map(str::to_string),
+        });
+        s
+    }
+
+    #[test]
+    fn recycle_a_card_without_the_box_is_drawn_as_it_always_was() {
+        let mut plain = screen_of(&japan(), Some(2));
+        let before = render(&mut plain, &LIGHT, 1280, 800);
+        assert!(plain.geo().options.is_none(), "no options row");
+        assert!(spot(&plain, PHit::Recycle).is_none());
+        assert!(!plain.recycle_on());
+        assert_eq!(plain.recycle_why(), None);
+        // The list ends where the footer begins, as before phase T.
+        let g = plain.geo();
+        assert_eq!(g.list.bottom(), g.card.bottom() - DIALOG_FOOTER);
+        let mut again = screen_of(&japan(), Some(2));
+        assert!(
+            render(&mut again, &LIGHT, 1280, 800).pixels == before.pixels,
+            "the same card, pixel for pixel"
+        );
+    }
+
+    #[test]
+    fn recycle_the_box_takes_a_row_above_the_footer() {
+        let s = with_box(None);
+        let g = s.geo();
+        let row = g.options.expect("the options row");
+        assert_eq!(row.h, OPTIONS_ROW_H);
+        assert_eq!(row.bottom(), g.card.bottom() - DIALOG_FOOTER);
+        assert_eq!(g.list.bottom(), row.y, "the list gives the row its room");
+    }
+
+    #[test]
+    fn recycle_is_disabled_by_lines_in_no_note_and_keep_the_rest_answers_it() {
+        let mut s = with_box(None);
+        let gaps = s.totals.lines_in_no_note;
+        assert!(gaps > 0, "the journal has lines between its notes");
+        assert_eq!(s.recycle_why(), Some(RecycleWhy::Lines(gaps)));
+        assert_eq!(RecycleWhy::Lines(18).text(), "18 lines are in no note.");
+        assert_eq!(RecycleWhy::Lines(1).text(), "1 line is in no note.");
+        let _ = render(&mut s, &LIGHT, 1280, 800);
+        // Disabled: the box is not a place to click, and a click there ticks nothing.
+        assert!(spot(&s, PHit::Recycle).is_none());
+        s.toggle_recycle();
+        assert!(!s.recycle.as_ref().expect("the box").wanted);
+        // The one-click answer: the rest is ticked, and the box can be ticked.
+        let link = spot(&s, PHit::KeepRest).expect("the answer");
+        assert_eq!(click(&mut s, link), Act::Nothing);
+        assert!(s.plan.rest_ticked());
+        assert_eq!(s.recycle_why(), None);
+        let _ = render(&mut s, &LIGHT, 1280, 800);
+        assert!(spot(&s, PHit::KeepRest).is_none(), "nothing left to answer");
+        let tick = spot(&s, PHit::Recycle).expect("the box");
+        click(&mut s, tick);
+        assert!(s.recycle_on());
+        click(&mut s, tick);
+        assert!(!s.recycle_on(), "a second click unticks it");
+    }
+
+    #[test]
+    fn recycle_is_disabled_by_the_applications_reason_whatever_is_ticked() {
+        for why in [
+            RECYCLE_NO_BIN.to_string(),
+            RECYCLE_ONE_DOCUMENT.to_string(),
+            recycle_unavailable("a policy on this PC deletes files instead"),
+        ] {
+            let mut s = with_box(Some(&why));
+            s.keep_the_rest();
+            assert!(s.totals.covered());
+            assert_eq!(s.recycle_why(), Some(RecycleWhy::Refused(why.clone())));
+            let _ = render(&mut s, &LIGHT, 1280, 800);
+            assert!(spot(&s, PHit::Recycle).is_none());
+            assert!(spot(&s, PHit::KeepRest).is_none(), "no click answers it");
+            s.toggle_recycle();
+            assert!(!s.recycle_on());
+        }
+        assert_eq!(
+            recycle_unavailable("off"),
+            "The Recycle Bin is not available here: off"
+        );
+    }
+
+    #[test]
+    fn recycle_ticked_says_nothing_is_lost_and_the_footer_says_what_happens() {
+        let mut s = with_box(None);
+        s.keep_the_rest();
+        assert!(
+            s.footer_sentence()
+                .ends_with("The source document is not changed.")
+        );
+        s.toggle_recycle();
+        assert!(s.recycle_on());
+        assert_eq!(
+            s.footer_sentence(),
+            format!(
+                "Writes one .md per ticked note into {}, then puts {} in the Recycle Bin.",
+                s.dest_text(),
+                s.source.name
+            )
+        );
+        // The ticked row and the unticked row differ by the sentence beside the box.
+        let ticked = render(&mut s, &LIGHT, 1280, 800);
+        let row = s.geo().options.expect("the row");
+        s.toggle_recycle();
+        let unticked = render(&mut s, &LIGHT, 1280, 800);
+        let differing = (row.y as u32 + 4..row.bottom() as u32 - 4)
+            .flat_map(|y| (row.x as u32 + 400..row.right() as u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixel(&ticked, x, y) != pixel(&unticked, x, y))
+            .count();
+        assert!(differing > 100, "the sentence drew {differing} pixels");
+    }
+
+    #[test]
+    fn recycle_wanted_and_then_blocked_turns_the_gaps_to_the_warning_colour() {
+        for pal in [LIGHT, DARK] {
+            let mut s = with_box(None);
+            s.keep_the_rest();
+            s.toggle_recycle();
+            // The owner unticks the rest and a note: their lines are in no note, and the box
+            // stands disabled with the wish kept.
+            let rest = s.plan.notes().len();
+            s.toggle(rest);
+            s.toggle(2);
+            s.select(0);
+            assert!(s.recycle_blocked());
+            assert!(
+                !s.recycle_on(),
+                "nothing goes to the bin while lines are left"
+            );
+            let warned = render(&mut s, &pal, 1280, 800);
+            let band = s
+                .bands
+                .iter()
+                .find(|b| b.row == 2 && b.note)
+                .copied()
+                .expect("the unticked note's band");
+            let g = s.geo();
+            let x = (g.strip.x + (band.x0 + band.x1) / 2.0) as u32;
+            let y = g.strip.cy() as u32;
+            // The bitmap holds its bytes blue first.
+            let bgr = |c: [u8; 3]| [c[2], c[1], c[0]];
+            let warn = bgr(crate::gfx::mix(pal.popup, pal.warn, 0.75));
+            assert_eq!(pixel(&warned, x, y), warn);
+            let gap = s
+                .bands
+                .iter()
+                .find(|b| !b.note && b.x1 - b.x0 >= 2.0)
+                .copied()
+                .expect("a gap between notes");
+            let gx = (g.strip.x + (gap.x0 + gap.x1) / 2.0) as u32;
+            assert_eq!(
+                pixel(&warned, gx, y),
+                warn,
+                "a gap is the warning colour too"
+            );
+            // Not wanted: the same lines are the plain track.
+            s.recycle.as_mut().expect("the box").wanted = false;
+            let calm = render(&mut s, &pal, 1280, 800);
+            assert_ne!(pixel(&calm, x, y), warn);
+            assert_eq!(pixel(&calm, x, y), bgr(super::draw::strip_colors(&pal).1));
+        }
     }
 }
