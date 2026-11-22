@@ -65,10 +65,10 @@ fn code_inline_and_in_blocks() {
         "```rust\nfn main() {\n    let a = 1 < 2;\n}\n```"
     );
     assert_eq!(md("<pre>a\n```\nb</pre>"), "````\na\n```\nb\n````");
-    // Tags inside a code block keep their text only.
+    // Tags inside a code block keep their text only; a block in it starts a line of its own.
     assert_eq!(
         md("<pre><b>x</b><br>y<div>z</div></pre>"),
-        "```\nx\nyz\n```"
+        "```\nx\ny\nz\n```"
     );
 }
 
@@ -104,8 +104,11 @@ fn text_that_would_read_as_markdown_is_escaped() {
     );
     assert_eq!(
         md("<p>&lt;div&gt; &amp; &copy; &#x41;&#66; &bogus;</p><i>i</i>"),
-        "\\<div> & \u{a9} AB &bogus;\n\n*i*"
+        "\\<div> & \u{a9} AB \\&bogus;\n\n*i*"
     );
+    // An unknown reference is not decoded: it stays as it was written (its `&` escaped above, as
+    // any that reads as a reference is).
+    assert_eq!(decode("&bogus; &amp"), "&bogus; &amp");
 }
 
 #[test]
@@ -302,4 +305,331 @@ fn deep_nesting_stays_bounded_and_quick() {
     let raw = "<script>".repeat(50_000);
     assert_eq!(to_markdown(&raw), None);
     assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+}
+
+// ---- the review of the first version: one test per finding --------------------------------------
+
+#[test]
+fn output_never_passes_the_cap() {
+    let nest = "<blockquote>".repeat(16) + &r#"<ol start="999999999"><li>"#.repeat(16);
+    // A code block left open, written whole by finish().
+    let html = nest.clone() + "<pre>" + &"x\n".repeat(50_000);
+    assert_eq!(to_markdown(&html), None);
+    let html = nest.clone() + "<pre>a" + &"\n".repeat(50_000) + "b";
+    assert_eq!(to_markdown(&html), None);
+    // A paragraph of hard breaks, written whole at its end tag.
+    let html = nest.clone() + "<p>" + &"x<br>".repeat(20_000) + "</p>";
+    assert_eq!(to_markdown(&html), None);
+    // Shallow, the same paragraph is no trouble.
+    let html = "<p>".to_string() + &"x<br>".repeat(20_000) + "</p><b>b</b>";
+    let out = md(&html);
+    assert!(out.len() <= cap(html.len()));
+    assert!(out.ends_with("x\n\n**b**"));
+}
+
+#[test]
+fn decode_is_quick_on_text_full_of_ampersands() {
+    let start = std::time::Instant::now();
+    let html = "<b>x</b>".to_string() + &"&".repeat(1_000_000);
+    let out = md(&html);
+    assert_eq!(out.len(), 5 + 1_000_000);
+    let query = "<b>x</b>".to_string() + &"see https://e.com/?a=1&b=2 ".repeat(40_000);
+    let _ = md(&query);
+    assert!(start.elapsed().as_secs() < 3, "{:?}", start.elapsed());
+}
+
+#[test]
+fn a_table_row_stays_on_one_line_whatever_its_cells_hold() {
+    assert_eq!(
+        md(
+            "<h2>T</h2><table><tr><td><p>a</p></td><td><p>b</p></td></tr><tr><td><p>1</p></td><td><div>2</div><p>3</p></td></tr></table><p>after</p>"
+        ),
+        "## T\n\na | b\n\n1 | 2 3\n\nafter"
+    );
+    // Rows left open, a cell's hard break, and a table in a cell.
+    assert_eq!(
+        md(
+            "<h2>T</h2><table><tr><td>a<br>b<td>c<tr><td>d<table><tr><td>e</td><td>f</td></tr></table></td><td>g</td></table>"
+        ),
+        "## T\n\na b | c\n\nd e f | g"
+    );
+}
+
+#[test]
+fn word_styles_are_read_by_their_whole_name() {
+    // Word's mso-bidi-font-weight is about complex scripts, not this text.
+    assert_eq!(
+        md(
+            "<h1>T</h1><p class=MsoNormal><b style='mso-bidi-font-weight:normal'><span lang=EN-US>Bold</span></b> rest</p>"
+        ),
+        "# T\n\n**Bold** rest"
+    );
+    assert_eq!(
+        md("<h1>T</h1><p><span style='mso-bidi-font-weight:700'>plain</span></p>"),
+        "# T\n\nplain"
+    );
+    // The last weight written is the one that counts.
+    assert_eq!(
+        md(
+            "<p><span style='font-weight:700;font-weight:400'>x</span> <span style='font-weight: 400; FONT-WEIGHT: Bold'>y</span></p>"
+        ),
+        "x **y**"
+    );
+}
+
+#[test]
+fn bold_and_italic_in_one_span_keep_both() {
+    assert_eq!(
+        md(r#"<p><span style="font-weight:700;font-style:italic;">both</span></p>"#),
+        "***both***"
+    );
+    // Inside bold only the italic is new.
+    assert_eq!(
+        md(r#"<p><b>x <span style="font-weight:700;font-style:italic">y</span></b></p>"#),
+        "**x *y***"
+    );
+    assert_eq!(
+        md(r#"<p><b style="font-style:italic">z</b></p>"#),
+        "***z***"
+    );
+}
+
+#[test]
+fn a_quote_inside_a_list_item_stays_in_the_item() {
+    assert_eq!(
+        md("<ul><li>a<blockquote>q</blockquote></li><li>b</li></ul>"),
+        "- a\n\n  > q\n- b"
+    );
+    // A list inside a quote inside a list (a quote may follow an item's line at once).
+    assert_eq!(
+        md("<ul><li>a<blockquote><ul><li>in</li></ul></blockquote></li></ul>"),
+        "- a\n  > - in"
+    );
+    // A quote's end closes the list left open in it.
+    assert_eq!(
+        md("<blockquote><ul><li>x</blockquote><p>after</p>"),
+        "> - x\n\nafter"
+    );
+}
+
+#[test]
+fn an_ampersand_that_reads_as_a_reference_is_escaped() {
+    assert_eq!(
+        md(
+            "<p>Use &amp;copy; and &amp;lt;div&amp;gt; or &amp;#169; &amp;#xA9; at AT&amp;T &amp; co</p><b>x</b>"
+        ),
+        "Use \\&copy; and \\&lt;div\\&gt; or \\&#169; \\&#xA9; at AT&T & co\n\n**x**"
+    );
+    assert_eq!(
+        md(r#"<a href="https://e.com/?a=1&amp;copy;=2&amp;b=3">l</a>"#),
+        "[l](https://e.com/?a=1\\&copy;=2&b=3)"
+    );
+    assert_eq!(
+        md(r#"<img src="a.png" alt="&amp;amp; x">"#),
+        "![\\&amp; x](a.png)"
+    );
+    // In code it is code.
+    assert_eq!(md("<p><code>&amp;copy;</code></p>"), "`&copy;`");
+}
+
+#[test]
+fn tildes_that_would_mark_or_fence_are_escaped() {
+    assert_eq!(
+        md("<p>~~~</p><p>after</p><b>x</b>"),
+        "\\~\\~\\~\n\nafter\n\n**x**"
+    );
+    assert_eq!(
+        md("<p>a ~~b~~ c, x~y~z, ~5 min</p><b>x</b>"),
+        "a \\~\\~b\\~\\~ c, x\\~y\\~z, ~5 min\n\n**x**"
+    );
+}
+
+#[test]
+fn line_starts_that_would_read_as_markdown_are_escaped() {
+    assert_eq!(
+        md("<p>a<br>--</p><p>b<br>=</p><p>c<br>-- -</p><p>d<br>==</p><b>x</b>"),
+        "a\\\n\\--\n\nb\\\n\\=\n\nc\\\n\\-- -\n\nd\\\n\\==\n\n**x**"
+    );
+    assert_eq!(
+        md(
+            "<p>&gt; not a quote</p><p>- not an item</p><p>+ nor this</p><p>---</p><p>===</p><p>1) no</p><p>-</p><p>+</p><b>x</b>"
+        ),
+        "\\> not a quote\n\n\\- not an item\n\n\\+ nor this\n\n\\---\n\n\\===\n\n1\\) no\n\n\\-\n\n\\+\n\n**x**"
+    );
+    // Words that only start with these stay as they are.
+    assert_eq!(
+        md("<p>-dash +plus =eq a-b 2.5 1.x</p><b>x</b>"),
+        "-dash +plus =eq a-b 2.5 1.x\n\n**x**"
+    );
+}
+
+#[test]
+fn a_heading_that_ends_in_a_hash_keeps_it() {
+    assert_eq!(
+        md("<h2>Issue #</h2><h1>#</h1><h3>C#</h3><h4>a ##</h4>"),
+        "## Issue \\#\n\n# \\#\n\n### C#\n\n#### a \\##"
+    );
+}
+
+#[test]
+fn white_space_pre_on_a_code_block_is_not_a_code_editors_copy() {
+    assert_eq!(
+        md("<h2>T</h2><pre><code style=\"white-space: pre;\">fn x()</code></pre>"),
+        "## T\n\n```\nfn x()\n```"
+    );
+    assert_eq!(
+        md(
+            "<h2>T</h2><pre style=\"white-space:pre\"><span style=\"white-space:pre\">a</span></pre>"
+        ),
+        "## T\n\n```\na\n```"
+    );
+    assert_eq!(
+        to_markdown("<h2>T</h2><div style=\"white-space:pre\">a</div>"),
+        None
+    );
+}
+
+#[test]
+fn an_inline_element_around_a_block_marks_it() {
+    assert_eq!(
+        md(r#"<h1>T</h1><a href="https://x"><div>card</div></a>"#),
+        "# T\n\n[card](https://x)"
+    );
+    assert_eq!(md("<b><p>a</p><p>b</p></b>"), "**a**\n\n**b**");
+    assert_eq!(md("<code><p>a*b</p></code>"), "`a*b`");
+    assert_eq!(
+        md("<p>x <b>y<div>z</div></b> w</p>"),
+        "x **y**\n\n**z**\n\nw"
+    );
+}
+
+#[test]
+fn a_script_link_is_dropped_with_tabs_or_new_lines_in_its_scheme() {
+    assert_eq!(
+        md(
+            "<p><a href=\"java&#9;script:alert(1)\">x</a> <a href=\"java\nscript:y\">y</a> <a href=\" &#10;JavaScript:z\">z</a> <b>b</b></p>"
+        ),
+        "x y z **b**"
+    );
+    // Other links lose their control characters too.
+    assert_eq!(
+        md("<a href=\"https://e.com/a&#9;b\">l</a>"),
+        "[l](https://e.com/ab)"
+    );
+}
+
+#[test]
+fn text_before_a_block_inside_pre_is_its_own_line() {
+    assert_eq!(md("<pre>y<div>z</div></pre>"), "```\ny\nz\n```");
+    assert_eq!(
+        md("<pre><div>a</div><div>b</div>c<p>d</p></pre>"),
+        "```\na\nb\nc\nd\n```"
+    );
+}
+
+#[test]
+fn more_of_what_the_converter_claims() {
+    // Google Docs writes a nested list beside its item.
+    assert_eq!(
+        md("<ul><li><p>a</p></li><ul><li><p>b</p></li></ul><li><p>c</p></li></ul>"),
+        "- a\n  - b\n- c"
+    );
+    assert_eq!(
+        md("<p><kbd>Ctrl</kbd> <samp>out</samp> <tt>tt</tt> <cite>c</cite> <dfn>d</dfn></p>"),
+        "`Ctrl` `out` `tt` *c* *d*"
+    );
+    // A data: picture is dropped, its alt text kept.
+    assert_eq!(
+        md(r#"<p><img src="data:image/png;base64,AAAA" alt="pic"> <b>x</b></p>"#),
+        "pic **x**"
+    );
+    // A rule and an empty item inside a list.
+    assert_eq!(
+        md("<ul><li>a<hr></li><li></li><li>b</li></ul>"),
+        "- a\n\n  ---\n-\n- b"
+    );
+}
+
+// ---- fuzz-style: the cap holds, whatever comes in -----------------------------------------------
+
+/// Pieces that make the output grow: deep nesting with wide markers first, then many lines.
+const HOSTILE: &[&str] = &[
+    "<blockquote>",
+    "<ol start=\"999999999\"><li>",
+    "<ul><li>",
+    "<li>",
+    "<pre>",
+    "</pre>",
+    "<p>",
+    "</p>",
+    "<br>",
+    "x<br>",
+    "\n",
+    "x\n",
+    "<hr>",
+    "<h1>",
+    "</h1>",
+    "<a href=\"https://example.com/a/long/address/of/a/page\">",
+    "<div>",
+    "</div>",
+    "<b>",
+    "</b>",
+    "<tr><td>",
+    "<td>",
+    "&",
+    "&amp;copy;",
+    "~",
+    "#",
+    "-",
+    "=",
+    "*",
+    "</li>",
+    "</ol>",
+    "</blockquote>",
+];
+
+#[test]
+fn hostile_html_never_panics_nor_passes_the_cap() {
+    let mut rng = Rng(0x5eed_cafe_f00d_0001);
+    for round in 0..300 {
+        let depth = (rng.next() % 40) as usize;
+        let mut s = String::new();
+        for _ in 0..depth {
+            s.push_str(rng.pick(&HOSTILE[..4]));
+        }
+        let n = 1 + (rng.next() % if round % 10 == 0 { 20_000 } else { 400 }) as usize;
+        // A run of one piece, then of another: the shape that grows the output most.
+        let mut left = n;
+        while left > 0 {
+            let piece = rng.pick(HOSTILE);
+            let run = 1 + (rng.next() % 500) as usize;
+            for _ in 0..run.min(left) {
+                s.push_str(piece);
+            }
+            left = left.saturating_sub(run);
+        }
+        // Every other round ends in one long block left open, written whole at the end.
+        if round % 2 == 0 {
+            s.push_str(rng.pick(&["<pre>", "<p>", "<h2>", "<li>"]));
+            let line = rng.pick(&["x\n", "\n", "x<br>", "<br>", "a&amp;copy;\n"]);
+            s.push_str(&line.repeat(1 + (rng.next() % 30_000) as usize));
+        }
+        if let Some(out) = to_markdown(&s) {
+            assert!(
+                out.len() <= cap(s.len()),
+                "{} > {}",
+                out.len(),
+                cap(s.len())
+            );
+        }
+    }
+    // The same for the inputs the first fuzz test makes.
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..5_000 {
+        let n = (rng.next() % 40) as usize;
+        let s: String = (0..n).map(|_| rng.pick(PIECES)).collect();
+        if let Some(out) = to_markdown(&s) {
+            assert!(out.len() <= cap(s.len()), "{s:?}");
+        }
+    }
 }
