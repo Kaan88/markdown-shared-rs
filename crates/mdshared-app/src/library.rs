@@ -1915,20 +1915,20 @@ mod tests {
             &text,
             &at(&["Money"]),
             "Taxes",
-            Path::new("D:/misc/taxes.md"),
+            Path::new(&root("D:/misc/taxes.md")),
         );
         text = add_note(
             &text,
             &at(&["Money"]),
             "Receipts",
-            Path::new("D:/misc/receipts.md"),
+            Path::new(&root("D:/misc/receipts.md")),
         );
         text = add_section(&text, &at(&["Money"]), "2025").unwrap();
         text = add_note(
             &text,
             &at(&["Money", "2025"]),
             "Last year",
-            Path::new("D:/misc/2025.md"),
+            Path::new(&root("D:/misc/2025.md")),
         );
         assert_eq!(
             notes(&text),
@@ -2011,8 +2011,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("Taxes 2026", "D:/misc/taxes.md".to_string(), at(&["Money"])),
-                ("Last year", "D:/misc/2025.md".to_string(), at(&["Money"])),
+                ("Taxes 2026", root("D:/misc/taxes.md"), at(&["Money"])),
+                ("Last year", root("D:/misc/2025.md"), at(&["Money"])),
             ]
         );
         assert_eq!(
