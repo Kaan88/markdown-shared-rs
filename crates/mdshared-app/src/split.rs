@@ -39,6 +39,8 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+pub mod answer;
+
 /// The names and caps of a split (`docs/ai-library-plan.md` 5.2 and 5.1): the most notes a plan
 /// holds (past this the lines stay in the rest and the plan says it was capped), the longest
 /// title in bytes (120, the length the function list cuts a name to), the longest section name in
@@ -281,7 +283,24 @@ pub struct Note {
     title_added: bool,
     heading_shift: u8,
     boundary_moved: bool,
+    /// What the checks of an AI's answer changed about the note's range (5.2): `None` for a note
+    /// cut at headings, and for one the model asked for as it stands.
+    fix: Option<Fix>,
     bytes: usize,
+}
+
+/// What the checks of an AI's answer did to a note's range, so its row can say so (5.2, checks
+/// 5 and 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    /// A boundary fell inside a paragraph and moved to its nearest edge.
+    Paragraph,
+    /// A boundary fell inside a fenced code block and moved past its end.
+    CodeBlock,
+    /// A boundary fell inside a table and moved past its end.
+    Table,
+    /// The note overlapped the one before it and now starts after it.
+    Overlap,
 }
 
 impl Note {
@@ -335,6 +354,11 @@ impl Note {
     /// it: the row says so.
     pub fn boundary_moved(&self) -> bool {
         self.boundary_moved
+    }
+
+    /// What the checks of an AI's answer changed about the note's range, if anything.
+    pub fn fix(&self) -> Option<Fix> {
+        self.fix
     }
 
     /// The bytes the note's file will hold.
@@ -464,6 +488,13 @@ pub struct Plan {
 /// into [`SPLIT_LEVELS`], because that is all the switch offers. Every note starts ticked, the
 /// rest unticked.
 pub fn plan(doc: Arc<dyn Lines>, name: &str, headings: &[Heading], level: u8) -> Plan {
+    let mut p = base(doc, name, headings, level);
+    p.cut();
+    p
+}
+
+/// A plan of `doc` with no notes yet: the headings sorted and checked, the blank lines mapped.
+fn base(doc: Arc<dyn Lines>, name: &str, headings: &[Heading], level: u8) -> Plan {
     let total = line_count(&*doc);
     let level = level.clamp(SPLIT_LEVELS[0], SPLIT_LEVELS[2]);
     let mut heads: Vec<Heading> = headings
@@ -475,7 +506,7 @@ pub fn plan(doc: Arc<dyn Lines>, name: &str, headings: &[Heading], level: u8) ->
     heads.dedup_by_key(|h| h.line);
     let bytes = doc.len_bytes();
     let blank_words = blank_words(&*doc, total);
-    let mut p = Plan {
+    Plan {
         doc,
         name: name.to_string(),
         level,
@@ -486,9 +517,7 @@ pub fn plan(doc: Arc<dyn Lines>, name: &str, headings: &[Heading], level: u8) ->
         rest_ticked: false,
         blank_words,
         capped: false,
-    };
-    p.cut();
-    p
+    }
 }
 
 impl Plan {
@@ -1075,6 +1104,7 @@ impl Plan {
                     title_added,
                     heading_shift,
                     boundary_moved: false,
+                    fix: None,
                     bytes: 0,
                 });
             }
@@ -1107,6 +1137,7 @@ impl Plan {
             title_added,
             heading_shift,
             boundary_moved: false,
+            fix: None,
             bytes: 0,
         }
     }
@@ -1696,7 +1727,7 @@ We walked along the Sumida and ate at a stall.
         super::plan(Arc::new(doc.clone()), name, headings, level)
     }
 
-    fn assert_ok(p: &Plan) {
+    pub(super) fn assert_ok(p: &Plan) {
         if let Err(e) = p.check() {
             panic!("{e}");
         }
@@ -1704,7 +1735,7 @@ We walked along the Sumida and ate at a stall.
 
     /// The document's headings, found with a plain scan of its own (the module is given its
     /// headings; the function list is not a dependency of this crate).
-    fn headings_of(text: &str) -> Vec<Heading> {
+    pub(super) fn headings_of(text: &str) -> Vec<Heading> {
         let run = |s: &str| -> Option<(u8, usize)> {
             let c = *s.as_bytes().first()?;
             if c != b'`' && c != b'~' {
