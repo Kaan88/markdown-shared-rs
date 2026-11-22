@@ -185,6 +185,19 @@ show a document that has no file, and ends the link. The saved message does carr
 not show, which does nothing. An older *sender* never writes `?doc=`. A test against a copy of
 the old listener shows both answers.
 
+### A view closed
+
+Added 2026-11-22. The request option `?closed` (`Request::closed`, a `follow`, with the file's
+`?path=` or the document's `?doc=`) says that the sender no longer shows that file or document:
+its tab of it was closed. The viewer sends it to the editor for a tab the editor had asked it to
+show (an opening `from=mdedit`, or a document opened by `?open`), so the editor ends that preview
+link; when the viewer's window closes it sends one for each such tab still open, waiting at most
+half a second, before the process ends. The listener delivers it whatever is on disk (the file
+may have been deleted), and the paths-only `listen_waking` never takes it as a file to open. An
+older receiver finds a live update with no line and does nothing; an older sender never writes it.
+A window that crashed sends nothing: the editor learns that with `alive` (below, "What the editor
+must do").
+
 ## Finding the other application
 
 `sister::find(name) -> Option<PathBuf>`, first match wins:
@@ -222,16 +235,6 @@ not tell a window its position (Wayland) nothing is remembered. The request opti
 to do its `restore`: an older build skips it and does not raise its window. Each application
 restores itself when it ends the arrangement and tells the other; one that is told does not
 tell back.
-
-**A view closed (2026-11-22).** The request option `?closed` (`Request::closed`, a `follow`,
-with the file's `?path=` or the document's `?doc=`) says that the sender no longer shows that file
-or document: its tab of it was closed. The viewer sends it to the editor for a tab the editor had
-asked it to show (an opening `from=mdedit`, or a document opened by `?open`), so the editor ends
-that preview link. The listener delivers it whatever is on disk (the file may have been deleted),
-and the paths-only `listen_waking` never takes it as a file to open. An older receiver finds a live
-update with no line and does nothing; an older sender never writes it. A window that is gone sends
-nothing: the editor learns that with `alive` (below, "What the editor must do").
-
 
 `set` takes the outer rectangle. Windows and X11: un-maximise, `set_outer_position`,
 `request_inner_size`. Wayland on KDE: a client cannot position itself, so a KWin script is
@@ -321,8 +324,10 @@ Sending ("Preview in mdview"):
       the link and try again; after that it means the viewer window is gone: end the link.
 - [ ] (Since 2026-11-22.) A viewer closed while nothing is sent: at moments the user does
       something (the window gains focus, a menu opens), and not within the first seconds after
-      `open`, ask `alive("mdview")` off the window's thread and end the links when it says no. No
-      timer. A `?closed` from the viewer ends the link of that file or document.
+      `open`, ask `alive("mdview")` off the window's thread and end the links when it says no;
+      when it says yes, ask once more a second later (a viewer whose window was just closed still
+      answers until its process ends). No timer beyond that one. A `?closed` from the viewer ends
+      the link of that file or document.
 - [ ] Unsaved changes are not in the viewer; the line still maps. Saving makes the viewer reload
       (its file watcher) and keep its place.
 - [ ] Nothing is started or sent at launch, and nothing runs while no link exists.
