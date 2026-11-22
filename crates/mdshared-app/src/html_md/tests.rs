@@ -356,6 +356,40 @@ fn a_table_row_stays_on_one_line_whatever_its_cells_hold() {
 }
 
 #[test]
+fn a_cell_copied_without_its_table_ends_its_row_at_the_next_block() {
+    // A row in no table, left open: the blocks after its cells are blocks, not more of the row.
+    assert_eq!(
+        md("<td>a</td><h1>T</h1><ul><li>x</li></ul><p>y</p>"),
+        "a
+
+# T
+
+- x
+
+y"
+    );
+    assert_eq!(
+        md("<td>a</td><td>b</td><p>y</p><h2>T</h2>"),
+        "a | b
+
+y
+
+## T"
+    );
+    // Blocks inside its cells stay on its line, and a table after it is a table.
+    assert_eq!(
+        md(
+            "<td><p>a</p><p>b</p></td><td>c</td><h2>T</h2><table><tr><td>1</td><td>2</td></tr></table>"
+        ),
+        "a b | c
+
+## T
+
+1 | 2"
+    );
+}
+
+#[test]
 fn word_styles_are_read_by_their_whole_name() {
     // Word's mso-bidi-font-weight is about complex scripts, not this text.
     assert_eq!(

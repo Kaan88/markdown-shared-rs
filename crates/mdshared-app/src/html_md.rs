@@ -504,6 +504,9 @@ struct Writer {
     row_table: usize,
     /// Cells read in the table row being read.
     cells: usize,
+    /// Cells open (`<td>`, `<th>`), at any depth: a row that is in no table ends at a block that
+    /// starts outside them.
+    cells_open: usize,
 }
 
 impl Writer {
@@ -572,6 +575,21 @@ impl Writer {
         }
         if name == "table" {
             self.tables += 1;
+        }
+        if matches!(name, "td" | "th") {
+            self.cells_open += 1;
+        }
+        // A cell copied without its table is a row; a block after its cells is not in it. (Inside
+        // a table a row left open goes on to the next row or the table's end, as browsers read
+        // it.)
+        if self.row
+            && self.row_table == 0
+            && self.cells_open == 0
+            && breaks_line(name)
+            && !matches!(name, "tr" | "br")
+        {
+            self.block();
+            self.row = false;
         }
         if self.row {
             let own = self.tables == self.row_table;
@@ -729,6 +747,9 @@ impl Writer {
         let table = name == "table";
         if table {
             self.tables = self.tables.saturating_sub(1);
+        }
+        if matches!(name, "td" | "th") {
+            self.cells_open = self.cells_open.saturating_sub(1);
         }
         if self.row {
             match name {
