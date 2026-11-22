@@ -21,6 +21,7 @@ pub mod palette;
 pub mod pane;
 pub mod pins;
 pub mod place;
+pub mod plan;
 pub mod platform;
 pub mod rows;
 pub mod scroll;
