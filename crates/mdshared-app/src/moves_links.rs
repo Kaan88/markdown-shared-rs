@@ -265,10 +265,12 @@ pub(super) fn rewrite(
         limit = link.start;
         n += 1;
     }
-    if n == 0 || !prefer.iter().any(|p| p.kind == ChangeKind::Link) {
+    if !prefer.iter().any(|p| p.kind == ChangeKind::Link) {
         return (out, n);
     }
     // The words a line had, when it is one this move wrote and they lead where the new one does.
+    // Also a line that needs no change to lead there: between two sibling folders
+    // `../Inbox/a.png` reads the same from both, and undo still owes the words it had.
     let old_lines: Vec<&str> = text.split_inclusive('\n').collect();
     let new_lines: Vec<&str> = out.split_inclusive('\n').collect();
     if old_lines.len() != new_lines.len() {
@@ -284,13 +286,17 @@ pub(super) fn rewrite(
     for (o, nl) in old_lines.iter().zip(&new_lines) {
         let ob = body(o);
         let nb = body(nl);
-        if ob != nb
-            && let Some(p) = prefer
-                .iter()
-                .find(|p| p.kind == ChangeKind::Link && p.after.trim_end() == ob.trim_end())
+        if let Some(p) = prefer
+            .iter()
+            .find(|p| p.kind == ChangeKind::Link && p.after.trim_end() == ob.trim_end())
+            && p.before != nb
         {
             let (a, b) = (targets(&p.before), targets(nb));
-            if a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| same_path(x, y)) {
+            if !b.is_empty() && a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| same_path(x, y))
+            {
+                if ob == nb {
+                    n += 1;
+                }
                 fixed.push_str(&p.before);
                 fixed.push_str(&nl[nb.len()..]);
                 continue;

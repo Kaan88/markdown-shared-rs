@@ -2039,3 +2039,36 @@ fn a_plan_whose_links_were_not_looked_at_moves_as_before() {
     assert!(w.library.join("Work/Tokyo/pics/p.png").exists());
     assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
 }
+
+#[test]
+fn undo_puts_back_a_link_that_would_still_lead_there_from_a_sibling_folder() {
+    // The group's folder is the library's `Work`; `b.md` sits in `Work/Inbox` and belongs in
+    // `Work/Food`, a sibling: its rewritten link `../Inbox/img/s.png` reads the same from both.
+    let w = world("sibling");
+    let b = w.library.join("Work/Inbox/b.md");
+    let note = "# B\n\n![](img/s.png)\n";
+    put(&b, note);
+    put(&w.library.join("Work/Inbox/img/s.png"), "shared");
+    put(&w.library.join("Work/Inbox/c.md"), "![](img/s.png)\n");
+    put(
+        &w.file,
+        "# Work\n\nhome: Work\n\n## Tokyo\n\n- [A](Work/Tokyo/a.md)\n\n## Food\n\n- [B](Work/Inbox/b.md)\n",
+    );
+    let plan = carried_plan(&w);
+    assert_eq!(plan.rows.len(), 1, "{:?}", plan.rows);
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(report.rolled_back.is_none(), "{report:?}");
+    assert_eq!(
+        text(&w.library.join("Work/Food/b.md")),
+        "# B\n\n![](../Inbox/img/s.png)\n"
+    );
+    let path = report.record_path.expect("record");
+    let record = runs::load(&path, &w.library).expect("record");
+    let back = undo(&path, &record, &w.library, &mut gate(), &mut flaky());
+    assert_eq!(back.start_error, None, "{back:?}");
+    assert_eq!(
+        text(&b),
+        note,
+        "the words it had, not just a link that works"
+    );
+}
