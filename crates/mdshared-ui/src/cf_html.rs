@@ -32,6 +32,45 @@ fn header(
     )
 }
 
+/// The most HTML a paste reads from the clipboard, in bytes.
+pub const MAX_BYTES: usize = 16 << 20;
+
+/// The fragment a CF_HTML text holds: the bytes its `StartFragment` and `EndFragment` offsets
+/// name, else what lies between the `<!--StartFragment-->` and `<!--EndFragment-->` comments,
+/// else everything from the first tag on. Offsets that are missing, out of range or reversed
+/// (some programs write `-1`) fall through to the next way. Bytes that are not UTF-8 are
+/// replaced. `None` for an empty fragment.
+pub fn fragment(cf: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(cf);
+    let offset = |name: &str| -> Option<usize> {
+        let at = text.find(name)? + name.len();
+        let digits: String = text
+            .get(at..)?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .take(12)
+            .collect();
+        digits.parse().ok()
+    };
+    // The offsets count bytes of what was on the clipboard, so they are applied to `cf`.
+    let by_offsets = offset("StartFragment:")
+        .zip(offset("EndFragment:"))
+        .filter(|(a, b)| a < b)
+        .and_then(|(a, b)| cf.get(a..b))
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let by_comments = || {
+        const START: &str = "<!--StartFragment-->";
+        let a = text.find(START)? + START.len();
+        let b = text.get(a..)?.find("<!--EndFragment-->")? + a;
+        text.get(a..b).map(str::to_string)
+    };
+    let from_first_tag = || text.get(text.find('<')?..).map(str::to_string);
+    by_offsets
+        .or_else(by_comments)
+        .or_else(from_first_tag)
+        .filter(|f| !f.trim().is_empty())
+}
+
 /// The whole document for `text/html` on systems that take it as is: the fragment with a charset
 /// declaration, since a reader may not assume UTF-8.
 pub fn html_document(fragment: &str) -> String {
@@ -70,6 +109,29 @@ mod tests {
         assert_eq!(sh, s.find("<html>").unwrap());
         assert!(sh < sf && sf == ef && ef < eh);
         assert_eq!(cf_html("a").len() - cf_html("").len(), 1);
+    }
+
+    #[test]
+    fn the_fragment_comes_back_out() {
+        let of = |s: &str| fragment(s.as_bytes());
+        let piece = "<p>caf\u{e9} <b>x</b></p>";
+        assert_eq!(of(&cf_html(piece)).as_deref(), Some(piece));
+        // Offsets that do not hold: the comments, then everything from the first tag.
+        let bad = "Version:0.9\r\nStartFragment:-1\r\nEndFragment:-1\r\n<html><!--StartFragment--><i>y</i><!--EndFragment--></html>";
+        assert_eq!(of(bad).as_deref(), Some("<i>y</i>"));
+        let bare = "Version:0.9\r\nStartFragment:999999\r\nEndFragment:5\r\n<b>z</b>";
+        assert_eq!(of(bare).as_deref(), Some("<b>z</b>"));
+        assert_eq!(of("Version:0.9\r\n"), None);
+        assert_eq!(
+            fragment(&[0xff, b'<', b'p', b'>', b'a']).as_deref(),
+            Some("<p>a")
+        );
+        // Any cut of it: no panic.
+        let whole = cf_html("<p>\u{1F600}</p>").into_bytes();
+        for i in 0..whole.len() {
+            let _ = fragment(&whole[..i]);
+            let _ = fragment(&whole[i..]);
+        }
     }
 
     #[test]

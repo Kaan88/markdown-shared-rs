@@ -242,8 +242,13 @@ mod imp {
         ok
     }
 
-    /// The bytes of the "HTML Format" on the clipboard, for the test of what a copy placed.
-    #[cfg(test)]
+    /// The HTML the clipboard holds: the fragment of its "HTML Format".
+    pub fn clipboard_html() -> Option<String> {
+        crate::cf_html::fragment(&clipboard_html_format()?)
+    }
+
+    /// The bytes of the "HTML Format" on the clipboard, up to its first NUL; `None` when there
+    /// is none, or more than [`crate::cf_html::MAX_BYTES`].
     pub fn clipboard_html_format() -> Option<Vec<u8>> {
         // SAFETY: a NUL-terminated UTF-16 name.
         let format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
@@ -260,7 +265,9 @@ mod imp {
                 // SAFETY: h is locked, so its size is valid and ptr points to that many bytes.
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, GlobalSize(h)) };
                 let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                out = Some(bytes[..len].to_vec());
+                if len <= crate::cf_html::MAX_BYTES {
+                    out = bytes.get(..len).map(<[u8]>::to_vec);
+                }
                 // SAFETY: matches the GlobalLock above.
                 unsafe { GlobalUnlock(h) };
             }
@@ -687,6 +694,11 @@ mod imp {
     pub fn set_clipboard_text(text: &str) -> bool {
         with_clipboard(|c| c.set_text(text).ok()).is_some()
     }
+    /// `text/html` on Linux (X11 or Wayland), `public.html` on a Mac, as the clipboard crate
+    /// reads them: the whole document a browser put there.
+    pub fn clipboard_html() -> Option<String> {
+        with_clipboard(|c| c.get().html().ok()).filter(|h| h.len() <= crate::cf_html::MAX_BYTES)
+    }
     pub fn set_clipboard_html(html: &str, text: &str) -> bool {
         let document = crate::cf_html::html_document(html);
         with_clipboard(|c| c.set().html(document.as_str(), Some(text)).ok()).is_some()
@@ -840,6 +852,12 @@ pub fn clipboard_text() -> Option<String> {
 /// Puts text on the clipboard. Returns false on failure.
 pub fn set_clipboard_text(text: &str) -> bool {
     imp::set_clipboard_text(text)
+}
+/// The HTML the clipboard holds, for a paste that keeps formatting: on Windows the fragment of
+/// its "HTML Format" (what was copied, without the page around it); elsewhere the `text/html` a
+/// browser or word processor offered, often a whole document. `None` when it holds no HTML.
+pub fn clipboard_html() -> Option<String> {
+    imp::clipboard_html()
 }
 /// Puts HTML and its plain-text equivalent on the clipboard together, so a paste into a word
 /// processor or mail keeps the formatting and one into a text field gets the text. `html` is a
@@ -1030,6 +1048,11 @@ mod explorer_tests {
             "<p><b>bold</b> \u{e9}</p>"
         );
         assert_eq!(field("EndHTML:"), s.len());
+        // And a paste reads the fragment back.
+        assert_eq!(
+            clipboard_html().as_deref(),
+            Some("<p><b>bold</b> \u{e9}</p>")
+        );
     }
 
     #[test]

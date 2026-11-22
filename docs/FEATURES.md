@@ -167,3 +167,25 @@ Wayland the app must present with `set_premultiplied_alpha(true)` (patched softb
 `wants_alpha()`. `Backdrop::HELP` says what happens off Windows (a different string off Windows
 only). Details, limits and what each app does: [LINUX.md](LINUX.md#window-backdrop-mdshared_uiblur)
 and [next/linux-frost.md](next/linux-frost.md).
+
+## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
+
+`html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
+clipboard into Markdown: headings, bold and italic (also as `font-weight` and `font-style` on a
+span, as Google Docs writes them, and not for its `<b style="font-weight:normal">` wrapper),
+strikethrough, links, images (not `data:` ones), nested and numbered lists, inline code, fenced
+code blocks with the language of a `language-…` class, block quotes, rules, hard breaks.
+Unknown tags keep their text; scripts and styles go; a table's cells become `a | b`, a row to a
+line. It answers `None` when there is nothing Markdown can say that the plain text does not, and
+for `white-space: pre` HTML (a code editor's coloured copy), so the caller pastes the plain text.
+Hand-written (no HTML crate), panic-free on any input, nesting capped at 16 for its prefixes, the
+output capped at eight times the input; tested with fixed cases, 25,000 generated inputs and every
+cut of a real copy. Not handled: Word's lists (paragraphs with `mso-list` styles stay paragraphs
+with their bullet character), tables as Markdown tables.
+
+`platform::clipboard_html()` reads the HTML: on Windows the fragment of the "HTML Format"
+(`cf_html::fragment`: the header's byte offsets, else the fragment comments, else everything from
+the first tag), at most `cf_html::MAX_BYTES`; on Linux and macOS through `arboard`'s `get().html()`
+(`text/html`, `public.html`), the whole document a browser offers. Read only when a caller asks;
+nothing changes for an existing caller. Used by mdedit's "Paste rich text as Markdown" (issue #8).
+Not verified: Linux and macOS reads (compiled by CI only).
