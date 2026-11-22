@@ -23,6 +23,13 @@ use crate::scroll;
 use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette as Colors;
 
+pub mod pages;
+
+#[cfg(test)]
+mod frozen;
+#[cfg(test)]
+mod unchanged;
+
 /// The value of one control, as it comes back in [`Outcome::Changed`] and goes in
 /// [`Form::set_value`].
 #[derive(Clone, Debug, PartialEq, Eq)]
