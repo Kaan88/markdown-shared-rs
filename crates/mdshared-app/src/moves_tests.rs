@@ -80,9 +80,19 @@ struct TestGate {
     edits: usize,
     probe: Option<PathBuf>,
     probe_seen: Vec<bool>,
+    /// A moved note's links cannot be written (D-091).
+    fail_rewrite: bool,
 }
 
 impl MoveGate for TestGate {
+    fn rewrite(&mut self, file: &Path, before: &str, after: &str) -> Result<(), String> {
+        if self.fail_rewrite {
+            return Err("the note could not be written".to_string());
+        }
+        self.free(file)?;
+        rewrite_note(file, before, after)
+    }
+
     fn free(&mut self, file: &Path) -> Result<(), String> {
         if self.open.iter().any(|p| same_path(p, file)) {
             return Err(format!(
@@ -1446,6 +1456,8 @@ fn sample_record(library: &Path) -> Record {
                 sha256: "abc".to_string(),
                 outside: true,
                 sections: vec!["Tokyo".to_string(), "Food".to_string()],
+                links: false,
+                with: None,
             }],
             changes: vec![Change {
                 file: library.join("Work.md"),
@@ -1778,4 +1790,252 @@ fn a_folder_a_rolled_back_run_could_not_remove_stays_in_its_record() {
             .any(|d| same_path(d, &w.work.join("Food"))),
         "and not the one that went"
     );
+}
+
+// ---- a moved note's pictures and links (D-091) -----------------------------------------------------
+
+/// The world, with `a.md`'s text and files beside it under `Work/Tokyo`.
+fn world_with(tag: &str, a: &str, files: &[&str]) -> World {
+    let w = world(tag);
+    put(&w.library.join("Work/Tokyo/a.md"), a);
+    for f in files {
+        put(&w.library.join("Work/Tokyo").join(f), "picture");
+    }
+    w
+}
+
+/// The group's plan with the notes' links looked at, as the window opens it.
+fn carried_plan(w: &World) -> Plan {
+    let mut plan = group_plan(w);
+    carry(&mut plan);
+    plan
+}
+
+/// How a link from the group's `Tokyo` folder reaches back to the library's.
+fn back_to(w: &World, rel: &str) -> String {
+    let from = w.work.join("Tokyo");
+    let up = from.components().count() - w.dir.components().count();
+    format!("{}library/Work/Tokyo/{rel}", "../".repeat(up))
+}
+
+#[test]
+fn a_picture_only_its_note_links_to_goes_with_it_to_the_same_place_beside_it() {
+    let a = "# A\n\n![a picture](pics/p.png)\n";
+    let w = world_with("carry", a, &["pics/p.png"]);
+    let plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert_eq!(carry.files.len(), 1);
+    assert_eq!(carry.files[0].to, w.work.join("Tokyo/pics/p.png"));
+    assert_eq!(carry.carried_text(), "and 1 picture");
+    assert_eq!(carry.rewrites, 0, "the link still leads there");
+    assert!(plan.rows[0].ticked);
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(
+        report.rolled_back.is_none() && report.failed.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(text(&w.work.join("Tokyo/pics/p.png")), "picture");
+    assert!(!w.library.join("Work/Tokyo/pics/p.png").exists());
+    assert_eq!(
+        text(&w.work.join("Tokyo/a.md")),
+        a,
+        "the note is not rewritten"
+    );
+    assert_eq!(report.carried.len(), 1);
+    assert!(
+        !w.library.join("Work/Tokyo/pics").exists(),
+        "the folder the move left empty went"
+    );
+}
+
+#[test]
+fn a_picture_used_twice_by_the_same_note_is_one_user_and_goes_with_it() {
+    let a = "![](pics/p.png) and again ![](pics/p.png)\n\n[p]: pics/p.png\n";
+    let w = world_with("twice", a, &["pics/p.png"]);
+    let plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert_eq!(carry.files.len(), 1, "{carry:?}");
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert_eq!(report.start_error, None);
+    assert!(w.work.join("Tokyo/pics/p.png").exists());
+    assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
+}
+
+#[test]
+fn a_picture_another_file_links_to_stays_and_the_notes_link_is_rewritten() {
+    // `p.png` is used by a file in the note's folder the library does not list; `my q.png` by
+    // `b.md`, a note the library lists (in another folder).
+    let a = "# A\n\n![](pics/p.png) ![q](pics/my%20q.png \"title\")\n";
+    let w = world_with("shared", a, &["pics/p.png", "pics/my q.png"]);
+    put(&w.library.join("Work/Tokyo/c.md"), "![](pics/p.png)\n");
+    put(
+        &w.library.join("Work/b.md"),
+        "# B\n\n![](Tokyo/pics/my%20q.png)\n",
+    );
+    let mut plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert!(carry.files.is_empty(), "{carry:?}");
+    assert_eq!(carry.rewrites, 2);
+    assert_eq!(carry.rewrites_text(), "2 links rewritten");
+    // Only `a.md` moves.
+    plan.set_ticked(1, false);
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(report.rolled_back.is_none(), "{report:?}");
+    assert!(w.library.join("Work/Tokyo/pics/p.png").exists());
+    assert!(w.library.join("Work/Tokyo/pics/my q.png").exists());
+    assert_eq!(
+        text(&w.work.join("Tokyo/a.md")),
+        format!(
+            "# A\n\n![]({}) ![q]({} \"title\")\n",
+            back_to(&w, "pics/p.png"),
+            back_to(&w, "pics/my%20q.png")
+        ),
+        "forward slashes, and the space escaped as the source escaped it"
+    );
+    assert_eq!(report.links, 2);
+    assert_eq!(report.rewritten, vec![w.work.join("Tokyo/a.md")]);
+}
+
+#[test]
+fn a_taken_name_where_a_picture_would_go_unticks_the_row_and_says_so() {
+    let w = world_with("ctaken", "![](pics/p.png)\n", &["pics/p.png"]);
+    put(&w.work.join("Tokyo/pics/p.png"), "someone else's");
+    let plan = carried_plan(&w);
+    assert_eq!(
+        plan.rows[0].verdict,
+        Verdict::CarriedTaken("p.png".to_string())
+    );
+    assert!(!plan.rows[0].ticked && plan.rows[0].verdict.blocked());
+    assert!(
+        plan.rows[0]
+            .verdict
+            .text()
+            .contains("already a file called p.png where its picture would go")
+    );
+    // A request that names it anyway is refused before anything moves.
+    let mut forced = plan.request();
+    let mut row = plan.rows[0].clone();
+    row.verdict = Verdict::Ready;
+    forced.rows.insert(0, row);
+    let report = do_write(&forced, &mut gate(), &mut flaky());
+    assert!(
+        report
+            .start_error
+            .as_deref()
+            .is_some_and(|e| e.contains("already a file called this")),
+        "{report:?}"
+    );
+    assert!(w.library.join("Work/Tokyo/a.md").exists());
+    assert_eq!(text(&w.work.join("Tokyo/pics/p.png")), "someone else's");
+}
+
+#[test]
+fn a_link_in_a_code_fence_is_not_read_and_not_rewritten() {
+    let a = "# A\n\n```md\n![](pics/f.png)\n```\n";
+    let w = world_with("fence", a, &["pics/f.png"]);
+    let plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert!(carry.files.is_empty() && carry.rewrites == 0, "{carry:?}");
+    do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
+    assert!(w.library.join("Work/Tokyo/pics/f.png").exists());
+}
+
+/// A picture named by an absolute path, outside every folder of the tests' worlds.
+fn abs_picture() -> PathBuf {
+    let p = scratch("abs").join("abs.png");
+    put(&p, "picture");
+    p
+}
+
+#[test]
+fn a_web_address_an_absolute_path_and_an_anchor_are_left_as_they_are() {
+    let abs = abs_picture();
+    let a = format!(
+        "![](https://example.com/p.png) [x](#top) ![](<{}>) [m](mailto:a@b.c)\n\n[r]: https://e.com/r.png\n",
+        slashes(&abs)
+    );
+    let w = world_with("web", &a, &[]);
+    let plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert!(carry.files.is_empty() && carry.rewrites == 0, "{carry:?}");
+    do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
+    assert!(abs.exists(), "an absolute path's file is not carried");
+}
+
+#[test]
+fn a_link_to_nothing_is_left_as_it_is() {
+    let a = "![](pics/gone.png) [n](notes/none.md)\n";
+    let w = world_with("gone", a, &[]);
+    let plan = carried_plan(&w);
+    let carry = plan.rows[0].carry.clone().expect("looked at");
+    assert!(carry.files.is_empty() && carry.rewrites == 0, "{carry:?}");
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(report.rewritten.is_empty());
+    assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
+}
+
+#[test]
+fn undo_puts_the_carried_files_and_every_link_back_to_its_exact_text() {
+    // A sole picture, and a shared one written in a way a rewrite would not write it.
+    let a = "# A\r\n\r\n![](pics/p.png)\r\n![s](<./pics/../pics/s x.png>)\r\n";
+    let w = world_with("cundo", a, &["pics/p.png", "pics/s x.png"]);
+    put(&w.library.join("Work/Tokyo/c.md"), "![](pics/s%20x.png)\n");
+    let plan = carried_plan(&w);
+    let report = do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(report.rolled_back.is_none(), "{report:?}");
+    let moved = text(&w.work.join("Tokyo/a.md"));
+    assert!(
+        moved.contains(&format!("<{}>", back_to(&w, "pics/s x.png"))),
+        "{moved}"
+    );
+    assert!(w.work.join("Tokyo/pics/p.png").exists());
+    let path = report.record_path.expect("record");
+    let record = runs::load(&path, &w.library).expect("record");
+    let question = prepare(&record, &w.library);
+    assert!(question.acts(), "{}", question.sentence());
+    let back = undo(&path, &record, &w.library, &mut gate(), &mut flaky());
+    assert_eq!(back.start_error, None, "{back:?}");
+    assert_eq!(
+        text(&w.library.join("Work/Tokyo/a.md")),
+        a,
+        "every line as it was, to the byte"
+    );
+    assert_eq!(text(&w.library.join("Work/Tokyo/pics/p.png")), "picture");
+    assert!(!w.work.join("Tokyo/pics/p.png").exists());
+    assert!(w.library.join("Work/Tokyo/pics/s x.png").exists());
+    assert_eq!(text(&w.file), w.original);
+    assert_eq!(
+        runs::load(&path, &w.library).expect("record").state,
+        State::Undone
+    );
+}
+
+#[test]
+fn a_note_whose_links_cannot_be_written_goes_back_with_its_pictures() {
+    let a = "![](pics/p.png) ![](pics/s.png)\n";
+    let w = world_with("cfail", a, &["pics/p.png", "pics/s.png"]);
+    put(&w.library.join("Work/Tokyo/c.md"), "![](pics/s.png)\n");
+    let plan = carried_plan(&w);
+    let mut g = gate();
+    g.fail_rewrite = true;
+    let report = do_write(&plan.request(), &mut g, &mut flaky());
+    assert!(report.rolled_back.is_some(), "{report:?}");
+    assert!(report.not_put_back.is_empty(), "{report:?}");
+    assert_eq!(text(&w.library.join("Work/Tokyo/a.md")), a);
+    assert!(w.library.join("Work/Tokyo/pics/p.png").exists());
+    assert!(!w.work.join("Tokyo").exists());
+    assert_eq!(text(&w.file), w.original);
+}
+
+#[test]
+fn a_plan_whose_links_were_not_looked_at_moves_as_before() {
+    let a = "![](pics/p.png)\n";
+    let w = world_with("nocarry", a, &["pics/p.png"]);
+    let plan = group_plan(&w);
+    assert!(plan.rows.iter().all(|r| r.carry.is_none()));
+    do_write(&plan.request(), &mut gate(), &mut flaky());
+    assert!(w.library.join("Work/Tokyo/pics/p.png").exists());
+    assert_eq!(text(&w.work.join("Tokyo/a.md")), a);
 }

@@ -30,6 +30,9 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[path = "moves_links.rs"]
+mod links;
+
 /// The longest a note's whole path may be after it moves (the plan's 240).
 pub const PATH_MAX_CHARS: usize = 240;
 
@@ -83,6 +86,8 @@ pub enum FileKind {
     Library,
     /// A record of an earlier run, or its journal.
     Record,
+    /// A file only a moved note links to, which goes with it (D-091). Never a `.md`.
+    Carried,
 }
 
 impl FileKind {
@@ -91,6 +96,7 @@ impl FileKind {
             FileKind::Note => "note",
             FileKind::Library => "library",
             FileKind::Record => "record",
+            FileKind::Carried => "carried",
         }
     }
 
@@ -99,6 +105,7 @@ impl FileKind {
             "note" => Some(FileKind::Note),
             "library" => Some(FileKind::Library),
             "record" => Some(FileKind::Record),
+            "carried" => Some(FileKind::Carried),
             _ => None,
         }
     }
@@ -108,6 +115,7 @@ impl FileKind {
         match self {
             FileKind::Note | FileKind::Library => has_extension(path, &["md"]),
             FileKind::Record => has_extension(path, &["json", "done"]),
+            FileKind::Carried => !has_extension(path, &["md", "markdown"]),
         }
     }
 }
@@ -129,6 +137,8 @@ pub enum Verdict {
     TooLong(usize),
     /// A file is where one of its folders would go.
     InTheWay(String),
+    /// A file the note carries would go where a file of that name already is: its name.
+    CarriedTaken(String),
 }
 
 impl Verdict {
@@ -153,6 +163,72 @@ impl Verdict {
             }
             Verdict::TooLong(n) => format!("the new path would be {n} characters long"),
             Verdict::InTheWay(name) => format!("{name} is a file where its folder would go"),
+            Verdict::CarriedTaken(name) => format!(
+                "there is already a file called {name} where its {} would go",
+                if links::is_picture(Path::new(name)) {
+                    "picture"
+                } else {
+                    "file"
+                }
+            ),
+        }
+    }
+}
+
+/// A file only one moved note links to: it goes with the note, to the same place beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    pub len: u64,
+    pub sha256: String,
+}
+
+/// What a note's links do in a move (D-091): the files that go with it, and how many of its
+/// links to files that stay are rewritten.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Carry {
+    pub files: Vec<Carried>,
+    /// Links to files that stay (other notes or files use them too, or they are outside the
+    /// note's folder) whose text changes so they still lead there.
+    pub rewrites: usize,
+}
+
+impl Carry {
+    /// What the note takes with it: "and 2 pictures", "and 1 picture and 1 file"; empty for
+    /// nothing.
+    pub fn carried_text(&self) -> String {
+        let pictures = self
+            .files
+            .iter()
+            .filter(|c| links::is_picture(&c.to))
+            .count();
+        let others = self.files.len() - pictures;
+        let count = |n: usize, one: &str, many: &str| {
+            if n == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{n} {many}")
+            }
+        };
+        match (pictures, others) {
+            (0, 0) => String::new(),
+            (p, 0) => format!("and {}", count(p, "picture", "pictures")),
+            (0, o) => format!("and {}", count(o, "file", "files")),
+            (p, o) => format!(
+                "and {} and {}",
+                count(p, "picture", "pictures"),
+                count(o, "other file", "other files")
+            ),
+        }
+    }
+
+    /// What it rewrites: "1 link rewritten"; empty for none.
+    pub fn rewrites_text(&self) -> String {
+        match self.rewrites {
+            0 => String::new(),
+            1 => "1 link rewritten".to_string(),
+            n => format!("{n} links rewritten"),
         }
     }
 }
@@ -173,6 +249,9 @@ pub struct Row {
     pub len: u64,
     pub sha256: String,
     pub outside: bool,
+    /// What the note's links do when it moves, once [`carry`] has looked (D-091). `None`: its
+    /// links are not looked at, as before D-091.
+    pub carry: Option<Carry>,
 }
 
 /// The group a plan is about.
@@ -375,6 +454,7 @@ fn make_row(
         len: 0,
         sha256: String::new(),
         outside: false,
+        carry: None,
     };
     row.verdict = match is_plain_file(from) {
         Some(Err(v)) => v,
@@ -670,6 +750,150 @@ pub fn plan_library(old: &Path, new: &Path) -> Plan {
     plan
 }
 
+/// The `.md` files directly in `dir`, up to `max`.
+fn md_files_in(dir: &Path, max: usize) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .take(WALK_MAX)
+        .map(|e| e.path())
+        .filter(|p| has_extension(p, &["md", "markdown"]) && p.is_file())
+        .take(max)
+        .collect()
+}
+
+/// Looks at each note row's links (D-091): a file that only this note links to, inside the
+/// note's folder, goes with it to the same place beside it; a file other notes or files also
+/// link to stays, and the note's link to it is rewritten when it moves. Who else links is read
+/// from every library file, every note the library lists, and every `.md` in the folders the
+/// notes and their files are in. A file that would land on a name that is taken makes its row
+/// say so, unticked. A row is opted in by this: a plan it has not seen moves as before D-091.
+pub fn carry(plan: &mut Plan) {
+    if plan.blocked.is_some() {
+        return;
+    }
+    // Each note that can move, its text and its links.
+    let mut notes: Vec<(usize, String, Vec<links::Link>)> = Vec::new();
+    let mut folders: Vec<PathBuf> = Vec::new();
+    for (i, row) in plan.rows.iter().enumerate() {
+        if row.kind != FileKind::Note || row.verdict.blocked() {
+            continue;
+        }
+        let Some(base) = row.from.parent() else {
+            continue;
+        };
+        // A note that is not UTF-8 is not rewritten: its links stay as they are.
+        let Some(text) = links::note_text(&row.from) else {
+            continue;
+        };
+        let found = links::links(&text, base);
+        folders.push(base.to_path_buf());
+        folders.extend(
+            found
+                .iter()
+                .filter_map(|l| l.target.parent().map(Path::to_path_buf)),
+        );
+        notes.push((i, text, found));
+    }
+    // Who else links to what.
+    let mut users: Vec<PathBuf> = library_files(&plan.library);
+    let mut libraries = vec![plan.library.clone()];
+    if let Some(from) = &plan.from_library {
+        users.extend(library_files(from));
+        libraries.push(from.clone());
+    }
+    for dir in &libraries {
+        for group in library::read(dir).groups {
+            users.extend(group.entries.into_iter().map(|e| e.path));
+        }
+    }
+    folders.sort();
+    folders.dedup_by(|a, b| same_path(a, b));
+    for dir in &folders {
+        users.extend(md_files_in(dir, links::USERS_MAX));
+    }
+    let index = links::Users::read(&users);
+    let runs_dir = canon(&plan.library.join(runs::RUNS_DIR));
+    // Every name the plan already takes, so two files never go to one.
+    let mut taken: Vec<PathBuf> = plan.rows.iter().map(|r| r.to.clone()).collect();
+    let place_of_rows: Vec<(PathBuf, PathBuf)> = plan
+        .rows
+        .iter()
+        .filter(|r| !r.verdict.blocked())
+        .map(|r| (r.from.clone(), r.to.clone()))
+        .collect();
+    for (i, text, found) in notes {
+        let (from, to) = (plan.rows[i].from.clone(), plan.rows[i].to.clone());
+        let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) else {
+            continue;
+        };
+        let mut carry = Carry::default();
+        let mut verdict: Option<Verdict> = None;
+        for link in &found {
+            let t = &link.target;
+            if carry.files.iter().any(|c| same_path(&c.from, t)) {
+                continue;
+            }
+            let plain = std::fs::symlink_metadata(t).is_ok_and(|m| {
+                m.is_file() && !m.file_type().is_symlink() && m.len() <= DIGEST_MAX_BYTES
+            });
+            let Some(rel) = below(from_dir, t) else {
+                continue;
+            };
+            let sole = index.complete
+                && plain
+                && FileKind::Carried.fits(t)
+                && !under(&canon(t), &runs_dir)
+                && !index.others(t, &from);
+            if !sole {
+                continue;
+            }
+            let Some(sha256) = runs::digest_of(t) else {
+                continue;
+            };
+            let dest = to_dir.join(&rel);
+            if verdict.is_none() {
+                let name = shown(t);
+                if std::fs::symlink_metadata(&dest).is_ok()
+                    || taken.iter().any(|p| same_path(p, &dest))
+                {
+                    verdict = Some(Verdict::CarriedTaken(name));
+                } else if chars(&dest) > PATH_MAX_CHARS {
+                    verdict = Some(Verdict::TooLong(chars(&dest)));
+                } else if let Some(blocker) = dest.parent().and_then(in_the_way) {
+                    verdict = Some(Verdict::InTheWay(blocker));
+                }
+            }
+            taken.push(dest.clone());
+            carry.files.push(Carried {
+                from: t.clone(),
+                to: dest,
+                len: std::fs::symlink_metadata(t).map_or(0, |m| m.len()),
+                sha256,
+            });
+        }
+        // How many of its links change: those to what stays, and to notes that move too.
+        let place = |p: &Path| -> PathBuf {
+            if let Some(c) = carry.files.iter().find(|c| same_path(&c.from, p)) {
+                return c.to.clone();
+            }
+            match place_of_rows.iter().find(|(f, _)| same_path(f, p)) {
+                Some((_, t)) => t.clone(),
+                None => p.to_path_buf(),
+            }
+        };
+        carry.rewrites = links::rewrite(&text, from_dir, to_dir, &place, &[]).1;
+        let row = &mut plan.rows[i];
+        if let Some(v) = verdict {
+            row.verdict = v;
+            row.ticked = false;
+        }
+        row.carry = Some(carry);
+    }
+}
+
 // ---- the disk, as a trait so a test can make any step fail --------------------------------------
 
 /// What the machine does to the disk. [`Disk`] is the real one; a test wraps it to make one step
@@ -746,6 +970,8 @@ impl Files for Disk {
 pub enum ChangeKind {
     Note,
     Home,
+    /// A line of a moved note whose links were rewritten (D-091): the file is the note.
+    Link,
 }
 
 impl ChangeKind {
@@ -753,6 +979,7 @@ impl ChangeKind {
         match self {
             ChangeKind::Note => "note",
             ChangeKind::Home => "home",
+            ChangeKind::Link => "link",
         }
     }
 
@@ -760,6 +987,7 @@ impl ChangeKind {
         match text {
             "note" => Some(ChangeKind::Note),
             "home" => Some(ChangeKind::Home),
+            "link" => Some(ChangeKind::Link),
             _ => None,
         }
     }
@@ -806,7 +1034,7 @@ pub fn with_edits(text: &str, edits: &[Edit], base: &Path) -> Option<String> {
             !used[j]
                 && body.trim_end() == edit.before.trim_end()
                 && match edit.kind {
-                    ChangeKind::Home => true,
+                    ChangeKind::Home | ChangeKind::Link => true,
                     ChangeKind::Note => parsed
                         .entries
                         .iter()
@@ -1064,6 +1292,27 @@ pub trait MoveGate {
         edits: &[Edit],
         expect: &Expected,
     ) -> Result<(), String>;
+
+    /// Rewrites a moved note whose links change (D-091), in one atomic write: the file must say
+    /// `before` now. The default is [`rewrite_note`]; a window that keeps the file open in a tab
+    /// adds its own refusal first.
+    fn rewrite(&mut self, file: &Path, before: &str, after: &str) -> Result<(), String> {
+        rewrite_note(file, before, after)
+    }
+}
+
+/// A note's text made `after` in one atomic write, only while it says `before`.
+pub fn rewrite_note(file: &Path, before: &str, after: &str) -> Result<(), String> {
+    match links::note_text(file) {
+        Some(now) if now == before => {
+            crate::settings::write_atomic(file, after).map_err(|e| e.to_string())
+        }
+        Some(_) => Err(format!(
+            "{} changed while its links were rewritten",
+            shown(file)
+        )),
+        None => Err(format!("{} could not be read", shown(file))),
+    }
 }
 
 // ---- the record --------------------------------------------------------------------------------
@@ -1083,6 +1332,11 @@ pub struct MovedFile {
     /// The plan said it lived outside the library's own area, and the owner ticked it anyway.
     pub outside: bool,
     pub sections: Vec<String>,
+    /// A note whose links the move keeps (D-091): its links are rewritten when it moves, and
+    /// put back when it goes back.
+    pub links: bool,
+    /// A carried file: the index of the note it goes with, in [`Moved::files`].
+    pub with: Option<usize>,
 }
 
 /// One line of a library file the run rewrote. Undo reads the file, so a line that is neither
@@ -1191,8 +1445,16 @@ pub(crate) fn record_json(rec: &Record, library: &Path) -> String {
         if i > 0 {
             s.push(',');
         }
+        // `links` and `with` only when set, so a record of a move without them reads as before.
+        let mut extra = String::new();
+        if f.links {
+            extra.push_str(", \"links\": true");
+        }
+        if let Some(w) = f.with {
+            extra.push_str(&format!(", \"with\": {w}"));
+        }
         s.push_str(&format!(
-            "\n      {{\"kind\": \"{}\", \"from\": \"{}\", \"to\": \"{}\", \"done\": {}, \"len\": {}, \"sha256\": \"{}\", \"outside\": {}, \"sections\": {}}}",
+            "\n      {{\"kind\": \"{}\", \"from\": \"{}\", \"to\": \"{}\", \"done\": {}, \"len\": {}, \"sha256\": \"{}\", \"outside\": {}, \"sections\": {}{extra}}}",
             f.kind.as_str(),
             esc(&stored(&f.from, library)),
             esc(&stored(&f.to, library)),
@@ -1278,6 +1540,8 @@ pub(crate) fn record_from_json(
                     .to_string(),
                 outside: f.get("outside").and_then(Json::bool).unwrap_or(false),
                 sections: f.get("sections").and_then(strings).unwrap_or_default(),
+                links: f.get("links").and_then(Json::bool).unwrap_or(false),
+                with: f.get("with").and_then(Json::usize),
             })
         })
         .collect::<Option<_>>()?;
@@ -1380,6 +1644,12 @@ pub struct Report {
     pub edited: Vec<PathBuf>,
     /// How many lines were rewritten.
     pub lines: usize,
+    /// The moved notes whose own links were rewritten (D-091), where they are now.
+    pub rewritten: Vec<PathBuf>,
+    /// How many links in them changed.
+    pub links: usize,
+    /// Files that went with a note because only it linked to them: where they were, and are.
+    pub carried: Vec<(PathBuf, PathBuf)>,
     /// A library file was refused or could not be written, so every move was put back.
     pub rolled_back: Option<Failure>,
     pub put_back: Vec<PathBuf>,
@@ -1409,6 +1679,10 @@ struct ExecRow {
     from: PathBuf,
     to: PathBuf,
     sha256: String,
+    /// A note whose links are kept: rewritten once it has moved (D-091).
+    links: bool,
+    /// A carried file: the row of its note, which moves first. It does not move without it.
+    with: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1436,6 +1710,9 @@ struct Job {
     planned: Planned,
     /// The row of the library file itself, when it moved.
     own: Option<usize>,
+    /// A moved note's own text with its links rewritten (D-091): written whole by
+    /// [`MoveGate::rewrite`], not line by line as a library file is.
+    note: Option<(String, usize)>,
 }
 
 /// The record while it is written: the file is written again as the run goes.
@@ -1542,6 +1819,20 @@ fn run(
             });
             continue;
         }
+        // A carried file goes only with its note: left behind, the note's link to it is
+        // rewritten to where it stays.
+        if row
+            .with
+            .is_some_and(|k| via.get(k).is_none_or(Option::is_none))
+        {
+            if let Some(f) = journal
+                .as_deref_mut()
+                .and_then(|j| j.moved().files.get_mut(i))
+            {
+                f.done = false;
+            }
+            continue;
+        }
         match move_one(row, files) {
             Ok(v) => {
                 via[i] = Some(v);
@@ -1610,6 +1901,7 @@ fn run(
                     text,
                     planned,
                     own,
+                    note: None,
                 });
             }
             Ok(None) => {}
@@ -1620,6 +1912,45 @@ fn run(
                 });
                 break;
             }
+        }
+    }
+    // Each moved note whose links are kept: its links lead where their files are now (D-091).
+    if failure.is_none() {
+        let place = |p: &Path| map.path(p).0;
+        for &i in &moved_rows {
+            let row = &rows[i];
+            if !row.links {
+                continue;
+            }
+            let (Some(before), Some(after)) = (row.from.parent(), row.to.parent()) else {
+                continue;
+            };
+            // Not UTF-8, or past the size read: its links are left as they are, as planned.
+            let Some(text) = links::note_text(&row.to) else {
+                continue;
+            };
+            let (new, n) = links::rewrite(&text, before, after, &place, &setup.prefer);
+            if new == text || n == 0 {
+                continue;
+            }
+            let edits = links::edits(&text, &new);
+            jobs.push(Job {
+                at: row.to.clone(),
+                planned: Planned {
+                    edit_rows: vec![Some(i); edits.len()],
+                    edits,
+                    expect: Expected {
+                        entries: Vec::new(),
+                        home: None,
+                        exact: Some(new.clone()),
+                    },
+                    rows: BTreeSet::from([i]),
+                    base: after.to_path_buf(),
+                },
+                text,
+                own: Some(i),
+                note: Some((new, n)),
+            });
         }
     }
     if let Some(j) = journal.as_deref_mut() {
@@ -1642,16 +1973,28 @@ fn run(
     let mut applied: Vec<usize> = Vec::new();
     if failure.is_none() {
         for (k, job) in jobs.iter().enumerate() {
-            match gate.edit(
-                &job.at,
-                &job.planned.base,
-                &job.planned.edits,
-                &job.planned.expect,
-            ) {
+            let wrote = match &job.note {
+                Some((new, _)) => gate.rewrite(&job.at, &job.text, new),
+                None => gate.edit(
+                    &job.at,
+                    &job.planned.base,
+                    &job.planned.edits,
+                    &job.planned.expect,
+                ),
+            };
+            match wrote {
                 Ok(()) => {
                     applied.push(k);
-                    report.edited.push(job.at.clone());
-                    report.lines += job.planned.edits.len();
+                    match &job.note {
+                        Some((_, n)) => {
+                            report.rewritten.push(job.at.clone());
+                            report.links += n;
+                        }
+                        None => {
+                            report.edited.push(job.at.clone());
+                            report.lines += job.planned.edits.len();
+                        }
+                    }
                 }
                 Err(why) => {
                     failure = Some(Failure {
@@ -1668,6 +2011,8 @@ fn run(
         report.rolled_back = Some(failure);
         report.edited.clear();
         report.lines = 0;
+        report.rewritten.clear();
+        report.links = 0;
         // The folders this run made for files that are back are left empty: they go again.
         if report.not_put_back.is_empty() {
             let mut gone = made.clone();
@@ -1733,9 +2078,12 @@ fn run(
         }
     }
     for &i in &moved_rows {
-        report
-            .moved
-            .push((rows[i].from.clone(), rows[i].to.clone()));
+        let pair = (rows[i].from.clone(), rows[i].to.clone());
+        if rows[i].with.is_some() {
+            report.carried.push(pair);
+        } else {
+            report.moved.push(pair);
+        }
     }
 
     // Folders the move left empty: those, and what they were inside while that is allowed. A
@@ -1840,7 +2188,11 @@ fn rollback(
             home: None,
             exact: Some(job.text.clone()),
         };
-        if let Err(why) = gate.edit(&job.at, &job.planned.base, &reverse, &expect) {
+        let back = match &job.note {
+            Some((new, _)) => gate.rewrite(&job.at, new, &job.text),
+            None => gate.edit(&job.at, &job.planned.base, &reverse, &expect),
+        };
+        if let Err(why) = back {
             report.not_put_back.push(Failure {
                 path: job.at.clone(),
                 why: format!("its lines could not be written back: {why}"),
@@ -1848,6 +2200,11 @@ fn rollback(
             stuck.extend(job.planned.rows.iter().copied());
         }
     }
+    // A note that stays where it went keeps the files it carried beside it.
+    let with_stuck: Vec<usize> = (0..rows.len())
+        .filter(|&j| rows[j].with.is_some_and(|k| stuck.contains(&k)))
+        .collect();
+    stuck.extend(with_stuck);
     for (i, row) in rows.iter().enumerate() {
         let Some(how) = via[i] else { continue };
         if stuck.contains(&i) {
@@ -2043,6 +2400,55 @@ pub fn preflight(req: &Request, gate: &mut dyn MoveGate) -> Result<(), String> {
         }
         tos.push(&row.to);
         gate.free(&row.from)?;
+        // The files the note carries, under the same rules (D-091).
+        for c in row.carry.iter().flat_map(|c| &c.files) {
+            let what = shown(&c.from);
+            if chars(&c.to) > PATH_MAX_CHARS {
+                return Err(format!(
+                    "{what}, which {name} carries: the new path would be {} characters long.",
+                    chars(&c.to)
+                ));
+            }
+            if has_parent_dir(&c.to) || !inside(library, &home, &c.to) {
+                return Err(format!(
+                    "{} is outside the library and the group's folder.",
+                    c.to.display()
+                ));
+            }
+            let same_name = c
+                .from
+                .file_name()
+                .zip(c.to.file_name())
+                .is_some_and(|(a, b)| same_path(Path::new(a), Path::new(b)));
+            if !FileKind::Carried.fits(&c.from) || !FileKind::Carried.fits(&c.to) || !same_name {
+                return Err(format!(
+                    "{what} would change its name, which a move never does."
+                ));
+            }
+            match is_plain_file(&c.from) {
+                Some(Err(v)) => return Err(format!("{what}: {}.", v.text())),
+                Some(Ok(_)) => {}
+                None => return Err(format!("{what} is not there.")),
+            }
+            if !runs::digest_of(&c.from).is_some_and(|d| d.eq_ignore_ascii_case(&c.sha256)) {
+                return Err(format!(
+                    "{what} has changed since this plan was made. Open the plan again."
+                ));
+            }
+            if std::fs::symlink_metadata(&c.to).is_ok() || tos.iter().any(|t| same_path(t, &c.to)) {
+                return Err(format!(
+                    "{what}: there is already a file called this in {}.",
+                    c.to.parent().map(shown).unwrap_or_default()
+                ));
+            }
+            if let Some(blocker) = c.to.parent().and_then(in_the_way) {
+                return Err(format!(
+                    "{blocker} is a file where a folder of {what} would go."
+                ));
+            }
+            tos.push(&c.to);
+            gate.free(&c.from)?;
+        }
     }
     // The dry run of every library file: the lines as the write will make them.
     let map = Mapping {
@@ -2095,15 +2501,52 @@ pub fn write_at(
         report.start_error = Some(format!("The run could not start: {why}"));
         return report;
     }
-    let rows: Vec<ExecRow> = req
-        .rows
-        .iter()
-        .map(|r| ExecRow {
+    // Each note, then the files it carries: one list, in the record's order.
+    let mut rows: Vec<ExecRow> = Vec::new();
+    let mut listed: Vec<MovedFile> = Vec::new();
+    for r in &req.rows {
+        let at = rows.len();
+        rows.push(ExecRow {
             from: r.from.clone(),
             to: r.to.clone(),
             sha256: r.sha256.clone(),
-        })
-        .collect();
+            links: r.carry.is_some(),
+            with: None,
+        });
+        listed.push(MovedFile {
+            kind: r.kind,
+            from: r.from.clone(),
+            to: r.to.clone(),
+            done: false,
+            len: r.len,
+            sha256: r.sha256.clone(),
+            outside: r.outside,
+            sections: r.sections.clone(),
+            links: r.carry.is_some(),
+            with: None,
+        });
+        for c in r.carry.iter().flat_map(|c| &c.files) {
+            rows.push(ExecRow {
+                from: c.from.clone(),
+                to: c.to.clone(),
+                sha256: c.sha256.clone(),
+                links: false,
+                with: Some(at),
+            });
+            listed.push(MovedFile {
+                kind: FileKind::Carried,
+                from: c.from.clone(),
+                to: c.to.clone(),
+                done: false,
+                len: c.len,
+                sha256: c.sha256.clone(),
+                outside: r.outside,
+                sections: Vec::new(),
+                links: false,
+                with: Some(at),
+            });
+        }
+    }
     let (name, file, home) = req
         .group
         .as_ref()
@@ -2138,20 +2581,7 @@ pub fn write_at(
         moved: Some(Moved {
             start: req.start,
             library_from: req.from_library.clone(),
-            files: req
-                .rows
-                .iter()
-                .map(|r| MovedFile {
-                    kind: r.kind,
-                    from: r.from.clone(),
-                    to: r.to.clone(),
-                    done: false,
-                    len: r.len,
-                    sha256: r.sha256.clone(),
-                    outside: r.outside,
-                    sections: r.sections.clone(),
-                })
-                .collect(),
+            files: listed,
             changes: Vec::new(),
             emptied: Vec::new(),
         }),
@@ -2288,8 +2718,19 @@ fn reach_of(record: &Record, library: &Path) -> Result<(Moved, Vec<usize>), Stri
         if !reach.allows(&file.to) {
             return Err(outside(&file.to));
         }
+        // A carried file names the note it went with, which comes before it; nothing else does.
+        let with_ok = match (file.kind, file.with) {
+            (FileKind::Carried, Some(k)) => {
+                k < i && m.files.get(k).is_some_and(|n| n.kind == FileKind::Note)
+            }
+            (FileKind::Carried, None) => false,
+            (_, with) => with.is_none(),
+        };
+        if !with_ok || (file.links && file.kind != FileKind::Note) {
+            return Err(foreign(&file.to));
+        }
         if !from_ok(&file.from) {
-            if file.outside && file.kind == FileKind::Note {
+            if file.outside && matches!(file.kind, FileKind::Note | FileKind::Carried) {
                 stay.push(i);
                 continue;
             }
@@ -2324,10 +2765,26 @@ fn reach_of(record: &Record, library: &Path) -> Result<(Moved, Vec<usize>), Stri
                     return Err(outside(&file.to));
                 }
             }
-            FileKind::Note => {}
+            FileKind::Note | FileKind::Carried => {}
+        }
+    }
+    // A carried file stays where its note stays.
+    for (i, file) in m.files.iter().enumerate() {
+        if file.with.is_some_and(|k| stay.contains(&k)) && !stay.contains(&i) {
+            stay.push(i);
         }
     }
     for change in &m.changes {
+        // A note's own line: the file is the note, where the run put it.
+        if change.edit.kind == ChangeKind::Link {
+            let ok = change.row.and_then(|r| m.files.get(r)).is_some_and(|f| {
+                f.kind == FileKind::Note && f.links && same_path(&f.to, &change.file)
+            });
+            if !ok {
+                return Err(outside(&change.file));
+            }
+            continue;
+        }
         let dir_ok = change.file.parent().is_some_and(|p| {
             same_path(&canon(p), &canon(library))
                 || m.library_from
@@ -2552,6 +3009,22 @@ fn plan_undo(record: &Record, library: &Path) -> (UndoPlan, Option<Moved>) {
             }
         }
         plan.rows.push(i);
+    }
+    // A carried file goes back only with its note (D-091): left beside a note that stays, the
+    // note's link to it still leads there.
+    let (rows, alone): (Vec<usize>, Vec<usize>) = plan
+        .rows
+        .iter()
+        .partition(|&&i| m.files[i].with.is_none_or(|k| plan.rows.contains(&k)));
+    for i in alone {
+        plan.kept.push((
+            m.files[i].to.clone(),
+            "the note it went with stays where it is".to_string(),
+        ));
+    }
+    plan.rows = rows;
+    for &i in &plan.rows {
+        let file = &m.files[i];
         if file.outside {
             plan.outside += 1;
         }
@@ -2621,6 +3094,10 @@ pub fn undo(
             from: m.files[i].to.clone(),
             to: m.files[i].from.clone(),
             sha256: m.files[i].sha256.clone(),
+            links: m.files[i].links,
+            with: m.files[i]
+                .with
+                .and_then(|k| plan.rows.iter().position(|&j| j == k)),
         })
         .collect();
     report.kept.extend(plan.kept.iter().cloned());
