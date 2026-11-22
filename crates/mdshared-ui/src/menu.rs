@@ -392,7 +392,7 @@ impl<T: Clone> Menu<T> {
             .rows
             .iter()
             .position(|r| r.contains(x, y) && self.rect.contains(x, y))
-            .filter(|&i| self.items[i].enabled);
+            .filter(|&i| self.items.get(i).is_some_and(|item| item.enabled));
         let changed = hit != self.hover;
         self.hover = hit;
         changed
@@ -455,11 +455,11 @@ impl<T: Clone> Menu<T> {
         self.rows.get(index).copied().unwrap_or_default()
     }
 
-    /// The highlighted item's id, for a click or Enter.
+    /// The highlighted item's id, for a click or Enter. None when the highlight names no item:
+    /// the items were replaced by fewer while the menu was open.
     pub fn chosen(&self) -> Option<T> {
-        self.hover
-            .filter(|&i| self.items[i].enabled)
-            .map(|i| self.items[i].id.clone())
+        let item = self.items.get(self.hover?)?;
+        item.enabled.then(|| item.id.clone())
     }
 }
 
@@ -590,6 +590,23 @@ mod tests {
         let r0 = menu.row_rect(19);
         assert!(!menu.pointer(r0.x + 20.0, menu.rect().bottom() + 3.0) || menu.hover.is_none());
         assert_eq!(menu.hover, None);
+    }
+
+    #[test]
+    fn a_menu_whose_items_became_fewer_chooses_nothing_stale() {
+        let area = Rect::new(0.0, 0.0, 400.0, 600.0);
+        let mut menu = placed(many(5), (10.0, 10.0), area);
+        menu.hover = Some(4);
+        assert_eq!(menu.chosen(), Some(4));
+        // The items are listed again while the menu is open, fewer, its rows not placed again.
+        let r4 = menu.row_rect(4);
+        menu.items.truncate(2);
+        assert_eq!(menu.chosen(), None);
+        assert!(menu.pointer(r4.x + 20.0, r4.cy()) && menu.hover.is_none());
+        menu.hover = Some(3);
+        menu.step(true);
+        assert_eq!(menu.hover, Some(0));
+        assert_eq!(menu.chosen(), Some(0));
     }
 
     #[test]
