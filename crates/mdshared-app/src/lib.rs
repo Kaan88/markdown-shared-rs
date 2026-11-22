@@ -14,6 +14,7 @@ pub mod files;
 pub mod folder_lock;
 pub mod foldersearch;
 pub mod fuzzy;
+pub mod html_md;
 pub mod job;
 pub mod library;
 pub mod moves;
