@@ -6,7 +6,7 @@ publish.workspace = true
 description = "Downloads for the Markdown apps: WinHTTP on Windows, a disk cache, strict limits."
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
 ] }
