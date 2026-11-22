@@ -1024,3 +1024,19 @@ fn every_state_of_the_sample_pages_draws() {
 fn specimen_pages() {
     pictures(true);
 }
+
+#[test]
+fn a_choice_marked_dropdown_stays_a_dropdown_with_two_options() {
+    let two = || Row::choice(MODEL, "Model", &["Default", "Other\u{2026}"], 0);
+    let page = |item: Item| vec![Page::new("AI rewrite", vec![item])];
+    // Unmarked, two options are segments; marked, they are a dropdown that opens on a click.
+    let t = T::new(page(Item::new(two())), (1280.0, 800.0));
+    assert_ne!(t.f.segment_rect(MODEL, 1), Rect::default());
+    let mut t = T::new(page(Item::new(two()).dropdown()), (1280.0, 800.0));
+    assert_eq!(t.f.segment_rect(MODEL, 1), Rect::default());
+    assert_eq!(t.click(t.f.control_rect(MODEL)), Outcome::Redraw);
+    assert!(t.f.menu.is_some());
+    // Only a choice can be marked.
+    let text = Item::new(Row::text(KEY, "API key", "")).dropdown();
+    assert!(!text.dropdown);
+}

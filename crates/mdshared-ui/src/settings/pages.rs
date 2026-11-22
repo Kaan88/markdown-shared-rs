@@ -111,6 +111,7 @@ pub struct Item {
     child: bool,
     disabled: Option<String>,
     stacked: bool,
+    dropdown: bool,
     button: Option<Button>,
 }
 
@@ -121,6 +122,7 @@ impl Item {
             child: false,
             disabled: None,
             stacked: false,
+            dropdown: false,
             button: None,
         }
     }
@@ -144,6 +146,13 @@ impl Item {
     /// (a path, an address, a key). Other rows are not stacked.
     pub fn stacked(mut self) -> Item {
         self.stacked = matches!(self.row, Row::Text { .. });
+        self
+    }
+    /// A choice drawn as a dropdown whatever its option count, for a list that grows or
+    /// shrinks with what is fetched (a model list), so the row keeps one shape. Other rows are
+    /// not changed.
+    pub fn dropdown(mut self) -> Item {
+        self.dropdown = matches!(self.row, Row::Choice { .. });
         self
     }
     /// A text button at the right of the control.
@@ -197,7 +206,7 @@ impl Item {
             Row::Toggle { .. } => Kind::Toggle,
             // The count decides, never the text, so a page keeps its shape when an option is
             // reworded or a model offers one more level.
-            Row::Choice { options, .. } if options.len() <= 3 => Kind::Segmented,
+            Row::Choice { options, .. } if options.len() <= 3 && !self.dropdown => Kind::Segmented,
             Row::Choice { .. } => Kind::Dropdown,
             Row::Number { .. } => Kind::Stepper,
             Row::Text { .. } if self.stacked => Kind::Stacked,
