@@ -1148,7 +1148,8 @@ mod tests {
     #[test]
     fn a_library_file_reads_as_a_group_of_notes_and_leaves_out_what_is_not_one() {
         let base = Path::new("/lib");
-        let text = "# Personal\n\
+        let text = &root(
+            "# Personal\n\
             \n\
             Anything may be written here.\n\
             \n\
@@ -1169,7 +1170,8 @@ mod tests {
             \n\
             ```\n\
             - [Not a note](D:/no.md)\n\
-            ```\n";
+            ```\n",
+        );
         let Parsed {
             name,
             home: _,
@@ -1190,15 +1192,11 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("Taxes 2026", "D:/misc/taxes.md".to_string(), vec!["Money"]),
-                ("", "D:/misc/receipts.md".to_string(), vec!["Money"]),
+                ("Taxes 2026", root("D:/misc/taxes.md"), vec!["Money"]),
+                ("", root("D:/misc/receipts.md"), vec!["Money"]),
                 // A deeper heading nests inside the one above it.
-                (
-                    "Last year",
-                    "D:/misc/2025.md".to_string(),
-                    vec!["Money", "2025"]
-                ),
-                ("Japan", "D:/my notes/japan.md".to_string(), vec!["Trips"]),
+                ("Last year", root("D:/misc/2025.md"), vec!["Money", "2025"]),
+                ("Japan", root("D:/my notes/japan.md"), vec!["Trips"]),
                 ("", "/lib/nearby.md".to_string(), vec!["Trips"]),
             ]
         );
@@ -1263,6 +1261,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A path the tests write as `D:/…`, made absolute on this platform: off Windows `D:/` is a
+    /// relative folder named `D:`, and a library reads a relative path as its own folder's.
+    fn root(text: &str) -> String {
+        if cfg!(windows) {
+            text.to_string()
+        } else {
+            text.replace("D:/", "/d/")
+        }
+    }
+
     /// A heading path from the names given.
     fn at(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
@@ -1295,7 +1303,7 @@ mod tests {
         let out = add_note("# Notes\n\nprose\n", &[], "One", Path::new("D:/one.md"));
         assert_eq!(out, "# Notes\n\nprose\n\n- [One](D:/one.md)\n");
         // A path with a space is written so that it reads back whole.
-        let out = add_note(&out, &[], "Two", Path::new("D:/my notes/two.md"));
+        let out = add_note(&out, &[], "Two", Path::new(&root("D:/my notes/two.md")));
         let entries = parse(&out, base).entries;
         assert_eq!(
             entries
@@ -1304,7 +1312,7 @@ mod tests {
                 .path
                 .to_string_lossy()
                 .replace('\\', "/"),
-            "D:/my notes/two.md"
+            root("D:/my notes/two.md")
         );
         // CRLF is kept.
         let out = add_note(
@@ -1951,12 +1959,12 @@ mod tests {
         text = set_note_path(
             &text,
             line_of(&text, "Receipts"),
-            Path::new("D:/misc/2025 receipts.md"),
+            Path::new(&root("D:/misc/2025 receipts.md")),
         )
         .unwrap();
         assert_eq!(
             parse(&text, base).entries[1].path,
-            Path::new("D:/misc/2025 receipts.md")
+            Path::new(&root("D:/misc/2025 receipts.md"))
         );
 
         text = move_note(&text, line_of(&text, "Last year"), &at(&["Money"])).unwrap();
@@ -2067,21 +2075,24 @@ mod tests {
 
     #[test]
     fn a_group_home_with_a_root_is_kept_as_it_is() {
-        let parsed = parse("# Work\n\nhome: D:/notes/work\n", Path::new("/lib"));
+        let parsed = parse(&root("# Work\n\nhome: D:/notes/work\n"), Path::new("/lib"));
         assert_eq!(
             parsed.home.as_deref().map(written),
-            Some("D:/notes/work".to_string())
+            Some(root("D:/notes/work"))
         );
         assert!(
             parsed.entries.is_empty(),
             "a path on its own is not taken for a note on this line"
         );
-        // The same folder, written with the other separator, is the same folder.
-        let parsed = parse("# Work\nhome: D:\\notes\\work\n", Path::new("/lib"));
-        assert_eq!(
-            parsed.home.as_deref().map(written),
-            Some("D:/notes/work".to_string())
-        );
+        // The same folder, written with the other separator, is the same folder. Only Windows
+        // has another separator: elsewhere a backslash is part of a name.
+        if cfg!(windows) {
+            let parsed = parse("# Work\nhome: D:\\notes\\work\n", Path::new("/lib"));
+            assert_eq!(
+                parsed.home.as_deref().map(written),
+                Some("D:/notes/work".to_string())
+            );
+        }
     }
 
     #[test]
