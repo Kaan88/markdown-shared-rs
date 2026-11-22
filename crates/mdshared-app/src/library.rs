@@ -30,6 +30,10 @@
 //! [`read`] does the whole of it: the folder, each file, the titles and what is missing. It
 //! touches the notes only for the titles it has to find, and never more than [`TITLE_BYTES`] of
 //! one, so it stays off the launch path by being called when the library is first shown.
+//!
+//! [`tree`] is the library as a pane lists it: its rows, the fold keys, and which note a path is.
+
+pub mod tree;
 
 use crate::files::{self, FileStamp};
 use std::path::{Path, PathBuf};
