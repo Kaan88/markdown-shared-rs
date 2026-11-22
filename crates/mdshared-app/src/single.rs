@@ -176,8 +176,9 @@ pub fn listen_waking(
 ) -> Option<Receiver<PathBuf>> {
     let (sender, receiver) = channel();
     serve(app, settings, wake, move |request| {
-        // This receiver is for files; folders reach only [`listen_requests_waking`].
-        if request.path.is_file() {
+        // This receiver is for files; folders reach only [`listen_requests_waking`]. A `closed`
+        // names a file only to say it is no longer shown: it never opens one.
+        if request.path.is_file() && !request.closed {
             _ = sender.send(request.path);
         }
     })?;
@@ -222,7 +223,8 @@ fn read_text(reader: &mut impl std::io::Read, n: usize) -> Option<String> {
 
 /// Binds the port, records it, and starts the thread that calls `deliver` with the request of each
 /// existing file or folder a message names, of an `?unplace` (which is about the window, not a
-/// file), and of a document without a file (`?doc=`, which
+/// file), of a `?closed` (which says a view is gone, whatever is on disk), and of a document
+/// without a file (`?doc=`, which
 /// needs nothing on disk), then `wake`. A message with such a document is answered `ok doc`.
 ///
 /// A message may be followed by the text its `?text=<bytes>` line announces: it is read here, up to
@@ -266,8 +268,10 @@ fn serve(
                 if request.doc.is_some() {
                     answer = OK_DOC;
                 }
-                // `unplace` is about the window, not about a file: it needs none.
+                // `unplace` is about the window, not about a file: it needs none. `closed` is
+                // about the sender's view of a file, which may since have been deleted.
                 if request.unplace
+                    || request.closed
                     || request.doc.is_some()
                     || request.path.is_file()
                     || request.path.is_dir()
@@ -358,6 +362,35 @@ mod tests {
         let paths = dir.join("paths.ini");
         let only = listen(APP, &paths).expect("listen");
         assert!(forward(APP, &paths, &[dir.join("sub")]));
+        assert!(only.recv_timeout(Duration::from_millis(300)).is_err());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_closed_reaches_a_request_receiver_though_its_file_is_gone_and_opens_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("mdshared-single-closed-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.ini");
+        let receiver = listen_requests_waking(APP, &settings, || {}).expect("listen");
+        let request = Request {
+            closed: true,
+            ..Request::new(dir.join("deleted.md"))
+        };
+        assert_eq!(deliver_request(APP, &settings, &request), Delivery::Taken);
+        let got = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(got.closed && got.follow && got.path == dir.join("deleted.md"));
+        // A receiver that takes files only is not asked to open one that exists.
+        let file = dir.join("a.md");
+        std::fs::write(&file, "# a\n").unwrap();
+        let paths = dir.join("paths.ini");
+        let only = listen(APP, &paths).expect("listen");
+        let request = Request {
+            closed: true,
+            ..Request::new(&file)
+        };
+        assert_eq!(deliver_request(APP, &paths, &request), Delivery::Taken);
         assert!(only.recv_timeout(Duration::from_millis(300)).is_err());
         _ = std::fs::remove_dir_all(&dir);
     }

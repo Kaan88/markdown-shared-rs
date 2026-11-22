@@ -84,6 +84,11 @@ pub struct Request {
     /// is over. Implies `follow`, and needs neither a path nor a document. A receiver that
     /// predates it does nothing. Only [`send`] carries it; no argument does.
     pub unplace: bool,
+    /// The sender no longer shows `path` (or the document `doc`): its tab of it was closed. The
+    /// receiver ends whatever link it had to that view (the editor's preview). Implies `follow`;
+    /// it needs nothing on disk. A receiver that predates it does nothing. Only [`send`] carries
+    /// it; no argument does.
+    pub closed: bool,
 }
 
 /// How a request was received: see [`deliver`].
@@ -158,13 +163,16 @@ impl Request {
     ///
     /// `unplace` is `?unplace` in a `follow` request. Sent alone it has an empty `?path=`, which
     /// an older receiver reads as a live update for a file it does not show: it does nothing,
-    /// and does not raise its window.
+    /// and does not raise its window. `closed` is `?closed`, also in a `follow` request, with
+    /// the file's `?path=` or the document's `?doc=`: an older receiver finds a live update with
+    /// no line, and does nothing.
     pub fn encode(&self, app: &str) -> String {
         let path = self.path.display();
         let mut out = format!("{app}\n");
         let doc = self.doc.as_deref().and_then(doc_id);
         let open = self.open && doc.is_some();
-        let follow = !open && (self.follow || self.text.is_some() || self.live_off || self.unplace);
+        let follow = !open
+            && (self.follow || self.text.is_some() || self.live_off || self.unplace || self.closed);
         if self.path.as_os_str().is_empty() && doc.is_some() {
             if follow {
                 out.push_str(&format!("{OPTION}follow\n"));
@@ -201,6 +209,9 @@ impl Request {
         }
         if self.unplace {
             out.push_str(&format!("{OPTION}unplace\n"));
+        }
+        if self.closed {
+            out.push_str(&format!("{OPTION}closed\n"));
         }
         if let Some(from) = self.from.as_deref().filter(|f| !f.contains(['\n', '\r'])) {
             out.push_str(&format!("{OPTION}from={from}\n"));
@@ -260,6 +271,10 @@ impl Request {
                 "open" => options.open = true,
                 "unplace" => {
                     options.unplace = true;
+                    options.follow = true;
+                }
+                "closed" => {
+                    options.closed = true;
                     options.follow = true;
                 }
                 _ => {}
@@ -623,6 +638,42 @@ mod tests {
             "mdview\n/home/u/a.md\n?line=200\n?col=5\n?place=-1920,40,960,1000\n?from=mdedit\n\n"
         );
         assert_eq!(Request::parse(lines(&message)), [r]);
+    }
+
+    #[test]
+    fn closed_names_its_file_or_document_and_hides_it_from_older_receivers() {
+        let file = Request {
+            closed: true,
+            from: Some("mdview".into()),
+            ..Request::new("/a/b.md")
+        };
+        let message = file.encode("mdedit");
+        assert_eq!(
+            message,
+            "mdedit\n?path=/a/b.md\n?follow\n?closed\n?from=mdview\n\n"
+        );
+        // An older receiver reads every line as a path and keeps the files: there is none, and
+        // what it parses is a live update with no line, which moves nothing.
+        assert!(lines(&message).iter().all(|l| l.starts_with('?')));
+        let got = Request::parse(lines(&message));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].closed && got[0].follow && got[0].line.is_none());
+        assert_eq!(got[0].path, Path::new("/a/b.md"));
+        let doc = Request {
+            closed: true,
+            from: Some("mdview".into()),
+            ..Request::document("mdedit-7-2", "Untitled 2")
+        };
+        let message = doc.encode("mdedit");
+        assert_eq!(
+            message,
+            "mdedit\n?follow\n?doc=mdedit-7-2\n?title=Untitled 2\n?closed\n?from=mdview\n\n"
+        );
+        let got = Request::parse(lines(&message));
+        assert!(got.len() == 1 && got[0].closed && got[0].follow && !got[0].open);
+        assert_eq!(got[0].doc.as_deref(), Some("mdedit-7-2"));
+        // A request that is not about closing never says so.
+        assert!(!Request::parse(lines(&Request::new("/a.md").encode("x")))[0].closed);
     }
 
     #[test]
