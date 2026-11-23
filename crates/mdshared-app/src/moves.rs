@@ -166,10 +166,9 @@ impl Verdict {
             }
             Verdict::TooLong(n) => format!("the new path would be {n} characters long"),
             Verdict::InTheWay(name) => format!("{name} is a file where its folder would go"),
-            Verdict::LibraryFile => {
-                "it is a library file of its own, so moving it would take its group out of the                  library"
-                    .to_string()
-            }
+            Verdict::LibraryFile => "it is a library file of its own, so moving it would take \
+                                     its group out of the library"
+                .to_string(),
             Verdict::CarriedTaken(name) => format!(
                 "there is already a file called {name} where its {} would go",
                 if links::is_picture(Path::new(name)) {

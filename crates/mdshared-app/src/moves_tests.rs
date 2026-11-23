@@ -2078,7 +2078,51 @@ fn undo_puts_back_a_link_that_would_still_lead_there_from_a_sibling_folder() {
 /// move that file out of the library; a flat note directly in the library folder still moves.
 #[test]
 fn another_groups_library_file_is_not_offered_as_a_note_to_move() {
-    let dir = scratch("libfile-row");
+    let (dir, lib, plan) = index_listing_a_group_file("libfile-row");
+    assert_eq!(plan.blocked, None);
+    let row = plan
+        .rows
+        .iter()
+        .find(|r| same_path(&r.from, &lib.join("Recipes.md")))
+        .expect("a row for the library file");
+    assert_eq!(row.verdict, Verdict::LibraryFile);
+    assert!(!row.ticked);
+    assert_eq!(
+        row.verdict.text(),
+        "it is a library file of its own, so moving it would take its group out of the library"
+    );
+    let loose = plan
+        .rows
+        .iter()
+        .find(|r| same_path(&r.from, &lib.join("Loose.md")))
+        .expect("a row for the flat note");
+    assert_ne!(loose.verdict, Verdict::LibraryFile);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Audit 4, D1: a moved note's links are written with `files::replace`, so a file of the owner's
+/// called `<note>.tmp` beside the note is never touched.
+#[test]
+fn rewriting_a_moved_notes_links_leaves_the_owners_tmp_file_alone() {
+    let dir = scratch("rewrite-tmp");
+    let note = dir.join("a.md");
+    put(&note, "# A\n\nSee [b](b.md).\n");
+    put(&dir.join("a.md.tmp"), "the owner's\n");
+    rewrite_note(
+        &note,
+        "# A\n\nSee [b](b.md).\n",
+        "# A\n\nSee [b](../b.md).\n",
+    )
+    .expect("written");
+    assert_eq!(text(&note), "# A\n\nSee [b](../b.md).\n");
+    assert_eq!(text(&dir.join("a.md.tmp")), "the owner's\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A group `Index` that lists `Recipes.md`, the library file of the group `Recipes`, and a flat
+/// note `Loose.md`, both directly in the library folder; and the plan of `Index`.
+fn index_listing_a_group_file(tag: &str) -> (PathBuf, PathBuf, Plan) {
+    let dir = scratch(tag);
     let lib = dir.join("library");
     put(
         &lib.join("Index.md"),
@@ -2098,19 +2142,30 @@ fn another_groups_library_file_is_not_offered_as_a_note_to_move() {
         .expect("the group")
         .clone();
     let plan = plan_group(&lib, &group);
-    assert_eq!(plan.blocked, None);
-    let row = plan
-        .rows
-        .iter()
-        .find(|r| same_path(&r.from, &lib.join("Recipes.md")))
-        .expect("a row for the library file");
-    assert_eq!(row.verdict, Verdict::LibraryFile);
-    assert!(!row.ticked);
-    let loose = plan
-        .rows
-        .iter()
-        .find(|r| same_path(&r.from, &lib.join("Loose.md")))
-        .expect("a row for the flat note");
-    assert_ne!(loose.verdict, Verdict::LibraryFile);
+    (dir, lib, plan)
+}
+
+/// Audit 4, A F6: a request that names another group's library file as a note to move (a plan
+/// edited by hand, or made before the file was a group's) is refused before anything moves.
+#[test]
+fn a_request_to_move_another_groups_library_file_is_refused() {
+    let (dir, lib, mut plan) = index_listing_a_group_file("libfile-request");
+    let recipes = lib.join("Recipes.md");
+    let before = text(&recipes);
+    for row in &mut plan.rows {
+        row.ticked = same_path(&row.from, &recipes);
+        if row.ticked {
+            row.verdict = Verdict::Ready;
+            row.sha256 = crate::update::sha256_hex(before.as_bytes());
+        }
+    }
+    let req = plan.request();
+    assert_eq!(req.rows.len(), 1);
+    let report = do_write(&req, &mut gate(), &mut flaky());
+    let why = report.start_error.expect("refused");
+    assert!(why.contains("is a library file of its own"), "{why}");
+    assert_eq!(text(&recipes), before);
+    assert!(!lib.join("Index/Recipes.md").exists());
+    assert!(records(&lib).is_empty(), "nothing started");
     let _ = std::fs::remove_dir_all(&dir);
 }
