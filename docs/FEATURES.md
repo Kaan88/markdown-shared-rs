@@ -176,7 +176,10 @@ span, as Google Docs writes them, and not for its `<b style="font-weight:normal"
 strikethrough, links, images (not `data:` ones), nested and numbered lists, inline code, fenced
 code blocks with the language of a `language-…` class, block quotes, rules, hard breaks.
 Unknown tags keep their text; scripts and styles go; a table's cells become `a | b`, a row to a
-line. It answers `None` when there is nothing Markdown can say that the plain text does not, and
+line. Text that Markdown would read as a mark, a tag or a character reference is escaped (`\*`,
+`\<b>`, `\<?`, `\&copy;`), also when the HTML splits it between two tags
+(`&lt;<span>script&gt;`); inside inline code nothing is marked or escaped. A link to
+`javascript:`, `vbscript:` or `data:` keeps its text only. It answers `None` when there is nothing Markdown can say that the plain text does not, and
 for `white-space: pre` HTML (a code editor's coloured copy), so the caller pastes the plain text.
 Hand-written (no HTML crate), panic-free on any input, nesting capped at 16 for its prefixes, the
 output capped at eight times the input; tested with fixed cases, 25,000 generated inputs and every

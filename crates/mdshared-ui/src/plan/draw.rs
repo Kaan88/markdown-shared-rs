@@ -968,8 +968,7 @@ impl PlanScreen {
     }
 }
 
-/// A text field in a framed box over a row or the group button.
-/// The part of `r` inside `to`; empty, at `r`'s corner, when they do not meet.
+/// The part of `r` inside `to`: no width or no height when they do not meet.
 fn clipped(r: Rect, to: Rect) -> Rect {
     let x = r.x.max(to.x);
     let y = r.y.max(to.y);
@@ -981,6 +980,7 @@ fn clipped(r: Rect, to: Rect) -> Rect {
     )
 }
 
+/// A text field in a framed box over a row or the group button.
 fn draw_field(
     p: &mut Painter,
     pal: &Palette,
