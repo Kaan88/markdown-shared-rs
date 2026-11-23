@@ -1,6 +1,6 @@
 //! Path helpers: one identity per file, Windows verbatim prefixes, tab titles.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// File names differ only in case on the same file: NTFS on Windows, and APFS as macOS formats
 /// it by default (a case-sensitive volume is rare, and then two names that differ only in case
@@ -103,14 +103,63 @@ fn unverbatim(path: &str) -> Option<String> {
 /// ordinary spelling when its names allow one, so a long path inside a folder reads as inside
 /// it (audit 4, N2). For comparing only: a path of 260 or more may need its verbatim form for a
 /// call that is not Rust's own.
+///
+/// A path that is not there is its nearest folder that is, canonicalized, and the names after
+/// it, where each `..` takes the name before it off again: a name that is not there is no link
+/// for the `..` to cross, and a folder made there later has the parent that name has. So
+/// `library/Trip/..` with no `Trip` is the library folder, on every system (audit 4, A F14):
+/// Windows folds a `..` by its names anyway, but on Linux and macOS `std::path::absolute` keeps
+/// it, and [`canonical_or_absolute`] keeps it too. A link that leads nowhere counts as a name
+/// that is not there. The result has no `..` left in it.
 pub fn comparable(path: &Path) -> PathBuf {
-    let resolved = canonical_or_absolute(path);
+    let resolved = std::fs::canonicalize(path)
+        .or_else(|_| canonical_parent_folded(path))
+        .unwrap_or_else(|_| canonical_or_absolute(path));
     if cfg!(windows)
         && let Some(plain) = resolved.to_str().and_then(unverbatim)
     {
         return PathBuf::from(plain);
     }
     resolved
+}
+
+/// A path that is not there, for [`comparable`]: its nearest existing ancestor canonicalized,
+/// with the parts after it folded onto it ([`folded_onto`]). When nothing of it is there, not
+/// even its root, the absolute path folded by its names alone.
+fn canonical_parent_folded(path: &Path) -> std::io::Result<PathBuf> {
+    let abs = std::path::absolute(path)?;
+    // The parts after the ancestor that is there, last first.
+    let mut tail: Vec<Component<'_>> = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        if let Ok(base) = std::fs::canonicalize(cur) {
+            return Ok(folded_onto(base, tail.into_iter().rev()));
+        }
+        let mut parts = cur.components();
+        match parts.next_back() {
+            Some(part @ (Component::Normal(_) | Component::ParentDir | Component::CurDir)) => {
+                tail.push(part);
+                cur = parts.as_path();
+            }
+            _ => return Ok(folded_onto(PathBuf::new(), abs.components())),
+        }
+    }
+}
+
+/// `parts` pushed onto `base`, with each `..` taking the last name off (the root keeps itself)
+/// and each `.` left out. `base` is canonical, so a `..` that reaches into it leads where the
+/// disk would.
+fn folded_onto<'a>(mut base: PathBuf, parts: impl Iterator<Item = Component<'a>>) -> PathBuf {
+    for part in parts {
+        match part {
+            Component::ParentDir => {
+                base.pop();
+            }
+            Component::CurDir => {}
+            other => base.push(other),
+        }
+    }
+    base
 }
 
 /// Verbatim paths skip the Win32 name rules, so a name can exist there and not be reachable otherwise.
@@ -341,5 +390,60 @@ mod tests {
     #[test]
     fn a_missing_file_still_has_an_absolute_identity() {
         assert!(canonical_or_absolute(Path::new("nowhere/gone.md")).is_absolute());
+    }
+
+    /// Audit 4, A F14: a `..` after a folder that is not there takes that folder off again, so
+    /// `library/Trip/..` is the library folder for a comparison. Windows folds a `..` by its
+    /// names before any of this; Linux and macOS kept it, and the path read as another one.
+    #[test]
+    fn a_dot_dot_after_a_missing_folder_folds_for_a_comparison() {
+        let dir = std::env::temp_dir().join(format!("mdshared-dotdot-{}", std::process::id()));
+        let lib = dir.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let here = comparable(&lib);
+        assert!(!here.components().any(|c| c == Component::ParentDir));
+        assert!(same_path(&comparable(&lib.join("Trip").join("..")), &here));
+        assert!(same_path(
+            &comparable(&lib.join("Trip").join("..").join("Note.md")),
+            &here.join("Note.md")
+        ));
+        assert!(same_path(
+            &comparable(&lib.join("a").join("b").join("..").join("..").join("c")),
+            &here.join("c")
+        ));
+        // Past the folder that is there, into its canonical parent.
+        assert!(same_path(
+            &comparable(&lib.join("Trip").join("..").join("..")),
+            &comparable(&dir)
+        ));
+        // A `.` is no part, and a path that is there is the disk's answer.
+        assert!(same_path(
+            &comparable(&lib.join(".").join("Trip").join("..")),
+            &here
+        ));
+        std::fs::create_dir_all(lib.join("Trip")).unwrap();
+        assert!(same_path(&comparable(&lib.join("Trip").join("..")), &here));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The folding itself, as it is on every system: a `..` takes the last name off, the root
+    /// keeps itself, a `.` is nothing.
+    #[test]
+    fn a_dot_dot_takes_the_name_before_it_off() {
+        let base = std::env::temp_dir();
+        let parts = Path::new("Trip/../a/./b/../c.md");
+        assert_eq!(
+            folded_onto(base.clone(), parts.components()),
+            base.join("a").join("c.md")
+        );
+        assert_eq!(
+            folded_onto(base.clone(), Path::new("x/../..").components()),
+            base.parent().unwrap_or(&base).to_path_buf()
+        );
+        let root = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+        assert_eq!(
+            folded_onto(root.clone(), Path::new("../../x").components()),
+            root.join("x")
+        );
     }
 }
