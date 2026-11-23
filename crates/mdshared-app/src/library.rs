@@ -33,6 +33,7 @@
 //!
 //! [`tree`] is the library as a pane lists it: its rows, the fold keys, and which note a path is.
 
+pub mod put;
 pub mod tree;
 
 use crate::files::{self, FileStamp};
