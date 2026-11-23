@@ -160,6 +160,8 @@ pub fn put_note(
     if !added {
         return Err(PutError::WouldNotReadBack);
     }
+    #[cfg(test)]
+    tests::meanwhile();
     if files::stamp(file) != stamp {
         return Err(PutError::Changed);
     }
@@ -175,12 +177,58 @@ pub fn put_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("mdshared-put-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    type Meanwhile = Option<Box<dyn FnOnce()>>;
+
+    thread_local! {
+        /// What another program does while [`put_note`] works: run once, after the file was
+        /// read and before it is looked at again to be written.
+        static MEANWHILE: RefCell<Meanwhile> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn meanwhile() {
+        if let Some(f) = MEANWHILE.with(|m| m.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    /// Audit 4, E6: a library file another program wrote while the note was being added is
+    /// not written over; its text is kept.
+    #[test]
+    fn a_library_file_changed_while_the_note_is_added_is_not_written_over() {
+        let s = scratch("changed");
+        let lib = s.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let note = s.join("N.md");
+        std::fs::write(&note, "# N\n").unwrap();
+        let file = lib.join("Personal.md");
+        std::fs::write(&file, "# Personal\n").unwrap();
+        let theirs = "# Personal\n\n- [Theirs](theirs.md)\n";
+        let other = file.clone();
+        MEANWHILE.with(|m| {
+            *m.borrow_mut() = Some(Box::new(move || std::fs::write(&other, theirs).unwrap()));
+        });
+        assert_eq!(put_note(&file, &[], &note, &lib), Err(PutError::Changed));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), theirs);
+        // One that is made while the note is added counts as changed too.
+        let new = lib.join("New.md");
+        let made = new.clone();
+        MEANWHILE.with(|m| {
+            *m.borrow_mut() = Some(Box::new(move || std::fs::write(&made, theirs).unwrap()));
+        });
+        assert_eq!(put_note(&new, &[], &note, &lib), Err(PutError::Changed));
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), theirs);
+        // Left alone, the same call writes.
+        assert!(put_note(&file, &[], &note, &lib).is_ok());
+        assert!(std::fs::read_to_string(&file).unwrap().contains("[N]"));
     }
 
     #[test]
