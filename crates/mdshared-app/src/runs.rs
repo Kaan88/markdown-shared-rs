@@ -1668,6 +1668,9 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
     if !record.folders.is_empty() || !record.pictures.is_empty() {
         let _ = record.close(&record_path, &req.library);
     }
+    if dies_at("before the notes") {
+        return report;
+    }
 
     // 4. Notes: each created at the name the plan gave it, never over a file. A note is the
     // run's only when this write made it; step 1's mark is put right for every other one.
@@ -1691,6 +1694,9 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                 }
                 report.notes_written.push(note.path.clone());
                 record.note_done(&record_path, &format!("note {}", shown(&note.path)));
+                if dies_at("after a note") {
+                    return report;
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 // 3.9: the same name with the same bytes is the note, already there. A file
@@ -1807,6 +1813,26 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
     }
     report.record = Some(record);
     report
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The step a test makes [`write_of`] stop at, as a process that died there would: what is
+    /// on disk then is what a crash leaves.
+    static DIES_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a test asked [`write_of`] to stop at `step`; never in a build of the program.
+fn dies_at(step: &str) -> bool {
+    #[cfg(test)]
+    {
+        DIES_AT.with(|d| d.get() == Some(step))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = step;
+        false
+    }
 }
 
 /// Step 1's record of a write: the whole plan, state "writing", with every note whose name is
@@ -5151,7 +5177,14 @@ mod tests {
         let mut gate = TestGate::new();
         let finished = finish(&path, &record, &library, &mut gate);
         assert_eq!(finished.added, 1);
+        assert_eq!(finished.present, 0);
         assert_eq!(finished.left_out, vec![library.join("Trip/Two.md")]);
+        // Finished again, the note it linked is counted as there already.
+        let record = load(&path, &library).expect("the record");
+        let again = finish(&path, &record, &library, &mut gate);
+        assert_eq!(again.added, 0);
+        assert_eq!(again.present, 1);
+        assert_eq!(again.left_out, vec![library.join("Trip/Two.md")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5494,7 +5527,7 @@ mod tests {
             sha256: String::new(),
             recycled: false,
         };
-        let record = planned(&req, Kind::Split, 3, "2026-11-21T14:03:11Z", src);
+        let record = planned(&req, Kind::Split, 3, "2026-11-21T14:03:11Z", src.clone());
         assert!(record.notes[0].created, "a free name is the run's");
         assert!(!record.notes[1].created, "a taken name is never the run's");
         // And a run that finished puts the marks right: Two was there with the same bytes.
@@ -5504,5 +5537,239 @@ mod tests {
         assert!(record.notes[0].created);
         assert!(!record.notes[1].created);
         let _ = std::fs::remove_dir_all(&dir);
+
+        // A note whose name was free but that could not be written is not the run's either.
+        let dir = scratch("a4-planned-failed");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = self::source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[
+                ("One", "# One\n", &[]),
+                ("Three", "# Three\n", &["Blocked"]),
+            ],
+        );
+        // A file where the note's folder would go.
+        write_file(&library.join("Trip/Blocked"), "a file of the owner's\n");
+        let record = planned(&req, Kind::Split, 3, "2026-11-21T14:03:11Z", src);
+        assert!(record.notes[1].created, "its name is free");
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        assert_eq!(report.note_failures.len(), 1, "{:?}", report.note_failures);
+        let record = report.record.expect("the record");
+        assert!(record.notes[0].created);
+        assert!(!record.notes[1].created, "it was never written");
+        assert_eq!(
+            read(&library.join("Trip/Blocked")),
+            "a file of the owner's\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W5: a run that dies after it made its folders, before its notes, leaves a record that
+    /// owns those folders, so undo takes them away again.
+    #[test]
+    fn a_run_that_dies_before_its_notes_owns_the_folders_it_made() {
+        let dir = scratch("a4-dies-folders");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(&library, &source, &[("One", "# One\n", &["Tokyo"])]);
+        DIES_AT.with(|d| d.set(Some("before the notes")));
+        let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+        DIES_AT.with(|d| d.set(None));
+        assert!(library.join("Trip/Tokyo").is_dir());
+        assert!(!library.join("Trip/Tokyo/One.md").exists());
+        let path = report.record_path.expect("a record");
+        let record = load(&path, &library).expect("the record a crash leaves");
+        assert_eq!(record.state, State::Writing);
+        assert!(
+            record
+                .folders
+                .iter()
+                .any(|f| same_path(f, &library.join("Trip/Tokyo"))),
+            "{:?}",
+            record.folders
+        );
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.refusal, None);
+        assert!(!library.join("Trip").exists(), "{done:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F9: a run that dies after it wrote a note, before the record was written again, leaves
+    /// a record that owns the note: undo takes it out, and does not look for the note it never
+    /// wrote.
+    #[test]
+    fn a_run_that_dies_while_it_writes_its_notes_can_be_undone() {
+        let dir = scratch("a4-dies-notes");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", &[]), ("Two", "# Two\n", &[])],
+        );
+        DIES_AT.with(|d| d.set(Some("after a note")));
+        let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+        DIES_AT.with(|d| d.set(None));
+        assert!(library.join("Trip/One.md").is_file());
+        assert!(!library.join("Trip/Two.md").exists());
+        let path = report.record_path.expect("a record");
+        let record = load(&path, &library).expect("the record a crash leaves");
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.refusal, None);
+        assert_eq!(done.removed_notes, vec![library.join("Trip/One.md")]);
+        assert!(!library.join("Trip/One.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F14 on the write's own check: a note's path with a `..` after a folder that is not
+    /// there is where the `..` leads, so one that leads out of the library is outside it.
+    #[test]
+    fn a_dot_dot_after_a_missing_folder_is_where_it_leads() {
+        let dir = scratch("a4-dotdot");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let none = Path::new("");
+        let escape = library
+            .join("Trip")
+            .join("..")
+            .join("..")
+            .join("elsewhere")
+            .join("x.md");
+        assert!(!inside(&library, none, &escape));
+        let back_in = library.join("Trip").join("..").join("Tokyo").join("x.md");
+        assert!(inside(&library, none, &back_in));
+        // The library folder itself, reached by `..`, is not inside it.
+        assert!(!inside(&library, none, &library.join("Trip").join("..")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1: undo of a rewrite puts the original back through `files::replace`, so a file of the
+    /// owner's called `<name>.tmp` beside it is never touched.
+    #[test]
+    fn undo_of_a_rewrite_leaves_the_owners_tmp_file_alone() {
+        let dir = scratch("a4-undo-tmp");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "one\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        )
+        .expect("the write");
+        write_file(&dir.join("notes.txt.tmp"), "the owner's\n");
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert_eq!(read(&file), "one\n");
+        assert_eq!(read(&dir.join("notes.txt.tmp")), "the owner's\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F2 for a rewrite: a file undo could not write back keeps the run to be undone again
+    /// ("undo pending"), and the next undo, once it can, finishes it.
+    #[test]
+    fn a_rewrite_undo_that_cannot_write_its_file_is_left_to_be_undone_again() {
+        let dir = scratch("a4-undo-ro");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "one\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        )
+        .expect("the write");
+        let set_readonly = |on: bool| {
+            let mut p = std::fs::metadata(&file).expect("there").permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(on);
+            std::fs::set_permissions(&file, p).expect("its permissions");
+        };
+        set_readonly(true);
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.failures.len(), 1, "{done:?}");
+        assert_eq!(read(&file), "ONE\n");
+        let again = load(&path, &library).expect("the record");
+        assert_eq!(again.state, State::UndoPending);
+        assert!(again.state.live() && !again.state.finishable());
+        set_readonly(false);
+        let done = undo(&path, &again, &library, &mut TestGate::new());
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert_eq!(read(&file), "one\n");
+        assert_eq!(
+            load(&path, &library).expect("the record").state,
+            State::Undone
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N8: a rewrite whose record cannot be written writes nothing, and leaves no original in
+    /// the record it holds.
+    #[test]
+    fn a_rewrite_whose_record_cannot_be_written_writes_nothing() {
+        let dir = scratch("a4-record-fails");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "one\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        // A folder where the record is: it cannot be written over.
+        std::fs::remove_file(&path).expect("the record goes");
+        std::fs::create_dir_all(path.join("in the way")).expect("a folder");
+        let failed = rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        );
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.contains("The record could not be written")),
+            "{failed:?}"
+        );
+        assert!(record.originals.is_empty());
+        assert_eq!(read(&file), "one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F11a: the question counts a run's lines in words, beside its notes: "with 1 line", not
+    /// "their 1 lines".
+    #[test]
+    fn the_undo_question_counts_the_lines_in_words() {
+        let none: &[&str] = &[];
+        for (notes, words) in [
+            (
+                vec![("One", "# One\n", none)],
+                "Removes 1 note this run wrote, with 1 line in Trip",
+            ),
+            (
+                vec![("One", "# One\n", none), ("Two", "# Two\n", none)],
+                "Removes 2 notes this run wrote, with 2 lines in Trip",
+            ),
+        ] {
+            let dir = scratch("a4-sentence");
+            let library = dir.join("library");
+            std::fs::create_dir_all(&library).expect("the library");
+            let source = source(&dir);
+            let req = plan(&library, &source, &notes);
+            let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+            let path = report.record_path.expect("a record");
+            let record = load(&path, &library).expect("the record");
+            let sentence = prepare(&record, &library).sentence("Trip");
+            assert!(sentence.starts_with(words), "{sentence}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
