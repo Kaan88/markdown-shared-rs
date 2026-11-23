@@ -135,7 +135,9 @@ fn stamp(secs: u64, kind: Kind) -> String {
 /// A kind is part of the file format (D-072): a version that has no word for one lists the record
 /// and never touches it, so adding one is a change older copies see only as "written by a newer
 /// version". [`Kind::Move`] was added after the format's first version and did not need a new
-/// `version`: the older readers already treat an unknown kind that way.
+/// `version`: the older readers already treat an unknown kind that way. [`Kind::Markdown`] came
+/// the same way (phase 5, `docs/ai-library-plan.md` 5.8): one note whose text a model wrote, from
+/// a text file that is never changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Split,
@@ -143,6 +145,8 @@ pub enum Kind {
     /// A text file rewritten in place (`docs/ai-library-plan.md` 5.6, D-074): the record holds
     /// the original text of every file the run overwrote (D-076).
     Rewrite,
+
+    Markdown,
 }
 
 impl Kind {
@@ -151,6 +155,8 @@ impl Kind {
             Kind::Split => "split",
             Kind::Move => "move",
             Kind::Rewrite => "rewrite",
+
+            Kind::Markdown => "markdown",
         }
     }
 
@@ -159,6 +165,8 @@ impl Kind {
             "split" => Some(Kind::Split),
             "move" => Some(Kind::Move),
             "rewrite" => Some(Kind::Rewrite),
+
+            "markdown" => Some(Kind::Markdown),
             _ => None,
         }
     }
@@ -1474,6 +1482,19 @@ pub fn write(req: &Request, gate: &mut dyn Gate) -> Report {
 
 /// [`write`] with the clock given, so a test can know the record's name.
 pub fn write_at(req: &Request, gate: &mut dyn Gate, secs: u64, started: &str) -> Report {
+    write_of(req, Kind::Split, gate, secs, started)
+}
+
+/// A text file's Markdown note (5.8): the same order of 4.3, with [`Kind::Markdown`] in the
+/// record. Its notes hold the text a model wrote, not line ranges of the source, so the caller
+/// composes each note and passes the same text as [`NewNote::from_source`]; the source is read for
+/// its digest and never written. Undo takes the note and its line out as it does for a split.
+pub fn write_note(req: &Request, gate: &mut dyn Gate) -> Report {
+    let (secs, started) = now_utc();
+    write_of(req, Kind::Markdown, gate, secs, &started)
+}
+
+fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: &str) -> Report {
     let mut report = Report::default();
     // The source as it is now: its length and digest go in the record, and step 8 compares the
     // file with them before it would move it anywhere.
@@ -1498,7 +1519,7 @@ pub fn write_at(req: &Request, gate: &mut dyn Gate, secs: u64, started: &str) ->
     // run that stops here leaves a record whose undo touches nothing it did not make.
     let mut record = Record {
         version: RECORD_VERSION,
-        kind: Kind::Split,
+        kind,
         started: started.to_string(),
         started_secs: secs,
         state: State::Writing,
@@ -3425,6 +3446,143 @@ mod tests {
         assert!(record_path.with_extension("done").is_file());
         // The source is untouched.
         assert_eq!(read(&source), "# Japan\n\none\n\n## Asakusa\n\ntwo\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_markdown_run_writes_the_model_text_and_undo_takes_it_out_again() {
+        let dir = scratch("markdown");
+        let library = dir.join("library");
+        std::fs::create_dir_all(library.join("Notes")).expect("the library");
+        let source = dir.join("pasta notes.txt");
+        write_file(&source, "PASTA\n\nboil it.\n");
+        let group = library.join("Notes.md");
+        write_file(&group, "# Notes\nhome: Notes\n");
+        let note = library.join("Notes/pasta-notes.md");
+        let model = "# Pasta\n\n- Boil it.\n";
+        let req = Request {
+            library: library.clone(),
+            source: source.clone(),
+            instruction: "Format this text as Markdown".to_string(),
+            sent: Some(Sent {
+                connection: "claude-code".to_string(),
+                model: "a model".to_string(),
+                bytes: 20,
+                requests: 1,
+            }),
+            group: Group {
+                name: "Notes".to_string(),
+                file: group.clone(),
+                created: false,
+                home: library.join("Notes"),
+            },
+            folders: Vec::new(),
+            notes: vec![NewNote {
+                link_path: PathBuf::from("Notes/pasta-notes.md"),
+                path: note.clone(),
+                text: model.to_string(),
+                from_source: model.to_string(),
+                title: "pasta notes".to_string(),
+                sections: Vec::new(),
+                ranges: Vec::new(),
+                heading_shift: 0,
+                title_added: false,
+                already: false,
+            }],
+            pictures: Vec::new(),
+        };
+        let mut gate = TestGate::new();
+        let report = write_note(&req, &mut gate);
+        assert_eq!(report.start_error, None);
+        assert_eq!(report.notes(), 1);
+        assert!(
+            report.note_failures.is_empty(),
+            "{:?}",
+            report.note_failures
+        );
+        assert_eq!(report.state(), Some(State::Done));
+        // The note holds the model's text, and the group lists it in its own notes.
+        assert_eq!(read(&note), model);
+        assert_eq!(
+            read(&group),
+            "# Notes\nhome: Notes\n\n- [pasta notes](Notes/pasta-notes.md)\n"
+        );
+        // The source was read and never written.
+        assert_eq!(read(&source), "PASTA\n\nboil it.\n");
+        let record_path = report.record_path.clone().expect("a record");
+        let record_name = record_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(record_name.ends_with("-markdown.json"), "{record_path:?}");
+        let text = read(&record_path);
+        assert!(text.contains("\"kind\": \"markdown\""), "{text}");
+        let loaded = load(&record_path, &library).expect("the record reads");
+        assert_eq!(loaded.kind, Kind::Markdown);
+        assert_eq!(
+            loaded.notes[0].sha256,
+            crate::update::sha256_hex(model.as_bytes())
+        );
+        assert!(loaded.notes[0].created);
+        // Undo: the line first, then the note, and the source is still there.
+        let plan = prepare(&loaded, &library);
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        assert!(plan.acts(), "something to undo");
+        let mut gate = TestGate::new();
+        let undone = undo(&record_path, &loaded, &library, &mut gate);
+        assert_eq!(undone.refusal, None);
+        assert_eq!(undone.removed_notes, vec![note.clone()]);
+        assert!(!note.exists());
+        // The blank line the link was written after stays, as it does for a split's undo.
+        assert_eq!(read(&group).trim_end(), "# Notes\nhome: Notes");
+        assert_eq!(read(&source), "PASTA\n\nboil it.\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_markdown_run_refuses_a_name_that_is_taken_with_other_bytes() {
+        let dir = scratch("markdown-taken");
+        let library = dir.join("library");
+        std::fs::create_dir_all(library.join("Notes")).expect("the library");
+        let source = dir.join("pasta notes.txt");
+        write_file(&source, "PASTA\n");
+        let group = library.join("Notes.md");
+        write_file(&group, "# Notes\nhome: Notes\n");
+        let note = library.join("Notes/pasta-notes.md");
+        write_file(&note, "# Somebody else's note\n");
+        let req = Request {
+            library: library.clone(),
+            source,
+            instruction: String::new(),
+            sent: None,
+            group: Group {
+                name: "Notes".to_string(),
+                file: group.clone(),
+                created: false,
+                home: library.join("Notes"),
+            },
+            folders: Vec::new(),
+            notes: vec![NewNote {
+                link_path: PathBuf::from("Notes/pasta-notes.md"),
+                path: note.clone(),
+                text: "# Pasta\n".to_string(),
+                from_source: "# Pasta\n".to_string(),
+                title: "pasta notes".to_string(),
+                sections: Vec::new(),
+                ranges: Vec::new(),
+                heading_shift: 0,
+                title_added: false,
+                already: false,
+            }],
+            pictures: Vec::new(),
+        };
+        let mut gate = TestGate::new();
+        let report = write_note(&req, &mut gate);
+        assert_eq!(report.notes(), 0);
+        assert_eq!(report.note_failures.len(), 1, "{:?}", report.note_failures);
+        // The file is not replaced and no line is written for it.
+        assert_eq!(read(&note), "# Somebody else's note\n");
+        assert_eq!(read(&group), "# Notes\nhome: Notes\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
