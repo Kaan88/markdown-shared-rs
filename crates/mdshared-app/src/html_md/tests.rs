@@ -667,3 +667,73 @@ fn hostile_html_never_panics_nor_passes_the_cap() {
         }
     }
 }
+
+/// `md` of `html` with a bold word after it, so that a paste with only escapes in it still
+/// converts; the word is taken off again.
+fn md_marked(html: &str) -> String {
+    let out = md(&format!("{html}<p><b>b</b></p>"));
+    out.strip_suffix("\n\n**b**")
+        .unwrap_or_else(|| panic!("{out:?}"))
+        .to_string()
+}
+
+/// Audit 4, W7 and T2: a `<` or `&` that ends one text token is escaped by what the next token
+/// begins with, as it would be in one token. Syntax-coloured markup has this shape.
+#[test]
+fn escaping_looks_past_the_end_of_a_text_token() {
+    assert_eq!(
+        md_marked("<p>&lt;<span>script&gt;alert(1)</span></p>"),
+        "\\<script>alert(1)"
+    );
+    assert_eq!(md_marked("<p>&amp;<span>copy;</span></p>"), "\\&copy;");
+    assert_eq!(md_marked("<p>&amp;co<span>py;</span> x</p>"), "\\&copy; x");
+    assert_eq!(md_marked("<p>&lt;<span>/b&gt;</span></p>"), "\\</b>");
+    // Neither a tag nor a reference: nothing to escape.
+    assert_eq!(
+        md_marked("<p>1 &lt;<span> 2</span> &amp;<span> 3</span></p>"),
+        "1 < 2 & 3"
+    );
+    // A mark between them: the backslash goes before the `<`, the mark around its word.
+    assert_eq!(md("<p>&lt;<b>script</b></p>"), "\\<**script**");
+    // Inside code nothing is escaped, and a held `<` does not reach into it.
+    assert_eq!(md("<p>&lt;<code>b</code></p>"), "<`b`");
+}
+
+/// Audit 4, W8: a backslash in an image's alt is the alt's own: one at its end cannot escape
+/// the `]`.
+#[test]
+fn an_image_alt_that_ends_in_a_backslash_keeps_its_image() {
+    assert_eq!(
+        md(r#"<p><img src="a.png" alt="back\"></p>"#),
+        "![back\\\\](a.png)"
+    );
+    assert_eq!(
+        md(r#"<p><img src="a.png" alt="a\b"></p>"#),
+        "![a\\\\b](a.png)"
+    );
+}
+
+/// Audit 4, N3: a `vbscript:` or `data:` link keeps its text only, as a `javascript:` one does.
+#[test]
+fn script_and_data_links_keep_their_text_only() {
+    assert_eq!(
+        md(
+            r#"<p><a href="vbscript:msgbox(1)">a</a> <a href=" DATA:text/html,x">b</a> <a href="VBScript:x">c</a> <b>x</b></p>"#
+        ),
+        "a b c **x**"
+    );
+}
+
+/// Audit 4, N4: `<?` would start a processing instruction, so it is escaped; and marks inside
+/// code would be its text, so none is made there.
+#[test]
+fn a_processing_instruction_is_escaped_and_code_holds_no_marks() {
+    assert_eq!(
+        md_marked("<p>&lt;?php echo 1; ?&gt;</p>"),
+        "\\<?php echo 1; ?>"
+    );
+    assert_eq!(
+        md(r#"<p><code>a <b>bold</b> <i>it</i> <a href="u">link</a></code></p>"#),
+        "`a bold it link`"
+    );
+}

@@ -139,6 +139,9 @@ pub enum Verdict {
     InTheWay(String),
     /// A file the note carries would go where a file of that name already is: its name.
     CarriedTaken(String),
+    /// The group lists another group's library file as a note: moving it would take that group,
+    /// and every note it lists, out of the library (audit 4, A F6).
+    LibraryFile,
 }
 
 impl Verdict {
@@ -163,6 +166,10 @@ impl Verdict {
             }
             Verdict::TooLong(n) => format!("the new path would be {n} characters long"),
             Verdict::InTheWay(name) => format!("{name} is a file where its folder would go"),
+            Verdict::LibraryFile => {
+                "it is a library file of its own, so moving it would take its group out of the                  library"
+                    .to_string()
+            }
             Verdict::CarriedTaken(name) => format!(
                 "there is already a file called {name} where its {} would go",
                 if links::is_picture(Path::new(name)) {
@@ -561,6 +568,9 @@ pub fn plan_group(library_dir: &Path, group: &library::Group) -> Plan {
             Some(n),
         );
         taken.push(to);
+        if !row.verdict.blocked() && is_group_file(library_dir, &entry.path) {
+            row.verdict = Verdict::LibraryFile;
+        }
         if !row.verdict.blocked() && !inside(library_dir, &home, &entry.path) {
             let dir = entry
                 .path
@@ -583,6 +593,23 @@ pub fn plan_group(library_dir: &Path, group: &library::Group) -> Plan {
         _ => format!("the notes of {} into their folder", group.name),
     };
     plan
+}
+
+/// Whether `path` is a `.md` directly in the library folder that the library reads as a group
+/// of its own: one that lists notes or names a folder with `home:`. A flat note there, with
+/// neither, is not.
+fn is_group_file(library_dir: &Path, path: &Path) -> bool {
+    let in_library = path
+        .parent()
+        .is_some_and(|d| same_path(&canon(d), &canon(library_dir)));
+    if !in_library || !runs::has_extension(path, &["md"]) {
+        return false;
+    }
+    let Some(bytes) = runs::read_regular(path, library::MAX_FILE_BYTES as u64, true) else {
+        return false;
+    };
+    let read = library::parse(&crate::files::decode(&bytes).0, library_dir);
+    !read.entries.is_empty() || read.home.is_some()
 }
 
 /// The plan for the library itself: its library files, the notes they list that are inside the
@@ -1305,7 +1332,7 @@ pub trait MoveGate {
 pub fn rewrite_note(file: &Path, before: &str, after: &str) -> Result<(), String> {
     match links::note_text(file) {
         Some(now) if now == before => {
-            crate::settings::write_atomic(file, after).map_err(|e| e.to_string())
+            crate::files::replace(file, after.as_bytes()).map_err(|e| e.to_string())
         }
         Some(_) => Err(format!(
             "{} changed while its links were rewritten",
@@ -2351,6 +2378,11 @@ pub fn preflight(req: &Request, gate: &mut dyn MoveGate) -> Result<(), String> {
         match row.kind {
             FileKind::Note if in_library => {
                 return Err(format!("{name} would be a library file, not a note."));
+            }
+            FileKind::Note if is_group_file(library, &row.from) => {
+                return Err(format!(
+                    "{name} is a library file of its own, so it is not moved as a note."
+                ));
             }
             FileKind::Library if !in_library => {
                 return Err(format!(

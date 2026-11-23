@@ -2073,3 +2073,44 @@ fn undo_puts_back_a_link_that_would_still_lead_there_from_a_sibling_folder() {
         "the words it had, not just a link that works"
     );
 }
+
+/// Audit 4, A F6: a group that lists another group's library file as a note does not offer to
+/// move that file out of the library; a flat note directly in the library folder still moves.
+#[test]
+fn another_groups_library_file_is_not_offered_as_a_note_to_move() {
+    let dir = scratch("libfile-row");
+    let lib = dir.join("library");
+    put(
+        &lib.join("Index.md"),
+        "# Index\nhome: Index\n\n- [Recipes](Recipes.md)\n- [Loose](Loose.md)\n",
+    );
+    put(
+        &lib.join("Recipes.md"),
+        "# Recipes\nhome: Recipes\n\n- [Bread](Recipes/bread.md)\n",
+    );
+    put(&lib.join("Recipes/bread.md"), "# Bread\n");
+    put(&lib.join("Loose.md"), "# Loose\n\nJust a note.\n");
+    let read = library::read(&lib);
+    let group = read
+        .groups
+        .iter()
+        .find(|g| g.name == "Index")
+        .expect("the group")
+        .clone();
+    let plan = plan_group(&lib, &group);
+    assert_eq!(plan.blocked, None);
+    let row = plan
+        .rows
+        .iter()
+        .find(|r| same_path(&r.from, &lib.join("Recipes.md")))
+        .expect("a row for the library file");
+    assert_eq!(row.verdict, Verdict::LibraryFile);
+    assert!(!row.ticked);
+    let loose = plan
+        .rows
+        .iter()
+        .find(|r| same_path(&r.from, &lib.join("Loose.md")))
+        .expect("a row for the flat note");
+    assert_ne!(loose.verdict, Verdict::LibraryFile);
+    let _ = std::fs::remove_dir_all(&dir);
+}

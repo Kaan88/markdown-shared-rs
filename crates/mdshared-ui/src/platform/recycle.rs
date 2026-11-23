@@ -71,6 +71,16 @@ pub fn recycle(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a file of `len` bytes cannot go to a Recycle Bin that holds `max_mb` megabytes (Windows'
+/// `MaxCapacity`, a drive's own setting): Windows deletes a file larger than its bin at once,
+/// and the call still succeeds (audit 4, D4). `None` when it fits, or when no size is set.
+#[cfg(any(test, windows))]
+fn larger_than_bin(len: u64, max_mb: Option<u32>) -> Option<String> {
+    let mb = max_mb?;
+    (len > u64::from(mb).saturating_mul(1024 * 1024))
+        .then(|| format!("the file is larger than this drive's Recycle Bin, which holds {mb} MB"))
+}
+
 /// Opens the Recycle Bin in the file manager. Windows only; elsewhere it does nothing and says
 /// so with false.
 pub fn open_recycle_bin() -> bool {
@@ -211,6 +221,11 @@ mod imp {
                         "this drive is set to delete files at once".to_string(),
                     ));
                 }
+                let len = std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+                let max = reg_dword(HKEY_CURRENT_USER, &key, "MaxCapacity");
+                if let Some(why) = super::larger_than_bin(len, max) {
+                    return Some(BinRefusal::Unavailable(why));
+                }
             }
         }
         let mut info = SHQUERYRBINFO {
@@ -324,6 +339,24 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 4, D4: a file larger than the drive's bin is refused, as Windows would delete it.
+    #[test]
+    fn a_file_larger_than_the_bin_is_refused() {
+        let mb = 1024 * 1024;
+        assert_eq!(larger_than_bin(10 * mb, None), None, "no size set");
+        assert_eq!(
+            larger_than_bin(10 * mb, Some(10)),
+            None,
+            "it fits to the byte"
+        );
+        assert_eq!(
+            larger_than_bin(10 * mb + 1, Some(10)).as_deref(),
+            Some("the file is larger than this drive's Recycle Bin, which holds 10 MB")
+        );
+        assert!(larger_than_bin(1, Some(0)).is_some());
+        assert!(larger_than_bin(u64::MAX, Some(u32::MAX)).is_some());
+    }
 
     #[test]
     fn recycle_refuses_a_relative_path_and_touches_nothing() {

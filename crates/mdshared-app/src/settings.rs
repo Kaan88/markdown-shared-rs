@@ -87,12 +87,16 @@ pub fn read_patiently(path: &Path) -> io::Result<Option<String>> {
 /// Writes through a temporary file and rename, so a crash cannot leave half a settings file.
 /// The temporary file is on the disk before the rename, so a power cut just after cannot leave
 /// the new name on an empty or older file (files listed in it may already be gone by then).
+///
+/// This is the write for the app's own files (its settings, session, macros, a run's record):
+/// the temporary is `<name>.tmp`, made over whatever has that name. A file of the owner's is
+/// written with [`crate::files::replace`], whose temporary can never be one of the owner's.
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     write_atomic_bytes(path, text.as_bytes())
 }
 
-/// [`write_atomic`] with the bytes as given: a file whose text begins with a byte order mark
-/// (a rewrite's undo, 5.6).
+/// [`write_atomic`] with the bytes as given. A write that fails after the temporary file was
+/// made removes it, so no `<name>.tmp` is left behind.
 pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
@@ -102,10 +106,12 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     // The rename itself, on systems where a folder can be synced.
     #[cfg(unix)]
     if let Some(dir) = path.parent()
@@ -260,6 +266,20 @@ mod tests {
         write_atomic(&path, "a=2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a=2\n");
         assert!(!path.with_extension("ini.tmp").exists());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 3, C9: a save whose rename fails takes its temporary away again.
+    #[test]
+    fn a_failed_save_leaves_no_temporary() {
+        let dir =
+            std::env::temp_dir().join(format!("mdshared-settings-fail-{}", std::process::id()));
+        let path = dir.join("taken.ini");
+        // A folder where the file would go: the rename cannot put a file over it.
+        std::fs::create_dir_all(path.join("inside")).unwrap();
+        assert!(write_atomic(&path, "a=1\n").is_err());
+        assert!(!dir.join("taken.ini.tmp").exists());
+        assert!(path.join("inside").is_dir());
         _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,5 +1,6 @@
 //! Reading files from disk: change stamps, a read that waits out a half-finished save, text
-//! decoding, and writing a new file that never replaces one.
+//! decoding, writing a new file that never replaces one, and replacing a file of the owner's
+//! through a temporary name that cannot be one of the owner's.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -208,6 +209,78 @@ pub fn create_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Writes `bytes` over the file at `path`, or makes it when it is not there: the write for a
+/// file of the owner's (a rewrite, its undo, a library file, a moved note), where
+/// [`crate::settings::write_atomic`] is the write for the app's own settings files.
+///
+/// The bytes go to a temporary name of this function's own beside the file (`name.part`, or a
+/// name with the process id in it), made with `create_new`, so a file of the owner's called
+/// `name.tmp` or `name.part` is never opened, truncated or renamed away. They are flushed and
+/// synced, the file's permissions are put on the temporary (so a file only its owner may read
+/// stays so, and a script keeps its executable bit), and the temporary is renamed over the
+/// file. The temporary is removed on every way out but the last, and a failed rename leaves the
+/// file as it was.
+///
+/// A read-only file is refused ([`io::ErrorKind::PermissionDenied`]), on every system alike: on
+/// Windows the rename would fail, and elsewhere it would replace the file anyway. A link is
+/// written through: the file it leads to is the one replaced, and the link stays. Anything that
+/// is not a file is refused. The folder is not made. A hard link to the file is split by the
+/// rename (the other name keeps the old bytes); so are what a rename never carries, a Windows
+/// file's own access list and its alternate streams.
+pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        Ok(m) if !m.is_file() => return Err(not_a_file(path)),
+        Ok(_) => path.to_path_buf(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(e) => return Err(e),
+    };
+    let old = match std::fs::metadata(&target) {
+        Ok(m) if !m.is_file() => return Err(not_a_file(path)),
+        Ok(m) => Some(m.permissions()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if old.as_ref().is_some_and(std::fs::Permissions::readonly) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the file is read-only: {}", path.display()),
+        ));
+    }
+    let (mut file, temp) = create_temporary(&target)?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let done = written
+        .and_then(|()| match old {
+            Some(permissions) => std::fs::set_permissions(&temp, permissions),
+            None => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    // The rename itself, on systems where a folder can be synced.
+    #[cfg(unix)]
+    if let Some(dir) = target.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+fn not_a_file(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("it is not a file: {}", path.display()),
+    )
+}
+
 fn already_exists(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -338,6 +411,116 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(names(&dir), vec!["free.md", "taken.md"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 4, D1 (audit 3, C9): a file of the owner's called `<name>.tmp`, or `<name>.part`,
+    /// beside the one replaced is never touched, and nothing is left behind.
+    #[test]
+    fn replace_leaves_the_owners_tmp_and_part_files_alone() {
+        let dir = scratch("replace-tmp");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::write(dir.join("notes.txt.tmp"), "the owner's tmp\n").unwrap();
+        std::fs::write(dir.join("notes.txt.part"), "the owner's part\n").unwrap();
+        replace(&path, b"new\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(
+            std::fs::read(dir.join("notes.txt.tmp")).unwrap(),
+            b"the owner's tmp\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("notes.txt.part")).unwrap(),
+            b"the owner's part\n"
+        );
+        assert_eq!(
+            names(&dir),
+            vec!["notes.txt", "notes.txt.part", "notes.txt.tmp"]
+        );
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_makes_a_file_that_is_not_there() {
+        let dir = scratch("replace-new");
+        let path = dir.join("new.md");
+        replace(&path, b"x").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        assert_eq!(names(&dir), vec!["new.md"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only file is refused and left as it was, with no temporary beside it: on Windows
+    /// the rename fails, and the old write left its `.tmp` there (audit 4, B6).
+    #[test]
+    fn replace_refuses_a_read_only_file_and_leaves_nothing_behind() {
+        let dir = scratch("replace-ro");
+        let path = dir.join("locked.md");
+        std::fs::write(&path, "kept\n").unwrap();
+        let mut p = std::fs::metadata(&path).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&path, p).unwrap();
+        let err = replace(&path, b"lost\n").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // It says so in its own words, whatever the system's refusal would have said.
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept\n");
+        assert_eq!(names(&dir), vec!["locked.md"]);
+        let mut p = std::fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        std::fs::set_permissions(&path, p).unwrap();
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_refuses_a_folder() {
+        let dir = scratch("replace-dir");
+        let sub = dir.join("sub.md");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            replace(&sub, b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(sub.is_dir());
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 4, W3: the file keeps its mode, so a note only its owner may read stays so and a
+    /// script keeps its executable bit.
+    #[cfg(unix)]
+    #[test]
+    fn replace_keeps_the_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("replace-mode");
+        for mode in [0o600, 0o755] {
+            let path = dir.join(format!("f{mode:o}"));
+            std::fs::write(&path, "old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            replace(&path, b"new").unwrap();
+            let now = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(now, mode);
+        }
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link is written through: the file it leads to gets the bytes and the link stays.
+    #[cfg(unix)]
+    #[test]
+    fn replace_writes_through_a_link() {
+        let dir = scratch("replace-link");
+        let real = dir.join("real.md");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace(&link, b"new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
         _ = std::fs::remove_dir_all(&dir);
     }
 }

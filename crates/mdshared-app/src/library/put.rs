@@ -83,6 +83,12 @@ pub enum PutError {
     Io(String),
     /// The new text would not read back as the old notes plus this one.
     WouldNotReadBack,
+    /// The library file is not UTF-8 text (another code page, or UTF-16): writing it back as
+    /// UTF-8 would change every letter outside ASCII, so it is not written (audit 4, D3).
+    NotUtf8,
+    /// The library file changed on disk between its read and the write: another program wrote
+    /// it, and its text is kept (audit 4, E6).
+    Changed,
 }
 
 impl std::fmt::Display for PutError {
@@ -90,6 +96,12 @@ impl std::fmt::Display for PutError {
         match self {
             PutError::Io(why) => f.write_str(why),
             PutError::WouldNotReadBack => f.write_str("the file would not read back as its notes"),
+            PutError::NotUtf8 => f.write_str(
+                "the file is not UTF-8 text, so it is left as it is; save it as UTF-8 first",
+            ),
+            PutError::Changed => {
+                f.write_str("the file changed while the note was being added; try again")
+            }
         }
     }
 }
@@ -106,9 +118,12 @@ pub fn listed_as(library: &Library, note: &Path) -> Option<String> {
 /// Writes `note` into the library file `file` under the heading path `section` (the group's own
 /// notes when it is empty), making the file from [`TEMPLATE`] when it is not there. A note
 /// inside the library folder `dir` is linked relative to it. The new text is written only when
-/// it reads back as the notes there were plus this one at its place, and in one atomic write.
-/// Whether the file is open with changes not saved is the caller's to ask first. Gives the
-/// title the note was listed under.
+/// it reads back as the notes there were plus this one at its place, and in one atomic write
+/// ([`files::replace`]). A file that is not UTF-8 text is refused rather than written back
+/// changed ([`PutError::NotUtf8`]); one that begins with a UTF-8 byte order mark keeps it; one
+/// that changed on disk since it was read is not written over ([`PutError::Changed`]). Whether
+/// the file is open with changes not saved is the caller's to ask first. Gives the title the
+/// note was listed under.
 pub fn put_note(
     file: &Path,
     section: &[String],
@@ -120,9 +135,17 @@ pub fn put_note(
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
-    let text = match std::fs::read(file) {
-        Ok(bytes) => files::decode(&bytes).0.into_owned(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE.to_string(),
+    let stamp = files::stamp(file);
+    let (text, bom) = match std::fs::read(file) {
+        Ok(bytes) => {
+            let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+            let (text, invalid) = files::decode(&bytes);
+            if utf16 || invalid {
+                return Err(PutError::NotUtf8);
+            }
+            (text.into_owned(), bytes.starts_with(&[0xEF, 0xBB, 0xBF]))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (TEMPLATE.to_string(), false),
         Err(e) => return Err(io(e)),
     };
     let base = file.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -137,7 +160,15 @@ pub fn put_note(
     if !added {
         return Err(PutError::WouldNotReadBack);
     }
-    settings::write_atomic(file, &new).map_err(io)?;
+    if files::stamp(file) != stamp {
+        return Err(PutError::Changed);
+    }
+    let mut bytes = Vec::with_capacity(new.len() + 3);
+    if bom {
+        bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    bytes.extend_from_slice(new.as_bytes());
+    files::replace(file, &bytes).map_err(io)?;
     Ok(title)
 }
 
@@ -255,5 +286,61 @@ code
             Err(PutError::WouldNotReadBack)
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    }
+
+    /// Audit 4, D3: a library file in another code page is refused, not written back with every
+    /// letter outside ASCII replaced.
+    #[test]
+    fn a_library_file_that_is_not_utf8_is_refused_and_left_byte_for_byte() {
+        let s = scratch("cp1254");
+        let lib = s.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let note = s.join("N.md");
+        std::fs::write(&note, "# N\n").unwrap();
+        let file = lib.join("Personal.md");
+        // `- [Çağrı](<cagri.md>)` in Windows-1254: Ç is C7, ğ is F0, ı is FD.
+        let before: &[u8] = b"# Personal\n\n- [\xC7a\xF0r\xFD](<cagri.md>)\n";
+        std::fs::write(&file, before).unwrap();
+        assert_eq!(put_note(&file, &[], &note, &lib), Err(PutError::NotUtf8));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    /// A UTF-16 file reads without a replaced character, but would be written back as UTF-8: it
+    /// is refused too.
+    #[test]
+    fn a_utf16_library_file_is_refused() {
+        let s = scratch("utf16");
+        let lib = s.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let note = s.join("N.md");
+        std::fs::write(&note, "# N\n").unwrap();
+        let file = lib.join("Personal.md");
+        let mut before = vec![0xFF, 0xFE];
+        for u in "# Personal\n".encode_utf16() {
+            before.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&file, &before).unwrap();
+        assert_eq!(put_note(&file, &[], &note, &lib), Err(PutError::NotUtf8));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    /// A UTF-8 file with a byte order mark keeps it, and the owner's `<name>.tmp` beside it is
+    /// not touched (audit 4, D1).
+    #[test]
+    fn a_bom_is_kept_and_the_owners_tmp_file_is_left_alone() {
+        let s = scratch("bom");
+        let lib = s.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let note = s.join("N.md");
+        std::fs::write(&note, "# N\n").unwrap();
+        let file = lib.join("Personal.md");
+        std::fs::write(&file, "\u{FEFF}# Personal\n").unwrap();
+        let tmp = lib.join("Personal.md.tmp");
+        std::fs::write(&tmp, "the owner's\n").unwrap();
+        put_note(&file, &[], &note, &lib).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "{bytes:?}");
+        assert!(String::from_utf8_lossy(&bytes).contains("[N]"));
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "the owner's\n");
     }
 }

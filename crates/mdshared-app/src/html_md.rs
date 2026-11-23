@@ -507,16 +507,42 @@ struct Writer {
     /// Cells open (`<td>`, `<th>`), at any depth: a row that is in no table ends at a block that
     /// starts outside them.
     cells_open: usize,
+    /// A `<` or `&` that ended a text token unescaped, at its byte in `line`, with the length
+    /// `line` had then: the next text token decides it, as one token would have (audit 4, W7).
+    held: Option<(usize, usize)>,
 }
 
 impl Writer {
     fn text(&mut self, raw: &str) {
         let text = decode(raw);
+        let held = self.held.take();
         if self.pre > 0 {
             self.line.push_str(&text);
             return;
         }
         let code = self.inline.iter().any(|i| i.wrap == Wrap::Code);
+        // The `<` or `&` the last token ended with, when nothing was written after it since: it
+        // reads with this token's text as one.
+        if let Some((at, len)) = held
+            && !code
+            && self.line.len() == len
+            && let Some(tail) = self.line.get(at + 1..)
+        {
+            let after = format!("{tail}{text}");
+            let escape = match self.line.as_bytes().get(at) {
+                Some(b'<') => opens_html(after.chars().next()),
+                Some(b'&') => entity_like(&after),
+                _ => false,
+            };
+            if escape {
+                self.line.insert(at, '\\');
+                for i in &mut self.inline {
+                    if i.start > at {
+                        i.start += 1;
+                    }
+                }
+            }
+        }
         let mut space = self.line.is_empty() || self.line.ends_with([' ', '\n']);
         let mut prev = self.line.chars().next_back();
         let mut chars = text.char_indices().peekable();
@@ -533,22 +559,33 @@ impl Writer {
             if !code {
                 let next = chars.peek().map(|&(_, n)| n);
                 let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+                let rest = text.get(at + 1..).unwrap_or("");
                 let escape = match c {
                     '\\' | '*' | '`' | '[' | ']' => true,
                     // Inside a word (snake_case) it is no emphasis.
                     '_' => !(word(prev) && word(next)),
-                    '<' => next.is_some_and(|n| n.is_ascii_alphabetic() || n == '/' || n == '!'),
-                    '&' => entity_like(text.get(at + 1..).unwrap_or("")),
+                    '<' => opens_html(next),
+                    '&' => entity_like(rest),
                     // A lone `~` after a space ("~5 min") can end no strikethrough.
                     '~' => next == Some('~') || prev.is_some_and(|p| !p.is_whitespace()),
                     _ => false,
                 };
                 if escape {
                     self.line.push('\\');
+                } else if (c == '<' && next.is_none())
+                    || (c == '&'
+                        && rest.len() < 34
+                        && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'#'))
+                {
+                    // What follows is in the next token: it decides.
+                    self.held = Some((self.line.len(), 0));
                 }
             }
             self.line.push(c);
             prev = Some(c);
+        }
+        if let Some((at, _)) = self.held {
+            self.held = Some((at, self.line.len()));
         }
     }
 
@@ -859,8 +896,10 @@ impl Writer {
                     || (i.wrap == Wrap::BoldItalic && matches!(w, Wrap::Bold | Wrap::Italic))
             })
         };
-        // What is open already is not marked again.
+        // What is open already is not marked again; inside code a mark would be its text, so
+        // nothing is marked there (audit 4, N4).
         let wrap = match wrap {
+            _ if has(Wrap::Code) => Wrap::Plain,
             Wrap::BoldItalic => match (has(Wrap::Bold), has(Wrap::Italic)) {
                 (true, true) => Wrap::Plain,
                 (true, false) => Wrap::Italic,
@@ -948,7 +987,9 @@ impl Writer {
         if !(self.line.is_empty() || self.line.ends_with([' ', '\n'])) {
             self.line.push(' ');
         }
-        let alt = escape_entities(alt.trim());
+        // A backslash in the alt is one in the text: doubled, so one at its end cannot escape
+        // the `]` (audit 4, W8).
+        let alt = escape_entities(&alt.trim().replace('\\', "\\\\"));
         self.line.push_str(&format!("![{alt}]({src})"));
         self.marked = true;
     }
@@ -1133,11 +1174,16 @@ fn link_target(href: &str) -> Option<String> {
     // characters go before the scheme is looked at.
     let clean: String = href.chars().filter(|c| !c.is_control()).collect();
     let href = clean.trim();
+    // A script is no link, and neither is data in the link itself (audit 4, N3).
+    let scheme = |name: &str| {
+        href.get(..name.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(name))
+    };
     if href.is_empty()
         || href.starts_with('#')
-        || href
-            .get(..11)
-            .is_some_and(|s| s.eq_ignore_ascii_case("javascript:"))
+        || scheme("javascript:")
+        || scheme("vbscript:")
+        || scheme("data:")
     {
         return None;
     }
@@ -1154,6 +1200,12 @@ fn link_target(href: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Whether a `<` followed by `next` would start HTML: a tag, a closing tag, a comment or
+/// declaration, or a processing instruction (`<?`, audit 4 N4).
+fn opens_html(next: Option<char>) -> bool {
+    next.is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'))
 }
 
 /// Whether text after a `&` would be read as a character reference (`copy;`, `#169;`, `#xA9;`),

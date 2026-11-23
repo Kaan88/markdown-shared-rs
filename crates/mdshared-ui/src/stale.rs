@@ -28,8 +28,9 @@ impl UseDays {
         if today == self.date {
             self
         } else {
+            // The count is read from the session: one at its top stays there (audit 4, E12).
             UseDays {
-                count: self.count + 1,
+                count: self.count.saturating_add(1),
                 date: today,
             }
         }
@@ -98,6 +99,9 @@ mod tests {
         assert_eq!(d.start(130).count, 2, "a month away is one day");
         assert_eq!(UseDays::parse(&d.to_setting()), Some(d));
         assert_eq!(UseDays::parse("x"), None);
+        // A count at its top, from a session line, stays at its top.
+        let top = UseDays::parse("4294967295 1").expect("a count");
+        assert_eq!(top.start(2).count, u32::MAX);
     }
 
     #[test]

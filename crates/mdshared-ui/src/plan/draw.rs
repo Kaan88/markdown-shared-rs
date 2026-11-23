@@ -12,7 +12,8 @@ use crate::check::{TICK, Tick, draw_tick};
 use crate::gfx::{Face, Painter, Rect, Rgb, mix};
 use crate::glyph;
 use crate::overlay::{
-    DIALOG_FOOTER, DIALOG_PAD, dialog_button_w, draw_backdrop, draw_dialog_button, draw_dialog_card,
+    DIALOG_FOOTER, DIALOG_PAD, dialog_button_w, draw_backdrop, draw_dialog_button,
+    draw_dialog_button_disabled, draw_dialog_card,
 };
 use crate::scroll::draw_scrollbar;
 use crate::segments::{SEGMENT_H, draw_segments, switch_width};
@@ -62,14 +63,6 @@ pub fn strip_colors(pal: &Palette) -> (Rgb, Rgb, Rgb) {
         mix(pal.popup, pal.text, 0.12),
         pal.accent,
     )
-}
-
-/// The disabled button, as `replace_ui::dialog_button` draws it: a plain frame, whether it is
-/// primary or not. (The shared `draw_dialog_button_disabled` differs: radius 5, and a tinted fill
-/// for a primary.)
-fn disabled_button(p: &mut Painter, pal: &Palette, r: Rect, label: &str) {
-    p.frame(r, 6.0, pal.field, pal.line);
-    p.text_center(Face::Semibold, 13.0, r, label, pal.faint);
 }
 
 impl PlanScreen {
@@ -557,6 +550,11 @@ impl PlanScreen {
                 _ => "Name of the note",
             };
             draw_field(p, pal, e, r, hint, caret_on, &mut self.spots);
+            // The field's spot is what shows of it: a row half out of the list takes no click
+            // meant for what is above or below the list (audit 4, W10).
+            if let Some((PHit::Field, spot)) = self.spots.last_mut() {
+                *spot = clipped(*spot, g.list);
+            }
         }
         p.restore(old);
         if let Some((track, thumb)) = rows.thumb(g.list) {
@@ -829,7 +827,9 @@ impl PlanScreen {
         let problem = self.problem();
         for (hit, label, primary, r) in buttons {
             if hit == PHit::Write && problem.is_some() {
-                disabled_button(p, pal, r, label);
+                // The shared disabled button draws what this card drew of its own (the same
+                // frame and label since `ecef629`), so the card uses it (audit 4, W13).
+                draw_dialog_button_disabled(p, pal, r, label, primary);
             } else {
                 draw_dialog_button(
                     p,
@@ -969,6 +969,18 @@ impl PlanScreen {
 }
 
 /// A text field in a framed box over a row or the group button.
+/// The part of `r` inside `to`; empty, at `r`'s corner, when they do not meet.
+fn clipped(r: Rect, to: Rect) -> Rect {
+    let x = r.x.max(to.x);
+    let y = r.y.max(to.y);
+    Rect::new(
+        x,
+        y,
+        (r.right().min(to.right()) - x).max(0.0),
+        (r.bottom().min(to.bottom()) - y).max(0.0),
+    )
+}
+
 fn draw_field(
     p: &mut Painter,
     pal: &Palette,

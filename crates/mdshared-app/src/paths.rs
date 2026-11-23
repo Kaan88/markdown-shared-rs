@@ -78,6 +78,12 @@ fn canonical_parent_join(path: &Path) -> std::io::Result<PathBuf> {
 /// the UI. This gives the ordinary spelling, or `None` if the path only works in verbatim form or is
 /// not verbatim at all, so a file keeps one identity whether or not it exists right now.
 pub fn strip_verbatim(path: &str) -> Option<String> {
+    // MAX_PATH, including the terminator.
+    unverbatim(path).filter(|plain| plain.len() < 260)
+}
+
+/// The ordinary spelling of a verbatim path whose names allow one, whatever its length.
+fn unverbatim(path: &str) -> Option<String> {
     let (plain, rest) = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         (format!(r"\\{rest}"), rest)
     } else {
@@ -88,8 +94,23 @@ pub fn strip_verbatim(path: &str) -> Option<String> {
         }
         (rest.to_string(), &rest[3..])
     };
-    // MAX_PATH, including the terminator.
-    (plain.len() < 260 && rest.split('\\').all(usable_without_verbatim)).then_some(plain)
+    rest.split('\\')
+        .all(usable_without_verbatim)
+        .then_some(plain)
+}
+
+/// [`canonical_or_absolute`] for comparing paths: a verbatim path of any length is given its
+/// ordinary spelling when its names allow one, so a long path inside a folder reads as inside
+/// it (audit 4, N2). For comparing only: a path of 260 or more may need its verbatim form for a
+/// call that is not Rust's own.
+pub fn comparable(path: &Path) -> PathBuf {
+    let resolved = canonical_or_absolute(path);
+    if cfg!(windows)
+        && let Some(plain) = resolved.to_str().and_then(unverbatim)
+    {
+        return PathBuf::from(plain);
+    }
+    resolved
 }
 
 /// Verbatim paths skip the Win32 name rules, so a name can exist there and not be reachable otherwise.
@@ -282,6 +303,10 @@ mod tests {
         }
         let long = format!(r"\\?\C:\{}", "a".repeat(300));
         assert_eq!(strip_verbatim(&long), None);
+        // For comparing, a long path has its ordinary spelling too (audit 4, N2); a name that
+        // needs the verbatim form still keeps it.
+        assert_eq!(unverbatim(&long), Some(format!(r"C:\{}", "a".repeat(300))));
+        assert_eq!(unverbatim(r"\\?\C:\Users\NUL.txt"), None);
     }
 
     #[cfg(windows)]

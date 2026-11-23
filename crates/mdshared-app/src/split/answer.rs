@@ -389,9 +389,11 @@ impl Dropped {
                 thousands(self.not_lines)
             ));
         }
+        // A note is emptied by a boundary moved to a block's edge, an overlap with the note
+        // before, or its blank lines trimmed: the words say all three (audit 4, N4).
         if self.emptied > 0 {
             why.push(format!(
-                "{} left empty by the note before",
+                "{} left with no lines of their own",
                 thousands(self.emptied)
             ));
         }

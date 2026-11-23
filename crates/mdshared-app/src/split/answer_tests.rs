@@ -145,6 +145,12 @@ fn blank_lines_at_the_ends_are_trimmed() {
     let (p, d) = split(r#"{"notes":[{"from":5,"to":11},{"from":2,"to":2}]}"#);
     assert_eq!(ranges(&p), [(6, 10)]);
     assert_eq!(d.emptied, 1);
+    // Line 2 is blank: no note before emptied it, and the sentence does not say one did (audit
+    // 4, N4).
+    assert_eq!(
+        d.text().as_deref(),
+        Some("Dropped 1 of the AI\u{2019}s 2 notes: 1 left with no lines of their own.")
+    );
 }
 
 #[test]

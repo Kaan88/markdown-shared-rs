@@ -1554,6 +1554,13 @@ impl PlanScreen {
         } else {
             let rows = self.rows();
             self.scroll = rows.clamp_scroll(self.scroll + dy);
+            // A name being typed stays in view: the list scrolls only as far as keeps its row
+            // whole (audit 4, N5).
+            if let Some(EditKind::Rename(k) | EditKind::Section(k)) =
+                self.edit.as_ref().map(|e| e.kind)
+            {
+                self.scroll = self.rows().reveal(k);
+            }
         }
     }
 
@@ -1792,7 +1799,16 @@ impl PlanScreen {
                         e.field.handle_key(&n, mods, typed, true);
                     }
                 }
-                None => {}
+                // A key with no name of its own still types its text, as it does in any other
+                // field (audit 4, N6).
+                None => {
+                    if let Some(t) = typed.filter(|t| !t.chars().any(char::is_control))
+                        && crate::keys::types_text(mods)
+                        && let Some(e) = self.edit.as_mut()
+                    {
+                        e.field.insert(t);
+                    }
+                }
             }
             return Act::Nothing;
         }
@@ -2538,6 +2554,82 @@ mod tests {
         s.press(r.cx(), r.cy());
         s.release(r.cx(), r.cy());
         assert_eq!(s.totals.notes, 23);
+    }
+
+    /// Audit 4, W10: the rename field's spot is what shows of it. With its row half under the
+    /// list's head, a click on "Tick all" ticks all and does not land in the field.
+    #[test]
+    fn a_rename_field_half_out_of_the_list_takes_no_click_meant_for_tick_all() {
+        let mut s = screen_of(&japan(), Some(2));
+        let spot = |s: &PlanScreen, h: PHit| {
+            s.spots
+                .iter()
+                .find(|(k, _)| *k == h)
+                .map(|(_, r)| *r)
+                .expect("a control")
+        };
+        render(&mut s, &LIGHT, 1280, 800);
+        let r = spot(&s, PHit::UntickAll);
+        s.press(r.cx(), r.cy());
+        s.release(r.cx(), r.cy());
+        assert_eq!(s.totals.notes, 0);
+        key(&mut s, KeyName::Down);
+        key(&mut s, KeyName::F(2));
+        assert!(matches!(
+            s.edit.as_ref().map(|e| e.kind),
+            Some(EditKind::Rename(1))
+        ));
+        s.scroll = ROW_H * 1.5;
+        render(&mut s, &LIGHT, 1280, 800);
+        let g = s.geo();
+        let field = spot(&s, PHit::Field);
+        assert!(
+            field.y >= g.list.y && field.bottom() <= g.list.bottom(),
+            "{field:?}"
+        );
+        // A point of "Tick all" the whole field would have covered.
+        let all = spot(&s, PHit::TickAll);
+        let row = s.rows().rect(g.list, 1);
+        let (x, y) = (all.cx(), g.list.y - 2.0);
+        assert!(all.contains(x, y) && row.contains(x, y), "{all:?} {row:?}");
+        s.press(x, y);
+        s.release(x, y);
+        assert_eq!(s.totals.notes, 23, "Tick all took the click");
+    }
+
+    /// Audit 4, N5: the wheel does not scroll a name being typed out of view.
+    #[test]
+    fn the_wheel_keeps_the_name_being_typed_in_view() {
+        let mut s = screen_of(&japan(), Some(2));
+        render(&mut s, &LIGHT, 1280, 800);
+        key(&mut s, KeyName::F(2));
+        let g = s.geo();
+        s.wheel(g.list.cx(), g.list.cy(), ROW_H * 10.0);
+        let r = s.rows().rect(g.list, 0);
+        assert!(r.y >= g.list.y && r.bottom() <= g.list.bottom(), "{r:?}");
+        // With no name being typed, it scrolls.
+        key(&mut s, KeyName::Escape);
+        s.wheel(g.list.cx(), g.list.cy(), ROW_H * 10.0);
+        assert!(s.scroll > ROW_H, "{}", s.scroll);
+    }
+
+    /// Audit 4, N6: text from a key with no name (a dead key's letter) goes into the name.
+    #[test]
+    fn a_key_with_no_name_types_its_text_into_the_name() {
+        let mut s = screen_of(&japan(), Some(2));
+        key(&mut s, KeyName::F(2));
+        s.edit.as_mut().expect("the field").field.set_text("Caf");
+        s.key(None, false, Mods::default(), Some("\u{e9}"));
+        assert_eq!(
+            s.edit.as_ref().expect("the field").field.text(),
+            "Caf\u{e9}"
+        );
+        // A control character is no text.
+        s.key(None, false, Mods::default(), Some("\u{7}"));
+        assert_eq!(
+            s.edit.as_ref().expect("the field").field.text(),
+            "Caf\u{e9}"
+        );
     }
 
     #[test]

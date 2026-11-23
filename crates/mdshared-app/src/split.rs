@@ -80,8 +80,13 @@ pub trait Lines: Debug + Send + Sync {
 /// Lines of a document as a comparison counts them: a final line break does not make a line.
 pub fn line_count(doc: &dyn Lines) -> usize {
     let n = doc.len_lines();
-    if doc.line_range_with_break(n - 1).is_empty() {
-        n - 1
+    // A document has a line even when empty; one that says it has none counts none (audit 4,
+    // N4).
+    let Some(last) = n.checked_sub(1) else {
+        return 0;
+    };
+    if doc.line_range_with_break(last).is_empty() {
+        last
     } else {
         n
     }
@@ -645,7 +650,7 @@ impl Plan {
                     "<!-- lines {}-{} of {} -->{}",
                     run.start.saturating_add(1),
                     run.end,
-                    self.name,
+                    comment_safe(&self.name),
                     self.eol_of(run.start)
                 ),
                 removed: 0,
@@ -1228,12 +1233,24 @@ impl Plan {
                 added: true,
             });
         }
-        let mut fence = Fence::default();
+        // Only the caller's headings are raised, the lines `bytes_of` counts: a line that
+        // reads as a heading and is not one of them (in an HTML block, say) stays as it is
+        // (audit 4, W9).
+        let first = self.headings.partition_point(|h| h.line < note.range.start);
+        let mut heads = self
+            .headings
+            .get(first..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|h| h.line)
+            .peekable();
         let mut raw = String::new();
         for line in note.range.clone() {
             if line >= self.total {
                 break;
             }
+            while heads.next_if(|&h| h < line).is_some() {}
+            let heading = heads.next_if_eq(&line).is_some();
             let body = self.doc.line_range(line);
             let full = self.doc.line_range_with_break(line);
             let break_len = full.len().saturating_sub(body.len());
@@ -1241,11 +1258,10 @@ impl Plan {
             let cut = raw.len().saturating_sub(break_len);
             let body_text = raw.get(..cut).unwrap_or("");
             let brk = raw.get(cut..).unwrap_or("");
-            let code = fence.line(body_text);
             let mut text = String::with_capacity(raw.len().saturating_add(1));
             let mut removed = 0u8;
             match atx(body_text) {
-                Some(a) if !code && note.heading_shift > 0 => {
+                Some(a) if heading && note.heading_shift > 0 => {
                     let new = a.level.saturating_sub(note.heading_shift).max(1);
                     removed = a.level.saturating_sub(new);
                     text.push_str(a.indent);
@@ -1464,6 +1480,24 @@ impl Atx<'_> {
 }
 
 /// The ATX heading a line is, if it is one.
+/// A file name as the comment above a run of the rest holds it: `--` cannot be in a comment
+/// (it would end it at `-->`), so the second hyphen of each pair is a U+2010 hyphen, which
+/// reads the same (audit 4, N4).
+fn comment_safe(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev = '\0';
+    for c in name.chars() {
+        let c = if c == '-' && prev == '-' {
+            '\u{2010}'
+        } else {
+            c
+        };
+        out.push(c);
+        prev = c;
+    }
+    out
+}
+
 fn atx(line: &str) -> Option<Atx<'_>> {
     let (cols, rest) = indent_of(line);
     if cols >= 4 {
@@ -2458,6 +2492,77 @@ We walked along the Sumida and ate at a stall.
         // The lines of the notes not made are in the rest, not lost.
         assert_eq!(p.rest().lines(), 11);
         assert_eq!(p.rest().runs().len(), 2);
+    }
+
+    /// Audit 4, W9 and T3: the headings are the caller's, and this test passes ones that
+    /// disagree with the module's own reading. A line that reads as a heading and is not one of
+    /// them (inside an HTML block, which the caller's outline knows of) is not raised, and the
+    /// byte count agrees with the text.
+    #[test]
+    fn only_the_callers_headings_are_raised() {
+        let text = "# A\n\n## B\n\n<pre>\n### not a heading\n</pre>\n\n### C\n";
+        let doc = buf(text);
+        let mut hs = headings_of(text);
+        let all = hs.len();
+        hs.retain(|h| h.line != 5);
+        assert_eq!(hs.len(), all - 1, "the scan reads line 6 as a heading");
+        let p = plan(&doc, "a.md", &hs, 2);
+        assert_ok(&p);
+        assert_eq!(p.notes().len(), 1);
+        assert_eq!(
+            p.note_text(0),
+            "# B\n\n<pre>\n### not a heading\n</pre>\n\n## C\n"
+        );
+    }
+
+    /// Audit 4, N4: a file name with `--` in it does not end the comment above a run of the
+    /// rest, and an empty document counts no line.
+    #[test]
+    fn the_rest_s_label_is_one_comment_whatever_the_name() {
+        let doc = buf(FIXTURE);
+        let p = plan(&doc, "a--b-->c.md", &headings_of(FIXTURE), 2);
+        let text = p.rest_text();
+        let labels: Vec<&str> = text.lines().filter(|l| l.starts_with("<!--")).collect();
+        assert_eq!(labels.len(), 2, "{text}");
+        for l in labels {
+            let inner = l
+                .strip_prefix("<!--")
+                .and_then(|l| l.strip_suffix("-->"))
+                .expect("one comment");
+            assert!(!inner.contains("--"), "{l}");
+            assert!(inner.contains("a-\u{2010}b-\u{2010}>c.md"), "{l}");
+        }
+        assert_ok(&p);
+
+        #[derive(Debug)]
+        struct NoLines;
+        impl Lines for NoLines {
+            fn len_lines(&self) -> usize {
+                0
+            }
+            fn line_range(&self, _: usize) -> Range<usize> {
+                0..0
+            }
+            fn line_range_with_break(&self, _: usize) -> Range<usize> {
+                0..0
+            }
+            fn line_start(&self, _: usize) -> usize {
+                0
+            }
+            fn len_bytes(&self) -> usize {
+                0
+            }
+            fn text(&self, _: Range<usize>, out: &mut String) {
+                out.clear();
+            }
+            fn char_at(&self, _: usize) -> Option<char> {
+                None
+            }
+            fn chunks(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+                Box::new(std::iter::empty())
+            }
+        }
+        assert_eq!(line_count(&NoLines), 0);
     }
 
     #[test]

@@ -5,10 +5,12 @@
 //! picture are created with [`crate::files::create_new`]: a name that is taken is refused
 //! before a byte is written, and the bytes reach the name by a rename that never replaces a file.
 //! A folder is only ever created, inside the library folder or the group's folder. The one
-//! deletion is undo's, and it goes only to what the record says this run created (`created`, set
-//! after the fact, never from the plan), only inside the library folder or the home the group's
-//! library file declares now, only a regular file with the extension a run writes, only while
-//! it is byte for byte the one it wrote, and only when no library file lists it any more.
+//! deletion is undo's, and it goes only to what the record says this run created (`created`: set
+//! after the fact, except for a note whose name was free when the run began, which is marked
+//! before it is written and put right after; never a file the run found there), only inside the
+//! library folder or the home the group's library file declares now, only a regular file with the
+//! extension a run writes, only while it is byte for byte the one it wrote, and only when no
+//! library file lists it any more.
 //!
 //! The order is the one of 4.3, and every prefix of it is a state that can be lived with: the
 //! record first, then folders, pictures, notes, the read-back, the links, the closed record, and
@@ -185,6 +187,11 @@ pub enum State {
     Stopped,
     /// Undo ran.
     Undone,
+    /// Undo ran and could not do all of it: a library file kept its lines, or the bin would
+    /// not take a note. Undo is offered again; Finish is not, since the owner asked for the run
+    /// to go (audit 4, A F2 and F3). A version before this one reads the word as a later
+    /// version's and leaves the record alone.
+    UndoPending,
 }
 
 impl State {
@@ -195,6 +202,7 @@ impl State {
             State::Done => "done",
             State::Stopped => "stopped",
             State::Undone => "undone",
+            State::UndoPending => "undo pending",
         }
     }
 
@@ -205,8 +213,15 @@ impl State {
             "done" => Some(State::Done),
             "stopped" => Some(State::Stopped),
             "undone" => Some(State::Undone),
+            "undo pending" => Some(State::UndoPending),
             _ => None,
         }
+    }
+
+    /// A run Finish can take further: one whose notes are written and whose links were not all
+    /// written, or that stopped before they were. Not one an undo has begun on.
+    pub fn finishable(self) -> bool {
+        matches!(self, State::Writing | State::LinksPending | State::Stopped)
     }
 
     /// A run that can be undone, or finished.
@@ -1162,22 +1177,56 @@ pub fn rewrite_into(
             "The file changed since it was read. Nothing was taken from the review.".to_string(),
         );
     }
+    // A record this program could not read back would keep the original where no undo finds
+    // it (audit 4, B2 and D2): it is refused before the file is touched.
+    if !rewrite_fits(record, library, file) {
+        return Err(RECORD_FULL.to_string());
+    }
+    let after = encoded(&file.after, file.bom);
+    record.originals.push(original_of(file));
+    // Whatever fails after this point takes the original out of the record again, in memory and
+    // on disk, so the record never names a file it did not rewrite (audit 4, B6).
+    if let Err(e) = record.close(record_path, library) {
+        record.originals.pop();
+        return Err(format!(
+            "The record could not be written, so nothing was: {e}"
+        ));
+    }
+    if let Err(e) = crate::files::replace(&file.path, &after) {
+        record.originals.pop();
+        let _ = record.close(record_path, library);
+        return Err(format!("The file could not be written: {e}"));
+    }
+    Ok(())
+}
+
+/// What [`rewrite_into`] says when the record has no room for one more original: the caller
+/// closes this record and starts another for the file.
+pub const RECORD_FULL: &str =
+    "The run's record has no room for this file's original. Nothing was written.";
+
+/// Whether the record, with `file`'s original added, is still one this program reads back
+/// ([`RECORD_MAX`]). A rewrite run whose next file does not fit is given a new record
+/// ([`start_rewrite`]) for it, so that every original stays where undo can find it.
+pub fn rewrite_fits(record: &Record, library: &Path, file: &RewriteFile) -> bool {
+    let mut with = record.clone();
+    with.originals.push(original_of(file));
+    with.to_json(library).len() as u64 <= RECORD_MAX
+}
+
+/// The record's entry for one file of a rewrite: its original text, and the digests before and
+/// after.
+fn original_of(file: &RewriteFile) -> Original {
     let before = encoded(&file.before, file.bom);
     let after = encoded(&file.after, file.bom);
-    record.originals.push(Original {
+    Original {
         path: file.path.clone(),
         sha256: crate::update::sha256_hex(&before),
         written: crate::update::sha256_hex(&after),
         len: before.len() as u64,
         bom: file.bom,
         text: file.before.clone(),
-    });
-    record
-        .close(record_path, library)
-        .map_err(|e| format!("The record could not be written, so nothing was: {e}"))?;
-    crate::settings::write_atomic_bytes(&file.path, &after)
-        .map_err(|e| format!("The file could not be written: {e}"))?;
-    Ok(())
+    }
 }
 
 /// A text as the bytes a file holds: a byte order mark when it had one, then UTF-8.
@@ -1514,43 +1563,14 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
         report.start_error = Some(format!("The run could not start: {why}"));
         return report;
     }
-    // 1. The record, state "writing", holding the whole plan. What the run did is not in it yet:
-    // no folder, no group file and no note is marked as made by this run until it was made, so a
-    // run that stops here leaves a record whose undo touches nothing it did not make.
-    let mut record = Record {
-        version: RECORD_VERSION,
-        kind,
-        started: started.to_string(),
-        started_secs: secs,
-        state: State::Writing,
-        instruction: req.instruction.clone(),
-        sent: req.sent.clone(),
-        source,
-        group: Group {
-            created: false,
-            ..req.group.clone()
-        },
-        folders: Vec::new(),
-        notes: req
-            .notes
-            .iter()
-            .map(|n| NoteRec {
-                path: n.path.clone(),
-                created: false,
-                // The digest of the bytes this note will hold, known before they are written.
-                sha256: crate::update::sha256_hex(n.text.as_bytes()),
-                ranges: n.ranges.clone(),
-                heading_shift: n.heading_shift,
-                title_added: n.title_added,
-                sections: n.sections.clone(),
-                line: library::link_line(&n.title, &n.link_path),
-            })
-            .collect(),
-        pictures: Vec::new(),
-        sections_added: Vec::new(),
-        moved: None,
-        originals: Vec::new(),
-    };
+    // 1. The record, state "writing", holding the whole plan. No folder and no group file is
+    // marked as made by this run until it was made. A note whose name is free now is marked as
+    // the run's before it is written, so that a run that dies while it writes its notes leaves a
+    // record that owns them (audit 4, A F9 and W5): undo removes such a note only while it holds,
+    // byte for byte, the text this run planned for it, and never a note it finds missing. Step 4
+    // puts the mark right for every note once it knows, and the record is written again after
+    // step 5.
+    let mut record = planned(req, kind, secs, started, source);
     let record_path = match record.create(&req.library) {
         Ok(path) => path,
         Err(e) => {
@@ -1643,9 +1663,19 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
         }
     }
 
-    // 4. Notes: each created at the name the plan gave it, never over a file.
+    // The folders and the pictures are the run's from here on: a run that dies while it writes
+    // its notes leaves a record that owns them too (audit 4, W5).
+    if !record.folders.is_empty() || !record.pictures.is_empty() {
+        let _ = record.close(&record_path, &req.library);
+    }
+
+    // 4. Notes: each created at the name the plan gave it, never over a file. A note is the
+    // run's only when this write made it; step 1's mark is put right for every other one.
     let mut written: Vec<usize> = Vec::new();
     for (i, note) in req.notes.iter().enumerate() {
+        if let Some(rec) = record.notes.get_mut(i) {
+            rec.created = false;
+        }
         if !inside_any(&note.path, req) {
             report.note_failures.push(Failure::new(
                 &note.path,
@@ -1779,6 +1809,45 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
     report
 }
 
+/// Step 1's record of a write: the whole plan, state "writing", with every note whose name is
+/// free now marked as the run's ([`write_of`] puts the marks right as it writes).
+fn planned(req: &Request, kind: Kind, secs: u64, started: &str, source: Source) -> Record {
+    Record {
+        version: RECORD_VERSION,
+        kind,
+        started: started.to_string(),
+        started_secs: secs,
+        state: State::Writing,
+        instruction: req.instruction.clone(),
+        sent: req.sent.clone(),
+        source,
+        group: Group {
+            created: false,
+            ..req.group.clone()
+        },
+        folders: Vec::new(),
+        notes: req
+            .notes
+            .iter()
+            .map(|n| NoteRec {
+                path: n.path.clone(),
+                created: n.path.symlink_metadata().is_err(),
+                // The digest of the bytes this note will hold, known before they are written.
+                sha256: crate::update::sha256_hex(n.text.as_bytes()),
+                ranges: n.ranges.clone(),
+                heading_shift: n.heading_shift,
+                title_added: n.title_added,
+                sections: n.sections.clone(),
+                line: library::link_line(&n.title, &n.link_path),
+            })
+            .collect(),
+        pictures: Vec::new(),
+        sections_added: Vec::new(),
+        moved: None,
+        originals: Vec::new(),
+    }
+}
+
 /// The text a note must hold, read from disk; `Err` says it does not read back the same.
 pub fn verify(path: &Path, expected: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -1888,15 +1957,16 @@ pub(crate) fn inside(library: &Path, home: &Path, path: &Path) -> bool {
     if library.as_os_str().is_empty() {
         return false;
     }
-    let path = crate::paths::canonical_or_absolute(path);
-    let library = crate::paths::canonical_or_absolute(library);
+    // Compared in one spelling, whatever their length (audit 4, N2).
+    let path = crate::paths::comparable(path);
+    let library = crate::paths::comparable(library);
     if under(&path, &library) && !same_path(&path, &library) {
         return true;
     }
     if home.as_os_str().is_empty() {
         return false;
     }
-    under(&path, &crate::paths::canonical_or_absolute(home))
+    under(&path, &crate::paths::comparable(home))
 }
 
 /// Whether `path` is `base` or lies below it, part by part, with the case rule of
@@ -1917,7 +1987,6 @@ fn inside_any(path: &Path, req: &Request) -> bool {
 
 /// Why the request must not be written, or `None`.
 fn outside(req: &Request) -> Option<String> {
-    let home = &req.group.home;
     for folder in &req.folders {
         if !inside_any(folder, req) {
             return Some(format!(
@@ -1942,7 +2011,14 @@ fn outside(req: &Request) -> Option<String> {
             ));
         }
     }
-    if !inside_any(&req.group.file, req) && home != &req.library {
+    // The group's file is a library file: a `.md` directly in the library folder, whatever the
+    // home is. A home that is the library folder itself waived the check before (audit 4, N1).
+    let library_file = Reach {
+        library: req.library.clone(),
+        home: None,
+    }
+    .is_library_file(&req.group.file);
+    if !library_file {
         return Some(format!(
             "{} is outside the library folder.",
             req.group.file.display()
@@ -2070,6 +2146,11 @@ pub fn check_links_removed(
 
 /// The library text with the section headings the run wrote taken out, when nothing is under
 /// them: deepest first, and only a heading whose path and place are still there.
+///
+/// "Nothing under it" means no note under it or under a heading inside it, and no line of
+/// anything else before the next heading of its level or above (or the end of the file): a
+/// sub-heading, a paragraph or a list of the owner's keeps the heading, so what they wrote is not
+/// left under the section before it (audit 3, C6; audit 4, A F5).
 pub fn with_headings_removed(text: &str, headings: &[Vec<String>], base: &Path) -> Option<String> {
     let mut out = text.to_string();
     let mut changed = false;
@@ -2090,7 +2171,15 @@ pub fn with_headings_removed(text: &str, headings: &[Vec<String>], base: &Path) 
         let Some(text_line) = out.lines().nth(line.saturating_sub(1)) else {
             continue;
         };
-        if !text_line.trim_start().starts_with('#') {
+        let Some(level) = atx_level(text_line) else {
+            continue;
+        };
+        let owned = out
+            .lines()
+            .skip(line)
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|next| atx_level(next).is_none_or(|l| l > level));
+        if owned {
             continue;
         }
         let mut lines: Vec<&str> = out.lines().collect();
@@ -2109,6 +2198,20 @@ pub fn with_headings_removed(text: &str, headings: &[Vec<String>], base: &Path) 
         changed = true;
     }
     changed.then_some(out)
+}
+
+/// The level of an ATX heading line (`## Tokyo` is 2), the way Markdown reads one: at most three
+/// spaces before one to six `#`, then a space or the end of the line.
+fn atx_level(line: &str) -> Option<usize> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let hashes = rest.len() - rest.trim_start_matches('#').len();
+    let after = &rest[hashes..];
+    ((1..=6).contains(&hashes) && (after.is_empty() || after.starts_with([' ', '\t'])))
+        .then_some(hashes)
 }
 
 pub(crate) fn sections_eq(a: &[String], b: &[String]) -> bool {
@@ -2280,12 +2383,20 @@ impl UndoPlan {
             return why.clone();
         }
         if !self.restore.is_empty() || !self.restore_kept.is_empty() || self.restore_gone > 0 {
+            // Each file is named where it is: a rewrite's record may name a file anywhere, so the
+            // question says which (audit 4, A F8).
             let mut s = if self.restore.is_empty() {
                 "Nothing of this run is left to put back.".to_string()
             } else {
+                let named: Vec<String> = self
+                    .restore
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
                 format!(
-                    "Puts back the original of {} this run rewrote.",
-                    count(self.restore.len(), "file", "files")
+                    "Puts back the original of {} this run rewrote: {}.",
+                    count(self.restore.len(), "file", "files"),
+                    named.join(", ")
                 )
             };
             if !self.restore_kept.is_empty() {
@@ -2328,7 +2439,10 @@ impl UndoPlan {
                 if goes.is_empty() {
                     s.push_str(&format!(": {lines} in {group}"));
                 } else {
-                    s.push_str(&format!(", their {lines} lines in {group}"));
+                    s.push_str(&format!(
+                        ", with {} in {group}",
+                        count(lines, "line", "lines")
+                    ));
                 }
             }
             if !self.folders.is_empty() {
@@ -2530,11 +2644,25 @@ impl Reach {
             library: library.to_path_buf(),
             home: declared_home(&record.group.file, library),
         };
+        // A group's file that is not there declares no folder, so a note in a folder outside the
+        // library cannot be checked against one: the sentence says that, and not that the record
+        // names a place it should not (audit 4, W2). Nothing is acted on either way.
+        let missing = record.group.file.symlink_metadata().is_err();
         let outside = |path: &Path| {
-            format!(
-                "{} is outside the library and the group's folder, so this run is not undone.",
-                path.display()
-            )
+            if missing {
+                format!(
+                    "The group's library file {} is not there, so the folder {} is in cannot be \
+                     checked, and this run is not undone or finished. Its notes are on disk as \
+                     they were; make the group again with that folder, or remove them yourself.",
+                    record.group.file.display(),
+                    path.display()
+                )
+            } else {
+                format!(
+                    "{} is outside the library and the group's folder, so this run is not undone.",
+                    path.display()
+                )
+            }
         };
         let foreign = |path: &Path| {
             format!(
@@ -2737,15 +2865,17 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     // A rewrite touches only the files it names, and puts back what each held: there is no
     // library in it, and nothing is created or removed. Each file goes back only while it still
     // holds the text this run wrote.
+    // A file the run rewrote twice has two originals: it goes back to the first one, while it
+    // holds what the last one wrote (audit 4, W1).
     if record.kind == Kind::Rewrite {
-        for original in &record.originals {
-            match digest_of(&original.path) {
+        for (first, last) in rewrite_chains(record) {
+            match digest_of(&first.path) {
                 None => plan.restore_gone += 1,
-                Some(d) if d.eq_ignore_ascii_case(&original.written) => {
-                    plan.restore.push(original.path.clone())
+                Some(d) if d.eq_ignore_ascii_case(&last.written) => {
+                    plan.restore.push(first.path.clone())
                 }
-                Some(d) if d.eq_ignore_ascii_case(&original.sha256) => plan.restore_gone += 1,
-                Some(_) => plan.restore_kept.push(original.path.clone()),
+                Some(d) if d.eq_ignore_ascii_case(&first.sha256) => plan.restore_gone += 1,
+                Some(_) => plan.restore_kept.push(first.path.clone()),
             }
         }
         return (plan, None);
@@ -2897,7 +3027,29 @@ pub fn with_removals(
 ) -> Option<String> {
     let without = with_links_removed(text, links, base);
     let swept = with_headings_removed(without.as_deref().unwrap_or(text), headings, base);
-    swept.or(without)
+    swept
+        .or(without)
+        .map(|new| without_new_trailing_blanks(text, new))
+}
+
+/// `new` without the blank lines at its end when `old` ended with a line of text: a blank line
+/// that is last only because the lines after it were taken out, as the one a run's first link
+/// is written below (audit 4, C11). Blank lines the file ended with before are kept.
+fn without_new_trailing_blanks(old: &str, new: String) -> String {
+    let ended_blank = |t: &str| t.lines().last().is_some_and(|l| l.trim().is_empty());
+    if ended_blank(old) || !ended_blank(&new) {
+        return new;
+    }
+    let eol = if new.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<&str> = new.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let mut out = lines.join(eol);
+    if !out.is_empty() {
+        out.push_str(eol);
+    }
+    out
 }
 
 /// Undoes one run: the links, then the files, then the group's file, then the folders, and the
@@ -3005,9 +3157,12 @@ pub fn undo_with(
         }
     }
     // 4. The group's library file, only when this run made it and nothing but its heading and
-    //    its `home:` line is left in it.
+    //    its `home:` line is left in it. Not while a note the bin would not take is still on
+    //    disk: its `home:` is what lets the next undo reach that note (audit 4, A F2).
     if let Some(file) = &plan.group_file {
-        if reach.is_library_file(file)
+        if !report.bin_failures.is_empty() {
+            report.group_kept = true;
+        } else if reach.is_library_file(file)
             && file.symlink_metadata().is_ok_and(|m| m.is_file())
             && only_heading_and_home(file)
         {
@@ -3031,13 +3186,14 @@ pub fn undo_with(
             report.folders_kept.push(folder.clone());
         }
     }
-    // 6. The record is marked and stays in the list, but only when its links went: a run whose
-    //    lines are still in a library file is not undone, and undo can be pressed again.
+    // 6. The record is marked and stays in the list, but only when its links and its notes
+    //    went: a run whose lines are still in a library file, or whose note the bin would not
+    //    take, is not undone, and undo can be pressed again (audit 4, A F2).
     let mut marked = record.clone();
-    marked.state = if report.failures.is_empty() {
+    marked.state = if report.failures.is_empty() && report.bin_failures.is_empty() {
         State::Undone
     } else {
-        State::LinksPending
+        State::UndoPending
     };
     match marked.close(path, library) {
         Ok(()) => report.marked = true,
@@ -3062,31 +3218,30 @@ fn undo_rewrite(
 ) -> UndoReport {
     report.kept.extend(plan.restore_kept.iter().cloned());
     report.restore_kept = plan.restore_kept.clone();
-    for original in &record.originals {
-        if !plan.restore.iter().any(|p| same_path(p, &original.path)) {
+    for (first, last) in rewrite_chains(record) {
+        if !plan.restore.iter().any(|p| same_path(p, &first.path)) {
             continue;
         }
         // Read again just before writing: the file may have changed since the plan was made.
-        let same =
-            digest_of(&original.path).is_some_and(|d| d.eq_ignore_ascii_case(&original.written));
+        let same = digest_of(&first.path).is_some_and(|d| d.eq_ignore_ascii_case(&last.written));
         if !same {
-            report.restore_kept.push(original.path.clone());
-            report.kept.push(original.path.clone());
+            report.restore_kept.push(first.path.clone());
+            report.kept.push(first.path.clone());
             continue;
         }
-        let bytes = encoded(&original.text, original.bom);
-        match crate::settings::write_atomic_bytes(&original.path, &bytes) {
-            Ok(()) => report.restored.push(original.path.clone()),
+        let bytes = encoded(&first.text, first.bom);
+        match crate::files::replace(&first.path, &bytes) {
+            Ok(()) => report.restored.push(first.path.clone()),
             Err(e) => report
                 .failures
-                .push(Failure::new(&original.path, e.to_string())),
+                .push(Failure::new(&first.path, e.to_string())),
         }
     }
     let mut marked = record.clone();
     marked.state = if report.failures.is_empty() {
         State::Undone
     } else {
-        State::Done
+        State::UndoPending
     };
     match marked.close(path, library) {
         Ok(()) => report.marked = true,
@@ -3094,6 +3249,31 @@ fn undo_rewrite(
     }
     report.plan = Some(plan);
     report
+}
+
+/// A rewrite's originals, one pair per file in the order they were first written: the original
+/// undo puts back, and the last one (whose `written` the file holds when nothing changed it
+/// since). For a file rewritten more than once the first is the earliest original of the unbroken
+/// chain that ends at the last, each one written over what the one before it wrote: a text the
+/// owner put in the file between two of the run's writes is the farthest back undo goes, so an
+/// edit of the owner's is never undone with the run.
+fn rewrite_chains(record: &Record) -> Vec<(&Original, &Original)> {
+    let mut chains: Vec<(&Original, &Original)> = Vec::new();
+    for original in &record.originals {
+        match chains
+            .iter_mut()
+            .find(|(first, _)| same_path(&first.path, &original.path))
+        {
+            Some((first, last)) => {
+                if !original.sha256.eq_ignore_ascii_case(&last.written) {
+                    *first = original;
+                }
+                *last = original;
+            }
+            None => chains.push((original, original)),
+        }
+    }
+    chains
 }
 
 /// Whether a library file holds nothing but its group's heading and its `home:` line.
@@ -3120,6 +3300,11 @@ fn only_heading_and_home(path: &Path) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct FinishReport {
     pub added: usize,
+    /// Notes the library file lists already: nothing to add for them.
+    pub present: usize,
+    /// Notes that are not on disk with the bytes the run wrote: gone, or changed since. They
+    /// cannot be written again from the record, and are left out (audit 3, C4).
+    pub left_out: Vec<PathBuf>,
     pub failures: Vec<Failure>,
     pub state: Option<State>,
     pub error: Option<String>,
@@ -3132,6 +3317,11 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
     let mut report = FinishReport::default();
     if !record.state.live() {
         report.error = Some("This run is undone already.".to_string());
+        return report;
+    }
+    if record.state == State::UndoPending {
+        report.error =
+            Some("This run is being undone: Undo it again to take the rest of it out.".to_string());
         return report;
     }
     if record.kind == Kind::Move {
@@ -3152,8 +3342,12 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
     let present = read_regular(&record.group.file, library::MAX_FILE_BYTES as u64, true)
         .map(|b| library::parse(&crate::files::decode(&b).0, library));
     let mut links: Vec<Link> = Vec::new();
+    // The headings the file does not have yet, as the write works them out: the run's own, so
+    // undo takes them out again with its lines (audit 4, A F4).
+    let mut added: Vec<Vec<String>> = Vec::new();
     for note in &record.notes {
         if !digest_of(&note.path).is_some_and(|d| d.eq_ignore_ascii_case(&note.sha256)) {
+            report.left_out.push(note.path.clone());
             continue;
         }
         let already = present.as_ref().is_some_and(|p| {
@@ -3162,7 +3356,20 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
                 .any(|e| same_path(&e.path, &note.path) && sections_eq(&e.sections, &note.sections))
         });
         if already {
+            report.present += 1;
             continue;
+        }
+        for n in 1..=note.sections.len() {
+            let path: Vec<String> = note.sections[..n].to_vec();
+            let known = present
+                .as_ref()
+                .is_some_and(|p| p.sections.iter().any(|s| sections_eq(s, &path)));
+            if !known
+                && !added.iter().any(|s| sections_eq(s, &path))
+                && !record.sections_added.iter().any(|s| sections_eq(s, &path))
+            {
+                added.push(path);
+            }
         }
         // The link is the recorded line, with the path as the line spells it: the same text a
         // write of the run would have put in the file, so that undo finds it as the run's own.
@@ -3179,13 +3386,16 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
             line: note.line.clone(),
         });
     }
+    let mut closed = record.clone();
     if !links.is_empty() {
         match gate.add_links(&record.group.file, &links) {
-            Ok(()) => report.added = links.len(),
+            Ok(()) => {
+                report.added = links.len();
+                closed.sections_added.extend(added);
+            }
             Err(why) => report.failures.push(Failure::new(&record.group.file, why)),
         }
     }
-    let mut closed = record.clone();
     closed.state = if report.failures.is_empty() {
         State::Done
     } else {
@@ -3229,6 +3439,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch folder");
         dir
+    }
+
+    /// Audit 4, N2: a note whose path is 260 characters or more is inside its library; the
+    /// long path is not read as outside it for its spelling.
+    #[cfg(windows)]
+    #[test]
+    fn a_long_path_inside_the_library_is_inside_it() {
+        let library = scratch("long");
+        let note = library
+            .join("a".repeat(100))
+            .join("b".repeat(100))
+            .join(format!("{}.md", "c".repeat(60)));
+        write_file(&note, "# Long\n");
+        assert!(note.as_os_str().len() >= 260, "{}", note.display());
+        assert!(inside(&library, Path::new(""), &note));
+        assert!(!inside(&library.join("a"), Path::new(""), &note));
+        let _ = std::fs::remove_dir_all(&library);
     }
 
     fn write_file(path: &Path, text: &str) {
@@ -4338,8 +4565,18 @@ mod tests {
         assert!(group.contains("[One]"), "{group}");
         assert!(group.contains("[Two]"), "{group}");
         let again = load(&record_path, &library).expect("the record stays");
-        assert_eq!(again.state, State::LinksPending);
+        // "Undo pending", not "links pending": the owner asked for the run to go, so Finish is
+        // not what comes next (audit 4, A F3).
+        assert_eq!(again.state, State::UndoPending);
         assert!(again.state.live(), "Undo is offered again");
+        assert!(!again.state.finishable());
+        let mut gate = TestGate::new();
+        let finished = finish(&record_path, &again, &library, &mut gate);
+        assert!(finished.error.is_some(), "{finished:?}");
+        assert_eq!(
+            load(&record_path, &library).expect("the record").state,
+            State::UndoPending
+        );
         // With the file saved or closed, the same press finishes the job.
         let mut gate = TestGate::new();
         let done = undo(&record_path, &again, &library, &mut gate);
@@ -4810,6 +5047,462 @@ mod tests {
         let undone = undo(&path, &record, &library, &mut gate);
         assert_eq!(undone.refusal, None);
         assert_eq!(read(&file), "one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- audit 4 -------------------------------------------------------------------------
+
+    fn rewrite_file(path: &Path, before: &str, after: &str) -> RewriteFile {
+        RewriteFile {
+            path: path.to_path_buf(),
+            before: before.to_string(),
+            after: after.to_string(),
+            bom: false,
+        }
+    }
+
+    /// A F2 (W4): a note the bin refuses at undo keeps the run live ("undo pending") and keeps
+    /// the group's file that reaches it, so a second undo takes the note out.
+    #[test]
+    fn a_note_the_bin_refuses_keeps_the_run_to_be_undone_again() {
+        let dir = scratch("a4-bin-refuses");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(&library, &source, &[("One", "# One\n", &[])]);
+        let mut gate = TestGate::new();
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        let path = report.record_path.clone().expect("a record");
+        let record = load(&path, &library).expect("the record");
+        let mut bin = TestBin::new(&dir);
+        bin.refuse = Some("the file is in use".to_string());
+        let done = undo_with(&path, &record, &library, &mut gate, &mut bin);
+        assert_eq!(done.bin_failures.len(), 1);
+        assert!(library.join("Trip/One.md").is_file(), "the note is kept");
+        assert!(
+            library.join("Trip.md").is_file(),
+            "the group's file stays while a note of the run is on disk"
+        );
+        assert!(done.group_kept);
+        let again = load(&path, &library).expect("the record");
+        assert_eq!(again.state, State::UndoPending);
+        assert_eq!(prepare(&again, &library).refusal, None);
+        // The bin takes it the second time.
+        let mut bin = TestBin::new(&dir);
+        let done = undo_with(&path, &again, &library, &mut gate, &mut bin);
+        assert!(done.bin_failures.is_empty(), "{:?}", done.bin_failures);
+        assert_eq!(done.removed_notes, vec![library.join("Trip/One.md")]);
+        assert!(!library.join("Trip/One.md").exists());
+        assert!(done.group_removed, "{done:?}");
+        assert_eq!(
+            load(&path, &library).expect("the record").state,
+            State::Undone
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F4 (W6): Finish records the headings it wrote, so undo takes them out with the lines,
+    /// and the group's file the run made goes too.
+    #[test]
+    fn finish_records_its_headings_and_undo_takes_them_and_the_groups_file_out() {
+        let dir = scratch("a4-finish-headings");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(&library, &source, &[("One", "# One\n", &["Tokyo"])]);
+        let mut refusing = TestGate::new();
+        refusing.refusals.push(library.join("Trip.md"));
+        let report = write_at(&req, &mut refusing, 3, "2026-11-21T14:03:11Z");
+        assert_eq!(report.state(), Some(State::LinksPending));
+        let path = report.record_path.clone().expect("a record");
+        let record = load(&path, &library).expect("the record");
+        assert!(record.sections_added.is_empty());
+        let mut gate = TestGate::new();
+        let finished = finish(&path, &record, &library, &mut gate);
+        assert_eq!(finished.added, 1, "{:?}", finished.failures);
+        let record = load(&path, &library).expect("the record");
+        assert_eq!(record.sections_added, vec![vec!["Tokyo".to_string()]]);
+        assert!(read(&library.join("Trip.md")).contains("## Tokyo"));
+        let done = undo(&path, &record, &library, &mut gate);
+        assert_eq!(done.removed_notes.len(), 1);
+        assert!(done.group_removed, "{done:?}");
+        assert!(!library.join("Trip.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 3 C4: Finish says what it left out, and links nothing for a note that is gone.
+    #[test]
+    fn finish_says_which_notes_it_left_out() {
+        let dir = scratch("a4-finish-left-out");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", &[]), ("Two", "# Two\n", &[])],
+        );
+        let mut refusing = TestGate::new();
+        refusing.refusals.push(library.join("Trip.md"));
+        let report = write_at(&req, &mut refusing, 3, "2026-11-21T14:03:11Z");
+        let path = report.record_path.clone().expect("a record");
+        let record = load(&path, &library).expect("the record");
+        std::fs::remove_file(library.join("Trip/Two.md")).expect("gone");
+        let mut gate = TestGate::new();
+        let finished = finish(&path, &record, &library, &mut gate);
+        assert_eq!(finished.added, 1);
+        assert_eq!(finished.left_out, vec![library.join("Trip/Two.md")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F5 (audit 3, C6): a heading the run wrote stays while the owner wrote anything under it,
+    /// and goes when nothing is.
+    #[test]
+    fn a_heading_the_owner_wrote_under_is_kept() {
+        let base = Path::new("C:/lib");
+        let tokyo = vec!["Tokyo".to_string()];
+        let sub = "# Trip\nhome: Trip\n\n## Tokyo\n\n### My own plans\n\n";
+        assert_eq!(
+            with_headings_removed(sub, std::slice::from_ref(&tokyo), base),
+            None
+        );
+        let prose = "# Trip\nhome: Trip\n\n## Tokyo\n\nTrains leave at nine.\n\n## Kyoto\n";
+        assert_eq!(
+            with_headings_removed(prose, std::slice::from_ref(&tokyo), base),
+            None
+        );
+        let empty = "# Trip\nhome: Trip\n\n## Tokyo\n\n## Kyoto\n";
+        assert_eq!(
+            with_headings_removed(empty, std::slice::from_ref(&tokyo), base).as_deref(),
+            Some("# Trip\nhome: Trip\n\n\n## Kyoto\n")
+        );
+        let last = "# Trip\nhome: Trip\n\n## Tokyo\n\n";
+        assert_eq!(
+            with_headings_removed(last, std::slice::from_ref(&tokyo), base).as_deref(),
+            Some("# Trip\nhome: Trip\n\n\n")
+        );
+        // A deeper heading of the run's own, emptied too, goes first and its parent after it.
+        let nested = "# Trip\n\n## Japan\n\n### Tokyo\n\n";
+        let both = [
+            vec!["Japan".to_string()],
+            vec!["Japan".to_string(), "Tokyo".to_string()],
+        ];
+        assert_eq!(
+            with_headings_removed(nested, &both, base).as_deref(),
+            Some("# Trip\n\n\n\n")
+        );
+    }
+
+    /// C11: undo of a note added to a group that was there leaves its file as it was, byte for
+    /// byte, and not with the blank line the first link was written below.
+    #[test]
+    fn undo_leaves_a_group_file_it_did_not_make_as_it_was() {
+        let base = Path::new("C:/lib");
+        let before = "# Recipes\nhome: Recipes\n";
+        let link = Link {
+            path: PathBuf::from("Recipes/pasta.md"),
+            title: "pasta".to_string(),
+            sections: Vec::new(),
+            line: library::link_line("pasta", Path::new("Recipes/pasta.md")),
+        };
+        let written = with_links_added(before, std::slice::from_ref(&link));
+        assert_ne!(written, before);
+        let removal = LinkRemoval {
+            path: link.path.clone(),
+            sections: Vec::new(),
+            line: link.line.clone(),
+        };
+        assert_eq!(
+            with_removals(&written, std::slice::from_ref(&removal), &[], base).as_deref(),
+            Some(before)
+        );
+        // A file that ends with blank lines of its own keeps them.
+        let owned = format!("{written}\n");
+        assert_eq!(
+            with_removals(&owned, &[removal], &[], base).as_deref(),
+            Some("# Recipes\nhome: Recipes\n\n\n")
+        );
+    }
+
+    /// B2 and D2: a rewrite's record that would pass the reader's cap is refused before the file
+    /// is touched, so every original the record holds can be read back and undone.
+    #[test]
+    fn a_rewrite_record_never_grows_past_what_can_be_read_back() {
+        let dir = scratch("a4-record-full");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        // Short lines escape to two bytes each: twenty files of 200 KB pass 4 MiB.
+        let text: String = "a\r\n".repeat(66_000);
+        let mut files = Vec::new();
+        for i in 0..20 {
+            let file = dir.join(format!("f{i}.txt"));
+            write_file(&file, &text);
+            files.push(file);
+        }
+        let (path, mut record) =
+            start_rewrite(&library, "shorten", None, &files[0]).expect("a record");
+        let mut refused = None;
+        for (i, file) in files.iter().enumerate() {
+            let one = rewrite_file(file, &text, "gone\n");
+            let fits = rewrite_fits(&record, &library, &one);
+            match rewrite_into(&path, &mut record, &library, &one) {
+                Ok(()) => assert!(fits),
+                Err(why) => {
+                    assert!(!fits);
+                    assert_eq!(why, RECORD_FULL);
+                    assert_eq!(read(file), text, "the file is not touched");
+                    refused = Some(i);
+                    break;
+                }
+            }
+        }
+        let refused = refused.expect("the cap is reached before the twentieth file");
+        assert!(refused > 0);
+        assert!(std::fs::metadata(&path).expect("the record").len() <= RECORD_MAX);
+        let (runs, unread) = list_all(&library);
+        assert!(unread.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].record.originals.len(), refused);
+        let mut gate = TestGate::new();
+        let done = undo(&path, &runs[0].record, &library, &mut gate);
+        assert_eq!(done.restored.len(), refused);
+        assert_eq!(read(&files[0]), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B6 and N8: a file that cannot be written leaves no original in the record, in memory or
+    /// on disk, and no temporary beside it; a `<name>.tmp` of the owner's is never touched (D1).
+    #[test]
+    fn a_rewrite_that_cannot_write_its_file_leaves_no_trace() {
+        let dir = scratch("a4-rewrite-fails");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "one\n");
+        write_file(&dir.join("notes.txt.tmp"), "the owner's\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        let mut p = std::fs::metadata(&file).expect("there").permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&file, p).expect("read-only");
+        let failed = rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        );
+        assert!(failed.is_err());
+        assert!(record.originals.is_empty());
+        assert!(
+            load(&path, &library)
+                .expect("the record")
+                .originals
+                .is_empty()
+        );
+        assert_eq!(read(&file), "one\n");
+        assert_eq!(read(&dir.join("notes.txt.tmp")), "the owner's\n");
+        let mut p = std::fs::metadata(&file).expect("there").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        std::fs::set_permissions(&file, p).expect("writable");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        )
+        .expect("the write");
+        assert_eq!(read(&file), "ONE\n");
+        assert_eq!(read(&dir.join("notes.txt.tmp")), "the owner's\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W1: a file rewritten twice in one record goes back to what it held before the run, and
+    /// the run is undone.
+    #[test]
+    fn a_file_rewritten_twice_in_one_record_is_undone_to_its_first_text() {
+        let dir = scratch("a4-twice");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "zero\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "zero\n", "one\n"),
+        )
+        .expect("first");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "two\n"),
+        )
+        .expect("second");
+        record.state = State::Done;
+        record.close(&path, &library).expect("closed");
+        let record = load(&path, &library).expect("it reads");
+        let plan = prepare(&record, &library);
+        assert_eq!(plan.restore, vec![file.clone()]);
+        assert!(plan.restore_kept.is_empty());
+        let mut gate = TestGate::new();
+        let done = undo(&path, &record, &library, &mut gate);
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert_eq!(read(&file), "zero\n");
+        assert_eq!(
+            load(&path, &library).expect("the record").state,
+            State::Undone
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W1: a text the owner put in the file between two of the run's writes is as far back as
+    /// undo goes.
+    #[test]
+    fn undo_of_a_file_rewritten_twice_stops_at_an_edit_of_the_owners() {
+        let dir = scratch("a4-twice-edited");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "zero\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "zero\n", "one\n"),
+        )
+        .expect("first");
+        write_file(&file, "one, and the owner's line\n");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one, and the owner's line\n", "two\n"),
+        )
+        .expect("second");
+        let mut gate = TestGate::new();
+        let done = undo(&path, &record, &library, &mut gate);
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert_eq!(read(&file), "one, and the owner's line\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F8: the question names each file a rewrite would put back, where it is.
+    #[test]
+    fn the_rewrite_question_names_its_files() {
+        let dir = scratch("a4-named");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("elsewhere/notes.txt");
+        write_file(&file, "one\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, "one\n", "ONE\n"),
+        )
+        .expect("the write");
+        let sentence = prepare(&record, &library).sentence("");
+        assert!(sentence.contains(&file.display().to_string()), "{sentence}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W2: a run whose group file was never made, its home outside the library, says so, and
+    /// neither undo nor finish acts on it.
+    #[test]
+    fn a_run_whose_group_file_was_never_made_says_so() {
+        let dir = scratch("a4-no-group-file");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let mut req = plan(&library, &source, &[("One", "# One\n", &[])]);
+        let home = dir.join("Notes/Trip");
+        req.group.home = home.clone();
+        req.folders = vec![home.clone()];
+        req.notes[0].path = home.join("One.md");
+        req.notes[0].link_path = home.join("One.md");
+        // The library is full, so the group's file is not made.
+        for i in 0..library::MAX_FILES {
+            write_file(&library.join(format!("g{i:03}.md")), "# G\n");
+        }
+        let mut gate = TestGate::new();
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        assert!(report.group_failure.is_some());
+        assert!(home.join("One.md").is_file());
+        let path = report.record_path.clone().expect("a record");
+        let record = load(&path, &library).expect("the record");
+        let why = prepare(&record, &library).refusal.expect("refused");
+        assert!(why.contains("is not there"), "{why}");
+        let finished = finish(&path, &record, &library, &mut gate);
+        assert!(
+            finished
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("is not there")),
+            "{finished:?}"
+        );
+        assert!(home.join("One.md").is_file(), "nothing is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// N1: a group's file that is not directly in the library folder is refused, also when the
+    /// home is the library folder itself.
+    #[test]
+    fn a_group_file_outside_the_library_folder_is_refused_whatever_the_home() {
+        let dir = scratch("a4-group-outside");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let mut req = plan(&library, &source, &[("One", "# One\n", &[])]);
+        req.group.home = library.clone();
+        req.group.file = dir.join("elsewhere/Trip.md");
+        let mut gate = TestGate::new();
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        assert!(
+            report
+                .start_error
+                .as_deref()
+                .is_some_and(|e| e.contains("outside the library folder")),
+            "{:?}",
+            report.start_error
+        );
+        assert!(!dir.join("elsewhere/Trip.md").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A F9 and W5: the record made before anything is written owns every note whose name is
+    /// free, so a run that dies while it writes leaves a record whose undo can take them out;
+    /// a name that is taken is never the run's.
+    #[test]
+    fn the_first_record_owns_the_notes_whose_names_are_free() {
+        let dir = scratch("a4-planned");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", &[]), ("Two", "# Two\n", &[])],
+        );
+        write_file(&library.join("Trip/Two.md"), "# Two\n");
+        let src = Source {
+            path: source.clone(),
+            len: 0,
+            sha256: String::new(),
+            recycled: false,
+        };
+        let record = planned(&req, Kind::Split, 3, "2026-11-21T14:03:11Z", src);
+        assert!(record.notes[0].created, "a free name is the run's");
+        assert!(!record.notes[1].created, "a taken name is never the run's");
+        // And a run that finished puts the marks right: Two was there with the same bytes.
+        let mut gate = TestGate::new();
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        let record = report.record.expect("the record");
+        assert!(record.notes[0].created);
+        assert!(!record.notes[1].created);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
