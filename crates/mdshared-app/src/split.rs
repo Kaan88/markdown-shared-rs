@@ -778,18 +778,16 @@ impl Plan {
     }
 
     /// Moves the note at `i` to the section path `sections`: names trimmed, cut to
-    /// [`SPLIT_SECTION_MAX`] bytes, empty ones dropped, at most [`SPLIT_MAX_SECTIONS`] kept. Its
-    /// lines, title and tick are not changed, and no file is moved or made.
+    /// [`SPLIT_SECTION_MAX`] bytes, empty ones and ones of only dots dropped (as an AI's answer
+    /// has them dropped: `..` would name the folder above), at most [`SPLIT_MAX_SECTIONS`] kept.
+    /// Its lines, title and tick are not changed, and no file is moved or made.
     pub fn move_to_section(&mut self, i: usize, sections: &[&str]) {
         let Some(note) = self.notes.get_mut(i) else {
             return;
         };
         note.sections = sections
             .iter()
-            .filter_map(|s| {
-                let name = clean(s, SPLIT_SECTION_MAX);
-                (!name.is_empty()).then_some(name)
-            })
+            .filter_map(|s| answer::section_name(s))
             .take(SPLIT_MAX_SECTIONS)
             .collect();
     }
@@ -1479,7 +1477,6 @@ impl Atx<'_> {
     }
 }
 
-/// The ATX heading a line is, if it is one.
 /// A file name as the comment above a run of the rest holds it: `--` cannot be in a comment
 /// (it would end it at `-->`), so the second hyphen of each pair is a U+2010 hyphen, which
 /// reads the same (audit 4, N4).
@@ -1498,6 +1495,7 @@ fn comment_safe(name: &str) -> String {
     out
 }
 
+/// The ATX heading a line is, if it is one.
 fn atx(line: &str) -> Option<Atx<'_>> {
     let (cols, rest) = indent_of(line);
     if cols >= 4 {
@@ -2476,6 +2474,11 @@ We walked along the Sumida and ate at a stall.
         assert!(p.note(0).expect("a note").sections().is_empty());
         assert_ok(&p);
         assert!(p.sections().contains(&Vec::<String>::new()));
+        // A name of only dots names the folder above, as an AI's answer would have it: it is
+        // dropped too (audit 4, N4). Dots inside a name are the name's own.
+        p.move_to_section(0, &["..", "Tokyo", " . ", "a.b", "..."]);
+        assert_eq!(p.note(0).expect("a note").sections(), ["Tokyo", "a.b"]);
+        assert_ok(&p);
     }
 
     #[test]

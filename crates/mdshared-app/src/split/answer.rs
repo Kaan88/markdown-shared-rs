@@ -548,8 +548,9 @@ fn snap_end(blocks: &[Block], e: usize) -> (usize, Option<Fix>) {
 }
 
 /// A section name as a plan keeps it (check 9): one line, trimmed, cut to the folder length;
-/// nothing when it has no text or is only dots, which would name the folder above.
-fn section_name(name: &str) -> Option<String> {
+/// nothing when it has no text or is only dots, which would name the folder above. The plan's
+/// own [`Plan::move_to_section`] keeps a name by the same rule.
+pub(super) fn section_name(name: &str) -> Option<String> {
     let name = clean(name, super::SPLIT_SECTION_MAX);
     let bare = name.trim_matches(|c: char| c == '.' || c.is_whitespace());
     (!bare.is_empty()).then_some(name)
