@@ -140,6 +140,9 @@ fn stamp(secs: u64, kind: Kind) -> String {
 pub enum Kind {
     Split,
     Move,
+    /// A text file rewritten in place (`docs/ai-library-plan.md` 5.6, D-074): the record holds
+    /// the original text of every file the run overwrote (D-076).
+    Rewrite,
 }
 
 impl Kind {
@@ -147,6 +150,7 @@ impl Kind {
         match self {
             Kind::Split => "split",
             Kind::Move => "move",
+            Kind::Rewrite => "rewrite",
         }
     }
 
@@ -154,6 +158,7 @@ impl Kind {
         match text {
             "split" => Some(Kind::Split),
             "move" => Some(Kind::Move),
+            "rewrite" => Some(Kind::Rewrite),
             _ => None,
         }
     }
@@ -262,6 +267,24 @@ pub struct PictureRec {
     pub sha256: String,
 }
 
+/// One file a [`Kind::Rewrite`] run overwrote: the original text (D-076), and the digests
+/// before and after, so undo can tell the rewritten file from one changed since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Original {
+    pub path: PathBuf,
+    /// The file's digest before the run.
+    pub sha256: String,
+    /// The digest this run left in the file. Undo puts the original back only while the file
+    /// still holds this text.
+    pub written: String,
+    /// The original's length in bytes.
+    pub len: u64,
+    /// The original began with a UTF-8 byte order mark; undo writes it back with one.
+    pub bom: bool,
+    /// The original text, as it was read.
+    pub text: String,
+}
+
 /// One run's record, in memory with absolute paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -286,6 +309,9 @@ pub struct Record {
     /// What a [`Kind::Move`] did: the files it moved, the lines it rewrote and the folders it
     /// removed. `None` for a split, whose record has no such part.
     pub moved: Option<crate::moves::Moved>,
+    /// What a [`Kind::Rewrite`] overwrote: each file's original text (D-076). Empty for every
+    /// other kind, and for a record written before this field existed.
+    pub originals: Vec<Original>,
 }
 
 /// A record read from disk.
@@ -745,7 +771,23 @@ impl Record {
                 )
             })
             .collect();
-        s.push_str(&format!("  \"pictures\": [{}]\n", pictures.join(", ")));
+        s.push_str(&format!("  \"pictures\": [{}],\n", pictures.join(", ")));
+        let originals: Vec<String> = self
+            .originals
+            .iter()
+            .map(|o| {
+                format!(
+                    "{{\"path\": \"{}\", \"sha256\": \"{}\", \"written\": \"{}\", \"len\": {}, \"bom\": {}, \"text\": \"{}\"}}",
+                    esc(&stored(&o.path, library)),
+                    esc(&o.sha256),
+                    esc(&o.written),
+                    o.len,
+                    o.bom,
+                    esc(&o.text)
+                )
+            })
+            .collect();
+        s.push_str(&format!("  \"originals\": [{}]\n", originals.join(", ")));
         s.push_str("}\n");
         s
     }
@@ -915,6 +957,33 @@ impl Record {
                     .collect()
             })
             .unwrap_or_default();
+        let originals = json
+            .get("originals")
+            .and_then(Json::arr)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| {
+                        let text = o.get("text")?.str()?.to_string();
+                        Some(Original {
+                            path: resolved(o.get("path")?.str()?, library),
+                            sha256: o
+                                .get("sha256")
+                                .and_then(Json::str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            written: o
+                                .get("written")
+                                .and_then(Json::str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            len: o.get("len").and_then(Json::uint).unwrap_or(0),
+                            bom: o.get("bom").and_then(Json::bool).unwrap_or(false),
+                            text,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Record {
             version,
             kind,
@@ -930,6 +999,7 @@ impl Record {
             pictures,
             sections_added,
             moved: None,
+            originals,
         })
     }
 
@@ -994,6 +1064,122 @@ impl Record {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     }
+
+    /// Whether this is a rewrite's record (5.6, D-074).
+    pub fn is_rewrite(&self) -> bool {
+        self.kind == Kind::Rewrite
+    }
+}
+
+/// A text file's before and after text, and whether its original began with a UTF-8 byte order
+/// mark: one file of a rewrite run (5.6, D-074).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewriteFile {
+    pub path: PathBuf,
+    /// The text the file held when the review was made.
+    pub before: String,
+    /// The text to write: what the owner accepted.
+    pub after: String,
+    pub bom: bool,
+}
+
+/// Starts a rewrite run's record, before its first file is touched. The record goes in the
+/// library's `.runs` (D-076); its `source` is the first file, and its originals grow as files
+/// are written.
+pub fn start_rewrite(
+    library: &Path,
+    instruction: &str,
+    sent: Option<Sent>,
+    first: &Path,
+) -> io::Result<(PathBuf, Record)> {
+    let bytes = read_regular(first, DIGEST_MAX_BYTES, false).unwrap_or_default();
+    let (secs, started) = now_utc();
+    let record = Record {
+        version: RECORD_VERSION,
+        kind: Kind::Rewrite,
+        started,
+        started_secs: secs,
+        state: State::Writing,
+        instruction: instruction.to_string(),
+        sent,
+        source: Source {
+            path: first.to_path_buf(),
+            len: bytes.len() as u64,
+            sha256: crate::update::sha256_hex(&bytes),
+            recycled: false,
+        },
+        group: Group {
+            name: String::new(),
+            file: PathBuf::new(),
+            created: false,
+            home: PathBuf::new(),
+        },
+        folders: Vec::new(),
+        notes: Vec::new(),
+        pictures: Vec::new(),
+        sections_added: Vec::new(),
+        moved: None,
+        originals: Vec::new(),
+    };
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// Writes one file of a rewrite run (`file.after`) and keeps `file.before` in the record first
+/// (D-074, D-076): the record is written before the file, so a crash between them leaves the
+/// original where undo can find it.
+///
+/// The file is rewritten only while it still holds `file.before` to the byte: a file changed
+/// since the review is refused, not overwritten. Only UTF-8 text is taken, because the record
+/// holds the original as text; a file with a byte order mark keeps it. `Error` says why.
+pub fn rewrite_into(
+    record_path: &Path,
+    record: &mut Record,
+    library: &Path,
+    file: &RewriteFile,
+) -> Result<(), String> {
+    if record.kind != Kind::Rewrite {
+        return Err("This record is not a rewrite's.".to_string());
+    }
+    let bytes = read_regular(&file.path, DIGEST_MAX_BYTES, false)
+        .ok_or_else(|| "The file could not be read. It was not rewritten.".to_string())?;
+    let (bom, body) = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        Some(rest) => (true, rest),
+        None => (false, &bytes[..]),
+    };
+    let now = std::str::from_utf8(body)
+        .map_err(|_| "The file is not UTF-8 text. It was not rewritten.".to_string())?;
+    if bom != file.bom || now != file.before {
+        return Err(
+            "The file changed since it was read. Nothing was taken from the review.".to_string(),
+        );
+    }
+    let before = encoded(&file.before, file.bom);
+    let after = encoded(&file.after, file.bom);
+    record.originals.push(Original {
+        path: file.path.clone(),
+        sha256: crate::update::sha256_hex(&before),
+        written: crate::update::sha256_hex(&after),
+        len: before.len() as u64,
+        bom: file.bom,
+        text: file.before.clone(),
+    });
+    record
+        .close(record_path, library)
+        .map_err(|e| format!("The record could not be written, so nothing was: {e}"))?;
+    crate::settings::write_atomic_bytes(&file.path, &after)
+        .map_err(|e| format!("The file could not be written: {e}"))?;
+    Ok(())
+}
+
+/// A text as the bytes a file holds: a byte order mark when it had one, then UTF-8.
+fn encoded(text: &str, bom: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 3);
+    if bom {
+        out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    out.extend_from_slice(text.as_bytes());
+    out
 }
 
 /// Reads one record. `None` when the file is not a record of ours; nothing here can panic.
@@ -1342,6 +1528,7 @@ pub fn write_at(req: &Request, gate: &mut dyn Gate, secs: u64, started: &str) ->
         pictures: Vec::new(),
         sections_added: Vec::new(),
         moved: None,
+        originals: Vec::new(),
     };
     let record_path = match record.create(&req.library) {
         Ok(path) => path,
@@ -2046,6 +2233,12 @@ pub struct UndoPlan {
     pub group_file: Option<PathBuf>,
     /// The folders the run made, deepest first.
     pub folders: Vec<PathBuf>,
+    /// A rewrite's originals that would be put back: the file still holds what the run wrote.
+    pub restore: Vec<PathBuf>,
+    /// A rewrite's originals changed since the run: kept, and listed.
+    pub restore_kept: Vec<PathBuf>,
+    /// A rewrite's originals that are gone already: nothing to put back.
+    pub restore_gone: usize,
 }
 
 impl UndoPlan {
@@ -2056,13 +2249,42 @@ impl UndoPlan {
                 || !self.pictures.is_empty()
                 || !self.links.is_empty()
                 || self.group_file.is_some()
-                || !self.folders.is_empty())
+                || !self.folders.is_empty()
+                || !self.restore.is_empty())
     }
 
     /// The question's sentence: what goes, and what stays.
     pub fn sentence(&self, group: &str) -> String {
         if let Some(why) = &self.refusal {
             return why.clone();
+        }
+        if !self.restore.is_empty() || !self.restore_kept.is_empty() || self.restore_gone > 0 {
+            let mut s = if self.restore.is_empty() {
+                "Nothing of this run is left to put back.".to_string()
+            } else {
+                format!(
+                    "Puts back the original of {} this run rewrote.",
+                    count(self.restore.len(), "file", "files")
+                )
+            };
+            if !self.restore_kept.is_empty() {
+                s.push_str(&format!(
+                    " {} changed since and {} kept.",
+                    count(self.restore_kept.len(), "file was", "files were"),
+                    if self.restore_kept.len() == 1 {
+                        "is"
+                    } else {
+                        "are"
+                    }
+                ));
+            }
+            if self.restore_gone > 0 {
+                s.push_str(&format!(
+                    " {} gone already.",
+                    count(self.restore_gone, "file is", "files are")
+                ));
+            }
+            return s;
         }
         let mut goes: Vec<String> = Vec::new();
         if !self.notes.is_empty() {
@@ -2491,6 +2713,22 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
         plan.refusal = Some("A move is undone by its own command.".to_string());
         return (plan, None);
     }
+    // A rewrite touches only the files it names, and puts back what each held: there is no
+    // library in it, and nothing is created or removed. Each file goes back only while it still
+    // holds the text this run wrote.
+    if record.kind == Kind::Rewrite {
+        for original in &record.originals {
+            match digest_of(&original.path) {
+                None => plan.restore_gone += 1,
+                Some(d) if d.eq_ignore_ascii_case(&original.written) => {
+                    plan.restore.push(original.path.clone())
+                }
+                Some(d) if d.eq_ignore_ascii_case(&original.sha256) => plan.restore_gone += 1,
+                Some(_) => plan.restore_kept.push(original.path.clone()),
+            }
+        }
+        return (plan, None);
+    }
     // Every path the record names must be one a write could have made, and is checked against
     // the library folder and the home the group's library file declares now, never against the
     // record's own word (4.1, 6.2). One that is not makes it a record this program did not
@@ -2617,6 +2855,10 @@ pub struct UndoReport {
     pub failures: Vec<Failure>,
     /// Notes and pictures the bin would not take ([`undo_with`]), and why: they are kept.
     pub bin_failures: Vec<Failure>,
+    /// A rewrite's originals put back.
+    pub restored: Vec<PathBuf>,
+    /// A rewrite's originals changed since the run: kept.
+    pub restore_kept: Vec<PathBuf>,
     /// The record was marked "undone".
     pub marked: bool,
     pub mark_error: Option<String>,
@@ -2658,7 +2900,15 @@ pub fn undo_with(
 ) -> UndoReport {
     let mut report = UndoReport::default();
     let (plan, reach) = plan_of(record, library);
-    let Some(reach) = reach.filter(|_| plan.refusal.is_none()) else {
+    if let Some(why) = &plan.refusal {
+        report.refusal = Some(why.clone());
+        report.plan = Some(plan);
+        return report;
+    }
+    if record.kind == Kind::Rewrite {
+        return undo_rewrite(path, record, library, plan, report);
+    }
+    let Some(reach) = reach else {
         report.refusal = plan.refusal.clone();
         report.plan = Some(plan);
         return report;
@@ -2779,6 +3029,52 @@ pub fn undo_with(
     report
 }
 
+/// Undo of a rewrite (5.6, D-074): puts each original back while the file still holds what the
+/// run wrote, and keeps any file changed since. Nothing is removed, and nothing is written to a
+/// path the record does not name.
+fn undo_rewrite(
+    path: &Path,
+    record: &Record,
+    library: &Path,
+    plan: UndoPlan,
+    mut report: UndoReport,
+) -> UndoReport {
+    report.kept.extend(plan.restore_kept.iter().cloned());
+    report.restore_kept = plan.restore_kept.clone();
+    for original in &record.originals {
+        if !plan.restore.iter().any(|p| same_path(p, &original.path)) {
+            continue;
+        }
+        // Read again just before writing: the file may have changed since the plan was made.
+        let same =
+            digest_of(&original.path).is_some_and(|d| d.eq_ignore_ascii_case(&original.written));
+        if !same {
+            report.restore_kept.push(original.path.clone());
+            report.kept.push(original.path.clone());
+            continue;
+        }
+        let bytes = encoded(&original.text, original.bom);
+        match crate::settings::write_atomic_bytes(&original.path, &bytes) {
+            Ok(()) => report.restored.push(original.path.clone()),
+            Err(e) => report
+                .failures
+                .push(Failure::new(&original.path, e.to_string())),
+        }
+    }
+    let mut marked = record.clone();
+    marked.state = if report.failures.is_empty() {
+        State::Undone
+    } else {
+        State::Done
+    };
+    match marked.close(path, library) {
+        Ok(()) => report.marked = true,
+        Err(e) => report.mark_error = Some(e.to_string()),
+    }
+    report.plan = Some(plan);
+    report
+}
+
 /// Whether a library file holds nothing but its group's heading and its `home:` line.
 fn only_heading_and_home(path: &Path) -> bool {
     let Some(bytes) = read_regular(path, library::MAX_FILE_BYTES as u64, false) else {
@@ -2819,6 +3115,12 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
     }
     if record.kind == Kind::Move {
         report.error = Some("A move has nothing to finish: it is put back or undone.".to_string());
+        return report;
+    }
+    if record.kind == Kind::Rewrite {
+        report.error = Some(
+            "A rewrite has nothing to finish: its files are written or left alone.".to_string(),
+        );
         return report;
     }
     // Finish writes into the group's library file, so it reaches no further than undo does.
@@ -3937,6 +4239,7 @@ mod tests {
             pictures: Vec::new(),
             sections_added: vec![vec!["Tokyo".to_string()]],
             moved: None,
+            originals: Vec::new(),
         };
         let text = record.to_json(&library);
         let back = Record::from_json(&text, &library).expect("it reads");
@@ -4150,5 +4453,205 @@ mod tests {
                 Path::new("/lib/Trip")
             ));
         }
+    }
+
+    // ---- a rewrite's record (5.6, D-074, D-076) -------------------------------------------
+
+    /// A rewrite of one file: the record made, the file written, and the record closed.
+    fn rewrite_one(tag: &str, before: &str, after: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = scratch(tag);
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.md");
+        write_file(&file, before);
+        let (path, mut record) =
+            start_rewrite(&library, "shorten it", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &RewriteFile {
+                path: file.clone(),
+                before: before.to_string(),
+                after: after.to_string(),
+                bom: false,
+            },
+        )
+        .expect("the write");
+        record.state = State::Done;
+        record.close(&path, &library).expect("closed");
+        (dir, library, path)
+    }
+
+    #[test]
+    fn a_rewrite_record_holds_the_original_and_undo_puts_it_back() {
+        let (dir, library, path) = rewrite_one("rewrite", "one\ntwo\n", "ONE\nTWO\n");
+        assert_eq!(read(&dir.join("notes.md")), "ONE\nTWO\n");
+        let text = std::fs::read_to_string(&path).expect("the record");
+        assert!(text.contains("\"kind\": \"rewrite\""), "{text}");
+        assert!(text.contains("\"originals\""), "{text}");
+        assert!(
+            text.contains("one\\ntwo\\n"),
+            "the original is in the record"
+        );
+        let record = load(&path, &library).expect("it reads");
+        assert_eq!(record.kind, Kind::Rewrite);
+        assert_eq!(record.originals.len(), 1);
+        assert_eq!(record.originals[0].text, "one\ntwo\n");
+        assert!(!record.originals[0].bom);
+        // Undo puts the text back, and marks the record.
+        let plan = prepare(&record, &library);
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        assert_eq!(plan.restore, vec![dir.join("notes.md")]);
+        assert!(plan.acts());
+        let mut gate = TestGate::new();
+        let report = undo(&path, &record, &library, &mut gate);
+        assert_eq!(report.refusal, None);
+        assert_eq!(report.restored, vec![dir.join("notes.md")]);
+        assert_eq!(read(&dir.join("notes.md")), "one\ntwo\n");
+        let after = load(&path, &library).expect("it still reads");
+        assert_eq!(after.state, State::Undone);
+        // A second undo says it is done already.
+        let again = prepare(&after, &library);
+        assert_eq!(
+            again.refusal.as_deref(),
+            Some("This run is undone already.")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_undo_keeps_a_file_changed_since_the_run() {
+        let (dir, library, path) = rewrite_one("rewrite-kept", "one\n", "ONE\n");
+        let file = dir.join("notes.md");
+        write_file(&file, "the owner's newer text\n");
+        let record = load(&path, &library).expect("it reads");
+        let plan = prepare(&record, &library);
+        assert!(plan.restore.is_empty());
+        assert_eq!(plan.restore_kept, vec![file.clone()]);
+        assert!(!plan.acts(), "nothing to put back");
+        assert!(
+            plan.sentence("").contains("1 file was"),
+            "{}",
+            plan.sentence("")
+        );
+        let mut gate = TestGate::new();
+        let report = undo(&path, &record, &library, &mut gate);
+        assert_eq!(read(&file), "the owner's newer text\n", "kept to the byte");
+        assert_eq!(report.restored.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_refuses_a_file_changed_before_it_is_written() {
+        let dir = scratch("rewrite-changed");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.md");
+        write_file(&file, "one\n");
+        let (path, mut record) =
+            start_rewrite(&library, "shorten it", None, &file).expect("a record");
+        write_file(&file, "somebody else\n");
+        let why = rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &RewriteFile {
+                path: file.clone(),
+                before: "one\n".to_string(),
+                after: "ONE\n".to_string(),
+                bom: false,
+            },
+        )
+        .expect_err("changed");
+        assert!(why.contains("changed since"), "{why}");
+        assert_eq!(read(&file), "somebody else\n");
+        let record = load(&path, &library).expect("the record reads");
+        assert!(record.originals.is_empty(), "nothing was recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_byte_order_mark_it_found() {
+        let dir = scratch("rewrite-bom");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.md");
+        std::fs::write(&file, [0xEF, 0xBB, 0xBF, b'o', b'n', b'e', b'\n']).expect("a file");
+        let (path, mut record) =
+            start_rewrite(&library, "shorten it", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &RewriteFile {
+                path: file.clone(),
+                before: "one\n".to_string(),
+                after: "ONE\n".to_string(),
+                bom: true,
+            },
+        )
+        .expect("the write");
+        assert_eq!(
+            std::fs::read(&file).expect("bytes"),
+            [0xEF, 0xBB, 0xBF, b'O', b'N', b'E', b'\n']
+        );
+        let mut gate = TestGate::new();
+        let undone = undo(&path, &record, &library, &mut gate);
+        assert_eq!(undone.restored, vec![file.clone()]);
+        assert_eq!(
+            std::fs::read(&file).expect("bytes"),
+            [0xEF, 0xBB, 0xBF, b'o', b'n', b'e', b'\n']
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_record_reads_originals_back_from_its_json() {
+        let (dir, library, path) = rewrite_one("rewrite-json", "a \"quoted\" line\n", "A\n");
+        let record = load(&path, &library).expect("it reads");
+        assert_eq!(record.originals.len(), 1);
+        assert_eq!(record.originals[0].text, "a \"quoted\" line\n");
+        assert_eq!(
+            record.originals[0].len as usize,
+            "a \"quoted\" line\n".len()
+        );
+        let json = record.to_json(&library);
+        let back = Record::from_json(&json, &library).expect("it reads");
+        assert_eq!(back.originals, record.originals);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_record_is_not_confined_to_the_library_its_files_are_anywhere() {
+        // A file outside the library folder is the owner's choice in the task window, and undo
+        // follows the record's own path: the confinement of 4.1 is for notes a run makes.
+        let dir = scratch("rewrite-outside");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("outside/notes.md");
+        write_file(&file, "one\n");
+        let (path, mut record) =
+            start_rewrite(&library, "shorten it", None, &file).expect("a record");
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &RewriteFile {
+                path: file.clone(),
+                before: "one\n".to_string(),
+                after: "ONE\n".to_string(),
+                bom: false,
+            },
+        )
+        .expect("the write");
+        record.state = State::Done;
+        record.close(&path, &library).expect("closed");
+        let record = load(&path, &library).expect("it reads");
+        let mut gate = TestGate::new();
+        let undone = undo(&path, &record, &library, &mut gate);
+        assert_eq!(undone.refusal, None);
+        assert_eq!(read(&file), "one\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

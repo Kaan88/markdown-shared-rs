@@ -88,6 +88,12 @@ pub fn read_patiently(path: &Path) -> io::Result<Option<String>> {
 /// The temporary file is on the disk before the rename, so a power cut just after cannot leave
 /// the new name on an empty or older file (files listed in it may already be gone by then).
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
+    write_atomic_bytes(path, text.as_bytes())
+}
+
+/// [`write_atomic`] with the bytes as given: a file whose text begins with a byte order mark
+/// (a rewrite's undo, 5.6).
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -96,7 +102,7 @@ pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
     let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(text.as_bytes())?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)?;
