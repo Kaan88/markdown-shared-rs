@@ -473,6 +473,28 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Audit 4, W3: a rename that fails (on Windows, a file another program holds open without
+    /// letting it be replaced) leaves the file as it was and takes the temporary away again.
+    #[cfg(windows)]
+    #[test]
+    fn replace_whose_rename_fails_leaves_no_temporary() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch("replace-held");
+        let path = dir.join("held.md");
+        std::fs::write(&path, "kept\n").unwrap();
+        // Read sharing only: no other handle may write it, rename over it or delete it.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        assert!(replace(&path, b"lost\n").is_err());
+        drop(held);
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept\n");
+        assert_eq!(names(&dir), vec!["held.md"]);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn replace_refuses_a_folder() {
         let dir = scratch("replace-dir");
