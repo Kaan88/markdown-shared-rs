@@ -1,0 +1,9 @@
+[package]
+name = "mdshared-term"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# No dependencies, on purpose: a terminal's screen model is bytes in and a grid out, and it must
+# be usable (and testable) with no window system, no font and none of the other shared crates.
+[dependencies]

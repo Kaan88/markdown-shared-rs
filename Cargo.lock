@@ -1307,6 +1307,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdshared-term"
+version = "0.1.0"
+
+[[package]]
 name = "mdshared-text"
 version = "0.1.0"
 dependencies = [
