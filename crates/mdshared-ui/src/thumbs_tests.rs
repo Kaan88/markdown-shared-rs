@@ -38,6 +38,16 @@ fn write_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
     std::fs::write(path, image::encode_png(&plain(w, h, rgba))).unwrap();
 }
 
+/// Writes the file again as a save would, and moves its change time on by ten seconds: two
+/// writes in one tick of the file system's clock, of the same length, are the same file to a
+/// key of length and change time, and a test must not depend on the clock's tick.
+fn rewrite_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
+    let before = std::fs::metadata(path).unwrap().modified().unwrap();
+    write_png(path, w, h, rgba);
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(before + Duration::from_secs(10)).unwrap();
+}
+
 /// Thumbnails whose wake sends on a channel.
 fn thumbnails(memory_cap: usize, disk: Option<DiskCache>) -> (Thumbnails, Receiver<()>) {
     let (tx, rx) = channel();
@@ -146,7 +156,7 @@ fn a_disk_key_changes_with_the_file_and_the_size() {
     );
     assert!(small.file_name().ends_with(".png"));
     assert_eq!(small.file_name().len(), 64 + 4);
-    write_png(&path, 12, 10, [255, 0, 0, 255]);
+    rewrite_png(&path, 12, 10, [255, 0, 0, 255]);
     assert_ne!(
         small.file_name(),
         DiskKey::of(&path, 50).unwrap().file_name()
@@ -297,7 +307,7 @@ fn invalidating_makes_a_changed_file_anew() {
         ready(t.request(&path, 64, 0, 0)).pixel(0, 0),
         Some([255, 0, 0, 255])
     );
-    write_png(&path, 11, 10, [0, 255, 0, 255]);
+    rewrite_png(&path, 11, 10, [0, 255, 0, 255]);
     t.invalidate(&path);
     assert_eq!(t.memory().len(), 0);
     t.request(&path, 64, 0, 0);

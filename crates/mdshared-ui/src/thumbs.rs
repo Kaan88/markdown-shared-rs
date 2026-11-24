@@ -13,7 +13,9 @@
 //! alone. The worker reads the file's size and change time, looks in the [`DiskCache`] under a
 //! key made of the path, those two and the size, and only on a miss reads, decodes
 //! ([`mdshared_text::image::decode`]) and shrinks the picture, and stores the result. A file
-//! that changes on disk gets a new disk key by itself; for the memory the application calls
+//! that changes on disk gets a new disk key by itself (unless it is written again within one
+//! tick of the file system's clock at the same length, which a key of this kind cannot see,
+//! as no thumbnail cache keyed so can); for the memory the application calls
 //! [`Thumbnails::invalidate`] when its watcher says so. Opening another folder is
 //! [`Thumbnails::set_generation`]: work still queued for the old one is dropped.
 //!
