@@ -58,6 +58,7 @@ pub mod tree;
 pub mod viewport;
 pub mod waveform;
 pub mod window;
+pub mod window_state;
 
 #[cfg(test)]
 mod specimen;
