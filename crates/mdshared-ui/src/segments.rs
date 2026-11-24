@@ -4,8 +4,10 @@
 //! read left to right and every option must stay readable, so a longer list belongs in a menu or
 //! a dropdown.
 
-use crate::gfx::{Face, Painter, Rect};
+use crate::anim::{Animator, Id, fluent};
+use crate::gfx::{Face, Painter, Rect, mix};
 use crate::theme::Palette;
+use std::hash::Hash;
 
 /// The height a switch wants, and what each side of a label keeps inside its own segment.
 pub const SEGMENT_H: f32 = 28.0;
@@ -85,9 +87,94 @@ pub fn draw_segments(
     rects
 }
 
+/// [`draw_segments`] with motion: the accent fill slides from the segment that was chosen to the
+/// one that is, the hover fill fades in and out, and a choice made or taken away fades. `id`
+/// names this switch in `anim`; two switches need two names.
+///
+/// At rest it draws exactly the pixels of [`draw_segments`], and so it does on every frame when
+/// the animator does not animate (reduced motion). On the way, a label takes the on-accent
+/// colour by how much of its segment the fill covers, and the semibold face once that is half.
+/// The fill moves relative to the switch, so a switch that moves with its window (a resize, a
+/// scroll) does not set it sliding. The rectangles returned are the segments' own, as always:
+/// the hits do not move with the fill.
+///
+/// The frame that first shows a switch shows it at rest. As with every animated drawing, the
+/// caller ends its frame with [`Animator::end_frame`] and draws again when that asks for it.
+#[allow(clippy::too_many_arguments)] // the arguments of `draw_segments`, the animator and a name
+pub fn draw_segments_animated(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl Hash,
+    r: Rect,
+    labels: &[&str],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Vec<Rect> {
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let id = Id::new(id);
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| p.measure(Face::Semibold, SEGMENT_TEXT, l) + 2.0 * SEGMENT_PAD)
+        .collect();
+    let rects = segment_rects(r, &widths);
+    p.frame(r, 6.0, pal.popup, pal.popup_line);
+    for (k, seg) in rects.iter().enumerate() {
+        let on = hovered == Some(k) && selected != Some(k);
+        let hover = anim.toggle(id.with(("hover", k)), on, fluent::FADE);
+        if hover > 0.0 {
+            p.rbox_a(seg.inset(1.0), 5.0, pal.hover, hover);
+        }
+    }
+    // The fill: how much of it is there, and where, as an offset from the switch's corner.
+    let chosen = selected.filter(|&k| k < rects.len());
+    let there = anim.toggle(id.with("chosen"), chosen.is_some(), fluent::FADE);
+    let place = id.with("fill");
+    let fill = match chosen {
+        Some(k) => {
+            let at = rects[k].inset(1.0);
+            let rest = Rect::new(at.x - r.x, at.y - r.y, at.w, at.h);
+            Some(anim.value(place, rest, fluent::MOVE))
+        }
+        // A choice taken away fades out where it was.
+        None if there > 0.0 => {
+            anim.keep(place);
+            anim.get::<Rect>(place)
+        }
+        None => None,
+    }
+    .map(|rel| Rect::new(r.x + rel.x, r.y + rel.y, rel.w, rel.h));
+    if let Some(fill) = fill {
+        p.rbox_a(fill, 5.0, pal.accent, there);
+    }
+    for (label, seg) in labels.iter().zip(&rects) {
+        // How much of this segment the fill covers, and how solid the fill is.
+        let covered = fill.map_or(0.0, |f| {
+            let inner = seg.inset(1.0);
+            let overlap = f.right().min(inner.right()) - f.x.max(inner.x);
+            if inner.w > 0.0 {
+                (overlap / inner.w).clamp(0.0, 1.0) * there
+            } else {
+                0.0
+            }
+        });
+        let face = if covered >= 0.5 {
+            Face::Semibold
+        } else {
+            Face::Ui
+        };
+        let colour = mix(pal.text, pal.on_accent, covered);
+        p.text_center(face, SEGMENT_TEXT, *seg, label, colour);
+    }
+    rects
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anim::{Clock, ManualClock, Policy};
     use crate::gfx::Gfx;
     use crate::theme::{DARK, LIGHT};
     use mdshared_text::Bitmap;
@@ -210,6 +297,209 @@ mod tests {
             draw_segments(&mut p, &LIGHT, r, &TWO, Some(1), Some(1))
         };
         assert_eq!(at(&bmp, rects[1].x + 3.0, rects[1].cy()), LIGHT.accent);
+    }
+
+    /// A switch of `THREE` drawn through the animator, frame after frame, on one clock.
+    struct Moving {
+        clock: ManualClock,
+        anim: Animator,
+        gfx: Gfx,
+        r: Rect,
+    }
+
+    impl Moving {
+        fn new() -> Moving {
+            let mut probe = Bitmap::new(8, 8);
+            let mut gfx = Gfx::new();
+            let w = switch_width(&mut painter(&mut probe, &mut gfx), &THREE);
+            Moving {
+                clock: ManualClock::new(),
+                anim: Animator::new(),
+                gfx,
+                r: Rect::new(10.0, 16.0, w, SEGMENT_H),
+            }
+        }
+
+        /// One frame `ms` later: the bitmap, the segments, and whether another frame is asked.
+        fn frame(
+            &mut self,
+            ms: u64,
+            selected: Option<usize>,
+            hovered: Option<usize>,
+        ) -> (Bitmap, Vec<Rect>, bool) {
+            self.clock.advance_ms(ms);
+            self.anim.begin_frame(self.clock.now());
+            let mut bmp = Bitmap::new(300, 60);
+            let rects = {
+                let mut p = painter(&mut bmp, &mut self.gfx);
+                p.fill(PAGE, LIGHT.pane);
+                draw_segments_animated(
+                    &mut p,
+                    &LIGHT,
+                    &mut self.anim,
+                    "switch",
+                    self.r,
+                    &THREE,
+                    selected,
+                    hovered,
+                )
+            };
+            (bmp, rects, self.anim.end_frame().is_some())
+        }
+
+        /// The same state as the plain switch draws it.
+        fn plain(&mut self, selected: Option<usize>, hovered: Option<usize>) -> Bitmap {
+            let mut bmp = Bitmap::new(300, 60);
+            let mut p = painter(&mut bmp, &mut self.gfx);
+            p.fill(PAGE, LIGHT.pane);
+            draw_segments(&mut p, &LIGHT, self.r, &THREE, selected, hovered);
+            bmp
+        }
+
+        /// Frames of 10 ms until no further one is asked for; the last bitmap.
+        fn settle(&mut self, selected: Option<usize>, hovered: Option<usize>) -> Bitmap {
+            for _ in 0..200 {
+                let (bmp, _, more) = self.frame(10, selected, hovered);
+                if !more {
+                    return bmp;
+                }
+            }
+            panic!("the switch never comes to rest");
+        }
+    }
+
+    /// The first and last column of row `y` that hold exactly `c`.
+    fn run_of(bmp: &Bitmap, y: f32, c: [u8; 3]) -> Option<(usize, usize)> {
+        let xs: Vec<usize> = (0..bmp.width as usize)
+            .filter(|&x| at(bmp, x as f32, y) == c)
+            .collect();
+        Some((*xs.first()?, *xs.last()?))
+    }
+
+    #[test]
+    fn the_animated_switch_at_rest_is_the_plain_switch_pixel_for_pixel() {
+        let mut m = Moving::new();
+        for (selected, hovered) in [
+            (Some(0), None),
+            (Some(2), Some(1)),
+            (None, Some(0)),
+            (Some(1), Some(1)),
+            (None, None),
+        ] {
+            // First seen, or come to rest after a change: no difference.
+            let rest = m.settle(selected, hovered);
+            assert!(
+                rest.pixels == m.plain(selected, hovered).pixels,
+                "{selected:?} {hovered:?} at rest"
+            );
+        }
+        // The very first frame of a switch is at rest, and asks for no other.
+        let mut fresh = Moving::new();
+        let (bmp, rects, more) = fresh.frame(0, Some(1), None);
+        assert!(!more);
+        assert!(bmp.pixels == fresh.plain(Some(1), None).pixels);
+        assert_eq!(rects.len(), 3);
+        // No labels: nothing drawn, nothing remembered.
+        let mut bmp = Bitmap::new(300, 60);
+        let mut p = painter(&mut bmp, &mut fresh.gfx);
+        fresh.anim.begin_frame(fresh.clock.now());
+        let none = draw_segments_animated(
+            &mut p,
+            &LIGHT,
+            &mut fresh.anim,
+            "empty",
+            fresh.r,
+            &[],
+            None,
+            None,
+        );
+        assert!(none.is_empty());
+        fresh.anim.end_frame();
+        assert!(fresh.anim.is_empty());
+    }
+
+    #[test]
+    fn the_fill_slides_from_the_old_choice_to_the_new_one() {
+        let mut m = Moving::new();
+        let (_, rects, _) = m.frame(0, Some(0), None);
+        let y = rects[0].y + 3.0;
+        let start = run_of(&m.plain(Some(0), None), y, LIGHT.accent).unwrap();
+        let end = run_of(&m.plain(Some(2), None), y, LIGHT.accent).unwrap();
+        // The frame that brings the new choice still draws the old place, and asks for more.
+        let (bmp, hits, more) = m.frame(0, Some(2), None);
+        assert!(more);
+        assert_eq!(run_of(&bmp, y, LIGHT.accent), Some(start));
+        assert_eq!(hits, rects, "the hits are the segments, not the fill");
+        // On the way the left edge only moves right, and never past its end.
+        let mut last = start.0;
+        let mut between = 0;
+        for _ in 0..40 {
+            let (bmp, _, more) = m.frame(10, Some(2), None);
+            let (left, right) = run_of(&bmp, y, LIGHT.accent).unwrap();
+            assert!(
+                left >= last && left <= end.0 && right <= end.1,
+                "{left}..{right}"
+            );
+            between += usize::from(left > start.0 && left < end.0);
+            last = left;
+            if !more {
+                break;
+            }
+        }
+        assert!(between >= 5, "only {between} frames between the two places");
+        assert_eq!(last, end.0);
+        assert!(m.settle(Some(2), None).pixels == m.plain(Some(2), None).pixels);
+        // 167 ms: by a quarter of a second it is over.
+        m.frame(0, Some(0), None);
+        let mut frames = 0;
+        while m.frame(10, Some(0), None).2 {
+            frames += 1;
+        }
+        assert!((14..=18).contains(&frames), "{frames} frames of 10 ms");
+    }
+
+    #[test]
+    fn a_hover_and_a_choice_fade_and_the_switch_moving_does_not_slide_the_fill() {
+        let mut m = Moving::new();
+        let (_, rects, _) = m.frame(0, None, None);
+        let (x, y) = (rects[1].x + 3.0, rects[1].cy());
+        // Hover: on the way the colour is between the popup and the hover fill.
+        m.frame(0, None, Some(1));
+        let (bmp, _, more) = m.frame(40, None, Some(1));
+        let mid = at(&bmp, x, y);
+        assert!(more && mid != LIGHT.popup && mid != LIGHT.hover, "{mid:?}");
+        assert_eq!(at(&m.settle(None, Some(1)), x, y), LIGHT.hover);
+        // A choice made where there was none fades in at its place; taken away, it fades out
+        // there.
+        m.settle(None, None);
+        m.frame(0, Some(1), None);
+        let (bmp, _, _) = m.frame(40, Some(1), None);
+        let mid = at(&bmp, x, y);
+        assert!(mid != LIGHT.popup && mid != LIGHT.accent, "{mid:?}");
+        assert_eq!(at(&m.settle(Some(1), None), x, y), LIGHT.accent);
+        m.frame(0, None, None);
+        let (bmp, _, more) = m.frame(40, None, None);
+        let mid = at(&bmp, x, y);
+        assert!(more && mid != LIGHT.popup && mid != LIGHT.accent, "{mid:?}");
+        assert!(m.settle(None, None).pixels == m.plain(None, None).pixels);
+
+        // The whole switch moved (its window was resized): the fill is with it at once.
+        m.settle(Some(0), None);
+        m.r.x += 40.0;
+        let (bmp, _, more) = m.frame(10, Some(0), None);
+        assert!(!more);
+        assert!(bmp.pixels == m.plain(Some(0), None).pixels);
+    }
+
+    #[test]
+    fn with_reduced_motion_the_animated_switch_is_the_plain_one_on_every_frame() {
+        let mut m = Moving::new();
+        m.anim.set_policy(Policy::Never);
+        for (selected, hovered) in [(Some(0), None), (Some(2), Some(0)), (None, Some(1))] {
+            let (bmp, _, more) = m.frame(10, selected, hovered);
+            assert!(!more);
+            assert!(bmp.pixels == m.plain(selected, hovered).pixels);
+        }
     }
 
     /// The "Changes / Preview" switch as the editor's review draws it today (`ai_ui::review`): the

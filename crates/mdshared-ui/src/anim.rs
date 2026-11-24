@@ -130,6 +130,10 @@ impl Clock for ManualClock {
 /// `Id` is that name already hashed, for a widget that is handed one name and needs several
 /// values under it ([`with`](Id::with)). The hash has fixed keys: the same name is the same id in
 /// every run.
+///
+/// An `Id` given where a name is asked for is a name like any other and is hashed once more:
+/// `anim.get(Id::new("a"))` is not `anim.get("a")`. A widget that makes an `Id` uses that `Id`
+/// in every call, as the ones in this crate do.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Id(u64);
 
@@ -762,6 +766,16 @@ mod tests {
 
     const LINEAR_100: Motion = Motion::tween_ms(100, Easing::Linear);
     const FRAME: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn an_id_used_as_a_name_is_not_the_name_it_was_made_from() {
+        let mut anim = Animator::new();
+        anim.set("a", 1.0);
+        assert_eq!(anim.get::<f32>("a"), Some(1.0));
+        assert_eq!(anim.get::<f32>(Id::new("a")), None);
+        // A borrowed name is the name.
+        assert_eq!(anim.get::<f32>(&"a"), Some(1.0));
+    }
 
     /// An animator on a clock that is moved by hand, with frames of 10 ms.
     struct Rig {

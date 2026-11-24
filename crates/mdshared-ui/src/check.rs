@@ -2,6 +2,7 @@
 //! that has to know nothing of what is behind the box. Drawing only; the caller owns the value,
 //! the hit and the keyboard.
 
+use crate::anim::{Animator, fluent, pop};
 use crate::gfx::{Painter, Rect, mix};
 use crate::glyph;
 use crate::theme::Palette;
@@ -97,6 +98,36 @@ pub fn draw_tick(p: &mut Painter, pal: &Palette, r: Rect, tick: Tick) {
     }
 }
 
+/// [`draw_tick`] with motion: the tick and its fill fade in over the empty box when the value
+/// turns on, and out when it turns off. `id` names this box in `anim`. At rest, and on every
+/// frame when the animator does not animate, it draws exactly what [`draw_tick`] draws; a box
+/// first seen is at rest.
+pub fn draw_tick_animated(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl std::hash::Hash,
+    r: Rect,
+    tick: Tick,
+) {
+    let t = anim.toggle(id, tick.on, fluent::FADE);
+    if t <= 0.0 || t >= 1.0 {
+        return draw_tick(
+            p,
+            pal,
+            r,
+            Tick {
+                on: t >= 1.0,
+                ..tick
+            },
+        );
+    }
+    draw_tick(p, pal, r, Tick { on: false, ..tick });
+    pop(p, r, t, (0.0, 0.0), |p| {
+        draw_tick(p, pal, r, Tick { on: true, ..tick })
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +145,52 @@ mod tests {
             draw_tick(&mut p, pal, Rect::new(12.0, 12.0, TICK, TICK), tick);
         }
         bmp
+    }
+
+    #[test]
+    fn the_animated_tick_at_rest_is_the_plain_one_and_fades_between() {
+        use crate::anim::{Clock, ManualClock};
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut gfx = Gfx::new();
+        let r = Rect::new(12.0, 12.0, TICK, TICK);
+        let mut frame = |ms: u64, tick: Tick| {
+            clock.advance_ms(ms);
+            anim.begin_frame(clock.now());
+            let mut bmp = Bitmap::new(40, 40);
+            {
+                let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+                p.fill(Rect::new(0.0, 0.0, 40.0, 40.0), LIGHT.popup);
+                draw_tick_animated(&mut p, &LIGHT, &mut anim, "tick", r, tick);
+            }
+            (bmp, anim.end_frame().is_some())
+        };
+        // A corner of the fill, clear of the check mark.
+        let look = |bmp: &Bitmap| {
+            let o = (15 * 40 + 14) * 4;
+            [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]]
+        };
+        let (off, on) = (
+            drawn(&LIGHT, Tick::new(false)),
+            drawn(&LIGHT, Tick::new(true)),
+        );
+        // First seen: at rest, whichever way it is set.
+        let (first, more) = frame(0, Tick::new(false));
+        assert!(!more && first.pixels == off.pixels);
+        // Turned on: the off box still, then between the two, then exactly the on box.
+        let (same, more) = frame(0, Tick::new(true));
+        assert!(more && same.pixels == off.pixels);
+        let (mid, more) = frame(40, Tick::new(true));
+        assert!(more && look(&mid) != look(&off) && look(&mid) != look(&on));
+        let (end, more) = frame(50, Tick::new(true));
+        assert!(!more && end.pixels == on.pixels);
+        // And back, with the focus mark and the disabled look passed through.
+        frame(0, Tick::new(false).with_focus());
+        frame(50, Tick::new(false).with_focus());
+        let (end, _) = frame(50, Tick::new(false).with_focus());
+        assert!(end.pixels == drawn(&LIGHT, Tick::new(false).with_focus()).pixels);
+        let (quiet, _) = frame(50, Tick::disabled(false));
+        assert!(quiet.pixels == drawn(&LIGHT, Tick::disabled(false)).pixels);
     }
 
     #[test]

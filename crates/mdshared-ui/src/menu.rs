@@ -123,6 +123,10 @@ const SEP: f32 = 9.0;
 const PAD: f32 = 5.0;
 const MAX_WIDTH: f32 = 420.0;
 
+/// How far from its place a menu starts when it is drawn by
+/// [`Menu::draw_in_presence`], in logical px.
+pub const MENU_DROP: f32 = 6.0;
+
 pub struct Menu<T> {
     pub items: Vec<Item<T>>,
     /// Where the menu hangs from: its top-left corner, or its top-right when `align_right`.
@@ -377,6 +381,22 @@ impl<T: Clone> Menu<T> {
         }
     }
 
+    /// Places the menu inside `area` and draws it as it opens or closes: `t` is how present it
+    /// is, 0 gone and 1 there, from [`Animator::presence`](crate::anim::Animator::presence) or
+    /// a [`Transient`](crate::anim::Transient) that holds the menu while it closes. The menu
+    /// fades as a whole and moves [`MENU_DROP`] px into place, downwards (upwards for a menu
+    /// that opens [`above`](Self::above) its anchor). At 1 this is
+    /// [`draw_in`](Self::draw_in), pixel for pixel; at 0 the menu is placed and nothing is
+    /// drawn. A menu that is closing takes no pointer and no keys: the application has let go
+    /// of it and only draws it.
+    pub fn draw_in_presence(&mut self, p: &mut Painter, pal: &Palette, area: Rect, t: f32) {
+        self.place_in(p, area);
+        let drop = if self.above { MENU_DROP } else { -MENU_DROP };
+        // The frame and the shadow round it.
+        let bounds = self.rect.inset(-18.0);
+        crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
+    }
+
     /// Where the menu was last placed.
     pub fn rect(&self) -> Rect {
         self.rect
@@ -524,6 +544,56 @@ mod tests {
 
     fn many(n: u8) -> Vec<Item<u8>> {
         (0..n).map(|i| Item::new(i, format!("Item {i}"))).collect()
+    }
+
+    #[test]
+    fn a_menu_that_is_there_draws_as_before_and_one_opening_is_fainter_and_off_its_place() {
+        use crate::theme::LIGHT;
+        let area = Rect::new(0.0, 0.0, 300.0, 400.0);
+        let draw = |t: Option<f32>, above: bool| {
+            let mut menu = Menu::new(many(4), 60.0, 200.0, false);
+            if above {
+                menu = menu.above();
+            }
+            let mut bmp = Bitmap::new(300, 400);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, LIGHT.page);
+            match t {
+                Some(t) => menu.draw_in_presence(&mut p, &LIGHT, area, t),
+                None => menu.draw_in(&mut p, &LIGHT, area),
+            }
+            (bmp, menu.rect())
+        };
+        let mut blank = Bitmap::new(300, 400);
+        blank.clear(LIGHT.page);
+        for above in [false, true] {
+            let (plain, rect) = draw(None, above);
+            let (there, _) = draw(Some(1.0), above);
+            assert!(there.pixels == plain.pixels, "above {above}: at 1");
+            // Gone: placed all the same, so the caller's geometry holds, and nothing drawn.
+            let (gone, placed) = draw(Some(0.0), above);
+            assert!(gone.pixels == blank.pixels && placed == rect);
+            // Half way: the whole menu, shadow and text and all, at half strength, and half of
+            // the drop away from its place: 3 px up when it opens downwards, 3 px down when it
+            // opens upwards.
+            let (half, _) = draw(Some(0.5), above);
+            let shift: i32 = if above { -3 } else { 3 };
+            for y in 0..400i32 {
+                for x in 0..300usize {
+                    let from = (y + shift).clamp(0, 399) as usize;
+                    for c in 0..3 {
+                        let moved = plain.pixels[(from * 300 + x) * 4 + c] as u32;
+                        let under = blank.pixels[(y as usize * 300 + x) * 4 + c] as u32;
+                        assert_eq!(
+                            half.pixels[(y as usize * 300 + x) * 4 + c] as u32,
+                            (moved + under).div_ceil(2),
+                            "above {above} at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

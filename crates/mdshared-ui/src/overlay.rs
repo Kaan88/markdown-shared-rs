@@ -2,6 +2,7 @@
 //! hint and tooltip bubbles, and the pieces of a modal dialog (backdrop, card, footer, buttons,
 //! keycaps). The application chooses the texts, the card size and the hit ids.
 
+use crate::anim::pop;
 use crate::gfx::{Face, Painter, Rect, mix};
 use crate::theme::Palette;
 
@@ -81,6 +82,22 @@ impl Bubble {
         }
     }
 
+    /// Draws the bubble as it enters or leaves: `t` is how present it is, 0 gone and 1 there,
+    /// from [`Animator::presence`](crate::anim::Animator::presence) or a
+    /// [`Transient`](crate::anim::Transient) that holds the bubble while it leaves. The bubble
+    /// fades as a whole, and a toast also rises [`TOAST_RISE`] px into its place and sinks as it
+    /// goes; a tooltip and a link hint only fade, since they appear where the eye already is.
+    /// At 1 this is [`draw`](Self::draw), pixel for pixel; at 0 it draws nothing. What it
+    /// touches is still [`bounds`](Self::bounds), grown downwards by the rise for a toast.
+    pub fn draw_presence(&self, p: &mut Painter, pal: &Palette, t: f32) {
+        let rise = if self.kind == Kind::Toast {
+            TOAST_RISE
+        } else {
+            0.0
+        };
+        pop(p, self.bounds(), t, (0.0, rise), |p| self.draw(p, pal));
+    }
+
     pub fn draw(&self, p: &mut Painter, pal: &Palette) {
         let r = self.rect;
         match self.kind {
@@ -118,6 +135,10 @@ impl Bubble {
     }
 }
 
+/// How far below its place a toast starts when it is drawn by
+/// [`Bubble::draw_presence`], in logical px.
+pub const TOAST_RISE: f32 = 8.0;
+
 // ---- dialogs ---------------------------------------------------------------------------------
 
 /// Padding inside a dialog card, and the height of its button footer.
@@ -143,6 +164,42 @@ pub fn draw_backdrop(p: &mut Painter, pal: &Palette, w: f32, h: f32) {
         if pal.dark { 0.45 } else { 0.28 },
     );
 }
+
+/// [`draw_backdrop`] at a part of its strength: `t` is how present the dialog is, 0 gone and 1
+/// there. At 1 it is `draw_backdrop`.
+pub fn draw_backdrop_presence(p: &mut Painter, pal: &Palette, w: f32, h: f32, t: f32) {
+    if t.is_nan() || t >= 1.0 {
+        return draw_backdrop(p, pal, w, h);
+    }
+    p.fill_a(
+        Rect::new(0.0, 0.0, w, h),
+        [0, 0, 0],
+        if pal.dark { 0.45 } else { 0.28 } * t.max(0.0),
+    );
+}
+
+/// Everything a dialog card at `card` touches, its shadow included: the bounds to give
+/// [`pop`] so that a dialog fades and rises as one thing.
+///
+/// ```
+/// # use mdshared_ui::{anim::pop, gfx::*, overlay::*, theme::LIGHT};
+/// # let (mut bmp, mut gfx) = (mdshared_text::Bitmap::new(400, 300), Gfx::new());
+/// # let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+/// # let (pal, t) = (&LIGHT, 0.5);
+/// let card = dialog_card(320.0, 200.0, 400.0, 300.0);
+/// draw_backdrop_presence(&mut p, pal, 400.0, 300.0, t);
+/// pop(&mut p, dialog_bounds(card), t, (0.0, DIALOG_RISE), |p| {
+///     let footer = draw_dialog_card(p, pal, card);
+///     // ... the dialog's text and buttons
+/// #   let _ = footer;
+/// });
+/// ```
+pub fn dialog_bounds(card: Rect) -> Rect {
+    card.inset(-18.0)
+}
+
+/// How far below its place a dialog starts when it enters through [`pop`], in logical px.
+pub const DIALOG_RISE: f32 = 10.0;
 
 /// Draws the card's shadow, body and button footer. Returns the footer rectangle; buttons go
 /// at `footer.y + (DIALOG_FOOTER - 32.0) / 2.0`, 32 px high.
@@ -310,6 +367,79 @@ mod tests {
     fn at(bmp: &Bitmap, x: f32, y: f32) -> [u8; 3] {
         let o = (y as usize * bmp.width as usize + x as usize) * 4;
         [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]]
+    }
+
+    #[test]
+    fn a_bubble_that_is_there_draws_as_before_and_one_on_its_way_is_fainter_and_lower() {
+        let white = |x: usize, y: usize, bmp: &Bitmap| at(bmp, x as f32, y as f32) == LIGHT.popup;
+        for kind in [Kind::Toast, Kind::Tip, Kind::Hint] {
+            let bubble = Bubble {
+                kind,
+                rect: Rect::new(60.0, 14.0, 80.0, 26.0),
+                text: "Saved".into(),
+            };
+            let page = |draw: &dyn Fn(&mut Painter<'_>)| {
+                let mut bmp = Bitmap::new(200, 60);
+                let mut gfx = Gfx::new();
+                let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+                p.fill(PAGE, LIGHT.page);
+                draw(&mut p);
+                bmp
+            };
+            let plain = page(&|p| bubble.draw(p, &LIGHT));
+            let there = page(&|p| bubble.draw_presence(p, &LIGHT, 1.0));
+            let gone = page(&|p| bubble.draw_presence(p, &LIGHT, 0.0));
+            let half = page(&|p| bubble.draw_presence(p, &LIGHT, 0.5));
+            assert!(there.pixels == plain.pixels, "{kind:?} at 1");
+            assert!(gone.pixels == page(&|_| ()).pixels, "{kind:?} at 0");
+            assert!(half.pixels != plain.pixels && half.pixels != gone.pixels);
+            // Half way the fill is half the popup colour over the page, and a toast is 4 px
+            // below its place: its first rows are still the page.
+            let low = if kind == Kind::Toast { 4 } else { 0 };
+            assert!(white(100, 20, &plain));
+            let mid = at(&half, 64.0, 18.0 + low as f32);
+            assert_eq!(mid, mix(LIGHT.page, LIGHT.popup, 0.5), "{kind:?}");
+            if kind == Kind::Toast {
+                let shadow_only = at(&half, 100.0, 15.0);
+                assert_ne!(shadow_only, mid, "the toast has not moved down");
+            }
+            // Nothing outside the bounds (grown by the rise) is touched.
+            let b = bubble.bounds();
+            let clean = page(&|_| ());
+            for y in 0..60usize {
+                for x in 0..200usize {
+                    let inside = b.contains(
+                        x as f32,
+                        y as f32 - if y as f32 >= b.bottom() { 9.0 } else { 0.0 },
+                    );
+                    if !inside {
+                        assert_eq!(
+                            at(&half, x as f32, y as f32),
+                            at(&clean, x as f32, y as f32),
+                            "{kind:?} at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_backdrop_dims_by_how_present_the_dialog_is() {
+        for pal in [&LIGHT, &DARK] {
+            let full = shot(pal, |p| draw_backdrop(p, pal, 200.0, 60.0));
+            let there = shot(pal, |p| draw_backdrop_presence(p, pal, 200.0, 60.0, 1.0));
+            let half = shot(pal, |p| draw_backdrop_presence(p, pal, 200.0, 60.0, 0.5));
+            let gone = shot(pal, |p| draw_backdrop_presence(p, pal, 200.0, 60.0, 0.0));
+            assert!(there.pixels == full.pixels);
+            assert!(gone.pixels == shot(pal, |_| ()).pixels);
+            let level = |b: &Bitmap| at(b, 5.0, 5.0)[1] as i32;
+            assert!(level(&full) < level(&half) && level(&half) < level(&gone));
+        }
+        // The bounds of a dialog hold its shadow.
+        let card = dialog_card(120.0, 40.0, 200.0, 200.0);
+        let b = dialog_bounds(card);
+        assert!(b.x < card.x - 14.0 && b.bottom() > card.bottom() + 17.0);
     }
 
     #[test]
