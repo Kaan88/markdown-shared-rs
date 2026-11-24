@@ -34,6 +34,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Accessibility",
 ] }
+# Accessibility (W8, the owner's decision 2026-11-24): AccessKit's tree and its winit adapter, only
+# with the `a11y` feature. Windows only for now (UI Automation, Purge's scope); the adapter's
+# default features (AT-SPI over zbus and async-io, winit's X11 and Wayland) are left out.
+accesskit = { version = "=0.25.2", optional = true }
+accesskit_winit = { version = "=0.34.2", optional = true, default-features = false, features = ["rwh_06"] }
 # The system's media controls (src/media_session/smtc.rs) and toasts (src/notify/toast.rs), only
 # with the media-session or the notify feature.
 windows = { version = "=0.62.2", optional = true, features = [
@@ -76,6 +81,10 @@ arboard = { version = "3", default-features = false }
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSUserDefaults", "NSAppleEventManager", "NSAppleEventDescriptor", "NSURL", "NSValue", "NSDictionary", "NSGeometry", "NSNotification", "objc2-core-services"] }
 
+# The window of examples/purge_shape.rs; the applications bring their own.
+[target.'cfg(windows)'.dev-dependencies]
+softbuffer = { version = "=0.4.8", default-features = false }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
 
@@ -98,3 +107,11 @@ media-session = ["dep:windows"]
 # current user's registry; on Linux the desktop's notification server over the zbus already
 # there. Off: `Notifier::new` answers Unsupported, and the model types are still there.
 notify = ["dep:windows", "windows?/Data_Xml_Dom", "windows?/UI_Notifications"]
+# Accessibility: `a11y::*` builds an AccessKit tree from the widgets' models, and the window's
+# adapter serves it to UI Automation (roadmap W8). Windows only so far; elsewhere the feature
+# builds and the adapter is absent.
+a11y = ["dep:accesskit", "dep:accesskit_winit"]
+
+[[example]]
+name = "purge_shape"
+required-features = ["a11y"]
