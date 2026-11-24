@@ -41,7 +41,7 @@ pub mod presence;
 pub mod region;
 pub mod spring;
 
-pub use ease::{Easing, cubic_bezier};
+pub use ease::{Bezier, Easing, cubic_bezier};
 pub use page::{Edge, PageEffect, PageTransition};
 pub use presence::{Transient, pop};
 pub use region::Snapshot;
@@ -320,11 +320,11 @@ pub mod fluent {
     pub const SLOW: Duration = Duration::from_millis(333);
 
     /// "Fast out, slow in": leaves its start at once and settles. For what enters.
-    pub const DECELERATE: Easing = Easing::CubicBezier(0.0, 0.0, 0.0, 1.0);
+    pub const DECELERATE: Easing = Easing::bezier(0.0, 0.0, 0.0, 1.0);
     /// "Slow out, fast in": gathers speed and is gone. For what leaves.
-    pub const ACCELERATE: Easing = Easing::CubicBezier(1.0, 0.0, 1.0, 1.0);
+    pub const ACCELERATE: Easing = Easing::bezier(1.0, 0.0, 1.0, 1.0);
     /// For what stays on screen and moves from one place to another.
-    pub const POINT_TO_POINT: Easing = Easing::CubicBezier(0.55, 0.55, 0.0, 1.0);
+    pub const POINT_TO_POINT: Easing = Easing::bezier(0.55, 0.55, 0.0, 1.0);
 
     /// A fade in or out, a hover or a press: linear, 83 ms.
     pub const FADE: Motion = Motion::tween(FASTER, Easing::Linear);
@@ -356,14 +356,14 @@ pub mod fluent {
         pub const DURATION_SLOWER: Duration = Duration::from_millis(400);
         pub const DURATION_ULTRA_SLOW: Duration = Duration::from_millis(500);
 
-        pub const CURVE_ACCELERATE_MAX: Easing = Easing::CubicBezier(0.9, 0.1, 1.0, 0.2);
-        pub const CURVE_ACCELERATE_MID: Easing = Easing::CubicBezier(1.0, 0.0, 1.0, 1.0);
-        pub const CURVE_ACCELERATE_MIN: Easing = Easing::CubicBezier(0.8, 0.0, 0.78, 1.0);
-        pub const CURVE_DECELERATE_MAX: Easing = Easing::CubicBezier(0.1, 0.9, 0.2, 1.0);
-        pub const CURVE_DECELERATE_MID: Easing = Easing::CubicBezier(0.0, 0.0, 0.0, 1.0);
-        pub const CURVE_DECELERATE_MIN: Easing = Easing::CubicBezier(0.33, 0.0, 0.1, 1.0);
-        pub const CURVE_EASY_EASE_MAX: Easing = Easing::CubicBezier(0.8, 0.0, 0.2, 1.0);
-        pub const CURVE_EASY_EASE: Easing = Easing::CubicBezier(0.33, 0.0, 0.67, 1.0);
+        pub const CURVE_ACCELERATE_MAX: Easing = Easing::bezier(0.9, 0.1, 1.0, 0.2);
+        pub const CURVE_ACCELERATE_MID: Easing = Easing::bezier(1.0, 0.0, 1.0, 1.0);
+        pub const CURVE_ACCELERATE_MIN: Easing = Easing::bezier(0.8, 0.0, 0.78, 1.0);
+        pub const CURVE_DECELERATE_MAX: Easing = Easing::bezier(0.1, 0.9, 0.2, 1.0);
+        pub const CURVE_DECELERATE_MID: Easing = Easing::bezier(0.0, 0.0, 0.0, 1.0);
+        pub const CURVE_DECELERATE_MIN: Easing = Easing::bezier(0.33, 0.0, 0.1, 1.0);
+        pub const CURVE_EASY_EASE_MAX: Easing = Easing::bezier(0.8, 0.0, 0.2, 1.0);
+        pub const CURVE_EASY_EASE: Easing = Easing::bezier(0.33, 0.0, 0.67, 1.0);
         pub const CURVE_LINEAR: Easing = Easing::Linear;
     }
 }

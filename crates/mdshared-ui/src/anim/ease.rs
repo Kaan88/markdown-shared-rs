@@ -29,19 +29,86 @@ pub enum Easing {
     InOutExpo,
     /// Ends slow after passing its end by about a tenth of the way: for something that lands.
     OutBack,
-    /// The CSS `cubic-bezier(x1, y1, x2, y2)`: a cubic Bézier from (0, 0) to (1, 1) with these
-    /// two control points, read as progress `y` for time `x`. `x1` and `x2` are clamped to
-    /// 0..=1 as CSS requires (time cannot run backwards); `y1` and `y2` may leave that range,
-    /// which makes the curve overshoot.
-    CubicBezier(f32, f32, f32, f32),
+    /// The CSS `cubic-bezier(x1, y1, x2, y2)`: a cubic Bézier from (0, 0) to (1, 1) with two
+    /// control points, read as progress `y` for time `x`. The curve inside is a [`Bezier`],
+    /// which only exists checked, so this variant is made by [`Easing::cubic_bezier`] (which
+    /// refuses a curve CSS refuses) or [`Easing::bezier`] (for constants; it pulls a wrong
+    /// curve to the nearest right one).
+    CubicBezier(Bezier),
+}
+
+/// The two control points of a CSS `cubic-bezier` curve, known to be a curve CSS accepts: all
+/// four numbers finite, and `x1` and `x2` inside 0..=1 (time cannot run backwards). `y1` and
+/// `y2` may leave that range, which makes the curve overshoot. Its numbers cannot be set from
+/// outside, so an [`Easing`] never holds a curve that is not one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bezier {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+}
+
+impl Bezier {
+    /// The curve with these control points, or `None` for what CSS refuses: a number that is
+    /// not finite, or an `x1` or `x2` outside 0..=1.
+    pub const fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Option<Bezier> {
+        let finite = x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite();
+        if finite && x1 >= 0.0 && x1 <= 1.0 && x2 >= 0.0 && x2 <= 1.0 {
+            Some(Bezier { x1, y1, x2, y2 })
+        } else {
+            None
+        }
+    }
+
+    /// The control points: `(x1, y1, x2, y2)`.
+    pub const fn points(self) -> (f32, f32, f32, f32) {
+        (self.x1, self.y1, self.x2, self.y2)
+    }
+
+    /// Progress at time `x`: see [`cubic_bezier`].
+    pub fn at(self, x: f32) -> f32 {
+        cubic_bezier(self.x1, self.y1, self.x2, self.y2, x)
+    }
 }
 
 impl Easing {
     /// The CSS keywords `ease`, `ease-in`, `ease-out` and `ease-in-out`.
-    pub const EASE: Easing = Easing::CubicBezier(0.25, 0.1, 0.25, 1.0);
-    pub const EASE_IN: Easing = Easing::CubicBezier(0.42, 0.0, 1.0, 1.0);
-    pub const EASE_OUT: Easing = Easing::CubicBezier(0.0, 0.0, 0.58, 1.0);
-    pub const EASE_IN_OUT: Easing = Easing::CubicBezier(0.42, 0.0, 0.58, 1.0);
+    pub const EASE: Easing = Easing::bezier(0.25, 0.1, 0.25, 1.0);
+    pub const EASE_IN: Easing = Easing::bezier(0.42, 0.0, 1.0, 1.0);
+    pub const EASE_OUT: Easing = Easing::bezier(0.0, 0.0, 0.58, 1.0);
+    pub const EASE_IN_OUT: Easing = Easing::bezier(0.42, 0.0, 0.58, 1.0);
+
+    /// The CSS `cubic-bezier(x1, y1, x2, y2)`, checked as CSS checks it: `None` when a number
+    /// is not finite or when `x1` or `x2` is outside 0..=1. For a curve that comes from
+    /// outside the program (a settings file, a theme).
+    pub const fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> Option<Easing> {
+        match Bezier::new(x1, y1, x2, y2) {
+            Some(curve) => Some(Easing::CubicBezier(curve)),
+            None => None,
+        }
+    }
+
+    /// The CSS `cubic-bezier(x1, y1, x2, y2)` for a constant in the code, where there is no
+    /// one to hand a refusal to: a wrong curve becomes the nearest right one and nothing
+    /// panics. An `x1` or `x2` outside 0..=1 is pulled to that range; if any number is not
+    /// finite the curve is [`Easing::Linear`]. A right curve is taken as it is, so for right
+    /// numbers this and [`cubic_bezier`](Easing::cubic_bezier) give the same easing.
+    pub const fn bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> Easing {
+        const fn unit(v: f32) -> f32 {
+            if v < 0.0 {
+                0.0
+            } else if v > 1.0 {
+                1.0
+            } else {
+                v
+            }
+        }
+        match Bezier::new(unit(x1), y1, unit(x2), y2) {
+            Some(curve) => Easing::CubicBezier(curve),
+            None => Easing::Linear,
+        }
+    }
 
     /// Progress at time `t`. `t` below 0 reads as 0, above 1 as 1, and a `t` that is not a
     /// number reads as 1, so a tween fed nonsense ends instead of sticking.
@@ -102,7 +169,7 @@ impl Easing {
                 let u = t - 1.0;
                 1.0 + C3 * u * u * u + C1 * u * u
             }
-            Easing::CubicBezier(x1, y1, x2, y2) => cubic_bezier(x1, y1, x2, y2, t),
+            Easing::CubicBezier(curve) => curve.at(t),
         }
     }
 }
@@ -113,12 +180,19 @@ impl Easing {
 /// thousandth for every curve an interface uses, and bisection for the rare curve whose slope is
 /// too flat for Newton (a control point at the very start or end). The answer is within 1e-4 of
 /// the true curve; the tests hold it to that against a fine sampling of the curve itself.
+///
+/// This is the bare arithmetic, for a caller that has four numbers and a time; an [`Easing`]
+/// holds a checked [`Bezier`]. Unchecked numbers are made harmless here: `x1` and `x2` are
+/// pulled into 0..=1, and control points that are not finite give the straight line, `x`.
 pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
     if x.is_nan() || x >= 1.0 {
         return 1.0;
     }
     if x <= 0.0 {
         return 0.0;
+    }
+    if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+        return x;
     }
     let (x1, x2) = (x1.clamp(0.0, 1.0), x2.clamp(0.0, 1.0));
     // A curve whose control points lie on the diagonal is the diagonal.
@@ -198,7 +272,7 @@ mod tests {
         Easing::EASE_IN,
         Easing::EASE_OUT,
         Easing::EASE_IN_OUT,
-        Easing::CubicBezier(0.0, 0.0, 0.0, 1.0),
+        Easing::bezier(0.0, 0.0, 0.0, 1.0),
     ];
 
     /// The point of a cubic Bézier coordinate at parameter `s`, the long way.
@@ -326,5 +400,59 @@ mod tests {
         // Control points outside 0..=1 in x are pulled in, not followed backwards in time.
         let pulled = cubic_bezier(-1.0, 0.0, 2.0, 1.0, 0.5);
         assert_eq!(pulled, cubic_bezier(0.0, 0.0, 1.0, 1.0, 0.5));
+    }
+
+    #[test]
+    fn a_checked_bezier_refuses_what_css_refuses_and_a_constant_is_pulled_right() {
+        // What CSS accepts, overshoot in y included.
+        let ease = Easing::cubic_bezier(0.25, 0.1, 0.25, 1.0).unwrap();
+        assert_eq!(ease, Easing::EASE);
+        assert!(Easing::cubic_bezier(0.68, -0.55, 0.27, 1.55).is_some());
+        assert!(Easing::cubic_bezier(0.0, 0.0, 1.0, 1.0).is_some());
+        let Easing::CubicBezier(curve) = ease else {
+            panic!("not a bezier");
+        };
+        assert_eq!(curve.points(), (0.25, 0.1, 0.25, 1.0));
+        assert_eq!(curve.at(0.5), ease.at(0.5));
+        // What it refuses: time running backwards, and numbers that are not numbers.
+        for (x1, y1, x2, y2) in [
+            (-0.1, 0.0, 0.5, 1.0),
+            (0.5, 0.0, 1.1, 1.0),
+            (f32::NAN, 0.0, 0.5, 1.0),
+            (0.5, f32::NAN, 0.5, 1.0),
+            (0.5, 0.0, f32::INFINITY, 1.0),
+            (0.5, 0.0, 0.5, f32::NEG_INFINITY),
+        ] {
+            let what = format!("{x1} {y1} {x2} {y2}");
+            assert_eq!(Easing::cubic_bezier(x1, y1, x2, y2), None, "{what}");
+            assert_eq!(Bezier::new(x1, y1, x2, y2), None, "{what}");
+            // The constant form never fails and never gives a curve that is not one: every
+            // value it gives is a number, from 0 at the start to 1 at the end.
+            let pulled = Easing::bezier(x1, y1, x2, y2);
+            if let Easing::CubicBezier(c) = pulled {
+                let (a, b, c, d) = c.points();
+                assert!(
+                    (0.0..=1.0).contains(&a) && (0.0..=1.0).contains(&c),
+                    "{what}"
+                );
+                assert!(b.is_finite() && d.is_finite(), "{what}");
+            } else {
+                assert_eq!(pulled, Easing::Linear, "{what}");
+            }
+            for i in 0..=10 {
+                assert!(pulled.at(i as f32 / 10.0).is_finite(), "{what}");
+            }
+            assert_eq!((pulled.at(0.0), pulled.at(1.0)), (0.0, 1.0), "{what}");
+            // The bare arithmetic is as harmless.
+            assert!(cubic_bezier(x1, y1, x2, y2, 0.3).is_finite(), "{what}");
+        }
+        assert_eq!(
+            Easing::bezier(-1.0, 0.0, 2.0, 1.0),
+            Easing::bezier(0.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(Easing::bezier(f32::NAN, 0.0, 0.5, 1.0), Easing::Linear);
+        // Usable where a constant is needed.
+        const C: Easing = Easing::bezier(0.2, 0.0, 0.0, 1.0);
+        assert_eq!(Some(C), Easing::cubic_bezier(0.2, 0.0, 0.0, 1.0));
     }
 }
