@@ -32,15 +32,18 @@
 //! The pieces: [`ease`] (easing curves and the CSS cubic-bezier solver), [`spring`], this file
 //! (the clock, [`Motion`], [`Animatable`], the [`Animator`] and the [`fluent`] presets),
 //! [`region`] (a saved piece of the bitmap and the blends of it), [`page`] (a page or tab
-//! switch) and [`presence`] (things that appear and disappear). `docs/ANIMATION.md` shows how an
+//! switch), [`presence`] (things that appear and disappear) and [`cycle`] (things that repeat
+//! for as long as they are shown: a spinner, a blinking caret). `docs/ANIMATION.md` shows how an
 //! application wires it into its window loop.
 
+pub mod cycle;
 pub mod ease;
 pub mod page;
 pub mod presence;
 pub mod region;
 pub mod spring;
 
+pub use cycle::Periodic;
 pub use ease::{Bezier, Easing, cubic_bezier};
 pub use page::{Edge, PageEffect, PageTransition};
 pub use presence::{Transient, pop};
@@ -562,6 +565,8 @@ impl Track {
 #[derive(Debug)]
 pub struct Animator {
     tracks: HashMap<u64, Track>,
+    /// The things that repeat ([`cycle`](Self::cycle), [`blink`](Self::blink)).
+    runs: HashMap<u64, cycle::Running>,
     /// The animator's own time: the sum of the frames' clamped steps.
     time: Duration,
     /// The real time of the frame in progress (or of the last one).
@@ -592,6 +597,7 @@ impl Animator {
     pub fn new() -> Animator {
         Animator {
             tracks: HashMap::new(),
+            runs: HashMap::new(),
             time: Duration::ZERO,
             frame_at: None,
             frame: 0,
@@ -682,14 +688,22 @@ impl Animator {
                 t.advance(time);
             }
         }
+        self.runs.retain(|_, r| r.seen == frame);
         let mut wait: Option<Duration> = None;
         for t in self.tracks.values().filter(|t| !t.settled) {
             let w = t.start.saturating_sub(time).max(self.frame_interval);
             wait = Some(wait.map_or(w, |old| old.min(w)));
         }
+        // What repeats says itself when it next needs a frame: a cycle one interval on, a
+        // blink when it changes.
+        for r in self.runs.values() {
+            let w = r.next.saturating_sub(time);
+            wait = Some(wait.map_or(w, |old| old.min(w)));
+        }
         self.animating = wait.is_some();
         let at = self.frame_at.unwrap_or_else(Instant::now);
-        let mut deadline = wait.map(|w| at + w);
+        // A wait too long for the clock to hold (a blink of centuries) is no deadline.
+        let mut deadline = wait.and_then(|w| at.checked_add(w));
         if let Some(wake) = self.wake.take() {
             deadline = Some(deadline.map_or(wake, |d| d.min(wake)));
         }
@@ -697,7 +711,8 @@ impl Animator {
         deadline
     }
 
-    /// Whether any value was still on its way at the end of the last frame.
+    /// Whether any value was still on its way, or anything that repeats was still asked for, at
+    /// the end of the last frame.
     pub fn animating(&self) -> bool {
         self.animating
     }
@@ -815,9 +830,13 @@ impl Animator {
         }
     }
 
-    /// Forgets `id` now: the next time it is asked for, it is first seen.
+    /// Forgets `id` now: the next time it is asked for, it is first seen. A
+    /// [`cycle`](Self::cycle) or [`blink`](Self::blink) of that name starts again from its
+    /// beginning.
     pub fn forget(&mut self, id: impl AsId) {
-        self.tracks.remove(&id.as_id().0);
+        let id = id.as_id().0;
+        self.tracks.remove(&id);
+        self.runs.remove(&id);
     }
 
     /// Puts every value at its target, now.
@@ -827,13 +846,13 @@ impl Animator {
         }
     }
 
-    /// How many names are remembered.
+    /// How many names are remembered: values, and things that repeat.
     pub fn len(&self) -> usize {
-        self.tracks.len()
+        self.tracks.len() + self.runs.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tracks.is_empty()
+        self.tracks.is_empty() && self.runs.is_empty()
     }
 
     fn track(

@@ -13,7 +13,7 @@
 //! caller draws them from [`Slider::thumb_center`] and [`Slider::fraction_of`]), and a value
 //! shown as text.
 
-use crate::anim::{Animator, AsId, Easing, Id, Motion, fluent};
+use crate::anim::{Animator, AsId, Easing, Id, fluent};
 use crate::gfx::{Painter, Rect, mix};
 pub use crate::splitter::Axis;
 use crate::theme::Palette;
@@ -488,24 +488,25 @@ pub fn draw_progress(p: &mut Painter, pal: &Palette, r: Rect, fraction: f32) {
     }
 }
 
-/// Seconds since `id` was first drawn, for a mark that moves for as long as it is shown; `None`
-/// when the animator does not animate. Asking keeps the animator asking for frames, and a
-/// frame that does not ask lets it sleep again: the value is on its way to a target it never
-/// reaches.
-fn running(anim: &mut Animator, id: Id) -> Option<f32> {
-    if !anim.animates() {
-        return None;
-    }
-    const FOREVER: u64 = 1_000_000;
-    let forever = Motion::tween(Duration::from_secs(FOREVER), Easing::Linear);
-    Some(anim.value_from(id, 0.0, FOREVER as f32, forever))
+/// How long one run of the piece of [`draw_progress_indeterminate`] along its track takes.
+pub const PROGRESS_RUN: Duration = Duration::from_millis(1600);
+/// How long one turn of [`draw_spinner`] takes.
+pub const SPINNER_TURN: Duration = Duration::from_millis(1100);
+/// How long the arc of [`draw_spinner`] takes to grow and shrink once.
+pub const SPINNER_BREATH: Duration = Duration::from_millis(1600);
+
+/// A phase as the drawings below take it: the fraction of a turn, whatever turn it is in. One
+/// that is not a number is none.
+fn turn(phase: f32) -> Option<f32> {
+    phase.is_finite().then(|| phase.rem_euclid(1.0))
 }
 
 /// A progress bar for work whose end is not known: a piece of the accent that runs along the
 /// track again and again, growing as it leaves and shrinking as it arrives. It moves for as
 /// long as it is drawn, so the window keeps drawing frames while it shows and sleeps once it
-/// is gone. `id` names it in `anim`. With reduced motion it is a still piece in the middle of
-/// the track, which still says "busy".
+/// is gone: its phase is [`Animator::cycle`] of `id` over [`PROGRESS_RUN`]. `id` names it in
+/// `anim`. With reduced motion it is a still piece in the middle of the track, which still
+/// says "busy". The drawing itself is [`draw_progress_indeterminate_at`].
 pub fn draw_progress_indeterminate(
     p: &mut Painter,
     pal: &Palette,
@@ -513,12 +514,21 @@ pub fn draw_progress_indeterminate(
     id: impl AsId,
     r: Rect,
 ) {
+    let phase = anim.animates().then(|| anim.cycle(id, PROGRESS_RUN));
+    draw_progress_indeterminate_at(p, pal, r, phase);
+}
+
+/// The bar of [`draw_progress_indeterminate`] at one moment of its run, with no animator and
+/// no clock: `phase` is how far through the run it is, from 0 to 1 (a larger number is that
+/// far into a later run), and `None` (or a phase that is not a number) is the still piece of
+/// reduced motion. For a caller that keeps its own time, and for a render that must come out
+/// the same every time.
+pub fn draw_progress_indeterminate_at(p: &mut Painter, pal: &Palette, r: Rect, phase: Option<f32>) {
     let radius = r.h / 2.0;
     p.rbox(r, radius, mix(pal.line, pal.text, 0.18));
-    let (from, to) = match running(anim, Id::new(id)) {
-        // One run in 1.6 s: the head sets off first and eases in, the tail follows.
-        Some(secs) => {
-            let t = (secs / 1.6).fract();
+    let (from, to) = match phase.and_then(turn) {
+        // The head sets off first and eases in, the tail follows.
+        Some(t) => {
             let head = Easing::OutCubic.at((t / 0.75).min(1.0));
             let tail = Easing::InCubic.at(((t - 0.25) / 0.75).max(0.0));
             (tail, head)
@@ -535,8 +545,11 @@ pub fn draw_progress_indeterminate(
 
 /// A spinner: an arc of the accent that turns round `cx, cy` at radius `r`, for a wait with
 /// no room for a bar. It turns for as long as it is drawn, as
-/// [`draw_progress_indeterminate`] moves. `id` names it in `anim`. With reduced motion it is
-/// a still three-quarter ring.
+/// [`draw_progress_indeterminate`] moves: a turn is [`Animator::cycle`] over
+/// [`SPINNER_TURN`], and the arc grows and shrinks by a second cycle over
+/// [`SPINNER_BREATH`]. `id` names it in `anim` (the two cycles are `id.with("turn")` and
+/// `id.with("breath")`). With reduced motion it is a still three-quarter ring. The drawing
+/// itself is [`draw_spinner_at`].
 pub fn draw_spinner(
     p: &mut Painter,
     pal: &Palette,
@@ -546,16 +559,37 @@ pub fn draw_spinner(
     cy: f32,
     r: f32,
 ) {
+    let id = Id::new(id);
+    let phase = anim.animates().then(|| {
+        (
+            anim.cycle(id.with("turn"), SPINNER_TURN),
+            anim.cycle(id.with("breath"), SPINNER_BREATH),
+        )
+    });
+    draw_spinner_at(p, pal, cx, cy, r, phase);
+}
+
+/// The spinner of [`draw_spinner`] at one moment, with no animator and no clock: `phase` is
+/// how far round the arc's start is and how far through its growing and shrinking the arc is,
+/// each from 0 to 1 (the arc is shortest at 0, longest at a half), and `None` (or a phase
+/// that is not a number) is the still ring of reduced motion.
+pub fn draw_spinner_at(
+    p: &mut Painter,
+    pal: &Palette,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    phase: Option<(f32, f32)>,
+) {
     let width = (r / 4.0).clamp(1.5, 4.0);
-    let (from, span) = match running(anim, Id::new(id)) {
-        // A turn in 1.1 s, the arc breathing between a sixth and two thirds of the ring.
-        Some(secs) => {
-            let breath = (1.0 - (secs / 1.6 * std::f32::consts::TAU).cos()) / 2.0;
-            (secs / 1.1, 0.16 + 0.5 * breath)
+    let (from, span) = match phase.and_then(|(at, breath)| turn(at).zip(turn(breath))) {
+        // The arc breathes between a sixth and two thirds of the ring.
+        Some((at, breath)) => {
+            let breath = (1.0 - (breath * std::f32::consts::TAU).cos()) / 2.0;
+            (at, 0.16 + 0.5 * breath)
         }
         None => (0.0, 0.75),
     };
-    let from = from.fract();
     p.arc(cx, cy, r, width, from, from + span, pal.accent, 1.0);
 }
 
@@ -1072,6 +1106,144 @@ mod tests {
         );
         assert!(accent(10.0) > 0, "the top of the spinner's ring");
     }
+
+    /// The two marks as they were drawn before they took a phase: from the seconds since they
+    /// were first shown. A copy of the old code, to hold the new drawing to it.
+    fn old_marks(p: &mut Painter, pal: &Palette, bar: Rect, at: (f32, f32, f32), secs: f32) {
+        let radius = bar.h / 2.0;
+        p.rbox(bar, radius, mix(pal.line, pal.text, 0.18));
+        let t = (secs / 1.6).fract();
+        let head = Easing::OutCubic.at((t / 0.75).min(1.0));
+        let tail = Easing::InCubic.at(((t - 0.25) / 0.75).max(0.0));
+        let piece = Rect::new(bar.x + bar.w * tail, bar.y, bar.w * (head - tail), bar.h);
+        if piece.w >= 1.0 {
+            let old = p.clip(bar);
+            p.rbox(piece, radius.min(piece.w / 2.0), pal.accent);
+            p.restore(old);
+        }
+        let (cx, cy, r) = at;
+        let width = (r / 4.0).clamp(1.5, 4.0);
+        let breath = (1.0 - (secs / 1.6 * std::f32::consts::TAU).cos()) / 2.0;
+        let from = (secs / 1.1).fract();
+        p.arc(
+            cx,
+            cy,
+            r,
+            width,
+            from,
+            from + 0.16 + 0.5 * breath,
+            pal.accent,
+            1.0,
+        );
+    }
+
+    #[test]
+    fn the_marks_at_a_phase_are_the_marks_as_they_were_drawn_from_the_seconds() {
+        let bar = Rect::new(20.0, 48.0, 200.0, 4.0);
+        let at = (120.0, 20.0, 10.0);
+        // The old drawing took the seconds since the mark was first shown; the new one takes
+        // the phase of each of its cycles. Given the phases those seconds stand for, it draws
+        // the same pixels: over three runs of the bar, every fifth of a second.
+        for pal in [&LIGHT, &DARK] {
+            for k in 0..24 {
+                let secs = 0.2 * k as f32;
+                let (run, turn) = ((secs / 1.6).fract(), (secs / 1.1).fract());
+                let old = shot(pal, |p| old_marks(p, pal, bar, at, secs));
+                let new = shot(pal, |p| {
+                    draw_progress_indeterminate_at(p, pal, bar, Some(run));
+                    draw_spinner_at(p, pal, at.0, at.1, at.2, Some((turn, run)));
+                });
+                assert!(old.pixels == new.pixels, "{k}: at {secs} s");
+            }
+        }
+        // A phase in a later run, or an earlier one, is the same phase (eighths, which are
+        // exact in binary, so nothing is lost by adding whole runs to them).
+        for k in 0..8 {
+            let q = k as f32 / 8.0;
+            let marks = |run: f32, turn: f32, breath: f32| {
+                shot(&LIGHT, |p| {
+                    draw_progress_indeterminate_at(p, &LIGHT, bar, Some(run));
+                    draw_spinner_at(p, &LIGHT, at.0, at.1, at.2, Some((turn, breath)));
+                })
+            };
+            let first = marks(q, q, q);
+            assert!(
+                marks(q + 3.0, q + 2.0, q + 5.0).pixels == first.pixels,
+                "{q} later"
+            );
+            assert!(
+                marks(q - 1.0, q - 4.0, q - 2.0).pixels == first.pixels,
+                "{q} earlier"
+            );
+        }
+        // No phase, and a phase that is not a number: the still marks of reduced motion.
+        let still = shot(&LIGHT, |p| {
+            draw_progress_indeterminate_at(p, &LIGHT, bar, None);
+            draw_spinner_at(p, &LIGHT, at.0, at.1, at.2, None);
+        });
+        for bad in [f32::NAN, f32::INFINITY] {
+            let got = shot(&LIGHT, |p| {
+                draw_progress_indeterminate_at(p, &LIGHT, bar, Some(bad));
+                draw_spinner_at(p, &LIGHT, at.0, at.1, at.2, Some((0.5, bad)));
+            });
+            assert!(got.pixels == still.pixels);
+        }
+        let reduced = {
+            let mut anim = Animator::new();
+            anim.set_system_reduced(true);
+            anim.begin_frame(ManualClock::new().now());
+            let bmp = shot(&LIGHT, |p| {
+                draw_progress_indeterminate(p, &LIGHT, &mut anim, "busy", bar);
+                draw_spinner(p, &LIGHT, &mut anim, "spin", at.0, at.1, at.2);
+            });
+            assert_eq!(anim.end_frame(), None);
+            bmp
+        };
+        assert!(reduced.pixels == still.pixels);
+    }
+
+    #[test]
+    fn the_marks_through_the_animator_are_the_marks_at_the_phase_of_its_clock() {
+        let bar = Rect::new(20.0, 48.0, 200.0, 4.0);
+        let at = (120.0, 20.0, 10.0);
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut elapsed = 0u64;
+        // Steps of 25 ms, inside the stall guard, for five seconds: three runs of the bar.
+        for step in 0..200 {
+            if step > 0 {
+                clock.advance_ms(25);
+                elapsed += 25;
+            }
+            anim.begin_frame(clock.now());
+            let drawn = shot(&LIGHT, |p| {
+                draw_progress_indeterminate(p, &LIGHT, &mut anim, "busy", bar);
+                draw_spinner(p, &LIGHT, &mut anim, "spin", at.0, at.1, at.2);
+            });
+            assert!(
+                anim.end_frame().is_some(),
+                "a mark that moves asks for the next frame"
+            );
+            // The phases by hand: the time gone by over each period, as a fraction.
+            let of = |period: u64| (elapsed % period) as f32 / period as f32;
+            let want = shot(&LIGHT, |p| {
+                draw_progress_indeterminate_at(p, &LIGHT, bar, Some(of(1600)));
+                draw_spinner_at(p, &LIGHT, at.0, at.1, at.2, Some((of(1100), of(1600))));
+            });
+            assert!(drawn.pixels == want.pixels, "after {elapsed} ms");
+        }
+        // The two marks keep three clocks; not drawn, they are forgotten.
+        assert_eq!(anim.len(), 3);
+        anim.begin_frame(clock.now());
+        assert_eq!(anim.end_frame(), None);
+        assert!(anim.is_empty());
+        assert_eq!(PROGRESS_RUN.as_millis(), 1600);
+        assert_eq!(
+            (SPINNER_TURN.as_millis(), SPINNER_BREATH.as_millis()),
+            (1100, 1600)
+        );
+    }
+
     /// The sheet a person looks at: the slider in its states, the seek bar, the progress bars
     /// and the spinner, light and dark, at two scales.
     /// `cargo test -p mdshared-ui slider_sheet -- --ignored`, then open
