@@ -218,6 +218,22 @@ impl State {
         }
     }
 
+    /// The state whose word is the longest: what a record is measured in when it must still
+    /// read back after whatever state it is closed with.
+    fn longest() -> State {
+        [
+            State::Writing,
+            State::LinksPending,
+            State::Done,
+            State::Stopped,
+            State::Undone,
+            State::UndoPending,
+        ]
+        .into_iter()
+        .max_by_key(|s| s.as_str().len())
+        .unwrap_or(State::LinksPending)
+    }
+
     /// A run Finish can take further: one whose notes are written and whose links were not all
     /// written, or that stopped before they were. Not one an undo has begun on.
     pub fn finishable(self) -> bool {
@@ -290,6 +306,19 @@ pub struct PictureRec {
     pub sha256: String,
 }
 
+/// What a run's links did to one library file: the text it held before them, and the digest of
+/// the text they left, so undo can give the file back byte for byte while nothing else changed
+/// it since: its blank lines, its line ends and its last line as they were (review of the audit 4
+/// fixes, S3). Kept only when the add was exactly the run's links on that text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Added {
+    pub file: PathBuf,
+    /// The file's text before the run's first add, without a byte order mark.
+    pub before: String,
+    /// The digest of the text the run's last add left in it, without a byte order mark.
+    pub written: String,
+}
+
 /// One file a [`Kind::Rewrite`] run overwrote: the original text (D-076), and the digests
 /// before and after, so undo can tell the rewritten file from one changed since.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,6 +364,10 @@ pub struct Record {
     /// What a [`Kind::Rewrite`] overwrote: each file's original text (D-076). Empty for every
     /// other kind, and for a record written before this field existed.
     pub originals: Vec<Original>,
+    /// What the run's links did to each library file ([`Added`]). Empty for a run that wrote
+    /// no link, and for a record written before this field existed: undo then takes the lines
+    /// out as [`with_removals`] does.
+    pub added: Vec<Added>,
 }
 
 /// A record read from disk.
@@ -795,6 +828,19 @@ impl Record {
             })
             .collect();
         s.push_str(&format!("  \"pictures\": [{}],\n", pictures.join(", ")));
+        let added: Vec<String> = self
+            .added
+            .iter()
+            .map(|a| {
+                format!(
+                    "{{\"file\": \"{}\", \"before\": \"{}\", \"written\": \"{}\"}}",
+                    esc(&stored(&a.file, library)),
+                    esc(&a.before),
+                    esc(&a.written)
+                )
+            })
+            .collect();
+        s.push_str(&format!("  \"added\": [{}],\n", added.join(", ")));
         let originals: Vec<String> = self
             .originals
             .iter()
@@ -1007,6 +1053,21 @@ impl Record {
                     .collect()
             })
             .unwrap_or_default();
+        let added = json
+            .get("added")
+            .and_then(Json::arr)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        Some(Added {
+                            file: resolved(x.get("file")?.str()?, library),
+                            before: x.get("before")?.str()?.to_string(),
+                            written: x.get("written")?.str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Record {
             version,
             kind,
@@ -1023,7 +1084,46 @@ impl Record {
             sections_added,
             moved: None,
             originals,
+            added,
         })
+    }
+
+    /// Keeps what an add of `links` did to `file`, read before it (`before`) and now: only when
+    /// the file now holds exactly those links added to that text, so the record never holds a
+    /// text the run did not start from. A second add to a file that still held what the first
+    /// left keeps the first text, so undo goes back to before the run's first add. Nothing is
+    /// kept when the record would no longer read back with it ([`RECORD_MAX`]).
+    fn keep_added(&mut self, file: &Path, before: Option<String>, links: &[Link], library: &Path) {
+        let Some(before) = before else {
+            return;
+        };
+        let Some(now) = library_text_of(file) else {
+            return;
+        };
+        if with_links_added(&before, links) != now {
+            return;
+        }
+        let written = crate::update::sha256_hex(now.as_bytes());
+        let was = crate::update::sha256_hex(before.as_bytes());
+        let at = self.added.iter().position(|a| same_path(&a.file, file));
+        let entry = match at.and_then(|i| self.added.get(i)) {
+            Some(a) if a.written.eq_ignore_ascii_case(&was) => Added {
+                file: file.to_path_buf(),
+                before: a.before.clone(),
+                written,
+            },
+            _ => Added {
+                file: file.to_path_buf(),
+                before,
+                written,
+            },
+        };
+        self.added.retain(|a| !same_path(&a.file, file));
+        let mut probe = self.clone();
+        probe.added.push(entry.clone());
+        if reads_back(&mut probe, library) {
+            self.added.push(entry);
+        }
     }
 
     /// Writes the record as a new file in `<library>/.runs`, and gives its path. A name that is
@@ -1143,6 +1243,7 @@ pub fn start_rewrite(
         sections_added: Vec::new(),
         moved: None,
         originals: Vec::new(),
+        added: Vec::new(),
     };
     let path = record.create(library)?;
     Ok((path, record))
@@ -1208,10 +1309,21 @@ pub const RECORD_FULL: &str =
 /// Whether the record, with `file`'s original added, is still one this program reads back
 /// ([`RECORD_MAX`]). A rewrite run whose next file does not fit is given a new record
 /// ([`start_rewrite`]) for it, so that every original stays where undo can find it.
+///
+/// It is measured in the longest state the record can be closed with, not the one it has now: a
+/// record that fits as "writing" and passes the cap as "undo pending" would lose its undo the
+/// moment an undo was refused (review of the audit 4 fixes, S1).
 pub fn rewrite_fits(record: &Record, library: &Path, file: &RewriteFile) -> bool {
     let mut with = record.clone();
     with.originals.push(original_of(file));
-    with.to_json(library).len() as u64 <= RECORD_MAX
+    reads_back(&mut with, library)
+}
+
+/// Whether `record` is one this program reads back ([`RECORD_MAX`]) in whatever state it is
+/// closed with. Its state is left as the longest.
+fn reads_back(record: &mut Record, library: &Path) -> bool {
+    record.state = State::longest();
+    record.to_json(library).len() as u64 <= RECORD_MAX
 }
 
 /// The record's entry for one file of a rewrite: its original text, and the digests before and
@@ -1466,6 +1578,21 @@ pub trait Gate {
         links: &[LinkRemoval],
         headings: &[Vec<String>],
     ) -> Result<(), String>;
+
+    /// [`Gate::remove_links`] for a library file whose add the record holds (`added`). A gate
+    /// that composes with [`with_removals_added`] gives the file back byte for byte while it
+    /// still holds what the add wrote (review of the audit 4 fixes, S3); one that does not takes
+    /// the lines out as `remove_links` does.
+    fn remove_links_added(
+        &mut self,
+        file: &Path,
+        links: &[LinkRemoval],
+        headings: &[Vec<String>],
+        added: &Added,
+    ) -> Result<(), String> {
+        let _ = added;
+        self.remove_links(file, links, headings)
+    }
 }
 
 /// Why one file was left out.
@@ -1777,9 +1904,11 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                     }
                 }
             }
+            let text_before = library_text_of(&req.group.file);
             match gate.add_links(&req.group.file, &links) {
                 Ok(()) => {
                     record.sections_added = added;
+                    record.keep_added(&req.group.file, text_before, &links, &req.library);
                     report.linked.push(req.group.file.clone());
                     record.note_done(
                         &record_path,
@@ -1871,6 +2000,7 @@ fn planned(req: &Request, kind: Kind, secs: u64, started: &str, source: Source) 
         sections_added: Vec::new(),
         moved: None,
         originals: Vec::new(),
+        added: Vec::new(),
     }
 }
 
@@ -2389,6 +2519,11 @@ pub struct UndoPlan {
     pub restore_kept: Vec<PathBuf>,
     /// A rewrite's originals that are gone already: nothing to put back.
     pub restore_gone: usize,
+    /// Notes and pictures this record marks as its own that a run started later names as its
+    /// own too: this run died before it wrote them, and the later run found the names free and
+    /// wrote them. They are that run's, and stay with their lines (review of the audit 4 fixes,
+    /// S2).
+    pub later: Vec<PathBuf>,
 }
 
 impl UndoPlan {
@@ -2541,6 +2676,17 @@ impl UndoPlan {
                 " {} there before this run and {} kept.",
                 count(self.before.len(), "file was", "files were"),
                 if self.before.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        if !self.later.is_empty() {
+            s.push_str(&format!(
+                " {} a later run's and {}.",
+                count(self.later.len(), "file is", "files are"),
+                if self.later.len() == 1 {
+                    "stays"
+                } else {
+                    "stay"
+                }
             ));
         }
         s
@@ -2934,9 +3080,21 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
         );
         return (plan, None);
     }
+    // What a later run wrote under the names this one marked: not this run's to take.
+    let later =
+        if record.notes.iter().any(|n| n.created) || record.pictures.iter().any(|p| p.created) {
+            claimed_later(record, library)
+        } else {
+            Vec::new()
+        };
+    let later_run_wrote = |path: &Path| later.iter().any(|p| same_path(p, path));
     // Each recorded note: its line, then its file.
     let mut removals: Vec<LinkRemoval> = Vec::new();
     for note in &record.notes {
+        if note.created && later_run_wrote(&note.path) {
+            plan.later.push(note.path.clone());
+            continue;
+        }
         let named = named_in(&listed, &note.path);
         let in_group: Vec<&&Listing> = named
             .iter()
@@ -2984,7 +3142,9 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
         }
     }
     for picture in &record.pictures {
-        if !picture.created {
+        if picture.created && later_run_wrote(&picture.path) {
+            plan.later.push(picture.path.clone());
+        } else if !picture.created {
             plan.before.push(picture.path.clone());
         } else if picture.path.symlink_metadata().is_err() {
             plan.gone.push(picture.path.clone());
@@ -3009,6 +3169,49 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     (plan, Some(reach))
 }
 
+/// The notes and pictures that the runs started after `record` name, from the records in
+/// `library/.runs` that are not undone. A run that died before its notes had marked them as its
+/// own (A F9); a later run of the same plan found the names free and wrote them, so they are that
+/// run's; or it found them there with its bytes and listed them, and counts on them (review of
+/// the audit 4 fixes, S2). Undo of the earlier run leaves them. Only the records named as
+/// started later are read, and not a rewrite's or a move's, which make no note: undo's question
+/// does not read megabytes of originals for this. Two runs started in the same second are not
+/// told apart.
+fn claimed_later(record: &Record, library: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(library.join(RUNS_DIR)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for path in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if !path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        if !secs_of(&name_stamp(&path)).is_some_and(|s| s > record.started_secs) {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let kind = stem.get(21..).unwrap_or_default();
+        if kind.starts_with(Kind::Rewrite.as_str()) || kind.starts_with(Kind::Move.as_str()) {
+            continue;
+        }
+        let Ok(other) = inspect(&path, library) else {
+            continue;
+        };
+        if !other.state.live() || other.started_secs <= record.started_secs {
+            continue;
+        }
+        out.extend(other.notes.iter().map(|n| n.path.clone()));
+        out.extend(other.pictures.iter().map(|p| p.path.clone()));
+    }
+    out
+}
+
 /// What undo did.
 #[derive(Clone, Debug, Default)]
 pub struct UndoReport {
@@ -3021,6 +3224,9 @@ pub struct UndoReport {
     pub links_kept: Vec<PathBuf>,
     /// Notes this run did not create: they were there already, and stay.
     pub before: Vec<PathBuf>,
+    /// Notes and pictures a later run wrote under names this run had marked: they stay
+    /// ([`UndoPlan::later`]).
+    pub later: Vec<PathBuf>,
     /// Notes kept because a library file still lists them, whether the line could not be taken
     /// out, the owner edited or moved it, or another file lists the note too.
     pub held_back: Vec<PathBuf>,
@@ -3056,6 +3262,53 @@ pub fn with_removals(
     swept
         .or(without)
         .map(|new| without_new_trailing_blanks(text, new))
+}
+
+/// [`with_removals`] for a library file whose add the record holds. While the file holds byte
+/// for byte the text the add left (`added.written`) and taking the run's lines out leaves the
+/// notes and the sections it had before, the text it had before comes back whole: its blank
+/// lines, its line ends and its last line as they were (review of the audit 4 fixes, S3).
+/// Otherwise (the file changed since, or some of the run's lines stay) the lines are taken out
+/// as `with_removals` does. A byte order mark at the start of `text` is kept.
+pub fn with_removals_added(
+    text: &str,
+    links: &[LinkRemoval],
+    headings: &[Vec<String>],
+    base: &Path,
+    added: &Added,
+) -> Option<String> {
+    let removed = with_removals(text, links, headings, base)?;
+    let (bom, body) = match text.strip_prefix('\u{FEFF}') {
+        Some(rest) => ("\u{FEFF}", rest),
+        None => ("", text),
+    };
+    let unchanged = crate::update::sha256_hex(body.as_bytes()).eq_ignore_ascii_case(&added.written);
+    if unchanged {
+        let was = library::parse(&added.before, base);
+        let now = library::parse(&removed, base);
+        let same_notes = was.entries.len() == now.entries.len()
+            && was.entries.iter().zip(&now.entries).all(|(a, b)| {
+                same_path(&a.path, &b.path) && a.sections == b.sections && a.title == b.title
+            });
+        let same_sections = was.sections.len() == now.sections.len()
+            && was
+                .sections
+                .iter()
+                .zip(&now.sections)
+                .all(|(a, b)| sections_eq(a, b));
+        if same_notes && same_sections {
+            return Some(format!("{bom}{}", added.before));
+        }
+    }
+    Some(removed)
+}
+
+/// A library file's text as its writers read it: the bytes without a UTF-8 byte order mark,
+/// when they are UTF-8 and no bigger than the reader takes; `None` otherwise.
+fn library_text_of(file: &Path) -> Option<String> {
+    let bytes = read_regular(file, library::MAX_FILE_BYTES as u64, true)?;
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    String::from_utf8(body.to_vec()).ok()
 }
 
 /// `new` without the blank lines at its end when `old` ended with a line of text: a blank line
@@ -3119,7 +3372,11 @@ pub fn undo_with(
         } else {
             &[]
         };
-        match gate.remove_links(file, removals, headings) {
+        let removed = match record.added.iter().find(|a| same_path(&a.file, file)) {
+            Some(added) => gate.remove_links_added(file, removals, headings, added),
+            None => gate.remove_links(file, removals, headings),
+        };
+        match removed {
             Ok(()) => report.removed_links += removals.len(),
             Err(why) => report.failures.push(Failure::new(file, why)),
         }
@@ -3228,6 +3485,7 @@ pub fn undo_with(
     report.kept.extend(plan.kept.iter().cloned());
     report.links_kept = plan.links_kept.clone();
     report.before = plan.before.clone();
+    report.later = plan.later.clone();
     report.plan = Some(plan);
     report
 }
@@ -3414,10 +3672,12 @@ pub fn finish(path: &Path, record: &Record, library: &Path, gate: &mut dyn Gate)
     }
     let mut closed = record.clone();
     if !links.is_empty() {
+        let text_before = library_text_of(&record.group.file);
         match gate.add_links(&record.group.file, &links) {
             Ok(()) => {
                 report.added = links.len();
                 closed.sections_added.extend(added);
+                closed.keep_added(&record.group.file, text_before, &links, library);
             }
             Err(why) => report.failures.push(Failure::new(&record.group.file, why)),
         }
@@ -3497,6 +3757,8 @@ mod tests {
         refusals: Vec<PathBuf>,
         added: Vec<(PathBuf, usize)>,
         removed: Vec<(PathBuf, usize)>,
+        /// A gate that has not opted in to [`Gate::remove_links_added`]: the trait's own.
+        plain: bool,
     }
 
     impl TestGate {
@@ -3505,6 +3767,7 @@ mod tests {
                 refusals: Vec::new(),
                 added: Vec::new(),
                 removed: Vec::new(),
+                plain: false,
             }
         }
     }
@@ -3556,10 +3819,41 @@ mod tests {
             if self.refusals.iter().any(|p| same_path(p, file)) {
                 return Err("The group's library file has unsaved changes.".to_string());
             }
+            self.remove_with(file, links, |text, base| {
+                with_removals(text, links, headings, base)
+            })
+        }
+
+        fn remove_links_added(
+            &mut self,
+            file: &Path,
+            links: &[LinkRemoval],
+            headings: &[Vec<String>],
+            added: &Added,
+        ) -> Result<(), String> {
+            if self.plain {
+                return self.remove_links(file, links, headings);
+            }
+            if self.refusals.iter().any(|p| same_path(p, file)) {
+                return Err("The group's library file has unsaved changes.".to_string());
+            }
+            self.remove_with(file, links, |text, base| {
+                with_removals_added(text, links, headings, base, added)
+            })
+        }
+    }
+
+    impl TestGate {
+        /// One removal, composed by `change`, checked and written as the window's gate does.
+        fn remove_with(
+            &mut self,
+            file: &Path,
+            links: &[LinkRemoval],
+            change: impl FnOnce(&str, &Path) -> Option<String>,
+        ) -> Result<(), String> {
             let text = std::fs::read_to_string(file).map_err(|e| e.to_string())?;
             let base = file.parent().unwrap_or(Path::new(""));
-            let new = with_removals(&text, links, headings, base)
-                .ok_or_else(|| "the file was not changed".to_string())?;
+            let new = change(&text, base).ok_or_else(|| "the file was not changed".to_string())?;
             if !check_links_removed(
                 &library::parse(&text, base),
                 &library::parse(&new, base),
@@ -4661,6 +4955,7 @@ mod tests {
             sections_added: vec![vec!["Tokyo".to_string()]],
             moved: None,
             originals: Vec::new(),
+            added: Vec::new(),
         };
         let text = record.to_json(&library);
         let back = Record::from_json(&text, &library).expect("it reads");
@@ -5443,6 +5738,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// T6: the rewrite question's words, whole: what it puts back, the file kept and the file
+    /// gone.
+    #[test]
+    fn the_rewrite_question_says_what_it_puts_back_in_these_words() {
+        let dir = scratch("review-t6");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let files: Vec<PathBuf> = ["a.txt", "b.txt", "c.txt", "d.txt"]
+            .iter()
+            .map(|n| dir.join("elsewhere").join(n))
+            .collect();
+        for f in &files {
+            write_file(f, "one\n");
+        }
+        let (path, mut record) = start_rewrite(&library, "x", None, &files[0]).expect("a record");
+        for f in &files {
+            rewrite_into(
+                &path,
+                &mut record,
+                &library,
+                &rewrite_file(f, "one\n", "ONE\n"),
+            )
+            .expect("the write");
+        }
+        let one = |p: &PathBuf| p.display().to_string();
+        assert_eq!(
+            prepare(&record, &library).sentence(""),
+            format!(
+                "Puts back the original of 4 files this run rewrote: {}, {}, {}, {}.",
+                one(&files[0]),
+                one(&files[1]),
+                one(&files[2]),
+                one(&files[3])
+            )
+        );
+        write_file(&files[1], "changed\n");
+        std::fs::remove_file(&files[2]).expect("gone");
+        write_file(&files[3], "one\n");
+        assert_eq!(
+            prepare(&record, &library).sentence(""),
+            format!(
+                "Puts back the original of 1 file this run rewrote: {}. 1 file was changed since \
+                 and is kept. 2 files are gone already.",
+                one(&files[0])
+            )
+        );
+        write_file(&files[0], "changed\n");
+        write_file(&files[2], "changed\n");
+        assert_eq!(
+            prepare(&record, &library).sentence(""),
+            "Nothing of this run is left to put back. 3 files were changed since and are kept. \
+             1 file is gone already."
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// W2: a run whose group file was never made, its home outside the library, says so, and
     /// neither undo nor finish acts on it.
     #[test]
@@ -5771,5 +6122,487 @@ mod tests {
             assert!(sentence.starts_with(words), "{sentence}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // ---- the review of the audit 4 fixes -----------------------------------------------------
+
+    /// S1: a rewrite's record that just fits when its file is written still reads back in every
+    /// state it can be closed with, "undo pending" among them, so a refused undo can be tried
+    /// again.
+    #[test]
+    fn a_rewrite_record_that_just_fits_still_reads_back_after_its_undo_is_refused() {
+        let dir = scratch("review-s1");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = dir.join("notes.txt");
+        write_file(&file, "one\n");
+        let (path, mut record) = start_rewrite(&library, "x", None, &file).expect("a record");
+        // The longest original that still fits: one more byte would not.
+        let fits = |n: usize| {
+            rewrite_fits(
+                &record,
+                &library,
+                &rewrite_file(&file, &"a".repeat(n), "b\n"),
+            )
+        };
+        let (mut low, mut high) = (0usize, RECORD_MAX as usize);
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            if fits(mid) { low = mid } else { high = mid }
+        }
+        assert!(fits(low) && !fits(low + 1), "{low}");
+        let before = "a".repeat(low);
+        write_file(&file, &before);
+        rewrite_into(
+            &path,
+            &mut record,
+            &library,
+            &rewrite_file(&file, &before, "b\n"),
+        )
+        .expect("the write");
+        assert_eq!(load(&path, &library).map(|r| r.state), Some(State::Writing));
+        // Every state the record can be closed with reads back.
+        for state in [
+            State::Writing,
+            State::LinksPending,
+            State::Done,
+            State::Stopped,
+            State::Undone,
+            State::UndoPending,
+        ] {
+            let mut closed = record.clone();
+            closed.state = state;
+            closed.close(&path, &library).expect("written");
+            assert_eq!(
+                load(&path, &library).map(|r| r.state),
+                Some(state),
+                "{} bytes",
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+            );
+        }
+        record.close(&path, &library).expect("written");
+        // And the probe's way: an undo that cannot write the file leaves "undo pending", which
+        // is read back and undone again once it can.
+        let set_readonly = |on: bool| {
+            let mut p = std::fs::metadata(&file).expect("there").permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(on);
+            std::fs::set_permissions(&file, p).expect("its permissions");
+        };
+        set_readonly(true);
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        set_readonly(false);
+        assert_eq!(done.failures.len(), 1, "{done:?}");
+        let again = load(&path, &library).expect("the record reads back");
+        assert_eq!(again.state, State::UndoPending);
+        let done = undo(&path, &again, &library, &mut TestGate::new());
+        assert_eq!(done.restored, vec![file.clone()]);
+        assert_eq!(read(&file), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2: a run that died before its notes left a record that marks them as its own. A later
+    /// run of the same plan wrote them; undo of the dead run leaves that run's notes and lines,
+    /// and the later run's undo takes them out.
+    #[test]
+    fn undo_of_a_dead_run_leaves_the_notes_a_later_run_wrote() {
+        let dir = scratch("review-s2");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let none: &[&str] = &[];
+        let req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", none), ("Two", "# Two\n", none)],
+        );
+        // The clock as a run reads it: the record's name and its `started` say the same time.
+        let at = |secs: u64| (secs, utc(secs));
+        let (secs, started) = at(1_795_000_000);
+        DIES_AT.with(|d| d.set(Some("before the notes")));
+        let dead = write_at(&req, &mut TestGate::new(), secs, &started);
+        DIES_AT.with(|d| d.set(None));
+        let dead_path = dead.record_path.expect("a record");
+        let dead_record = load(&dead_path, &library).expect("the record a crash leaves");
+        assert!(dead_record.notes.iter().all(|n| n.created));
+        let (secs, started) = at(1_795_000_060);
+        let later = write_at(&req, &mut TestGate::new(), secs, &started);
+        assert_eq!(later.state(), Some(State::Done));
+        let later_path = later.record_path.expect("a record");
+        let one = library.join("Trip/One.md");
+        let two = library.join("Trip/Two.md");
+        let group = read(&library.join("Trip.md"));
+        assert!(one.is_file() && two.is_file());
+        let plan_of_dead = prepare(&dead_record, &library);
+        assert!(plan_of_dead.notes.is_empty(), "{plan_of_dead:?}");
+        assert!(plan_of_dead.links.is_empty(), "{plan_of_dead:?}");
+        assert_eq!(plan_of_dead.later.len(), 2, "{plan_of_dead:?}");
+        let sentence = plan_of_dead.sentence("Trip");
+        assert!(
+            sentence.contains("2 files are a later run's and stay."),
+            "{sentence}"
+        );
+        let done = undo(&dead_path, &dead_record, &library, &mut TestGate::new());
+        assert!(done.removed_notes.is_empty(), "{done:?}");
+        assert_eq!(done.removed_links, 0, "{done:?}");
+        assert!(one.is_file() && two.is_file());
+        assert_eq!(read(&library.join("Trip.md")), group);
+        // The later run is still its own, and its undo takes its notes and lines.
+        let later_record = load(&later_path, &library).expect("the later record");
+        assert_eq!(later_record.state, State::Done);
+        let done = undo(&later_path, &later_record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_notes.len(), 2, "{done:?}");
+        assert!(!one.exists() && !two.exists());
+        // An undone run names nothing any more.
+        assert!(prepare(&dead_record, &library).later.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3: undo gives a library file back byte for byte when it still holds what the run's add
+    /// wrote, whatever its shape: the owner's blank lines at its end, a link written above a
+    /// heading, no newline at its end, CRLF or mixed line ends, a heading the run made.
+    #[test]
+    fn undo_gives_the_library_file_back_byte_for_byte_whatever_its_shape() {
+        let none: &[&str] = &[];
+        let shapes = [
+            "# Trip\n",
+            "# Trip\n\n- [a](a.md)\n\n",
+            "# Trip\n\n## S\n\n- [b](b.md)\n\n",
+            "# Trip\n\n## S\n\n- [b](b.md)\n",
+            "# Trip",
+            "# Trip\n\n- [a](a.md)",
+            "# Trip\r\n\r\n- [a](a.md)\r\n",
+            "# Trip\r\n\r\n- [a](a.md)\r\n\r\n",
+            "# Trip\n\n- [a](a.md)\r\n## S\r\n",
+            "# Trip\n\n\n\n",
+            "# Trip\nhome: Trip\n\nA line of the owner's.\n\n## S\n\n### Deeper\n\n- [b](b.md)\n\n\n",
+        ];
+        let notes: [&[(&str, &str, &[&str])]; 3] = [
+            &[("One", "# One\n", none)],
+            &[("One", "# One\n", none), ("Two", "# Two\n", &["S"])],
+            &[("Two", "# Two\n", &["New", "Deeper"])],
+        ];
+        let mut wrong = Vec::new();
+        for (i, shape) in shapes.iter().enumerate() {
+            for (j, notes) in notes.iter().enumerate() {
+                let dir = scratch("review-s3");
+                let library = dir.join("library");
+                std::fs::create_dir_all(&library).expect("the library");
+                let source = source(&dir);
+                let group = library.join("Trip.md");
+                write_file(&group, shape);
+                let mut req = plan(&library, &source, notes);
+                req.group.created = false;
+                let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+                assert_eq!(report.state(), Some(State::Done), "{i} {j} {report:?}");
+                assert_ne!(read(&group), *shape, "{i} {j}: the links are in");
+                let path = report.record_path.expect("a record");
+                let record = load(&path, &library).expect("the record");
+                let done = undo(&path, &record, &library, &mut TestGate::new());
+                assert!(done.failures.is_empty(), "{i} {j} {done:?}");
+                assert_eq!(done.removed_notes.len(), notes.len(), "{i} {j} {done:?}");
+                let back = std::fs::read(&group).expect("the file");
+                if back != shape.as_bytes() {
+                    wrong.push(format!(
+                        "{i} {j}: {shape:?} came back as {:?}",
+                        String::from_utf8_lossy(&back)
+                    ));
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// S3, the rest: what the add did is in the record and read back; a file changed since, a
+    /// line that stays, a gate that has not opted in and a record without it all take the lines
+    /// out as before, and the owner's change is kept.
+    #[test]
+    fn undo_takes_the_lines_out_as_before_when_the_file_changed_since_the_add() {
+        let none: &[&str] = &[];
+        let shape = "# Trip\n\nA line of the owner's.\n\n";
+        let setup = |tag: &str| {
+            let dir = scratch(tag);
+            let library = dir.join("library");
+            std::fs::create_dir_all(&library).expect("the library");
+            let source = source(&dir);
+            let group = library.join("Trip.md");
+            write_file(&group, shape);
+            let mut req = plan(
+                &library,
+                &source,
+                &[("One", "# One\n", none), ("Two", "# Two\n", none)],
+            );
+            req.group.created = false;
+            let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+            assert_eq!(report.state(), Some(State::Done), "{report:?}");
+            let path = report.record_path.expect("a record");
+            let record = load(&path, &library).expect("the record");
+            (dir, library, group, path, record)
+        };
+        // The record holds the text before the add and the digest of the one after it.
+        let (dir, library, group, path, record) = setup("review-s3-record");
+        assert_eq!(record.added.len(), 1, "{record:?}");
+        assert!(same_path(&record.added[0].file, &group));
+        assert_eq!(record.added[0].before, shape);
+        assert_eq!(
+            record.added[0].written,
+            crate::update::sha256_hex(read(&group).as_bytes())
+        );
+        assert_eq!(
+            Record::from_json(&record.to_json(&library), &library),
+            Some(record.clone())
+        );
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_links, 2);
+        assert_eq!(read(&group), shape);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A line of the owner's added since: the run's lines go, the owner's line stays, and the
+        // text before the run is not put back over it.
+        let (dir, library, group, path, record) = setup("review-s3-changed");
+        let changed = read(&group).replace(
+            "A line of the owner's.",
+            "A line of the owner's.\nAnd one more.",
+        );
+        std::fs::write(&group, &changed).expect("the owner's edit");
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_links, 2, "{done:?}");
+        let now = read(&group);
+        assert!(now.contains("And one more."), "{now:?}");
+        assert!(!now.contains("[One]") && !now.contains("[Two]"), "{now:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A note changed since keeps its line: the file is not the one before the run.
+        let (dir, library, group, path, record) = setup("review-s3-kept");
+        std::fs::write(library.join("Trip/Two.md"), "# Two, edited\n").expect("the edit");
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_links, 1, "{done:?}");
+        let now = read(&group);
+        assert!(!now.contains("[One]") && now.contains("[Two]"), "{now:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A gate that has not opted in, and a record from before the field, take the lines out
+        // the way they did, through `remove_links`.
+        for old in [false, true] {
+            let (dir, library, group, path, mut record) = setup("review-s3-plain");
+            let mut gate = TestGate::new();
+            if old {
+                record.added.clear();
+            } else {
+                gate.plain = true;
+            }
+            let heuristic = with_removals(
+                &read(&group),
+                &record
+                    .notes
+                    .iter()
+                    .map(|n| LinkRemoval {
+                        path: n.path.clone(),
+                        sections: n.sections.clone(),
+                        line: n.line.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+                &record.sections_added,
+                &library,
+            )
+            .expect("the lines are there");
+            let done = undo(&path, &record, &library, &mut gate);
+            assert_eq!(done.removed_links, 2, "{done:?}");
+            assert_eq!(read(&group), heuristic);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// S3 for Finish: the links Finish writes are recorded the same way, and undo gives the file
+    /// back byte for byte.
+    #[test]
+    fn undo_after_finish_gives_the_library_file_back_byte_for_byte() {
+        let none: &[&str] = &[];
+        let dir = scratch("review-s3-finish");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let group = library.join("Trip.md");
+        let shape = "# Trip\r\n\r\n## S\r\n\r\n- [b](b.md)\r\n\r\n";
+        write_file(&group, shape);
+        let mut req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", none), ("Two", "# Two\n", &["S"])],
+        );
+        req.group.created = false;
+        let mut gate = TestGate::new();
+        gate.refusals.push(group.clone());
+        let report = write_at(&req, &mut gate, 3, "2026-11-21T14:03:11Z");
+        assert_eq!(report.state(), Some(State::LinksPending));
+        let path = report.record_path.expect("a record");
+        let record = load(&path, &library).expect("the record");
+        assert!(record.added.is_empty());
+        let done = finish(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.added, 2, "{done:?}");
+        let record = load(&path, &library).expect("the record");
+        assert_eq!(record.added.len(), 1, "{record:?}");
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_links, 2, "{done:?}");
+        assert_eq!(std::fs::read(&group).expect("the file"), shape.as_bytes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3: a library file whose text would take the record past what is read back is not kept
+    /// in it; the record still reads back, and undo takes the lines out as before.
+    #[test]
+    fn a_library_file_too_big_for_the_record_is_not_kept_in_it() {
+        let none: &[&str] = &[];
+        let dir = scratch("review-s3-big");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let group = library.join("Trip.md");
+        // Each control character is six bytes in the record: 700,000 of them pass 4 MiB.
+        let shape = format!("# Trip\n\n{}\n", "\u{1}".repeat(700_000));
+        write_file(&group, &shape);
+        let mut req = plan(&library, &source, &[("One", "# One\n", none)]);
+        req.group.created = false;
+        let report = write_at(&req, &mut TestGate::new(), 3, "2026-11-21T14:03:11Z");
+        assert_eq!(
+            report.state(),
+            Some(State::Done),
+            "{:?}",
+            report.link_failures
+        );
+        let path = report.record_path.expect("a record");
+        assert!(std::fs::metadata(&path).expect("the record").len() <= RECORD_MAX);
+        let record = load(&path, &library).expect("the record reads back");
+        assert!(record.added.is_empty());
+        let done = undo(&path, &record, &library, &mut TestGate::new());
+        assert_eq!(done.removed_links, 1, "{done:?}");
+        assert!(!read(&group).contains("[One]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3, the keeping itself: a second add to a file that still holds what the first left
+    /// keeps the text before the first, a file changed between them starts again from the
+    /// second, and a file that does not hold exactly the links on the text read before keeps
+    /// nothing.
+    #[test]
+    fn what_an_add_did_is_kept_only_when_the_file_holds_exactly_it() {
+        let dir = scratch("review-s3-keep");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let file = library.join("Trip.md");
+        let link = |name: &str| Link {
+            path: PathBuf::from(format!("Trip/{name}.md")),
+            title: name.to_string(),
+            sections: Vec::new(),
+            line: format!("- [{name}](Trip/{name}.md)"),
+        };
+        let mut record = Record {
+            version: 1,
+            kind: Kind::Split,
+            started: "2026-11-21T14:03:11Z".to_string(),
+            started_secs: 3,
+            state: State::Writing,
+            instruction: String::new(),
+            sent: None,
+            source: Source {
+                path: dir.join("Trip.md"),
+                len: 0,
+                sha256: String::new(),
+                recycled: false,
+            },
+            group: Group {
+                name: "Trip".to_string(),
+                file: file.clone(),
+                created: false,
+                home: library.join("Trip"),
+            },
+            folders: Vec::new(),
+            notes: Vec::new(),
+            pictures: Vec::new(),
+            sections_added: Vec::new(),
+            moved: None,
+            originals: Vec::new(),
+            added: Vec::new(),
+        };
+        let t0 = "# Trip\n\nThe owner's line.\n\n";
+        let t1 = with_links_added(t0, &[link("One")]);
+        write_file(&file, &t1);
+        record.keep_added(&file, Some(t0.to_string()), &[link("One")], &library);
+        assert_eq!(record.added.len(), 1);
+        assert_eq!(record.added[0].before, t0);
+        let t2 = with_links_added(&t1, &[link("Two")]);
+        write_file(&file, &t2);
+        record.keep_added(&file, Some(t1.clone()), &[link("Two")], &library);
+        assert_eq!(record.added.len(), 1, "{:?}", record.added);
+        assert_eq!(record.added[0].before, t0, "the text before the first add");
+        assert_eq!(
+            record.added[0].written,
+            crate::update::sha256_hex(t2.as_bytes())
+        );
+        // Changed between the adds: the first text is not what this one started from.
+        let t2b = format!("{t2}The owner again.\n");
+        let t3 = with_links_added(&t2b, &[link("Three")]);
+        write_file(&file, &t3);
+        record.keep_added(&file, Some(t2b.clone()), &[link("Three")], &library);
+        assert_eq!(record.added.len(), 1);
+        assert_eq!(record.added[0].before, t2b);
+        // The file holds something else than the links on the text read before: nothing kept.
+        let mut other = record.clone();
+        other.added.clear();
+        write_file(&file, &format!("{t3}And a line written meanwhile.\n"));
+        other.keep_added(&file, Some(t2b), &[link("Three")], &library);
+        assert!(other.added.is_empty(), "{:?}", other.added);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2, a run that died after a note: the later run found that note there with its bytes
+    /// and listed it, and the picture too; it counts on them, so undo of the dead run leaves
+    /// them as well as the note the later run wrote.
+    #[test]
+    fn undo_of_a_dead_run_leaves_what_a_later_run_found_there_and_listed() {
+        let dir = scratch("review-s2-found");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).expect("the library");
+        let source = source(&dir);
+        let none: &[&str] = &[];
+        let mut req = plan(
+            &library,
+            &source,
+            &[("One", "# One\n", none), ("Two", "# Two\n", none)],
+        );
+        let picture = dir.join("map.png");
+        std::fs::write(&picture, b"a picture").expect("the picture");
+        req.pictures.push(NewPicture {
+            source: picture,
+            folder: library.join("Trip"),
+        });
+        let at = |secs: u64| (secs, utc(secs));
+        let (secs, started) = at(1_795_000_000);
+        DIES_AT.with(|d| d.set(Some("after a note")));
+        let dead = write_at(&req, &mut TestGate::new(), secs, &started);
+        DIES_AT.with(|d| d.set(None));
+        let dead_path = dead.record_path.expect("a record");
+        let dead_record = load(&dead_path, &library).expect("the record a crash leaves");
+        let one = library.join("Trip/One.md");
+        let two = library.join("Trip/Two.md");
+        let map = library.join("Trip/map.png");
+        assert!(one.is_file() && !two.exists() && map.is_file());
+        assert!(dead_record.pictures.iter().all(|p| p.created));
+        let (secs, started) = at(1_795_000_060);
+        let later = write_at(&req, &mut TestGate::new(), secs, &started);
+        assert_eq!(later.state(), Some(State::Done), "{later:?}");
+        let later_record = load(&later.record_path.expect("a record"), &library).expect("it");
+        assert!(!later_record.notes[0].created && later_record.notes[1].created);
+        assert!(later_record.pictures.iter().all(|p| !p.created));
+        let plan_of_dead = prepare(&dead_record, &library);
+        assert!(plan_of_dead.notes.is_empty(), "{plan_of_dead:?}");
+        assert!(plan_of_dead.pictures.is_empty(), "{plan_of_dead:?}");
+        assert_eq!(plan_of_dead.later.len(), 3, "{plan_of_dead:?}");
+        let group = read(&library.join("Trip.md"));
+        let done = undo(&dead_path, &dead_record, &library, &mut TestGate::new());
+        assert!(done.removed_notes.is_empty(), "{done:?}");
+        assert!(done.removed_pictures.is_empty(), "{done:?}");
+        assert_eq!(done.later.len(), 3, "{done:?}");
+        assert!(one.is_file() && two.is_file() && map.is_file());
+        assert_eq!(read(&library.join("Trip.md")), group);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

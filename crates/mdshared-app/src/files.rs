@@ -108,6 +108,14 @@ fn has_valid_encoding(bytes: &[u8]) -> bool {
         || std::str::from_utf8(bytes).is_ok()
 }
 
+/// Whether [`decode`] reads `bytes` as UTF-16: a UTF-16 byte order mark at the start, or just
+/// after a UTF-8 one. A writer that takes only UTF-8 refuses such bytes, since written back as
+/// UTF-8 every letter would change (review of the audit 4 fixes, RB5).
+pub fn utf16_marked(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
 /// Decodes file bytes to text with any BOM removed. The flag reports replaced invalid input.
 pub fn decode(bytes: &[u8]) -> (std::borrow::Cow<'_, str>, bool) {
     use std::borrow::Cow;
@@ -317,19 +325,72 @@ fn create_temporary(path: &Path) -> io::Result<(std::fs::File, PathBuf)> {
 }
 
 /// `name.part`, then a name carrying the process id, so two writers do not take each other's.
+/// A name too long to carry the ending (a name is at most [`NAME_MAX`] long, on Windows and
+/// elsewhere) gets a short temporary of its own, `~<process>.<attempt>.part` (review of the
+/// audit 4 fixes, RB3).
 fn temporary_name(path: &Path, attempt: u32) -> Option<PathBuf> {
     let mut name = path.file_name()?.to_os_string();
-    if attempt == 0 {
-        name.push(".part");
+    let ending = if attempt == 0 {
+        ".part".to_string()
     } else {
-        name.push(format!(".{}.{attempt}.part", std::process::id()));
+        format!(".{}.{attempt}.part", std::process::id())
+    };
+    // The encoded length is the bytes on Unix, and on Windows never less than its UTF-16 units.
+    if name.as_encoded_bytes().len() + ending.len() > NAME_MAX {
+        return Some(path.with_file_name(format!("~{}.{attempt}.part", std::process::id())));
     }
+    name.push(ending);
     Some(path.with_file_name(name))
 }
+
+/// The longest file name the systems take: 255 UTF-16 units on Windows, 255 bytes on Linux and
+/// macOS.
+const NAME_MAX: usize = 255;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RB3: a file whose name is too long to carry `.part` is still replaced, through a short
+    /// temporary that is gone after; a name that can carry it uses `name.part` as before.
+    #[test]
+    fn a_file_with_a_name_too_long_for_the_ending_is_replaced() {
+        let dir = std::env::temp_dir().join(format!("mdshared-files-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for len in [250usize, 251, 255] {
+            let file = dir.join(format!("{}.md", "a".repeat(len - 3)));
+            std::fs::write(&file, "old").unwrap();
+            replace(&file, b"new").unwrap_or_else(|e| panic!("{len}: {e}"));
+            assert_eq!(std::fs::read(&file).unwrap(), b"new", "{len}");
+            let names: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 1, "{len}: {names:?}");
+            std::fs::remove_file(&file).unwrap();
+        }
+        let short = dir.join("note.md");
+        assert_eq!(temporary_name(&short, 0), Some(dir.join("note.md.part")));
+        let long = dir.join(format!("{}.md", "a".repeat(248)));
+        let temp = temporary_name(&long, 0).unwrap();
+        assert!(temp.file_name().unwrap().len() < 32, "{temp:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RB5: a UTF-16 mark after a UTF-8 one is read as UTF-16 by `decode`, and is said to be.
+    #[test]
+    fn a_utf16_mark_is_found_after_a_utf8_one_too() {
+        assert!(utf16_marked(&[0xFF, 0xFE, b'a', 0]));
+        assert!(utf16_marked(&[0xFE, 0xFF, 0, b'a']));
+        assert!(utf16_marked(&[0xEF, 0xBB, 0xBF, 0xFF, 0xFE, b'a', 0]));
+        assert!(utf16_marked(&[0xEF, 0xBB, 0xBF, 0xFE, 0xFF, 0, b'a']));
+        assert!(!utf16_marked(&[0xEF, 0xBB, 0xBF, b'a']));
+        assert!(!utf16_marked(b"plain"));
+        assert!(!utf16_marked(&[]));
+        let (text, invalid) = decode(&[0xEF, 0xBB, 0xBF, 0xFF, 0xFE, b'a', 0]);
+        assert_eq!((text.as_ref(), invalid), ("a", false));
+    }
 
     #[test]
     fn decode_strips_a_bom_and_reads_utf16() {
@@ -543,6 +604,29 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link that leads nowhere is not written through: `replace` says the file is not found,
+    /// makes no file where the link leads, leaves no temporary, and the link stays as it was
+    /// (review of the audit 4 fixes, T6).
+    #[cfg(unix)]
+    #[test]
+    fn replace_through_a_dangling_link_writes_nothing() {
+        let dir = scratch("replace-dangling");
+        let real = dir.join("gone.md");
+        let link = dir.join("link.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = replace(&link, b"new").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert!(!real.exists());
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("link.md")]);
         _ = std::fs::remove_dir_all(&dir);
     }
 }

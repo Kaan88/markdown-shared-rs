@@ -1472,6 +1472,7 @@ fn sample_record(library: &Path) -> Record {
             emptied: vec![library.join("Work/Old")],
         }),
         originals: Vec::new(),
+        added: Vec::new(),
     }
 }
 

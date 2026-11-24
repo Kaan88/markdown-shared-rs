@@ -138,7 +138,7 @@ pub fn put_note(
     let stamp = files::stamp(file);
     let (text, bom) = match std::fs::read(file) {
         Ok(bytes) => {
-            let utf16 = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+            let utf16 = files::utf16_marked(&bytes);
             let (text, invalid) = files::decode(&bytes);
             if utf16 || invalid {
                 return Err(PutError::NotUtf8);
@@ -365,6 +365,24 @@ code
         let file = lib.join("Personal.md");
         let mut before = vec![0xFF, 0xFE];
         for u in "# Personal\n".encode_utf16() {
+            before.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&file, &before).unwrap();
+        assert_eq!(put_note(&file, &[], &note, &lib), Err(PutError::NotUtf8));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+    }
+
+    /// RB5: UTF-16 behind a UTF-8 byte order mark is UTF-16 to `decode`, and is refused the same.
+    #[test]
+    fn a_utf16_library_file_behind_a_utf8_mark_is_refused() {
+        let s = scratch("bom-utf16");
+        let lib = s.join("library");
+        std::fs::create_dir_all(&lib).unwrap();
+        let note = s.join("N.md");
+        std::fs::write(&note, "# N\n").unwrap();
+        let file = lib.join("Personal.md");
+        let mut before = vec![0xEF, 0xBB, 0xBF, 0xFF, 0xFE];
+        for u in "# Personal \u{e9}\n".encode_utf16() {
             before.extend_from_slice(&u.to_le_bytes());
         }
         std::fs::write(&file, &before).unwrap();

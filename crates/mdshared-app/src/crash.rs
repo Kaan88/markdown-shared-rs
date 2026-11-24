@@ -334,35 +334,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn a_panic_writes_a_report_and_the_old_hook_still_runs() {
-        let dir = scratch("hook");
-        install("testapp", "9.9", dir.clone());
-        set_context("Markdown, 3 KB");
-        let t = std::thread::Builder::new()
-            .name("worker".into())
-            .spawn(|| panic!("boom {}", 42))
-            .unwrap();
-        assert!(t.join().is_err());
-        let report = pending(&dir).expect("a report");
-        let text = std::fs::read_to_string(&report).unwrap();
-        assert!(
-            text.starts_with("testapp 9.9 closed because of an error.\n"),
-            "{text}"
-        );
-        assert!(text.contains("what:    panic: boom 42\n"), "{text}");
-        assert!(
-            // Windows writes the path with backslashes.
-            text.replace('\\', "/")
-                .contains("where:   crates/mdshared-app/src/crash.rs:"),
-            "{text}"
-        );
-        assert!(text.contains("thread:  worker\n"), "{text}");
-        assert!(text.contains("doing:   Markdown, 3 KB\n"), "{text}");
-        // The process lived through it and ends normally: the report goes.
-        closed_normally();
-        assert!(!report.exists());
-        assert_eq!(pending(&dir), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // The test of the hook itself, `a_panic_writes_a_report_and_the_old_hook_still_runs`, is in
+    // `tests/crash_hook.rs`: the hook is the whole process's, so a test that panics beside it
+    // here (any failing test) wrote its report into that test's folder, and it failed.
 }
