@@ -17,7 +17,7 @@ use crate::keys::{KeyName, Mods};
 use crate::menu::{Item, Menu};
 use crate::overlay::{
     DIALOG_FOOTER, DIALOG_PAD, dialog_button_w, dialog_card, draw_backdrop, draw_dialog_button,
-    draw_dialog_card,
+    draw_dialog_card_with,
 };
 use crate::scroll;
 use crate::textfield::{FieldColors, TextField};
@@ -27,6 +27,9 @@ pub mod pages;
 
 #[cfg(test)]
 mod frozen;
+#[cfg(test)]
+#[path = "settings/style_tests.rs"]
+mod style_tests;
 #[cfg(test)]
 mod unchanged;
 
@@ -299,6 +302,62 @@ enum Look {
     Button(f32),
 }
 
+/// How a form is drawn: its card's corners and shadow, the chosen segment of a segmented
+/// choice, and the group headings. [`Style::CLASSIC`] is how every form has been drawn, and
+/// what a form given no style draws, pixel for pixel; an application that wants the rest
+/// starts from it and changes fields (`let mut s = Style::CLASSIC; s.radius = 8.0;`) and gives
+/// it to [`Form::style`]. The struct is `non_exhaustive`, so a field added later breaks no
+/// application. Only the drawing changes: every rectangle, hit and key is the same in every
+/// style.
+///
+/// Deliberately not here: colours (the palette's), sizes of rows and controls, and kinds of
+/// control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Style {
+    /// The card's corners. A radius that is not finite or is out of 0..=32 is the classic 10.
+    pub radius: f32,
+    /// The card's shadow: `None` the toolkit's (twice on a dark palette), `Some(k)` the soft
+    /// popup shadow a web page draws ([`Shade::POPUP`](crate::gfx::Shade::POPUP)) at strength
+    /// `k`, times [`LIGHT_SHADOW`](crate::gfx::LIGHT_SHADOW) on a light palette; `Some(0.0)`
+    /// draws none. See [`draw_dialog_card_with`](crate::overlay::draw_dialog_card_with).
+    pub soft_shadow: Option<f32>,
+    /// The chosen segment of a segmented choice drawn as a neutral raised pill (a lighter grey
+    /// on a dark palette, white on a light one) on a track a shade off the card, its label
+    /// brightest and the others a little dimmer, instead of filled with the accent.
+    pub neutral_segments: bool,
+    /// Group headings in small capitals (11 px, semibold, upper case) in the muted colour,
+    /// instead of 13 px semibold in the text colour.
+    pub caps_headings: bool,
+}
+
+impl Style {
+    /// How every form has been drawn: 10 px corners, the toolkit's shadow, the chosen segment
+    /// in the accent, headings in the text colour.
+    pub const CLASSIC: Style = Style {
+        radius: 10.0,
+        soft_shadow: None,
+        neutral_segments: false,
+        caps_headings: false,
+    };
+
+    /// The card's corners as drawn: the radius, or the classic one when it is out of reason.
+    fn card_radius(&self) -> f32 {
+        if self.radius.is_finite() && (0.0..=32.0).contains(&self.radius) {
+            self.radius
+        } else {
+            Style::CLASSIC.radius
+        }
+    }
+}
+
+impl Default for Style {
+    /// [`Style::CLASSIC`].
+    fn default() -> Style {
+        Style::CLASSIC
+    }
+}
+
 pub struct Form {
     title: String,
     rows: Vec<Row>,
@@ -321,6 +380,7 @@ pub struct Form {
     pending_jump: Option<usize>,
     /// One page: the groups are headings in the scrolling body, with no category list.
     single_page: bool,
+    style: Style,
 
     // The last layout.
     laid: bool,
@@ -356,6 +416,7 @@ impl Form {
             pin: None,
             pending_jump: None,
             single_page: false,
+            style: Style::CLASSIC,
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -381,6 +442,20 @@ impl Form {
         self.single_page = true;
         self.laid = false;
         self
+    }
+
+    /// Draws the form in `style` ([`Style`]); a form given none draws [`Style::CLASSIC`].
+    pub fn style(mut self, style: Style) -> Form {
+        self.style = style;
+        self
+    }
+
+    /// Changes the style of a form that is open, for a look changed while it shows; true when
+    /// it changed, so the caller redraws.
+    pub fn set_style(&mut self, style: Style) -> bool {
+        let changed = self.style != style;
+        self.style = style;
+        changed
     }
 
     // ---- data --------------------------------------------------------------------------------
@@ -1320,7 +1395,7 @@ impl Form {
         self.layout(p, window);
         draw_backdrop(p, pal, window.w, window.h);
         let r = self.card;
-        draw_dialog_card(p, pal, r);
+        draw_dialog_card_with(p, pal, r, self.style.card_radius(), self.style.soft_shadow);
         p.text(
             Face::Semibold,
             17.0,
@@ -1413,15 +1488,29 @@ impl Form {
             }
         };
         if let Row::Header(text) = &self.rows[i] {
-            p.text(
-                Face::Semibold,
-                13.0,
-                row.x + 12.0,
-                row.cy() + if i == 0 { 0.0 } else { 6.0 },
-                text,
-                pal.text,
-                row.w - 24.0,
-            );
+            let cy = row.cy() + if i == 0 { 0.0 } else { 6.0 };
+            if self.style.caps_headings {
+                let caps = text.to_uppercase();
+                p.text(
+                    Face::Semibold,
+                    11.0,
+                    row.x + 12.0,
+                    cy,
+                    &caps,
+                    pal.muted,
+                    row.w - 24.0,
+                );
+            } else {
+                p.text(
+                    Face::Semibold,
+                    13.0,
+                    row.x + 12.0,
+                    cy,
+                    text,
+                    pal.text,
+                    row.w - 24.0,
+                );
+            }
             return;
         }
         let hovered = self.hover_in_row(i);
@@ -1481,6 +1570,21 @@ impl Form {
                 );
             }
             Row::Choice { options, value, .. } => match &self.looks[i] {
+                Look::Segmented(_) if self.style.neutral_segments => {
+                    if ring_on {
+                        ring(p, pal, ctrl, 6.0, bg);
+                    }
+                    let segments: Vec<(Rect, &str)> = options
+                        .iter()
+                        .enumerate()
+                        .map(|(k, o)| (self.segment_rect(i, k), o.as_str()))
+                        .collect();
+                    let hovered = match self.hover {
+                        Some(Target::Segment(row, k)) if row == i => Some(k),
+                        _ => None,
+                    };
+                    draw_neutral_segments(p, pal, ctrl, &segments, *value, hovered);
+                }
                 Look::Segmented(_) => {
                     if ring_on {
                         ring(p, pal, ctrl, 6.0, bg);
@@ -1663,6 +1767,41 @@ fn footer_bg(pal: &Colors) -> crate::gfx::Rgb {
 fn ring(p: &mut Painter, pal: &Colors, r: Rect, radius: f32, bg: crate::gfx::Rgb) {
     p.rbox(r.inset(-3.0), radius + 3.0, pal.accent);
     p.rbox(r.inset(-1.5), radius + 1.5, bg);
+}
+
+/// A segmented choice in the neutral style ([`Style::neutral_segments`]): the track `ctrl` a
+/// shade off the card with a faint line, the chosen segment a raised pill (a lighter grey on a
+/// dark palette, white with a faint line on a light one), a hovered one a lighter shade, the
+/// chosen label brightest and the others a little dimmer. `segments` are the segments'
+/// rectangles and labels.
+fn draw_neutral_segments(
+    p: &mut Painter,
+    pal: &Colors,
+    ctrl: Rect,
+    segments: &[(Rect, &str)],
+    chosen: usize,
+    hovered: Option<usize>,
+) {
+    let shade = |t: f32| mix(pal.popup, pal.text, t);
+    p.frame(ctrl, 6.0, shade(0.04), shade(0.1));
+    for (k, (s, label)) in segments.iter().enumerate() {
+        let on = k == chosen;
+        if on {
+            if pal.dark {
+                p.rbox(*s, 4.0, shade(0.2));
+            } else {
+                p.frame(*s, 4.0, [255, 255, 255], shade(0.14));
+            }
+        } else if hovered == Some(k) {
+            p.rbox(*s, 4.0, shade(0.1));
+        }
+        let color = match (on, pal.dark) {
+            (true, true) => mix(pal.text, [255, 255, 255], 0.6),
+            (true, false) => pal.text,
+            (false, _) => shade(0.8),
+        };
+        p.text_center(Face::Ui, 13.0, *s, label, color);
+    }
 }
 
 /// The Windows 11 switch: a pill, with the knob at the end that says on.
