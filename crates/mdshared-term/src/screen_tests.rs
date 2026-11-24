@@ -782,3 +782,46 @@ fn garbage_never_panics_and_never_leaves_the_grid_broken() {
     // Whatever state it ended in, the readers still work.
     let _ = (s.take_dirty(), s.take_reply(), s.take_title(), grid(&s));
 }
+
+/// A session as a person has one, written apart from the tests above as a check on them: a
+/// shell prompt and a listing in colour, a full-screen program on the alternate screen, the
+/// shell's screen given back as it was, a progress line rewritten in place, and a tab.
+#[test]
+fn a_shell_session_a_full_screen_program_and_back() {
+    let mut s = fed(20, 5, "$ ls\r\n\x1b[1;34mdir\x1b[0m  file.txt\r\n$ ");
+    assert_eq!(grid(&s), "$ ls\ndir  file.txt\n$\n\n");
+    assert_eq!(at(&s), (2, 2));
+    let d = s.cell(1, 0);
+    assert_eq!((d.ch, d.fg), ('d', Color::Indexed(4)));
+    assert!(d.attrs.contains(Attrs::BOLD));
+    let f = s.cell(1, 5);
+    assert_eq!((f.ch, f.fg), ('f', Color::Default));
+    assert!(f.attrs.is_empty());
+
+    s.feed(b"\x1b[?1049h\x1b[2J\x1b[Hhello\x1b[5;1H-- INSERT --");
+    assert!(s.modes().alt_screen);
+    assert_eq!(grid(&s), "hello\n\n\n\n-- INSERT --");
+    assert_eq!(
+        s.scrollback_len(),
+        0,
+        "the alternate screen feeds no scrollback"
+    );
+
+    s.feed(b"\x1b[?1049l");
+    assert!(!s.modes().alt_screen);
+    assert_eq!(grid(&s), "$ ls\ndir  file.txt\n$\n\n");
+    assert_eq!(at(&s), (2, 2));
+
+    s.feed(b"10%\r100%\x1b[K");
+    assert_eq!(s.row_text(2), "100%");
+    s.feed(b"\r\na\tb");
+    assert_eq!(s.row_text(3), "a       b");
+    assert_eq!(at(&s), (3, 9));
+    // Three more lines: the first two rows go to the scrollback, in order.
+    s.feed(b"\r\none\r\ntwo\r\nthree");
+    assert_eq!(grid(&s), "100%\na       b\none\ntwo\nthree");
+    assert_eq!(s.scrollback_len(), 2);
+    assert_eq!(s.scrollback_line(0).unwrap().text(), "$ ls");
+    assert_eq!(s.scrollback_line(1).unwrap().text(), "dir  file.txt");
+    check(&s);
+}
