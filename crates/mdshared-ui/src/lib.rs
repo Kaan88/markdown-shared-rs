@@ -33,6 +33,7 @@ pub mod settings;
 pub mod shadow;
 pub mod snap;
 pub mod stale;
+pub mod table;
 pub mod textfield;
 pub mod theme;
 pub mod tree;
