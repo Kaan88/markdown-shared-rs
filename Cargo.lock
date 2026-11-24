@@ -1338,6 +1338,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-plasma",
+ "windows",
  "windows-sys 0.59.0",
  "winit",
  "x11rb",

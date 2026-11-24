@@ -1,7 +1,8 @@
 # Checks on every push to main, feat/linux or f/macos and every pull request: formatting, clippy
 # (warnings are errors) and the tests, on Linux, on real Windows and on real Macs (Apple Silicon
 # and Intel). See docs/CI.md.
-# The Recycle Bin (feature `recycle`, off in the workspace build) is built and tested on its own.
+# The Recycle Bin (feature `recycle`) and the media session (feature `media-session`), off in the
+# workspace build, are built and tested on their own.
 name: ci
 
 on:
@@ -48,6 +49,8 @@ jobs:
       - run: cargo test --release --workspace
       - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
       - run: cargo test --release -p mdshared-ui --features recycle recycle
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features media-session media_session
 
   windows:
     runs-on: windows-latest
@@ -67,6 +70,8 @@ jobs:
       - run: cargo test --release --workspace --no-fail-fast
       - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
       - run: cargo test --release -p mdshared-ui --features recycle recycle
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features media-session media_session
 
   macos:
     strategy:
@@ -93,3 +98,5 @@ jobs:
       - run: cargo test --release --workspace --no-fail-fast
       - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
       - run: cargo test --release -p mdshared-ui --features recycle recycle
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features media-session media_session

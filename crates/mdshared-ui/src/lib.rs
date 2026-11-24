@@ -21,6 +21,7 @@ pub mod glyph;
 pub mod grid;
 pub mod keys;
 pub mod knob;
+pub mod media_session;
 pub mod menu;
 pub mod menu_bar;
 pub mod meter;

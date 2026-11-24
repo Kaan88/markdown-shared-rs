@@ -33,6 +33,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
 ] }
+# The system's media controls (src/media_session/smtc.rs), only with the media-session feature.
+windows = { version = "=0.62.2", optional = true, features = [
+    "Foundation",
+    "Media",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
@@ -78,3 +86,8 @@ client-margin = ["dep:x11rb"]
 # (D-046). Off: the crate is not built, and nothing of it is in the application. mdview leaves it
 # off; mdedit turns it on.
 recycle = ["dep:trash", "windows-sys/Win32_Storage_FileSystem"]
+# The system's now-playing surface and media keys: `media_session::MediaSession` (roadmap M1).
+# On Windows the SystemMediaTransportControls (the windows crate's WinRT); on Linux an MPRIS
+# service on the session bus (the zbus already there). Off: `MediaSession::new` answers
+# Unsupported, and the model types are still there.
+media-session = ["dep:windows"]
