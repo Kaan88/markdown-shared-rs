@@ -22,6 +22,7 @@ pub mod cursor;
 pub mod desktop_entry;
 pub mod dropdown;
 pub mod expander;
+pub mod flyout;
 pub mod focus;
 pub mod frost;
 pub mod gfx;
