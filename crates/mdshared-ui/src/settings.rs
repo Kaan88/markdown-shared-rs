@@ -2304,4 +2304,84 @@ mod tests {
             f.draw(&mut p, &crate::theme::DARK, win, false);
         }
     }
+
+    /// The form drawn in a `w` x `h` device px window at `scale`, its card's shadow blended
+    /// whole (as before it left out what the card covers) or not. Under it is a pattern that
+    /// differs from one pixel to the next, so that a shadow blended where it was not before
+    /// cannot round away to the same bytes.
+    fn form_drawn(pal: &Colors, w: u32, h: u32, scale: f32, whole: bool) -> Vec<u8> {
+        let mut gfx = Gfx::new();
+        let mut bmp = Bitmap::new(w, h);
+        for (i, px) in bmp.pixels.chunks_mut(4).enumerate() {
+            let v = (i * 37 % 251) as u8;
+            px.copy_from_slice(&[v, 255 - v, v / 2 + 60, 255]);
+        }
+        crate::gfx::WHOLE_SHADOW.with(|s| s.set(whole));
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            let win = Rect::new(0.0, 0.0, w as f32 / scale, h as f32 / scale);
+            let mut f = Form::new("Settings", rows());
+            f.key(&KeyName::Tab, NONE, None);
+            f.draw(&mut p, pal, win, true);
+        }
+        crate::gfx::WHOLE_SHADOW.with(|s| s.set(false));
+        bmp.pixels
+    }
+
+    #[test]
+    fn the_form_draws_as_it_did_when_its_cards_whole_shadow_was_blended() {
+        for pal in [&crate::theme::LIGHT, &crate::theme::DARK] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                for (w, h) in [(1000u32, 760u32), (1013, 777), (701, 519)] {
+                    assert!(
+                        form_drawn(pal, w, h, scale, true) == form_drawn(pal, w, h, scale, false),
+                        "{w} x {h} at {scale}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    /// Not a test: the time of a large settings dialog's frame, with the card's whole shadow
+    /// and without. `cargo test --release -p mdshared-ui settings_draw_time -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn settings_draw_time() {
+        let mut rows = rows();
+        for i in 0..12 {
+            rows.push(Row::toggle(100 + i, "Another toggle", i % 2 == 0).help("With help"));
+        }
+        for (name, pal) in [
+            ("light", &crate::theme::LIGHT),
+            ("dark", &crate::theme::DARK),
+        ] {
+            for whole in [true, false] {
+                let mut gfx = Gfx::new();
+                let mut bmp = Bitmap::new(1650, 1050);
+                let mut f = Form::new("Settings", rows.clone());
+                let win = Rect::new(0.0, 0.0, 1100.0, 700.0);
+                crate::gfx::WHOLE_SHADOW.with(|s| s.set(whole));
+                let mut p = Painter::new(&mut bmp, &mut gfx, 1.5);
+                f.draw(&mut p, pal, win, true);
+                let runs = 30;
+                let t = std::time::Instant::now();
+                for _ in 0..runs {
+                    f.draw(&mut p, pal, win, true);
+                }
+                let each = t.elapsed() / runs;
+                crate::gfx::WHOLE_SHADOW.with(|s| s.set(false));
+                println!(
+                    "{name}, {}: {each:?} a frame, card {:?}",
+                    if whole {
+                        "whole shadow"
+                    } else {
+                        "shadow under the card"
+                    },
+                    f.card
+                );
+            }
+        }
+    }
 }

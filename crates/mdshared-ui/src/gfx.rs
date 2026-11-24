@@ -11,6 +11,9 @@ use parley::{
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod covered;
+#[cfg(test)]
+pub(crate) use covered::WHOLE_SHADOW;
 mod shapes;
 pub use shapes::{Along, Path};
 

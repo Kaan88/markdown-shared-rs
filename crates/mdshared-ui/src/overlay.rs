@@ -114,12 +114,12 @@ impl Bubble {
                 );
             }
             Kind::Toast => {
-                p.shadow(r, 8.0, pal.dark);
+                p.shadow_under_frame(r, 8.0, pal.dark, 1.0);
                 p.frame(r, 8.0, pal.popup, pal.popup_line);
                 p.text_center(Face::Ui, 13.0, r.inset(10.0), &self.text, pal.text);
             }
             Kind::Tip => {
-                p.shadow(r, 5.0, pal.dark);
+                p.shadow_under_frame(r, 5.0, pal.dark, 1.0);
                 p.frame(r, 5.0, pal.popup, pal.popup_line);
                 p.text(
                     Face::Ui,
@@ -204,9 +204,11 @@ pub const DIALOG_RISE: f32 = 10.0;
 /// Draws the card's shadow, body and button footer. Returns the footer rectangle; buttons go
 /// at `footer.y + (DIALOG_FOOTER - 32.0) / 2.0`, 32 px high.
 pub fn draw_dialog_card(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
-    p.shadow(r, 10.0, pal.dark);
+    // The frame below covers the card's middle opaquely, so the shadow leaves it out: the
+    // pixels are those of the whole shadow, at a fraction of the cost under a large dialog.
+    p.shadow_under_frame(r, 10.0, pal.dark, 1.0);
     if pal.dark {
-        p.shadow(r, 10.0, true);
+        p.shadow_under_frame(r, 10.0, true, 1.0);
     }
     p.frame(r, 10.0, pal.popup, pal.popup_line);
     let footer = Rect::new(
@@ -577,5 +579,116 @@ mod tests {
         assert!(r.x >= 0.0 && r.y >= 0.0 && r.right() <= 520.0 && r.bottom() <= 360.0);
         let r = dialog_card(460.0, 236.0, 1000.0, 700.0);
         assert_eq!((r.x, r.y, r.w, r.h), (270.0, 232.0, 460.0, 236.0));
+    }
+
+    /// `draw_dialog_card` as it stood before its shadow left out what the card covers, copied
+    /// whole: the whole shadow (twice on a dark palette), then the card and its footer.
+    fn card_before(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
+        p.shadow(r, 10.0, pal.dark);
+        if pal.dark {
+            p.shadow(r, 10.0, true);
+        }
+        p.frame(r, 10.0, pal.popup, pal.popup_line);
+        let footer = Rect::new(
+            r.x + 1.0,
+            r.bottom() - DIALOG_FOOTER,
+            r.w - 2.0,
+            DIALOG_FOOTER - 1.0,
+        );
+        let old = p.clip(footer);
+        p.rbox(
+            Rect::new(footer.x, footer.y - 12.0, footer.w, footer.h + 12.0),
+            9.0,
+            mix(
+                pal.popup,
+                if pal.dark { [0, 0, 0] } else { pal.bar },
+                if pal.dark { 0.22 } else { 0.7 },
+            ),
+        );
+        p.restore(old);
+        let px = p.px();
+        p.fill(Rect::new(footer.x, footer.y, footer.w, px), pal.popup_line);
+        footer
+    }
+
+    /// A window with a backdrop and `draw` on it at `scale`. Under the backdrop is a pattern
+    /// that differs from one pixel to the next, so that a shadow blended where it was not
+    /// before cannot round away to the same bytes.
+    fn window(pal: &Palette, scale: f32, draw: impl FnOnce(&mut Painter<'_>)) -> Bitmap {
+        let mut bmp = Bitmap::new(420, 340);
+        for (i, px) in bmp.pixels.chunks_mut(4).enumerate() {
+            let v = (i * 37 % 251) as u8;
+            px.copy_from_slice(&[v, 255 - v, v / 2 + 60, 255]);
+        }
+        let mut gfx = Gfx::new();
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            p.rbox(Rect::new(30.0, 40.0, 150.0, 90.0), 6.0, pal.accent);
+            draw_backdrop(&mut p, pal, 420.0, 340.0);
+            draw(&mut p);
+        }
+        bmp
+    }
+
+    #[test]
+    fn a_dialog_card_draws_as_it_did_when_its_whole_shadow_was_blended() {
+        let cards = [
+            Rect::new(40.0, 30.0, 200.0, 160.0),
+            Rect::new(17.3, 21.65, 150.45, 111.15),
+            Rect::new(33.7, 12.2, 181.9, 123.35),
+            Rect::new(60.5, 50.5, 40.0, 70.0),
+            Rect::new(80.25, 40.75, 30.1, 20.3),
+            Rect::new(100.0, 100.0, 12.0, 4.0),
+            Rect::new(-20.4, -10.6, 120.0, 90.0),
+            Rect::new(150.9, 120.1, 300.0, 200.0),
+        ];
+        for pal in [&LIGHT, &DARK] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                for r in cards {
+                    let was = window(pal, scale, |p| {
+                        card_before(p, pal, r);
+                    });
+                    let now = window(pal, scale, |p| {
+                        draw_dialog_card(p, pal, r);
+                    });
+                    assert!(
+                        was.pixels == now.pixels,
+                        "{r:?} at {scale}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_toast_and_a_tip_draw_as_they_did_when_their_whole_shadow_was_blended() {
+        for pal in [&LIGHT, &DARK] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                for kind in [Kind::Toast, Kind::Tip] {
+                    for rect in [
+                        Rect::new(60.0, 40.0, 180.0, 36.0),
+                        Rect::new(41.35, 77.7, 133.3, 23.45),
+                    ] {
+                        let bubble = Bubble {
+                            kind,
+                            rect,
+                            text: "Saved to the library".to_string(),
+                        };
+                        let drawn = |whole: bool| {
+                            crate::gfx::WHOLE_SHADOW.with(|w| w.set(whole));
+                            let bmp = window(pal, scale, |p| bubble.draw(p, pal));
+                            crate::gfx::WHOLE_SHADOW.with(|w| w.set(false));
+                            bmp.pixels
+                        };
+                        assert!(
+                            drawn(true) == drawn(false),
+                            "{kind:?} {rect:?} at {scale}, dark {}",
+                            pal.dark
+                        );
+                    }
+                }
+            }
+        }
     }
 }
