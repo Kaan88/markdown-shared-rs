@@ -16,6 +16,8 @@ mod covered;
 pub(crate) use covered::WHOLE_SHADOW;
 mod shapes;
 pub use shapes::{Along, Path};
+mod soft;
+pub use soft::{LIGHT_SHADOW, Shade, soft_bounds};
 
 pub type Rgb = [u8; 3];
 type Brush = [u8; 4];
