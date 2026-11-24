@@ -44,6 +44,7 @@ pub mod settings;
 pub mod shadow;
 pub mod slider;
 pub mod snap;
+pub mod spectrum;
 pub mod splitter;
 pub mod stale;
 pub mod table;
