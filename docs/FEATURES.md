@@ -493,6 +493,65 @@ joined to its title, in the toolkit's look and in mdplay's prototype's; the agen
 Not verified: seen by the owner; Linux and macOS (CI not run); used by an application (mdplay's
 port is its own work); mdview and mdedit not rebuilt against the branch (they name none of it).
 
+## Soft shadows and the settings form's style (`Painter::soft_shadow`, `settings::Style`, 2026-11-25, `wk/menulook`, roadmap L12)
+
+mdplay's look is drawn after its HTML prototype, whose shadows are CSS `box-shadow`s. The
+toolkit's shadow (`shadow_with`) is ten faint boxes, each blended and rounded down, so on a dark
+page the stack sinks to black next to the box (the Look dialog on mdplay's dimmed page had 9 px
+of pure black under it), and it reaches up about as far as down. These pieces draw what the
+prototype draws; each is opt-in.
+
+- **`Painter::soft_shadow(r, radius, &layers, k)`**, a CSS `box-shadow` in software. Each
+  `Shade { dx, dy, blur, alpha }` is the box with its rounded corners blurred by a Gaussian of
+  sigma `blur / 2` (as browsers draw it), computed exactly (the normal distribution across and
+  down, less each corner's notch in strips), offset, its alpha times `k`; the layers stack as CSS
+  stacks them, and each pixel is blended once and rounded, so a tail too faint to show leaves a
+  dark page as it was. Outside the box only, as CSS; the box is drawn over it next. Recipes:
+  `Shade::POPUP` (`0 8px 24px 55%, 0 2px 6px 35%`, the prototype's menus) and `Shade::TAB`
+  (`0 2px 10px 45%`, a joined menu's control); `LIGHT_SHADOW` (0.45) is the prototype's factor
+  on a light page; `soft_bounds` says how far it reaches (three sigmas). It honours the clip and
+  the offset, the shadow at 150% is the one at 100% made larger, and nonsense (a number that is
+  not finite, `k` of 0 or less) draws nothing.
+- **`menu::Look::soft_shadow`**: the menu casts `Shade::POPUP` at its `shadow_strength` (times
+  `LIGHT_SHADOW` on a light palette) instead of `shadow_with`, its joined control `Shade::TAB`,
+  and `draw_in_presence` fades the whole shadow with the menu. Off in `ROUNDED` and `FLAT`.
+- **`overlay::draw_dialog_card_with(p, pal, r, radius, soft)`**: the dialog card with other
+  corners and, given `Some(k)`, the soft popup shadow at `k`; `draw_dialog_card` is it with 10
+  and `None`.
+- **`settings::Style`**, given by `Form::style` (or `set_style` while the form is open, for a
+  look changed under it): the card's `radius` (out of 0..=32 it is 10), its `soft_shadow`,
+  `neutral_segments` (the chosen segment of a segmented choice a grey pill, white on a light
+  palette, on a track a shade off the card, instead of the accent) and `caps_headings` (11 px
+  small capitals in the muted colour). `Style::CLASSIC` is the form as it was, and what a form
+  given none draws. The struct is `non_exhaustive`: start from `CLASSIC` and change fields.
+
+Against the browser: Edge's own `box-shadow`, rendered headless at 100% and 150% and read pixel
+by pixel, is within 3 to 4 / 255 of the formula these follow (`soft_tests` holds the formula
+against a brute-force 6 x 6 supersampled blur, within 2 / 255).
+
+Cost: two numbers per layer for every column and row in reach, worked out once a call, a product
+per pixel, and a few strips at the corners. mdplay's frames on the release profile, three runs
+each: its Look dialog at 1650 x 1050 (150%) 5.7 to 6.1 ms against 5.55 with the old shadow, at
+100% 2.55 to 2.80 against 2.57; its menus 1.15 to 1.25 against 1.22 to 1.28.
+
+Compatibility: nothing existing changes. `ROUNDED` and `FLAT` gain `soft_shadow: false` (the
+struct is `non_exhaustive`); `draw_dialog_card` is `draw_dialog_card_with(.., 10.0, None)`, and the
+test that pins its pixels to a copy of the old loop passes unchanged; a form given no style draws
+the same pixels as one given `CLASSIC` (a test, light and dark, at 1 and 1.5); every other
+existing test passes unchanged.
+
+What was run, on Windows, on 9bebfcd..b1211de with these docs: the nine commands of AGENTS.md,
+all passing (the workspace's tests 1282 passed, 0 failed, 23 ignored; the feature runs recycle
+11, media_session 7, notify 11, none failed); the new tests also in a debug build. Mutants that
+drew the menu's or the tab's soft shadow as the old one, kept the old snapshot reach, turned the
+soft shadow on in `ROUNDED`, dropped the light factor, rounded the blend down, took sigma as a
+third of the blur, shadowed the corners' partial pixels whole, or ignored the style's radius,
+its limits, its soft shadow, its capitals, its neutral segments or `set_style`'s answer each
+failed a test. mdplay's shots show all of it (its own commit).
+
+Not verified: seen by the owner; Linux and macOS (CI not run); Wine; mdview and mdedit not
+rebuilt against the branch (they name none of it).
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
