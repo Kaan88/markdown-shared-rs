@@ -5,8 +5,9 @@
 //! lists and toggle switches ([`dropdown`], [`toggle`]), expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
-//! ([`focus`]), and animation ([`anim`]). No window loop; the application
-//! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
+//! ([`focus`]), animation ([`anim`]), and with the feature `a11y` an accessibility tree
+//! built from the same models (`a11y`). No window loop; the application owns that.
+//! `docs/CATALOGUE.md` lists every module with its entry points.
 
 #[cfg(feature = "a11y")]
 pub mod a11y;
