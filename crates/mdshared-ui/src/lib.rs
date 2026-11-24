@@ -4,6 +4,8 @@
 //! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, drop-down lists and
 //! toggle switches ([`dropdown`], [`toggle`]), table columns and splitters, link buttons, the
 //! cursors the widgets ask for, the models
+//! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, expanders, table
+//! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), and animation ([`anim`]). No window loop; the application
 //! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
@@ -19,6 +21,7 @@ pub mod cover;
 pub mod cursor;
 pub mod desktop_entry;
 pub mod dropdown;
+pub mod expander;
 pub mod focus;
 pub mod frost;
 pub mod gfx;
