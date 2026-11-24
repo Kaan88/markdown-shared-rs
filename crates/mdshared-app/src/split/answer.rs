@@ -75,15 +75,7 @@ impl TooLong {
 
 /// 31,000.
 fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    crate::fmt::count(n as u64)
 }
 
 /// `text` as one line of the outline: control characters as spaces, the end trimmed, cut to
