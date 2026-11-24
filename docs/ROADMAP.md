@@ -58,31 +58,14 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
-## Unfinished work on branches
-
-Agents' branches in this repository (local only, never pushed). All were cut from `16aca68`,
-before the animation fixes: rebase onto `feat/anim` before going on. The commits marked WIP were
-stopped mid-work on 2026-11-24 before their checks ran: not reviewed, and they may not compile.
-Read one before reusing it; dropping one loses nothing that is not described here.
-
-| Branch | Commit | Item | What is there |
-|---|---|---|---|
-| `wk/menus` | `dd07739` WIP | L1 | `menu/stack.rs`, `menu/hang.rs` (submenus, the hover delay and aim) with tests, changes to `menu.rs` |
-| `wk/winstate` | `84a7c27` WIP | W3 | `winstate.rs`, `winstate/live.rs` (winit glue), tests; a change to `place.rs` |
-| `wk/focus` | `7e25b98` WIP | W2 | `focus.rs` |
-| `wk/sections` | `a6f6853` WIP | L2 | `vrows.rs` (rows of differing heights); the sectioned list itself not started |
-| `wk/cursors` | `d57130c` | W4 | `cursor.rs`, committed by the agent after its checks, not reviewed; the horizontal scrollbar (L3) not started |
-| `wk/termgaps` | `0c86398` WIP | T3, T4, T6 | a generated width table (`width_table.rs`, `tools/gen_width.rs`), changes to `screen.rs` and its tests |
-| `wk/fslist` | `349b3e9` WIP | F1 | `dirlist/` (the listing model); the watcher F2 not started |
-
 ## Shell and window
 
 | Id | What | Size | Risk | Deps | Builds on | Status |
 |---|---|---|---|---|---|---|
 | W1 | **A shared window host.** The loop every application rewrites: winit events reduced to the toolkit's own (pointer, key, wheel, text, focus, scale), the softbuffer present, damage rectangles, timers (caret blink, tooltip delay, the animator's deadline in one `WaitUntil`), the hidden first frame. `docs/PLAN.md` step 4. The applications plug regions into it | XL | high | none (winit, softbuffer are there; softbuffer becomes a real dependency behind a feature) | `anim::Animator::end_frame`/`wake_at`/`blink`, `window`, `chrome`, `corners`, `shadow`; two real loops to read: mdview's and mdedit's `app.rs` | open |
-| W2 | **Focus model.** Which widget has the keyboard, Tab order, focus rings on keyboard use only, focus scopes for a dialog or a menu, return of focus when one closes | M | medium | none | `settings::Form` (has its own focus), `textfield`, `slider::Look::focused`, `check::Tick::focused` | wip: `wk/focus` |
-| W3 | **Window-state persistence.** Position, size, maximized and the monitor they belong to, as settings lines; restored on screen, on a monitor that still exists, at the right scale | S | medium | none | `mdshared_app::settings`, `place::work_area` | wip: `wk/winstate` |
-| W4 | **Cursors.** One enum of the cursors the widgets ask for (resize east-west for `table` and `splitter` edges, text, hand, grab, not-allowed) and the hit that picks one, so the loop sets it in one place | S | low | none | `table::HeaderHit`, `splitter::Splitter::hit`, `window::edge_at` | built, unreviewed: `wk/cursors` `d57130c` |
+| W2 | **Focus model.** Which widget has the keyboard, Tab order, focus rings on keyboard use only, focus scopes for a dialog or a menu, return of focus when one closes | M | medium | none | `settings::Form` (has its own focus), `textfield`, `slider::Look::focused`, `check::Tick::focused` | open |
+| W3 | **Window-state persistence.** Position, size, maximized and the monitor they belong to, as settings lines; restored on screen, on a monitor that still exists, at the right scale | S | medium | none | `mdshared_app::settings`, `place::work_area` | open |
+| W4 | **Cursors.** One enum of the cursors the widgets ask for (resize east-west for `table` and `splitter` edges, text, hand, grab, not-allowed) and the hit that picks one, so the loop sets it in one place | S | low | none | `table::HeaderHit`, `splitter::Splitter::hit`, `window::edge_at` | open |
 | W5 | **Theme tokens.** The palette as named tokens with an accent taken from the system (optional), high-contrast variants, and sizes (radius, row height, text sizes) that the widgets read from one place. Opt-in; its defaults reproduce `LIGHT` and `DARK` exactly | M | medium | none (the look changes only for an application that opts in) | `theme::Palette`, every `draw_*` | open |
 | W6 | **Tray icon and its menu.** For a player or a control panel that keeps running with its window closed | M | high | decided: hand-written per system | `menu::Item` for the items' data, L1 | open |
 | W7 | **Notifications.** A system toast (output switched, track changed, copy finished), with actions where the system has them | M | high | decided: `windows` WinRT feature, objc2-user-notifications 0.3, zbus | `platform`, zbus | open |
@@ -93,8 +76,8 @@ Read one before reusing it; dropping one loses nothing that is not described her
 
 | Id | What | Size | Risk | Deps | Builds on | Status |
 |---|---|---|---|---|---|---|
-| L1 | **Submenus, and menus anchored to a rectangle.** A menu item that opens another menu to its side with the usual hover delay and keyboard (Right opens, Left closes); a context menu that stays on screen at any corner | M | medium | none | `menu::Menu` (has `above`, `place_in`), `anim::Transient` | wip: `wk/menus` |
-| L2 | **Sectioned and variable-height lists.** Rows of differing heights (prefix sums, estimated heights corrected when measured); group headings that stick to the top while their group scrolls, collapsible groups, with the same questions `rows::Rows` answers (visible, rect, row at, nav, reveal) | M | low | none | `rows`, `select` | wip: `wk/sections` (variable heights only) |
+| L1 | **Submenus, and menus anchored to a rectangle.** A menu item that opens another menu to its side with the usual hover delay and keyboard (Right opens, Left closes); a context menu that stays on screen at any corner | M | medium | none | `menu::Menu` (has `above`, `place_in`), `anim::Transient` | open |
+| L2 | **Sectioned and variable-height lists.** Rows of differing heights (prefix sums, estimated heights corrected when measured); group headings that stick to the top while their group scrolls, collapsible groups, with the same questions `rows::Rows` answers (visible, rect, row at, nav, reveal) | M | low | none | `rows`, `select` | open |
 | L3 | **Horizontal scrollbar and two-axis scrolling.** `scroll::scrollbar` turned on its side; a viewport model with both offsets (`f64`), for a table wider than its view and for a terminal | S | low | none | `scroll`, `table` (already takes a shifted `row.x`), `scroll::SmoothScroll` | open |
 | L4 | **Table: hidden and reordered columns.** A header context menu to show and hide columns, dragging a title to another place, both saved in the settings line | M | medium | none | `table` (its doc lists these as refused), L1 | open |
 | L5 | **Rename in place.** A text field laid over a row or a grid cell: begins with the stem selected, commits on Enter, cancels on Escape or a click away, refuses names the system refuses | S | medium | none | `textfield`, `rows`/`grid` `rect`, `select::Selection::single` | open |
@@ -108,7 +91,7 @@ Read one before reusing it; dropping one loses nothing that is not described her
 
 | Id | What | Size | Risk | Deps | Builds on | Status |
 |---|---|---|---|---|---|---|
-| F1 | **Directory listing model.** The entries of a folder read on a worker (name, kind, size, times, hidden), sorted by any column with folders first, filtered, kept in step with the disk without re-reading it all, with the selection remapped across a re-sort | L | medium | none | `job` or `pool`, `fmt::natural_cmp`, `select::Selection::remap`, `table::Sort`, `tree` (reads folders lazily already) | wip: `wk/fslist` |
+| F1 | **Directory listing model.** The entries of a folder read on a worker (name, kind, size, times, hidden), sorted by any column with folders first, filtered, kept in step with the disk without re-reading it all, with the selection remapped across a re-sort | L | medium | none | `job` or `pool`, `fmt::natural_cmp`, `select::Selection::remap`, `table::Sort`, `tree` (reads folders lazily already) | open |
 | F2 | **A watcher that says what changed.** `watch::FileWatcher` says "something in this folder"; a file manager needs created, removed, renamed-from-to and modified per entry, debounced and coalesced | M | medium | none (notify is there) | `watch` | open |
 | F3 | **File operations with undo.** Copy, move, delete to the bin and rename as jobs with progress, conflict questions (replace, skip, keep both), cancel that leaves no half file, and a record that undoes each. Data-loss risk: built on a fake file system that can fail at every step, as `moves` and `runs` are | XL | high | none | `runs` (records and undo for notes: the pattern), `files::replace`, `platform::recycle`, `job` | open |
 | F4 | **Volumes.** The drives and mounts, their names, kinds, free space, and arrivals and removals; a dead network drive never blocks | M | high | none (`windows-sys`, `libc`, `/proc/self/mountinfo`) | `platform` | open |
@@ -133,8 +116,8 @@ Read one before reusing it; dropping one loses nothing that is not described her
 |---|---|---|---|---|---|---|
 | T1 | **Drawing a grid of cells.** Monospace glyphs placed on a fixed cell grid from the text engine's glyph cache, wide cells, colours and attributes from `mdshared_term::Cell`, box-drawing characters drawn as lines so they join, the cursor, the selection, and only the damaged rows redrawn | L | medium | none | `mdshared_text::TextEngine`, `gfx::Face::Mono`, `mdshared_term::Screen::take_dirty`, `anim::Animator::blink` for the cursor | open |
 | T2 | **A pseudo-terminal.** ConPTY on Windows, `openpty`/`forkpty` on Unix: start a shell, read and write on threads, resize, exit status | L | high | none (`windows-sys`, `libc`, both there) but `unsafe`, so its own crate `mdshared-pty` | `job` (thread and wake), `mdshared_term::Screen::feed`/`take_reply` | open |
-| T3 | **Reflow on resize.** Re-wrap lines when the width changes, using the `wrapped` flag lines already carry | M | medium | none | `mdshared_term::screen` | wip: `wk/termgaps` |
-| T4 | **Combining marks, grapheme clusters, Unicode widths.** Cells that hold a cluster, not a `char`; widths from the Unicode data | M | medium | none (the table is generated into the source) | `mdshared_term::width`, `screen::Cell` | wip: `wk/termgaps` (the width table) |
+| T3 | **Reflow on resize.** Re-wrap lines when the width changes, using the `wrapped` flag lines already carry | M | medium | none | `mdshared_term::screen` | open |
+| T4 | **Combining marks, grapheme clusters, Unicode widths.** Cells that hold a cluster, not a `char`; widths from the Unicode data | M | medium | none (the table is generated into the source) | `mdshared_term::width`, `screen::Cell` | open |
 | T5 | **The rest of xterm that people meet.** OSC 8 hyperlinks, OSC 52 clipboard, colour queries (OSC 4/10/11), synchronized output (2026), underline styles and colours, the kitty keyboard protocol | M each | low | none | `mdshared_term::parse`, `screen`, `input` | open |
 | T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | open |
 | T7 | **Colour schemes and IME at the cursor.** The 16 colours and the default pair as a scheme (with the palette's light and dark), and the IME composition window placed at the terminal's cursor with the preedit drawn in the cells | M | medium | none | T1, `textfield::Preedit`, winit `set_ime_cursor_area` | open |
