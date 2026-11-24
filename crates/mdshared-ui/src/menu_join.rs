@@ -24,7 +24,7 @@
 //! only once the menu is there.
 
 use super::Look;
-use crate::gfx::{Painter, Rect};
+use crate::gfx::{Painter, Rect, Shade};
 use crate::theme::Palette;
 
 /// The largest the concave curve between a tab's side and the menu's top grows, in logical px,
@@ -54,13 +54,19 @@ pub fn joins(tab: Rect, menu: Rect) -> bool {
 
 /// Before the menu is drawn: the shadow of the control at `tab`, the menu's shadow
 /// ([`Painter::shadow_with`]) with the look's radius and strength, so that tab and menu cast one
-/// shadow. Nothing when the look has no shadow, its strength is 0, or `tab` is not a real
-/// rectangle. The caller calls it only for a menu that will join ([`joins`], after
+/// shadow; in a look with the [soft shadow](Look::soft_shadow), the control's own soft one
+/// ([`Shade::TAB`], at the look's strength, times [`LIGHT_SHADOW`](crate::gfx::LIGHT_SHADOW)
+/// on a light palette). Nothing when the look has no shadow, its strength is 0, or `tab` is not
+/// a real rectangle. The caller calls it only for a menu that will join ([`joins`], after
 /// `Menu::place_in`), since a menu that does not leaves the control as it is.
 pub fn join_under(p: &mut Painter, pal: &Palette, look: &Look, tab: Rect) {
     let look = look.sane();
     if look.shadow && real(tab) {
-        p.shadow_with(tab, look.radius, pal.dark, look.shadow_strength);
+        if look.soft_shadow {
+            p.soft_shadow(tab, look.radius, &Shade::TAB, look.soft_strength(pal));
+        } else {
+            p.shadow_with(tab, look.radius, pal.dark, look.shadow_strength);
+        }
     }
 }
 

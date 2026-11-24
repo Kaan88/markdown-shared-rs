@@ -6,7 +6,7 @@
 //! [`beside`](Menu::beside) one another. A menu can be drawn joined to the control that opens
 //! it, the control a tab of the menu: [`join_under`], [`join_over`] and [`joins`].
 
-use crate::gfx::{Face, Painter, Rect};
+use crate::gfx::{Face, LIGHT_SHADOW, Painter, Rect, Shade, soft_bounds};
 use crate::scroll;
 use crate::theme::Palette;
 use std::borrow::Cow;
@@ -169,6 +169,13 @@ pub struct Look {
     /// How dark that shadow is ([`Painter::shadow_with`]): 1 is the shadow menus have always
     /// had, 0.5 half as dark, 0 none; [`sane`](Look::sane) holds it to 0..=2.
     pub shadow_strength: f32,
+    /// Whether that shadow is the soft one a web page draws, in place of
+    /// [`Painter::shadow_with`]'s: [`Painter::soft_shadow`] with [`Shade::POPUP`] (a wide layer
+    /// well below the menu and a tight one just under it) at `shadow_strength`, times
+    /// [`LIGHT_SHADOW`] on a light palette; a joined menu's control casts [`Shade::TAB`]
+    /// ([`join_under`]). Off in [`Look::ROUNDED`] and [`Look::FLAT`], so a menu draws as it
+    /// always has until its application turns it on.
+    pub soft_shadow: bool,
     /// The height of a row.
     pub row: f32,
     /// The room above the first row and below the last.
@@ -192,6 +199,7 @@ impl Look {
         radius: 8.0,
         shadow: true,
         shadow_strength: 1.0,
+        soft_shadow: false,
         row: ROW,
         pad: PAD,
         inset: PAD,
@@ -207,6 +215,7 @@ impl Look {
         radius: 0.0,
         shadow: false,
         shadow_strength: 1.0,
+        soft_shadow: false,
         row: 26.0,
         pad: 4.0,
         inset: 1.0,
@@ -234,6 +243,7 @@ impl Look {
             } else {
                 d.shadow_strength
             },
+            soft_shadow: self.soft_shadow,
             row: ok(self.row, 1.0, 256.0, d.row),
             pad: ok(self.pad, 0.0, 64.0, d.pad),
             inset: ok(self.inset, 0.0, 64.0, d.inset),
@@ -241,6 +251,14 @@ impl Look {
             separator: ok(self.separator, 0.0, 64.0, d.separator),
             gap: ok(self.gap, 0.0, 64.0, d.gap),
         }
+    }
+}
+
+impl Look {
+    /// The strength of the soft shadow on `pal`: [`shadow_strength`](Look::shadow_strength),
+    /// times [`LIGHT_SHADOW`] on a light palette.
+    pub(crate) fn soft_strength(&self, pal: &Palette) -> f32 {
+        self.shadow_strength * if pal.dark { 1.0 } else { LIGHT_SHADOW }
     }
 }
 
@@ -594,7 +612,12 @@ impl<T: Clone> Menu<T> {
         let (marks, icons) = self.columns();
         let look = self.look;
         if look.shadow {
-            p.shadow_with(self.rect, look.radius, pal.dark, look.shadow_strength);
+            if look.soft_shadow {
+                let k = look.soft_strength(pal);
+                p.soft_shadow(self.rect, look.radius, &Shade::POPUP, k);
+            } else {
+                p.shadow_with(self.rect, look.radius, pal.dark, look.shadow_strength);
+            }
         }
         p.frame(self.rect, look.radius, pal.popup, pal.popup_line);
         let old = p.clip(self.rect);
@@ -685,7 +708,11 @@ impl<T: Clone> Menu<T> {
             -MENU_DROP
         };
         // The frame and the shadow round it.
-        let bounds = self.rect.inset(-18.0);
+        let bounds = if self.look.shadow && self.look.soft_shadow {
+            soft_bounds(self.rect, &Shade::POPUP)
+        } else {
+            self.rect.inset(-18.0)
+        };
         crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
     }
 

@@ -787,3 +787,95 @@ fn a_menu_from_a_point_or_opened_rightwards_is_placed_as_before() {
         }
     }
 }
+
+/// The standard normal distribution's cumulative function by plain summing of its density,
+/// for the soft shadow's expected values.
+fn normal_cdf(t: f32) -> f32 {
+    let (lo, n) = (-9.0f64, 20_000);
+    let t = t as f64;
+    if t <= lo {
+        return 0.0;
+    }
+    let dx = (t - lo) / n as f64;
+    let f = |x: f64| (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let inner: f64 = (1..n).map(|i| f(lo + i as f64 * dx)).sum();
+    (((f(lo) + f(t)) / 2.0 + inner) * dx) as f32
+}
+
+/// A soft-shadowed menu with the given strength and corners, drawn on white in `pal`.
+fn soft_menu(pal: &crate::theme::Palette, k: f32, t: f32) -> (Bitmap, Rect) {
+    let mut look = Look::ROUNDED;
+    look.soft_shadow = true;
+    look.shadow_strength = k;
+    look.radius = 6.0;
+    let mut menu = Menu::new(many(5), 60.0, 30.0, false).with_look(look);
+    let mut bmp = Bitmap::new(360, 320);
+    bmp.clear([255, 255, 255]);
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+    menu.draw_in_presence(&mut p, pal, Rect::new(0.0, 0.0, 360.0, 320.0), t);
+    let r = menu.rect();
+    (bmp, r)
+}
+
+#[test]
+fn the_soft_shadow_is_off_in_both_looks_and_kept_by_sane() {
+    assert_eq!(
+        (Look::ROUNDED.soft_shadow, Look::FLAT.soft_shadow),
+        (false, false)
+    );
+    let mut look = Look::ROUNDED;
+    look.soft_shadow = true;
+    assert!(look.sane().soft_shadow);
+    assert!(
+        Menu::new(many(2), 0.0, 0.0, false)
+            .with_look(look)
+            .look()
+            .soft_shadow
+    );
+}
+
+#[test]
+fn a_soft_shadowed_menu_casts_the_popup_recipe_below_it_lighter_on_a_light_palette() {
+    use crate::theme::{DARK, LIGHT};
+    // The prototype's menu, `0 8px 24px 55%, 0 2px 6px 35%` at the look's 60%, and .45 of
+    // that on a light palette: the shadow below the middle of the menu's foot.
+    for (pal, factor) in [(&DARK, 1.0), (&LIGHT, 0.45)] {
+        let (bmp, r) = soft_menu(pal, 0.6, 1.0);
+        let x = r.cx();
+        for d in [0.0f32, 2.0, 4.0, 8.0, 16.0, 24.0, 32.0] {
+            let mut keep = 1.0;
+            for (dy, blur, a) in [(8.0f32, 24.0f32, 0.55f32), (2.0, 6.0, 0.35)] {
+                keep *= 1.0 - a * 0.6 * factor * normal_cdf((dy - (d + 0.5)) / (blur / 2.0));
+            }
+            let want = 1.0 - keep;
+            let got = 1.0 - pixel(&bmp, x, r.bottom() + d)[1] as f32 / 255.0;
+            assert!(
+                (got - want).abs() <= 1.5 / 255.0,
+                "{d} px below, dark {}: {got} drawn, {want} the recipe",
+                pal.dark
+            );
+        }
+        // Well above the menu it is faint: the shadow falls downwards.
+        let above = 1.0 - pixel(&bmp, x, r.y - 6.0)[1] as f32 / 255.0;
+        assert!(above < 0.12 * factor, "above: {above}");
+    }
+}
+
+#[test]
+fn a_soft_shadowed_menu_that_fades_fades_its_whole_shadow() {
+    use crate::theme::DARK;
+    // 22 px below the menu is past the 18 px a menu's fade used to take, inside the soft
+    // shadow's reach: half present, it is half as dark (the menu is 3 px higher by then, so a
+    // little lighter still), where a shadow left out of the fade would be nearly as dark.
+    let (full, r) = soft_menu(&DARK, 1.5, 1.0);
+    let (half, _) = soft_menu(&DARK, 1.5, 0.5);
+    let a = |b: &Bitmap| 1.0 - pixel(b, r.cx(), r.bottom() + 22.0)[1] as f32 / 255.0;
+    assert!(a(&full) > 0.08, "{}", a(&full));
+    assert!(
+        a(&half) < a(&full) * 0.5,
+        "{} faded, {} there",
+        a(&half),
+        a(&full)
+    );
+}

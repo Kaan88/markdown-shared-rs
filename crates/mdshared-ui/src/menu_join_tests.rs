@@ -298,3 +298,52 @@ fn the_tabs_shadow_is_the_menus_shadow_at_the_looks_strength() {
         assert!(draw(look, tab, &under).pixels == blank.pixels, "{tab:?}");
     }
 }
+
+#[test]
+fn in_a_soft_look_the_tab_casts_its_own_soft_shadow() {
+    // The prototype's joined control, `0 2px 10px 45%`, at the look's strength: below the
+    // middle of the tab's foot, on a light ground, and nothing inside the tab itself.
+    let mut look = Look::ROUNDED;
+    look.soft_shadow = true;
+    look.shadow_strength = 0.6;
+    look.radius = 6.0;
+    let mut bmp = Bitmap::new(200, 120);
+    bmp.clear([255, 255, 255]);
+    let mut gfx = Gfx::new();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        join_under(&mut p, &DARK, &look, TAB);
+    }
+    let alpha = |x: i32, y: i32| 1.0 - pixel(&bmp, x, y)[1] as f32 / 255.0;
+    let x = TAB.cx() as i32;
+    let foot = TAB.bottom() as i32;
+    // The tab's Gaussian across its 60 px is whole in its middle; down, it is the foot's.
+    let cdf = |t: f32| 0.5 * (1.0 + erf(t / std::f32::consts::SQRT_2));
+    for d in [0, 2, 4, 8] {
+        let want = 0.45 * 0.6 * cdf((2.0 - (d as f32 + 0.5)) / 5.0);
+        let got = alpha(x, foot + d);
+        assert!(
+            (got - want).abs() <= 1.5 / 255.0,
+            "{d} below: {got}, {want}"
+        );
+    }
+    assert_eq!(alpha(x, TAB.cy() as i32), 0.0);
+    // And on a light palette, .45 of it.
+    let mut light = Bitmap::new(200, 120);
+    light.clear([255, 255, 255]);
+    {
+        let mut p = Painter::new(&mut light, &mut gfx, 1.0);
+        join_under(&mut p, &LIGHT, &look, TAB);
+    }
+    let l = 1.0 - pixel(&light, x, foot)[1] as f32 / 255.0;
+    assert!((l - 0.45 * alpha(x, foot)).abs() <= 1.5 / 255.0, "{l}");
+}
+
+/// The error function by plain summing of its integrand, for the expected shadow.
+fn erf(x: f32) -> f32 {
+    let n = 4000;
+    let dx = x as f64 / n as f64;
+    let f = |t: f64| (-t * t).exp();
+    let inner: f64 = (1..n).map(|i| f(i as f64 * dx)).sum();
+    (((f(0.0) + f(x as f64)) / 2.0 + inner) * dx * 2.0 / std::f64::consts::PI.sqrt()) as f32
+}
