@@ -33,10 +33,19 @@ fn shape(tree: &mut Tree, invoked: u32, scroll: f32, selected: Option<usize>) ->
         multiselect: true,
     };
     let list_id = list(tree, &l, |i| {
-        (format!("Program {i}"), format!("Row{i}"), Some(i) == selected)
+        (
+            format!("Program {i}"),
+            format!("Row{i}"),
+            Some(i) == selected,
+        )
     });
     let b = id("UninstallButton");
-    let mut button = button("Uninstall", "UninstallButton", Rect::new(8.0, 8.0, 100.0, 32.0), false);
+    let mut button = button(
+        "Uninstall",
+        "UninstallButton",
+        Rect::new(8.0, 8.0, 100.0, 32.0),
+        false,
+    );
     button.set_description(format!("pressed {invoked}"));
     tree.add(b, button);
     tree.add(tree.root(), window("Purge", 1.5, vec![b, list_id]));
@@ -101,6 +110,8 @@ fn rows_carry_their_position_and_the_list_its_count_and_scroll() {
     let (_, l) = up.nodes.iter().find(|(i, _)| *i == list_id).unwrap();
     assert_eq!(l.size_of_set(), Some(2000));
     assert!(l.is_multiselectable());
+    // A clipping list would make AccessKit hide the rows outside the viewport from UIA.
+    assert!(!l.clips_children());
     assert_eq!(l.transform().map(|t| t.as_coeffs()[5]), Some(-400.0));
     // Its bounds, through the transform, are the viewport on screen.
     let b = l.bounds().unwrap();
@@ -166,13 +177,19 @@ fn the_widget_nodes_have_their_roles_and_states() {
     assert!(button("B", "b", r, true).is_disabled());
     assert_eq!(link("L", "l", r, false).role(), Role::Link);
     let c = check_box("C", "c", r, Some(true), false);
-    assert_eq!((c.role(), c.toggled()), (Role::CheckBox, Some(Toggled::True)));
+    assert_eq!(
+        (c.role(), c.toggled()),
+        (Role::CheckBox, Some(Toggled::True))
+    );
     assert_eq!(
         check_box("C", "c", r, None, false).toggled(),
         Some(Toggled::Mixed)
     );
     let s = switch("S", "s", r, false, false);
-    assert_eq!((s.role(), s.toggled()), (Role::Switch, Some(Toggled::False)));
+    assert_eq!(
+        (s.role(), s.toggled()),
+        (Role::Switch, Some(Toggled::False))
+    );
     let d = combo_box("Theme", "ThemeBox", r, "Dark", true);
     assert_eq!((d.value(), d.is_expanded()), (Some("Dark"), Some(true)));
     let e = expander("Details", "DebugExpander", r, false);
@@ -180,7 +197,10 @@ fn the_widget_nodes_have_their_roles_and_states() {
     let p = progress("Scan", "ScanProgress", r, Some(0.25));
     assert_eq!(p.numeric_value(), Some(25.0));
     assert_eq!(progress("Scan", "x", r, None).numeric_value(), None);
-    assert_eq!(text("3 selected", "FooterCount", r).value(), Some("3 selected"));
+    assert_eq!(
+        text("3 selected", "FooterCount", r).value(),
+        Some("3 selected")
+    );
     assert_eq!(
         text_input("Search", "SearchBox", r, "fire", false).value(),
         Some("fire")
