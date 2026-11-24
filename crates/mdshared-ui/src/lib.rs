@@ -28,6 +28,7 @@ pub mod platform;
 pub mod rows;
 pub mod scroll;
 pub mod segments;
+pub mod select;
 pub mod settings;
 pub mod shadow;
 pub mod snap;
