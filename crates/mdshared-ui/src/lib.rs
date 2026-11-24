@@ -8,6 +8,7 @@ pub mod blur;
 pub mod cf_html;
 pub mod check;
 pub mod chrome;
+pub mod commands;
 pub mod corners;
 pub mod desktop_entry;
 pub mod frost;
