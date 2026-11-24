@@ -11,6 +11,9 @@ use parley::{
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod shapes;
+pub use shapes::{Along, Path};
+
 pub type Rgb = [u8; 3];
 type Brush = [u8; 4];
 
