@@ -117,6 +117,7 @@ The only modules that call the system. Each fails soft where the system lacks th
 | `place` | Putting a window on a half of the screen (the two Markdown applications side by side) | `halves`, `work_area`, `set` |
 | `desktop_entry` | The desktop entry and icon of an AppImage | `ensure`, `Spec` |
 | `open_documents` | Files macOS asks a running application to open | `on_open` |
+| `a11y` (feature `a11y`) | An AccessKit tree built from the models that draw, for UI Automation (Windows only so far): stable ids from author ids (UIA's AutomationId), updates that send only the nodes that changed, node helpers for the widgets, a list that puts every row in the tree and scrolls by its transform (provisional; driven by `tests/uia/purge_shape.ps1`, not yet tried with Narrator) | `id(author)`, `item_id`, `Tree::new` / `begin` / `add` / `end(focus)` / `full`, `request -> Request`; `window`, `group`, `button`, `link`, `check_box`, `switch`, `combo_box`, `expander`, `progress`, `text`, `text_input`, `tab_list`, `tab`, `dialog`; `List`, `list`, `RowIndex` |
 
 ## Application plumbing (`mdshared-app`, `mdshared-fetch`)
 

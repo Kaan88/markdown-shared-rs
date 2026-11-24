@@ -1,5 +1,6 @@
 # A UI Automation client run against examples/purge_shape (roadmap W8 and check C2): it finds
-# the window's elements by AutomationId and drives them the way Purge's VM rig drives WinUI
+# the window's elements by AutomationId and drives them (Invoke, Toggle, SelectionItem,
+# ScrollItem, ExpandCollapse, Value, RangeValue) the way Purge's VM rig drives WinUI
 # (vm/guest/m3-e2e-ui.ps1 in Purge). Run it with Windows PowerShell on the host:
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\uia\purge_shape.ps1 -Exe <path to purge_shape.exe>
@@ -114,13 +115,6 @@ try {
     Check 'find by AutomationId' ($null -ne $button) 'UninstallButton'
     Check 'find by name' ($null -ne (ByName $win 'Show components')) 'Show components'
 
-    # Invoke.
-    $inv = Pattern $button ([System.Windows.Automation.InvokePattern]::Pattern)
-    Check 'Invoke pattern' ($null -ne $inv)
-    if ($inv) { $inv.Invoke(); Start-Sleep -Milliseconds 300 }
-    $f = Footer $win
-    Check 'Invoke acted' ($f -match 'pressed 1 times') "footer: $f"
-
     # Toggle.
     $check = ById $win 'ShowComponents'
     $tog = Pattern $check ([System.Windows.Automation.TogglePattern]::Pattern)
@@ -132,17 +126,16 @@ try {
         Check 'Toggle acted' ($before -eq 'Off' -and $after -eq 'On') "$before -> $after"
     }
 
-    # The list: only some rows are realized, and each says where it is in all 2,000 (UIA has the
-    # count on the items, PositionInSet and SizeOfSet, not on the list).
+    # The list: every row is in the tree, and each says where it is in all 2,000 (UIA has the
+    # count on the items, PositionInSet and SizeOfSet).
     $list = ById $win 'ProgramList'
     Check 'list found' ($null -ne $list)
     $kids = $list.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
-    Check 'only some rows realized' ($kids.Count -gt 0 -and $kids.Count -lt 2000) "$($kids.Count)"
+    Check 'every row in the tree' ($kids.Count -eq 2000) "$($kids.Count)"
     $row5 = ById $list 'Row4'
     if ($row5) {
         $rs = ComSet $hwnd 'Row4'
         Check 'row position of size' ($rs.Position -eq 5 -and $rs.Size -eq 2000) "row 5: $($rs.Position) of $($rs.Size), name '$($row5.Current.Name)'"
-        # SelectionItem.
         $si = Pattern $row5 ([System.Windows.Automation.SelectionItemPattern]::Pattern)
         Check 'SelectionItem pattern' ($null -ne $si)
         if ($si) {
@@ -153,33 +146,25 @@ try {
         $sp = Pattern $list ([System.Windows.Automation.SelectionPattern]::Pattern)
         Check 'Selection pattern on list' ($null -ne $sp) "CanSelectMultiple=$(if ($sp) { $sp.Current.CanSelectMultiple })"
     } else {
-        Check 'row 5 realized' $false
+        Check 'row 5 found' $false
     }
 
-    # ScrollItem: walk to a far row by scrolling the last realized row into view, then scroll the
-    # far row itself into view and select it.
+    # ScrollItem: a far row is found directly, scrolled into view and selected.
     $target = "Row$($FarRow - 1)"
     $far = ById $list $target
-    $steps = 0
-    while ($null -eq $far -and $steps -lt 200) {
-        $kids = $list.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
-        $last = $kids[$kids.Count - 1]
-        $sc = Pattern $last ([System.Windows.Automation.ScrollItemPattern]::Pattern)
-        if ($null -eq $sc) { break }
-        $sc.ScrollIntoView(); Start-Sleep -Milliseconds 150
-        $steps++
-        $far = ById $list $target
-    }
-    Check 'far row realized by ScrollItem steps' ($null -ne $far) "$target after $steps steps"
+    Check 'far row found' ($null -ne $far) $target
     if ($far) {
         $sc = Pattern $far ([System.Windows.Automation.ScrollItemPattern]::Pattern)
         Check 'ScrollItem pattern' ($null -ne $sc)
-        $sc.ScrollIntoView(); Start-Sleep -Milliseconds 300
+        $lb = $list.Current.BoundingRectangle
+        $rb = $far.Current.BoundingRectangle
+        $wasOut = -not (($rb.Top -ge $lb.Top - 1) -and ($rb.Bottom -le $lb.Bottom + 1))
+        if ($sc) { $sc.ScrollIntoView(); Start-Sleep -Milliseconds 300 }
         $far = ById $list $target
         $lb = $list.Current.BoundingRectangle
         $rb = $far.Current.BoundingRectangle
         $inView = ($rb.Top -ge $lb.Top - 1) -and ($rb.Bottom -le $lb.Bottom + 1)
-        Check 'far row scrolled into view' $inView "row $($rb.Top)-$($rb.Bottom), list $($lb.Top)-$($lb.Bottom)"
+        Check 'far row scrolled into view' ($wasOut -and $inView) "out before: $wasOut; row $($rb.Top)-$($rb.Bottom), list $($lb.Top)-$($lb.Bottom)"
         $si = Pattern $far ([System.Windows.Automation.SelectionItemPattern]::Pattern)
         if ($si) { $si.Select(); Start-Sleep -Milliseconds 300 }
         $sel = (Pattern (ById $list $target) ([System.Windows.Automation.SelectionItemPattern]::Pattern)).Current.IsSelected
@@ -190,6 +175,56 @@ try {
     $prog = ById $win 'SelectedProgress'
     $rv = Pattern $prog ([System.Windows.Automation.RangeValuePattern]::Pattern)
     Check 'RangeValue pattern' ($null -ne $rv) "value=$(if ($rv) { $rv.Current.Value }) of $(if ($rv) { $rv.Current.Maximum })"
+
+    # Invoke opens the modal dialog; Cancel closes it, Uninstall confirms.
+    $inv = Pattern $button ([System.Windows.Automation.InvokePattern]::Pattern)
+    Check 'Invoke pattern' ($null -ne $inv)
+    if ($inv) { $inv.Invoke(); Start-Sleep -Milliseconds 300 }
+    $dlg = ById $win 'ConfirmDialog'
+    Check 'Invoke opened the dialog' ($null -ne $dlg) "footer: $(Footer $win)"
+    if ($dlg) {
+        $wp = Pattern $dlg ([System.Windows.Automation.WindowPattern]::Pattern)
+        $modal = if ($wp) { $wp.Current.IsModal } else { 'no Window pattern' }
+        Check 'dialog is a modal window' ($modal -eq $true) "$($dlg.Current.ControlType.ProgrammaticName), modal: $modal"
+        $no = ById $dlg 'ConfirmNo'
+        (Pattern $no ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke(); Start-Sleep -Milliseconds 300
+        Check 'Cancel closed the dialog' ($null -eq (ById $win 'ConfirmDialog')) "footer: $(Footer $win)"
+        $inv.Invoke(); Start-Sleep -Milliseconds 300
+        $yes = ById $win 'ConfirmYes'
+        if ($yes) { (Pattern $yes ([System.Windows.Automation.InvokePattern]::Pattern)).Invoke(); Start-Sleep -Milliseconds 300 }
+        $f = Footer $win
+        Check 'Uninstall confirmed' ($f -match 'uninstalled 1,' -and $f -match 'pressed 2 times') "footer: $f"
+    }
+
+    # ExpandCollapse on a group header of the grouped list.
+    $hdr = ById $win 'GroupHeader1'
+    $ec = Pattern $hdr ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    Check 'ExpandCollapse pattern' ($null -ne $ec) "state: $(if ($ec) { $ec.Current.ExpandCollapseState })"
+    if ($ec) {
+        Check 'group items shown while open' ($null -ne (ById $win 'Leftover1_0'))
+        $ec.Collapse(); Start-Sleep -Milliseconds 300
+        $st = (Pattern (ById $win 'GroupHeader1') ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)).Current.ExpandCollapseState
+        Check 'Collapse acted' ($st -eq 'Collapsed' -and $null -eq (ById $win 'Leftover1_0')) "state: $st"
+        (Pattern (ById $win 'GroupHeader1') ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)).Expand(); Start-Sleep -Milliseconds 300
+        $st = (Pattern (ById $win 'GroupHeader1') ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)).Current.ExpandCollapseState
+        Check 'Expand acted' ($st -eq 'Expanded' -and $null -ne (ById $win 'Leftover1_0')) "state: $st"
+    }
+
+    # Value: the search field filters the list.
+    $box = ById $win 'SearchBox'
+    $val = Pattern $box ([System.Windows.Automation.ValuePattern]::Pattern)
+    Check 'Value pattern' ($null -ne $val)
+    if ($val) {
+        $val.SetValue('Program 15'); Start-Sleep -Milliseconds 400
+        $got = (Pattern (ById $win 'SearchBox') ([System.Windows.Automation.ValuePattern]::Pattern)).Current.Value
+        $f = Footer $win
+        # "Program 1500" to "Program 1599".
+        Check 'search filtered' ($got -eq 'Program 15' -and $f -match ' 100 shown') "value '$got', footer: $f"
+        $kids = (ById $win 'ProgramList').FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        Check 'list has the filtered rows' ($kids.Count -eq 100) "$($kids.Count)"
+        $val.SetValue(''); Start-Sleep -Milliseconds 400
+        Check 'search cleared' ((Footer $win) -match ' 2000 shown') "footer: $(Footer $win)"
+    }
 }
 catch {
     Write-Output "FAIL script error: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"

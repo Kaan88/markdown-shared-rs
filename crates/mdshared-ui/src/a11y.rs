@@ -38,8 +38,8 @@ use std::collections::HashMap;
 
 pub use accesskit;
 use accesskit::{
-    Action, ActionData, ActionRequest, Affine, Node, NodeId, Rect as AkRect, Role, Toggled,
-    TreeId, TreeInfo, TreeUpdate,
+    Action, ActionData, ActionRequest, Affine, Node, NodeId, Rect as AkRect, Role, Toggled, TreeId,
+    TreeInfo, TreeUpdate,
 };
 
 use crate::gfx::Rect;
@@ -56,7 +56,13 @@ pub fn id(author: &str) -> NodeId {
 /// The id of item `index` of the container `container` (a list's row): mixed from both, so two
 /// lists' rows never share ids in practice.
 pub fn item_id(container: NodeId, index: usize) -> NodeId {
-    NodeId(fnv(&(index as u64).to_le_bytes(), container.0 ^ 0x9e37_79b9_7f4a_7c15).max(1))
+    NodeId(
+        fnv(
+            &(index as u64).to_le_bytes(),
+            container.0 ^ 0x9e37_79b9_7f4a_7c15,
+        )
+        .max(1),
+    )
 }
 
 fn fnv(bytes: &[u8], seed: u64) -> u64 {
@@ -405,7 +411,8 @@ pub fn list(
         l.area.h,
     )));
     n.set_transform(Affine::translate((0.0, -scroll)));
-    n.set_clips_children();
+    // Not `set_clips_children`: AccessKit then hides every row outside the viewport but the
+    // nearest one each side, which is the stepping this module is here to avoid.
     if l.multiselect {
         n.set_multiselectable();
     }
