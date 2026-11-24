@@ -11,6 +11,11 @@
 # the time from Start-Process to the bare window found by its title, and to purge_shape's names
 # visible (the first time UninstallButton is found by its AutomationId).
 #
+# It also listens for UIA's focus-changed events (Purge's B1), moves the focus with SetFocus and
+# then with a Tab typed into the window, and checks that each move raised one. The Tab needs the
+# window in the foreground: the script asks for it (an Alt press, then SetForegroundWindow), so
+# do not use the desktop while it runs.
+#
 # Nothing waits a fixed time: after each action the script polls for the state it expects, up to
 # a deadline (WaitFor). Each section has its own try/catch, so an exception fails that section
 # and the rest still run. It prints one PASS or FAIL line per check, then how many checks ran
@@ -40,7 +45,7 @@ $P = @{
     Value     = [System.Windows.Automation.ValuePattern]::Pattern
 }
 # Every check below, counted by hand; the script says so when fewer ran.
-$Expected = 42
+$Expected = 44
 $script:checks = 0
 $script:failures = 0
 
@@ -166,6 +171,74 @@ function ComDescription($hwnd, [string]$id) {
     $r = [UiaCom]::Get($hwnd, $id, [int[]](30159))
     if ($null -eq $r) { $null } else { [string]$r[0] }
 }
+
+# UIA focus-changed events (Purge's B1: "focus changes raise UIA focus events"). UIA calls the
+# handler on its own thread, where a PowerShell scriptblock is not safe, so the handler is C#: it
+# queues "pid:AutomationId" of each element that takes the focus. The same class brings a window
+# to the foreground and types keys into it with SendInput.
+$refs = @(
+    [System.Windows.Automation.Automation].Assembly.Location,
+    [System.Windows.Automation.AutomationElement].Assembly.Location,
+    [System.Windows.Automation.TreeScope].Assembly.Location,
+    [System.Windows.Point].Assembly.Location
+) | Select-Object -Unique
+Add-Type -ReferencedAssemblies $refs -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Windows.Automation;
+public static class UiaFocus {
+    static readonly ConcurrentQueue<string> seen = new ConcurrentQueue<string>();
+    static AutomationFocusChangedEventHandler handler;
+    public static void Start() {
+        handler = (sender, e) => {
+            var el = sender as AutomationElement;
+            string s = "?";
+            try { s = el.Current.ProcessId + ":" + el.Current.AutomationId; } catch (Exception) { }
+            seen.Enqueue(s);
+        };
+        Automation.AddAutomationFocusChangedEventHandler(handler);
+    }
+    public static void Stop() {
+        if (handler != null) Automation.RemoveAutomationFocusChangedEventHandler(handler);
+        handler = null;
+    }
+    public static string[] Seen() { return seen.ToArray(); }
+    public static void Clear() { string s; while (seen.TryDequeue(out s)) { } }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    // INPUT is a type and a union whose largest member (MOUSEINPUT) is 32 bytes on x64; the
+    // padding keeps the size SendInput checks.
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public KEYBDINPUT ki; public long pad; }
+    [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    const uint KEYUP = 2;
+
+    // Asks for the window to come to the front. Windows lets a process take the foreground only
+    // in some cases; a press of Alt first is the usual way for a script to qualify. Answers
+    // whether the window is in front afterwards.
+    public static bool Front(IntPtr hwnd) {
+        if (GetForegroundWindow() == hwnd) return true;
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
+        keybd_event(0x12, 0, KEYUP, UIntPtr.Zero);
+        SetForegroundWindow(hwnd);
+        System.Threading.Thread.Sleep(50);
+        return GetForegroundWindow() == hwnd;
+    }
+    public static bool IsFront(IntPtr hwnd) { return GetForegroundWindow() == hwnd; }
+
+    // A press and release of the virtual key `vk`; answers how many inputs Windows took (2).
+    public static uint Key(ushort vk) {
+        var down = new INPUT { type = 1, ki = new KEYBDINPUT { wVk = vk } };
+        var up = new INPUT { type = 1, ki = new KEYBDINPUT { wVk = vk, dwFlags = KEYUP } };
+        return SendInput(2, new[] { down, up }, Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+'@
 
 $ErrorActionPreference = 'Stop'
 # The first UIA call of a process loads and starts the client; done here so the timings below
@@ -374,6 +447,33 @@ try {
         Check 'search cleared' ($f -match ' 2000 shown') "footer: $(Footer $win)"
     }
     catch { SectionFailed 'Value' $_ }
+
+    # --- Focus events: a focus moved by UIA, then one moved by the keyboard, raises UIA's
+    # focus-changed event for the element that took it.
+    try {
+        $mine = { @([UiaFocus]::Seen() | Where-Object { $_ -like "$($proc.Id):*" } | ForEach-Object { $_.Substring($_.IndexOf(':') + 1) }) }
+        [UiaFocus]::Start()
+        $want = @('Row4', 'SearchBox', 'GroupHeader2')
+        foreach ($id in $want) {
+            (ById $win $id).SetFocus()
+            $null = WaitFor { (& $mine) -contains $id }
+        }
+        # Each wanted id in order, whatever else came between (the window itself, say).
+        $got = & $mine
+        $at = 0
+        foreach ($g in $got) { if ($at -lt $want.Count -and $g -eq $want[$at]) { $at++ } }
+        Check 'SetFocus raises focus events, in order' ($at -eq $want.Count) "seen: $($got -join ', ')"
+
+        # The keyboard: Tab from GroupHeader2 goes to GroupHeader3 in the window's ring.
+        [UiaFocus]::Clear()
+        $front = WaitFor { [UiaFocus]::Front($hwnd) } -TimeoutMs 2000 -IntervalMs 100
+        $sent = 0
+        if ($front) { $sent = [UiaFocus]::Key(0x09) }
+        $tab = WaitFor { (& $mine) -contains 'GroupHeader3' }
+        Check 'Tab raises a focus event for the next element' ($tab) "foreground: $front, inputs sent: $sent, seen: $((& $mine) -join ', ')"
+    }
+    catch { SectionFailed 'focus events' $_ }
+    finally { [UiaFocus]::Stop() }
 }
 finally {
     if (-not $proc.HasExited) { $proc.Kill() }
