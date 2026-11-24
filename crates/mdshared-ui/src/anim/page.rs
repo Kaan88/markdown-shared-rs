@@ -6,6 +6,18 @@
 //! page is drawn as always and [`PageTransition::apply`] then blends the snapshot with it in
 //! place. The cost is one copy of the region at the switch and one pass over it per frame, for
 //! a quarter of a second.
+//!
+//! The old page is pixels, so it is only right where and as it was taken. A switch remembers
+//! the bitmap's size, the scale and the region's device rectangle at its start, and
+//! [`apply`](PageTransition::apply) is told the region each frame: if the window was resized,
+//! moved to a screen of another scale, or laid out anew so that the region is elsewhere, the
+//! switch ends there and then and the frame shows the new page plainly. A switch cut short is
+//! never wrong; an old page blended in the wrong place is.
+//!
+//! Deliberately not here: a switch that survives a resize (it would need the old page drawn
+//! again at the new size, which is the application's to do: draw it, take a snapshot, and
+//! [`begin_with`](PageTransition::begin_with) it), and transitions of more than one region at
+//! once (keep one `PageTransition` for each).
 
 use super::{Animator, AsId, Easing, Id, Motion, Snapshot, fluent};
 use crate::gfx::{Painter, Rect};
@@ -64,6 +76,34 @@ pub enum PageEffect {
 
 /// One region's switch from an old page to a new one. Keep one per region that switches pages,
 /// next to the application's other window state.
+///
+/// ```
+/// # use mdshared_ui::anim::{Animator, Edge, PageEffect, PageTransition};
+/// # use mdshared_ui::gfx::{Gfx, Painter, Rect};
+/// # use mdshared_text::Bitmap;
+/// # struct State { page: u8 }
+/// # fn draw_page(p: &mut Painter, r: Rect, page: u8) { p.fill(r, [page * 80; 3]); }
+/// # let (mut bitmap, mut gfx, scale) = (Bitmap::new(64, 48), Gfx::new(), 1.0);
+/// # let mut anim = Animator::new();
+/// # let content_rect = Rect::new(8.0, 8.0, 48.0, 32.0);
+/// # let (mut state, next) = (State { page: 1 }, 2);
+/// # anim.begin_frame(std::time::Instant::now());
+/// // State: one for each region that switches pages.
+/// let mut page_switch = PageTransition::new("content");
+///
+/// // When the switch is decided (the bitmap still holds the old page):
+/// let p = Painter::new(&mut bitmap, &mut gfx, scale);
+/// let effect = PageEffect::SlideFade { from: Edge::Bottom, distance: 24.0 };
+/// page_switch.begin(&mut anim, &p, content_rect, effect);
+/// state.page = next;
+///
+/// // Every frame, after the content region is drawn and before anything that lies over it:
+/// let mut p = Painter::new(&mut bitmap, &mut gfx, scale);
+/// draw_page(&mut p, content_rect, state.page);
+/// page_switch.apply(&mut anim, &mut p, content_rect);
+/// # assert!(page_switch.running());
+/// # assert!(anim.end_frame().is_some());
+/// ```
 #[derive(Debug)]
 pub struct PageTransition {
     id: Id,
@@ -133,6 +173,8 @@ impl PageTransition {
     /// As [`begin`](Self::begin), with a snapshot the application took itself: for one whose
     /// bitmap no longer holds the old page when the switch is decided, and which therefore
     /// draws the old page once more, takes [`Painter::snapshot`] of it, and then draws the new.
+    /// The snapshot is taken of the whole region, with no clip in force that cuts it: its
+    /// rectangle is what [`apply`](Self::apply) holds the region to.
     pub fn begin_with(
         &mut self,
         anim: &mut Animator,
@@ -160,17 +202,49 @@ impl PageTransition {
         anim.forget(self.id);
     }
 
-    /// Blends the old page into the region of `bmp`, which holds the new page as this frame
-    /// drew it. Call it every frame, after the region's content is drawn and before anything
-    /// that lies over the region (a popup, a toast) is. It does nothing when no switch runs,
-    /// and ends the switch when its time is up or when the bitmap no longer holds the region
-    /// (the window shrank). Returns whether the switch is still running.
-    pub fn apply(&mut self, anim: &mut Animator, bmp: &mut Bitmap) -> bool {
+    /// Blends the old page into the region `r` of the painter's bitmap, which holds the new
+    /// page as this frame drew it. Call it every frame, after the region's content is drawn and
+    /// before anything that lies over the region (a popup, a toast) is; `r` is the region as
+    /// this frame laid it out, the rectangle given to [`begin`](Self::begin). It does nothing
+    /// when no switch runs, and ends the switch when its time is up. It also ends it, at once
+    /// and with the new page left as drawn, when the old page would no longer be in its place:
+    /// the bitmap has another size than at the start (the window was resized), the painter
+    /// another scale (the window moved to another screen), or `r` is another device rectangle
+    /// (the layout changed). Returns whether the switch is still running.
+    ///
+    /// The blend is of the whole region and does not heed the painter's clip.
+    pub fn apply(&mut self, anim: &mut Animator, p: &mut Painter, r: Rect) -> bool {
+        let rect = p.dev_rect(r);
+        let scale = p.scale;
+        self.apply_dev(anim, p.bmp, rect, scale)
+    }
+
+    /// As [`apply`](Self::apply), for a device rectangle (far edges outside) of a bitmap held
+    /// without a painter, as [`begin_dev`](Self::begin_dev) takes them. `rect` and `scale` are
+    /// this frame's; the switch ends if they, or the bitmap's size, are not those of its start.
+    pub fn apply_dev(
+        &mut self,
+        anim: &mut Animator,
+        bmp: &mut Bitmap,
+        rect: (i32, i32, i32, i32),
+        scale: f32,
+    ) -> bool {
         let Some(old) = &self.old else {
             return false;
         };
+        // The region as a snapshot would hold it: cut to the bitmap.
+        let region = (
+            rect.0.max(0),
+            rect.1.max(0),
+            rect.2.min(bmp.width as i32),
+            rect.3.min(bmp.height as i32),
+        );
+        if !old.fits(bmp) || old.rect() != region || scale != self.scale {
+            self.cancel(anim);
+            return false;
+        }
         let t: f32 = anim.value(self.id, 1.0, Motion::tween(self.duration, Easing::Linear));
-        if t >= 1.0 || !old.fits(bmp) {
+        if t >= 1.0 {
             self.old = None;
             return false;
         }
@@ -257,10 +331,124 @@ mod tests {
                 p.fill(Rect::new(0.0, 0.0, 60.0, 30.0), [9, 9, 9]);
                 p.fill(REGION, page);
                 p.fill(Rect::new(49.0, 5.0, 1.0, 20.0), [255, 255, 255]);
+                self.tr.apply(&mut self.anim, &mut p, REGION);
             }
-            self.tr.apply(&mut self.anim, &mut self.bmp);
             self.anim.end_frame().is_some()
         }
+
+        /// What `frame` draws with no switch at all: the new page plainly.
+        fn plain(&mut self, page: [u8; 3]) -> Vec<u8> {
+            let mut bmp = Bitmap::new(self.bmp.width, self.bmp.height);
+            let mut p = Painter::new(&mut bmp, &mut self.gfx, 1.0);
+            p.fill(Rect::new(0.0, 0.0, 60.0, 30.0), [9, 9, 9]);
+            p.fill(REGION, page);
+            p.fill(Rect::new(49.0, 5.0, 1.0, 20.0), [255, 255, 255]);
+            bmp.pixels
+        }
+    }
+
+    #[test]
+    fn a_resize_a_new_scale_or_a_moved_region_ends_the_switch_with_the_new_page_plain() {
+        // The window grew: the same device rectangle is another part of it.
+        for size in [(80, 30), (60, 40), (90, 60)] {
+            let mut r = Rig::new();
+            r.begin(PageEffect::Crossfade);
+            assert!(r.frame(0, NEW));
+            assert!(r.frame(30, NEW));
+            assert_ne!(r.plain(NEW), r.bmp.pixels, "the switch is under way");
+            r.bmp = Bitmap::new(size.0, size.1);
+            assert!(!r.frame(10, NEW), "{size:?}: no further frame");
+            assert!(!r.tr.running());
+            assert_eq!(
+                r.plain(NEW),
+                r.bmp.pixels,
+                "{size:?}: the new page as drawn"
+            );
+            assert!(r.anim.is_empty(), "its progress is forgotten at once");
+        }
+
+        // The layout changed: the region is elsewhere, or of another size.
+        for moved in [
+            Rect::new(15.0, 5.0, 40.0, 20.0),
+            Rect::new(10.0, 6.0, 40.0, 20.0),
+            Rect::new(10.0, 5.0, 30.0, 20.0),
+            Rect::new(10.0, 5.0, 40.0, 24.0),
+            Rect::new(f32::NAN, 5.0, 40.0, 20.0),
+        ] {
+            for effect in [
+                PageEffect::Crossfade,
+                PageEffect::Push { from: Edge::Left },
+                PageEffect::SlideFade {
+                    from: Edge::Bottom,
+                    distance: 8.0,
+                },
+            ] {
+                let mut r = Rig::new();
+                r.begin(effect);
+                r.frame(0, NEW);
+                r.frame(30, NEW);
+                // This frame is drawn as always, and the switch is told the region moved.
+                let plain = r.plain(NEW);
+                r.clock.advance_ms(10);
+                r.anim.begin_frame(r.clock.now());
+                {
+                    let mut p = Painter::new(&mut r.bmp, &mut r.gfx, 1.0);
+                    p.fill(Rect::new(0.0, 0.0, 60.0, 30.0), [9, 9, 9]);
+                    p.fill(REGION, NEW);
+                    p.fill(Rect::new(49.0, 5.0, 1.0, 20.0), [255, 255, 255]);
+                    assert!(!r.tr.apply(&mut r.anim, &mut p, moved), "{moved:?}");
+                }
+                assert_eq!(r.anim.end_frame(), None);
+                assert!(!r.tr.running());
+                assert_eq!(r.bmp.pixels, plain, "{moved:?} {effect:?}");
+            }
+        }
+
+        // Another scale (the window went to another screen), the device rectangle as it was.
+        let mut r = Rig::new();
+        r.begin(PageEffect::SlideFade {
+            from: Edge::Right,
+            distance: 20.0,
+        });
+        r.frame(0, NEW);
+        r.frame(30, NEW);
+        let before = r.plain(NEW);
+        r.bmp.pixels.copy_from_slice(&before);
+        r.clock.advance_ms(10);
+        r.anim.begin_frame(r.clock.now());
+        assert!(
+            !r.tr
+                .apply_dev(&mut r.anim, &mut r.bmp, (10, 5, 50, 25), 1.25)
+        );
+        assert!(!r.tr.running());
+        assert_eq!(r.bmp.pixels, before);
+        // The same rectangle and scale would have gone on.
+        r.anim.end_frame();
+        r.frame(0, OLD);
+        r.begin(PageEffect::Crossfade);
+        r.frame(0, NEW);
+        r.clock.advance_ms(50);
+        r.anim.begin_frame(r.clock.now());
+        r.bmp.pixels.copy_from_slice(&before);
+        assert!(r.tr.apply_dev(&mut r.anim, &mut r.bmp, (10, 5, 50, 25), 1.0));
+        assert_eq!(at(&r.bmp, 20, 10), [100, 0, 100]);
+        // A region that reaches past the bitmap is held to as it was cut at the start.
+        assert!(r.tr.apply_dev(&mut r.anim, &mut r.bmp, (10, 5, 50, 25), 1.0));
+        r.anim.end_frame();
+        let mut r = Rig::new();
+        r.tr.begin_dev(
+            &mut r.anim,
+            &r.bmp,
+            (40, 20, 90, 70),
+            1.0,
+            PageEffect::Crossfade,
+        );
+        r.anim.begin_frame(r.clock.now());
+        assert!(r.tr.apply_dev(&mut r.anim, &mut r.bmp, (40, 20, 90, 70), 1.0));
+        assert!(
+            !r.tr
+                .apply_dev(&mut r.anim, &mut r.bmp, (40, 20, 55, 70), 1.0)
+        );
     }
 
     #[test]

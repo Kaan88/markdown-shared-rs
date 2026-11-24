@@ -14,12 +14,19 @@
 use mdshared_text::Bitmap;
 
 /// The pixels of a rectangle of a bitmap, as they were when it was taken.
+///
+/// It remembers the size of the bitmap it was taken from, and blends only into a bitmap of
+/// that size ([`fits`](Snapshot::fits)). After a resize the same device rectangle is another
+/// part of the window (what was the content is now half content, half sidebar), so pixels put
+/// back there would be the old page in the wrong place.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+    /// The size of the bitmap it was taken from.
+    of: (u32, u32),
     pixels: Vec<u8>,
 }
 
@@ -52,6 +59,7 @@ impl Snapshot {
         let (x0, y0) = (x0.max(0), y0.max(0));
         let (x1, y1) = (x1.min(bmp.width as i32), y1.min(bmp.height as i32));
         self.pixels.clear();
+        self.of = (bmp.width, bmp.height);
         if x0 >= x1 || y0 >= y1 {
             (self.x, self.y, self.w, self.h) = (0, 0, 0, 0);
             return;
@@ -75,10 +83,17 @@ impl Snapshot {
         (self.x, self.y, self.x + self.w, self.y + self.h)
     }
 
-    /// Whether the snapshot is of `bmp`'s size of thing: its rectangle lies inside `bmp`. False
-    /// after the window shrank under it, and for an empty one; the blends then do nothing.
+    /// The width and height of the bitmap it was taken from.
+    pub fn bitmap_size(&self) -> (u32, u32) {
+        self.of
+    }
+
+    /// Whether the snapshot can be blended into `bmp`: `bmp` has the size of the bitmap it was
+    /// taken from. False after the window was resized under it, larger or smaller, and for an
+    /// empty one; the blends then do nothing.
     pub fn fits(&self, bmp: &Bitmap) -> bool {
         !self.is_empty()
+            && self.of == (bmp.width, bmp.height)
             && self.x + self.w <= bmp.width as i32
             && self.y + self.h <= bmp.height as i32
             && bmp.pixels.len() >= bmp.width as usize * bmp.height as usize * 4
@@ -397,5 +412,29 @@ mod tests {
         snap.slide_fade(&mut small, 1, 0, 0.2);
         snap.push(&mut small, 1, 0);
         assert_eq!(small.pixels, painted(9, 8, new_page).pixels);
+    }
+
+    #[test]
+    fn a_snapshot_is_blended_only_into_a_bitmap_of_the_size_it_was_taken_from() {
+        let (snap, same) = switched();
+        assert_eq!(snap.bitmap_size(), (12, 8));
+        assert!(snap.fits(&same));
+        // Larger in either direction: the rectangle still lies inside, but it is no longer
+        // the same part of the window, so nothing is blended.
+        for (w, h) in [(13, 8), (12, 9), (20, 12), (8, 12)] {
+            let mut other = painted(w, h, new_page);
+            assert!(!snap.fits(&other), "{w} by {h}");
+            snap.restore(&mut other);
+            snap.crossfade(&mut other, 0.5);
+            snap.slide_fade(&mut other, 2, 0, 0.5);
+            snap.push(&mut other, 0, 1);
+            assert_eq!(other.pixels, painted(w, h, new_page).pixels, "{w} by {h}");
+        }
+        // Taken again from the new bitmap, it fits that one.
+        let mut snap = snap;
+        let big = painted(20, 12, old_page);
+        snap.retake(&big, 2, 1, 10, 7);
+        assert!(snap.fits(&big) && !snap.fits(&same));
+        assert_eq!(Snapshot::default().bitmap_size(), (0, 0));
     }
 }

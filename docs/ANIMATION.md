@@ -160,17 +160,27 @@ A page or tab switch. The old page is the pixels of the last frame; the new page
 always and the transition blends the old one in:
 
 ```rust
-// State: page_switch: PageTransition::new("content")
+// State: one for each region that switches pages.
+let mut page_switch = PageTransition::new("content");
 
 // When the switch is decided (the bitmap still holds the old page):
 let p = Painter::new(&mut bitmap, &mut gfx, scale);
-page_switch.begin(&mut anim, &p, content_rect, PageEffect::SlideFade { from: Edge::Bottom, distance: 24.0 });
+let effect = PageEffect::SlideFade { from: Edge::Bottom, distance: 24.0 };
+page_switch.begin(&mut anim, &p, content_rect, effect);
 state.page = next;
 
 // Every frame, after the content region is drawn and before anything that lies over it:
+let mut p = Painter::new(&mut bitmap, &mut gfx, scale);
 draw_page(&mut p, content_rect, state.page);
-page_switch.apply(&mut anim, &mut bitmap);
+page_switch.apply(&mut anim, &mut p, content_rect);
 ```
+
+These lines are the doc-test of `PageTransition`, so they are compiled with the crate.
+`apply` is given the region each frame: if the bitmap's size, the scale or the region's device
+rectangle is not what it was when the switch began (a resize, a move to another screen, a new
+layout), the switch ends at once and the frame shows the new page plainly, since the old page
+is pixels and would be blended in the wrong place. `apply_dev` is the same for a bitmap held
+without a painter.
 
 `PageEffect::Crossfade` suits any content; `SlideFade` wants a page whose edge towards `from` is
 its background (it repeats that edge behind the moving page); `Push { from }` moves both pages
