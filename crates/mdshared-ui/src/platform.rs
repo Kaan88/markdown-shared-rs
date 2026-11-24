@@ -856,8 +856,9 @@ mod imp {
 
     /// The desktop's wish for less motion, as the settings portal last said it. It never waits
     /// for the portal: it gives the last answer at once (false until there has been one) and,
-    /// at most once a second, starts a helper thread that asks again. A portal that is slow,
-    /// hung or absent costs the caller nothing and leaves the last answer standing.
+    /// at most once a second and only while no thread listens for changes, starts a helper
+    /// thread that asks again. A portal that is slow, hung or absent costs the caller nothing
+    /// and leaves the last answer standing.
     #[cfg(not(target_os = "macos"))]
     pub fn motion_reduced() -> bool {
         use std::time::Instant;
@@ -899,7 +900,10 @@ mod imp {
             .and_then(|portal| portal.receive_signal("SettingChanged"))
             .ok()
         });
-        MOTION.answer(bus.as_ref().and_then(read_reduced_motion));
+        // Each reading takes its number before it asks, so an answer that comes back late
+        // loses to one asked for after it.
+        let stamp = MOTION.stamp();
+        MOTION.answer(stamp, bus.as_ref().and_then(read_reduced_motion));
         MOTION.reading_done(Instant::now());
         if let (Some(bus), Some(signals)) = (&bus, signals) {
             for change in signals {
@@ -912,7 +916,8 @@ mod imp {
                         MOTION_NAMESPACES.contains(&namespace.as_str())
                     });
                 if ours {
-                    MOTION.answer(read_reduced_motion(bus));
+                    let stamp = MOTION.stamp();
+                    MOTION.answer(stamp, read_reduced_motion(bus));
                 }
             }
         }
@@ -1081,10 +1086,12 @@ pub fn reveal_in_file_manager(path: &Path) -> bool {
 /// It never blocks. On Windows and macOS the system answers at once. On Linux the portal is
 /// another process that may be slow, hung or not there, so it is asked on a helper thread and
 /// this call gives the last answer it gave (false before the first one), taking only a lock
-/// for a moment. Each call starts a new reading, at most once a second, and the first reading
-/// stays to listen for the portal's `SettingChanged` signal, so a change of the setting is
-/// read when it is made. A reading that fails or never ends leaves the last answer standing:
-/// a setting that was on is not taken for off because the portal did not answer in time.
+/// for a moment. The first call starts a reading that then stays to listen for the portal's
+/// `SettingChanged` signal, so a change of the setting is read when it is made. Only while
+/// nothing listens (no session bus, a portal without the signal) does a later call start
+/// another reading, at most once a second. A reading that fails or never ends leaves the last
+/// answer standing: a setting that was on is not taken for off because the portal did not
+/// answer in time, and an answer that comes back after a newer one is dropped.
 ///
 /// Because the first call on Linux comes before the first answer, an application that wants
 /// the right value from its first frame gives [`watch_motion_reduced`] a wake and reads again
@@ -1100,6 +1107,10 @@ pub fn motion_reduced() -> bool {
 /// winit's `EventLoopProxy`); the loop then calls [`motion_reduced`] and passes the answer to
 /// its animators. Like the wake of a [`Job`](mdshared_app::job), nothing here looks at what it
 /// does. A second call replaces the wake of the first.
+///
+/// The order of the two calls does not matter: when the portal has already answered by the
+/// time `wake` is given, `wake` is called once at once, on the caller's thread, so an answer
+/// that came first is not missed.
 ///
 /// On Windows and macOS nothing changes behind the application's back (the system tells the
 /// window, and the application reads again then), so the wake is dropped and never called.
@@ -1126,6 +1137,12 @@ struct Held {
     read_at: Option<std::time::Instant>,
     /// A thread is listening for changes.
     watching: bool,
+    /// There has been an answer.
+    answered: bool,
+    /// The number the last reading was given by [`stamp`](LastGood::stamp); 0 before any.
+    issued: u64,
+    /// The number of the reading whose answer `value` is; 0 before any.
+    newest: u64,
     wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -1138,6 +1155,9 @@ impl LastGood {
                 reading: false,
                 read_at: None,
                 watching: false,
+                answered: false,
+                issued: 0,
+                newest: 0,
                 wake: None,
             }),
         }
@@ -1154,16 +1174,29 @@ impl LastGood {
         self.held().value
     }
 
-    /// Takes an answer. `None` (the service did not answer) changes nothing: the last answer
-    /// stands. An answer that differs from the last one calls the wake, after the lock is let
-    /// go, so a wake that reads the value at once does not wait on itself.
-    fn answer(&self, answer: Option<bool>) {
+    /// A number for a reading about to ask, larger than every one given before: what orders
+    /// the answers of readings that run side by side.
+    fn stamp(&self) -> u64 {
+        let mut held = self.held();
+        held.issued += 1;
+        held.issued
+    }
+
+    /// Takes the answer of the reading numbered `stamp`. `None` (the service did not answer)
+    /// changes nothing: the last answer stands. Neither does an answer from a reading older
+    /// than the one the kept answer came from: it is stale. An answer that differs from the
+    /// last one calls the wake, after the lock is let go, so a wake that reads the value at
+    /// once does not wait on itself.
+    fn answer(&self, stamp: u64, answer: Option<bool>) {
         let wake = {
             let mut held = self.held();
             match answer {
-                Some(value) if value != held.value => {
+                Some(value) if stamp >= held.newest => {
+                    held.newest = stamp;
+                    held.answered = true;
+                    let changed = value != held.value;
                     held.value = value;
-                    held.wake.clone()
+                    held.wake.clone().filter(|_| changed)
                 }
                 _ => None,
             }
@@ -1173,16 +1206,17 @@ impl LastGood {
         }
     }
 
-    /// Whether the caller should start a reading now: none is under way, and the last one
-    /// ended at least `every` ago (or there was none). When true, the reading is the
-    /// caller's, and it says [`reading_done`](Self::reading_done) when it ends. A reading that
-    /// never ends is never followed by another: one stuck thread, not one a call.
+    /// Whether the caller should start a reading now: none is under way, no thread listens
+    /// for changes (it reads each change itself), and the last reading ended at least `every`
+    /// ago (or there was none). When true, the reading is the caller's, and it says
+    /// [`reading_done`](Self::reading_done) when it ends. A reading that never ends is never
+    /// followed by another: one stuck thread, not one a call.
     fn claim_reading(&self, now: std::time::Instant, every: Duration) -> bool {
         let mut held = self.held();
         let due = held
             .read_at
             .is_none_or(|at| now.saturating_duration_since(at) >= every);
-        let claim = !held.reading && due;
+        let claim = !held.reading && !held.watching && due;
         held.reading |= claim;
         claim
     }
@@ -1203,8 +1237,18 @@ impl LastGood {
         self.held().watching = false;
     }
 
+    /// Keeps `wake` for the answers to come, and calls it once now (after the lock is let
+    /// go) if an answer came before it: the caller may have read the value before that
+    /// answer, and would otherwise not hear of it until the next change.
     fn set_wake(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        self.held().wake = Some(wake);
+        let answered = {
+            let mut held = self.held();
+            held.wake = Some(wake.clone());
+            held.answered
+        };
+        if answered {
+            wake();
+        }
     }
 }
 
@@ -1364,18 +1408,18 @@ mod motion_tests {
     fn the_last_good_answer_stands_when_the_service_does_not_answer() {
         let last = LastGood::new();
         assert!(!last.get(), "false before any answer");
-        last.answer(None);
+        last.answer(last.stamp(), None);
         assert!(!last.get());
-        last.answer(Some(true));
+        last.answer(last.stamp(), Some(true));
         assert!(last.get());
         // A reading that failed or timed out is no answer: the setting that was on stays on.
         for _ in 0..3 {
-            last.answer(None);
+            last.answer(last.stamp(), None);
             assert!(last.get(), "a failed reading must not switch the wish off");
         }
-        last.answer(Some(false));
+        last.answer(last.stamp(), Some(false));
         assert!(!last.get());
-        last.answer(None);
+        last.answer(last.stamp(), None);
         assert!(!last.get());
     }
 
@@ -1394,27 +1438,30 @@ mod motion_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = last.clone();
         std::thread::spawn(move || {
-            worker.answer(Some(false)); // as it was: no wake
-            worker.answer(None); // no answer: no wake
-            worker.answer(Some(true)); // changed: woken, and the wake reads true
-            worker.answer(Some(true)); // the same again: no wake
-            worker.answer(None);
-            worker.answer(Some(false)); // changed back: woken, and the wake reads false
+            worker.answer(worker.stamp(), Some(false)); // as it was: no wake
+            worker.answer(worker.stamp(), None); // no answer: no wake
+            worker.answer(worker.stamp(), Some(true)); // changed: woken, and the wake reads true
+            worker.answer(worker.stamp(), Some(true)); // the same again: no wake
+            worker.answer(worker.stamp(), None);
+            worker.answer(worker.stamp(), Some(false)); // changed back: woken, and the wake reads false
             _ = tx.send(());
         });
         rx.recv_timeout(Duration::from_secs(10))
             .expect("the wake waited on the lock of the answer it was called for");
         assert_eq!(seen.load(Ordering::SeqCst), 101);
-        // A second wake replaces the first.
+        // A second wake replaces the first; there has been an answer, so it is called once
+        // when given, and then on the next change.
         let count = seen.clone();
         last.set_wake(Arc::new(move || {
             count.fetch_add(10_000, Ordering::SeqCst);
         }));
-        last.answer(Some(true));
         assert_eq!(seen.load(Ordering::SeqCst), 10_101);
+        last.answer(last.stamp(), Some(false)); // as it was: no wake
+        last.answer(last.stamp(), Some(true)); // changed: woken
+        assert_eq!(seen.load(Ordering::SeqCst), 20_101);
         // Without a wake an answer is just kept.
         let quiet = LastGood::new();
-        quiet.answer(Some(true));
+        quiet.answer(quiet.stamp(), Some(true));
         assert!(quiet.get());
     }
 
@@ -1451,6 +1498,101 @@ mod motion_tests {
         assert!(last.claim_watching());
         // None of this touched the answer.
         assert!(!last.get());
+    }
+
+    #[test]
+    fn no_reading_is_started_while_a_thread_listens_for_changes() {
+        let every = Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let last = LastGood::new();
+        // The first reading becomes the listener and ends its reading.
+        assert!(last.claim_reading(at(0), every));
+        assert!(last.claim_watching());
+        last.reading_done(at(0));
+        // As long as it listens, no call starts a reading, however long after.
+        for s in [1, 2, 60, 3_600] {
+            assert!(!last.claim_reading(at(s), every), "a reading at {s} s");
+        }
+        // It stopped (the bus went away): readings start again.
+        last.watching_done();
+        assert!(last.claim_reading(at(3_601), every));
+    }
+
+    #[test]
+    fn an_answer_older_than_the_one_kept_is_dropped() {
+        let last = LastGood::new();
+        // Two readings run side by side; the later one (a change the listener read) answers
+        // first, then the earlier one comes back with what was true before it.
+        let early = last.stamp();
+        let late = last.stamp();
+        assert!(late > early);
+        last.answer(late, Some(true));
+        last.answer(early, Some(false));
+        assert!(last.get(), "a stale answer overwrote a newer one");
+        // An older reading that did not answer changes nothing either; a newer one counts.
+        last.answer(early, None);
+        assert!(last.get());
+        let next = last.stamp();
+        last.answer(next, Some(false));
+        assert!(!last.get());
+        // A reading that failed does not hold its place: a newer reading's answer is taken,
+        // and an older one that comes back after it still loses.
+        let (a, b, c) = (last.stamp(), last.stamp(), last.stamp());
+        last.answer(c, None);
+        last.answer(b, Some(true));
+        assert!(last.get());
+        last.answer(a, Some(false));
+        assert!(last.get());
+    }
+
+    #[test]
+    fn a_wake_given_after_the_first_answer_is_called_once_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = |seen: &Arc<AtomicUsize>| {
+            let seen = seen.clone();
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        // No answer yet: the wake waits for one, as before.
+        let last = LastGood::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        last.set_wake(count(&seen));
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        last.answer(last.stamp(), None);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        // The portal answered before the wake was given (true, or even false as assumed):
+        // the wake is called once when given, whichever the answer, and then only on changes.
+        for answer in [true, false] {
+            let last = LastGood::new();
+            last.answer(last.stamp(), Some(answer));
+            let seen = Arc::new(AtomicUsize::new(0));
+            last.set_wake(count(&seen));
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "answer {answer}");
+            last.answer(last.stamp(), Some(answer));
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "answer {answer}");
+            last.answer(last.stamp(), Some(!answer));
+            assert_eq!(seen.load(Ordering::SeqCst), 2, "answer {answer}");
+            // A replacing wake is called once too, and the one it replaced no more.
+            let other = Arc::new(AtomicUsize::new(0));
+            last.set_wake(count(&other));
+            assert_eq!(other.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.load(Ordering::SeqCst), 2);
+        }
+        // A wake given on another thread that reads the value at once does not wait on itself.
+        let last = Arc::new(LastGood::new());
+        last.answer(last.stamp(), Some(true));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = last.clone();
+        std::thread::spawn(move || {
+            let reader = worker.clone();
+            worker.set_wake(Arc::new(move || {
+                _ = tx.send(reader.get());
+            }));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
     }
 }
 

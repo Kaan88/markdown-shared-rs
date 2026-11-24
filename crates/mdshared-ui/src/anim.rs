@@ -367,11 +367,12 @@ impl Motion {
     }
 
     /// How long a tween takes, its delay included; `None` for a spring, which has no fixed
-    /// length, and the delay alone (zero unless one was set) for [`SNAP`](Motion::SNAP).
+    /// length, and the delay alone (zero unless one was set) for [`SNAP`](Motion::SNAP). A
+    /// length too long for a `Duration` is `Duration::MAX`.
     pub fn length(self) -> Option<Duration> {
         match self.kind {
             Kind::Snap => Some(self.delay),
-            Kind::Tween { duration, .. } => Some(self.delay + duration),
+            Kind::Tween { duration, .. } => Some(self.delay.saturating_add(duration)),
             Kind::Spring(_) => None,
         }
     }
@@ -885,7 +886,9 @@ impl Animator {
             target,
             from,
             precision,
-            start: now + motion.delay,
+            // A delay too long for the clock never ends: the motion never starts, and
+            // `end_frame` asks for no frame for it.
+            start: now.saturating_add(motion.delay),
             updated: now,
             motion,
             settled: from == target,
@@ -921,7 +924,8 @@ impl Animator {
             t.motion.kind = Kind::Snap;
         }
         t.advance(now);
-        if t.target != target {
+        let changed = t.target != target;
+        if changed {
             // Starts again from where it is. A spring keeps its speed; a tween has none.
             let velocity = match (t.motion.kind, motion.kind) {
                 (Kind::Spring(_), Kind::Spring(_)) => t.velocity,
@@ -943,12 +947,16 @@ impl Animator {
                 t.velocity = [0.0; 4];
             }
         }
-        if motion.kind == Kind::Snap && motion.delay.is_zero() {
-            // Nothing to move through and nothing to wait for: it is there on this frame.
-            t.arrive();
-        } else if motion.kind == Kind::Snap {
-            // The wait may be over on this very frame (a delay of nothing left).
-            t.advance(now);
+        // A snap is read only when the target changes (or motion is off): a snap given for an
+        // unchanged target leaves the motion in flight alone, as for any other motion.
+        if (changed || instant) && motion.kind == Kind::Snap {
+            if motion.delay.is_zero() {
+                // Nothing to move through and nothing to wait for: it is there on this frame.
+                t.arrive();
+            } else {
+                // The wait may be over on this very frame (a delay of nothing left).
+                t.advance(now);
+            }
         }
         t.value
     }

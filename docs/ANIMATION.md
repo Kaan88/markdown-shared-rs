@@ -305,13 +305,16 @@ command palette, the tree's disclosure, the tab strip and the text field's caret
 | Linux | The settings portal: `org.freedesktop.appearance` `reduced-motion`, else `org.gnome.desktop.interface` `enable-animations`, else `org.kde.kdeglobals.KDE` `AnimationDurationFactor` at 0. Read on a helper thread, never on the caller's; false without a portal |
 
 `motion_reduced()` never blocks. On Linux the portal is another process that may be slow, hung
-or absent, so the call gives the last answer the portal gave (false before the first), starts a
-new reading at most once a second, and the first reading stays to listen for the portal's
-`SettingChanged` signal. A reading that fails or never ends leaves the last answer standing: a
-setting that is on is not taken for off because the portal was slow.
+or absent, so the call gives the last answer the portal gave (false before the first). The first
+call starts a reading that stays to listen for the portal's `SettingChanged` signal; only while
+nothing listens (no bus, no signal) does a later call start another reading, at most once a
+second. A reading that fails or never ends leaves the last answer standing: a setting that is on
+is not taken for off because the portal was slow. Each reading is numbered when it asks, and an
+answer older than the one kept is dropped, so a late answer cannot undo a newer change.
 `platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux only;
 elsewhere the wake is dropped), so the application has the right value a moment after it
-starts and when the user changes the setting.
+starts and when the user changes the setting. The order of the two calls does not matter: a
+wake given after the portal already answered is called once at once.
 
 The application passes the answer to `Animator::set_system_reduced`. When it is on (and the
 policy is `System`), nothing moves: a value goes to its target at once, slides, fades and smooth
@@ -321,6 +324,12 @@ animation of the system's own controls. Delays are kept, since a delay is a wait
 movement: a value with a delayed motion keeps its old value for the delay and then takes the new
 one, with one wake-up at the end of the wait. `Animator::set_policy` is the application's switch
 over it: `Policy::Always` animates whatever the system says, `Policy::Never` never does.
+
+A delay too long for the clock (`.delayed(Duration::MAX)`) is a wait that never ends: the value
+keeps its old value and `end_frame` asks for no frame for it, and `Motion::length` gives
+`Duration::MAX`. `Motion::SNAP`, like every motion, is read only when the target changes: a snap
+given with an unchanged target leaves a tween or spring in flight alone (with reduced motion, the
+one in flight arrives).
 
 `platform::reduces_motion()`, which existed, is unchanged (macOS only, false elsewhere), since
 the applications call it.
@@ -349,5 +358,11 @@ equal to the new page drawn plainly, for all three effects; the example above as
 and `blink` (150 frames for a minute of blinking, each deadline at the next change); the spinner
 and the busy bar at a phase pixel for pixel as a copy of the old code drew them; and the logic of
 the Linux reading (`LastGood`: no answer keeps the last one, the wake is called on a change
-only, one reading at a time) on every system. The two-targets `debug_assert` is tested in debug
+only, one reading at a time) on every system.
+
+Added with the second review: a wake given after the first answer is called once at once (and a
+replacing one too); an answer older than the one kept is dropped; no reading starts while a
+listener is active; `.delayed(Duration::MAX)` neither panics nor asks for a frame, as a tween, a
+snap and under reduced motion; a snap with an unchanged target leaves a tween and a spring in
+flight moving. The two-targets `debug_assert` is tested in debug
 builds only.

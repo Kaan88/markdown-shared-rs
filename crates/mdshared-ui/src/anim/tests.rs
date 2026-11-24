@@ -235,6 +235,59 @@ fn a_tween_follows_its_easing() {
 }
 
 #[test]
+fn a_delay_too_long_for_the_clock_never_panics_and_asks_for_no_busy_frames() {
+    let never = fluent::FADE.delayed(Duration::MAX);
+    assert_eq!(never.length(), Some(Duration::MAX));
+    assert_eq!(
+        Motion::spring(Spring::SMOOTH)
+            .delayed(Duration::MAX)
+            .length(),
+        None
+    );
+    let mut r = Rig::new();
+    // First seen: it is its target, as always.
+    assert_eq!(r.frame(1.0, never), (1.0, None));
+    // A new target waits for ever: the old value stays, and no frame is asked for.
+    assert_eq!(r.after(10, 0.0, never), (1.0, None));
+    assert_eq!(r.after(3_600_000, 0.0, never), (1.0, None));
+    // So does a snap after such a wait, and one with reduced motion.
+    assert_eq!(
+        r.after(10, 2.0, Motion::SNAP.delayed(Duration::MAX)),
+        (1.0, None)
+    );
+    r.anim.set_policy(Policy::Never);
+    assert_eq!(r.after(10, 3.0, never), (1.0, None));
+    // A later target with no wait is taken as usual.
+    assert_eq!(r.after(10, 4.0, Motion::SNAP), (4.0, None));
+}
+
+#[test]
+fn a_snap_with_an_unchanged_target_leaves_the_motion_in_flight_alone() {
+    for motion in [LINEAR_100, Motion::spring(Spring::SNAPPY)] {
+        let mut r = Rig::new();
+        r.frame(0.0, motion);
+        r.after(10, 1.0, motion);
+        let (moving, _) = r.after(30, 1.0, motion);
+        assert!(moving > 0.0 && moving < 1.0, "{motion:?}: {moving}");
+        // The same target, now with a snap: it goes on moving, as for any other motion.
+        let (v, deadline) = r.after(10, 1.0, Motion::SNAP);
+        assert!(
+            v > moving && v < 1.0,
+            "{motion:?}: the snap stopped it at {v}"
+        );
+        assert!(deadline.is_some());
+        assert!(!r.anim.settled("x"));
+        // A snap with a new target is there at once.
+        assert_eq!(r.after(10, 5.0, Motion::SNAP), (5.0, None));
+        // And with motion off, the one in flight arrives, even with its target unchanged.
+        r.after(10, 0.0, motion);
+        r.after(30, 0.0, motion);
+        r.anim.set_policy(Policy::Never);
+        assert_eq!(r.after(10, 0.0, motion), (0.0, None));
+    }
+}
+
+#[test]
 fn a_delay_is_kept_by_a_snap_and_by_reduced_motion() {
     // A snap after a wait: the old value for the wait, one wake-up at its end, then the new
     // value at once and no further frame.
