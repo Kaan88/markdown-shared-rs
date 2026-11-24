@@ -69,9 +69,13 @@ cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warn
 cargo test --release -p mdshared-ui --features notify notify
 cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
 cargo test --release -p mdshared-ui --features a11y a11y
+cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
+cargo test --release -p mdshared-ui --features host host::
+cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
+cargo test --release -p mdshared-ui --features host,a11y host::
 ```
 
-Run all eleven before you say a change is done. While working, the debug forms are faster
+Run all fifteen before you say a change is done. While working, the debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
 warnings`). Two traps:
 
