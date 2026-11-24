@@ -1,11 +1,23 @@
 //! A segmented switch: two or three labelled options in one rounded frame, one of them chosen
-//! (or none, for a question not answered yet). Geometry and drawing only; the caller records the
-//! hits and handles the keyboard and the value. It refuses more than a few options: a switch is
-//! read left to right and every option must stay readable, so a longer list belongs in a menu or
-//! a dropdown.
+//! (or none, for a question not answered yet), and a selector bar of any number of options, like
+//! a tab strip. Geometry and drawing only; the caller records the hits and handles the pointer,
+//! the keyboard and the value.
+//!
+//! The switch keeps to a few options: it is read left to right and every option must stay
+//! readable, so a longer list belongs in a menu or a dropdown. The selector bar is the same look
+//! without that limit, for a place a Windows tab strip or a radio group would be: [`bar_width`],
+//! [`selector_rects`], [`selector_at`], [`selector_key`], [`draw_selector`] and
+//! [`draw_selector_animated`]. Both kinds lay their options out with [`segment_rects`], so the
+//! options tile the rectangle in the same way.
+//!
+//! Deliberately not here: the chosen value itself, the pointer and key events, the focus ring and
+//! the accessibility nodes. The caller keeps the selection, passes the keys through
+//! [`selector_key`], and asks [`selector_rects`] for one rectangle per option, which is what a
+//! tab item will need.
 
 use crate::anim::{Animator, AsId, Id, fluent};
 use crate::gfx::{Face, Painter, Rect, mix};
+use crate::keys::KeyName;
 use crate::theme::Palette;
 
 /// The height a switch wants, and what each side of a label keeps inside its own segment.
@@ -18,6 +30,13 @@ const SEGMENT_TEXT: f32 = 13.0;
 /// caller that makes its rectangle this wide gets segments that tile it exactly; a narrower one
 /// squeezes the last segments, which is the caller's choice and not this module's.
 pub fn switch_width(p: &mut Painter, labels: &[&str]) -> f32 {
+    bar_width(p, labels)
+}
+
+/// The width a selector bar of these labels wants: every label plus [`SEGMENT_PAD`] on each side,
+/// the same measurement [`switch_width`] makes. A bar laid out at this width gives each option its
+/// label's room exactly; a wider one gives the last option the rest.
+pub fn bar_width(p: &mut Painter, labels: &[&str]) -> f32 {
     labels
         .iter()
         .map(|l| p.measure(Face::Semibold, SEGMENT_TEXT, l) + 2.0 * SEGMENT_PAD)
@@ -49,6 +68,67 @@ pub fn segment_at(rects: &[Rect], x: f32, y: f32) -> Option<usize> {
     rects.iter().position(|s| s.contains(x, y))
 }
 
+/// The rectangle of each option of a selector bar that fills `r`, left to right, measured from
+/// `labels`. It is [`segment_rects`] over the labels' own widths, so the options tile `r` with no
+/// gap and no overlap and the last one takes whatever is left. A rectangle narrower than
+/// [`bar_width`] squeezes the options from the right: each keeps its label's width until the
+/// space runs out, and the options after that get nothing, with their labels elided in the
+/// smaller ones that remain. That is how a switch behaves too, and it is the caller's choice of
+/// rectangle, not this module's.
+///
+/// No labels give no rectangles. This is the list an accessibility layer reports a tab item for.
+pub fn selector_rects(p: &mut Painter, r: Rect, labels: &[&str]) -> Vec<Rect> {
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| p.measure(Face::Semibold, SEGMENT_TEXT, l) + 2.0 * SEGMENT_PAD)
+        .collect();
+    segment_rects(r, &widths)
+}
+
+/// Which option of a selector bar a point falls in, or `None` outside it. The options tile the
+/// bar, so a point on the edge between two is in the later one, as [`segment_at`] has it. A point
+/// that is not a number is in none.
+pub fn selector_at(rects: &[Rect], x: f32, y: f32) -> Option<usize> {
+    segment_at(rects, x, y)
+}
+
+/// What a key does to the selection of a selector bar of `count` options: the new selected option,
+/// or `None` when the key is not one of the four or would move past an end. Left and Right move by
+/// one, Home and End go to the first and the last. It does not wrap, as a Windows tab strip does
+/// not: Left on the first and Right on the last change nothing.
+///
+/// With nothing selected (`selected` is `None`) any of the four picks an option: Left and Home the
+/// first, Right and End the last. A selection past the end, from a caller's damaged state, is read
+/// as the last: Right changes nothing and Left steps back from there. No options, or any other
+/// key, give `None`. It reads no clock, no painter and no state of its own.
+pub fn selector_key(selected: Option<usize>, count: usize, key: &KeyName) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let last = count - 1;
+    match key {
+        KeyName::Left => match selected {
+            Some(0) => None,
+            Some(k) => Some(k.min(last).saturating_sub(1)),
+            None => Some(0),
+        },
+        KeyName::Right => match selected {
+            Some(k) if k < last => Some(k + 1),
+            Some(_) => None,
+            None => Some(0),
+        },
+        KeyName::Home => match selected {
+            Some(0) => None,
+            _ => Some(0),
+        },
+        KeyName::End => match selected {
+            Some(k) if k == last => None,
+            _ => Some(last),
+        },
+        _ => None,
+    }
+}
+
 /// Draws a switch of `labels` in `r`, of which `selected` is the chosen one and `hovered` the one
 /// under the pointer (from the caller's own state). The chosen segment is filled with the accent
 /// and its label is the on-accent colour in the semibold face; the others carry the text colour,
@@ -56,6 +136,64 @@ pub fn segment_at(rects: &[Rect], x: f32, y: f32) -> Option<usize> {
 /// record as hits; it records none itself. With no labels it draws nothing at all and returns no
 /// rectangles: a switch without options is a caller's mistake, not a frame to show.
 pub fn draw_segments(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    labels: &[&str],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Vec<Rect> {
+    draw_bar(p, pal, r, labels, selected, hovered)
+}
+
+/// [`draw_segments`] for any number of options: the same frame, the same chosen and hovered
+/// fills and the same labels, with each option as wide as its label plus [`SEGMENT_PAD`] on each
+/// side. The options tile `r` left to right exactly as [`segment_rects`] lays them out, so a
+/// rectangle narrower than [`bar_width`] squeezes the options from the right and elides their
+/// labels, and a wider one gives the last option the rest. With two or three labels the pixels
+/// are exactly those of [`draw_segments`].
+///
+/// Returns one rectangle per option, in order, for the caller to record as hits and for an
+/// accessibility layer to report. With no labels it draws nothing and returns no rectangles.
+pub fn draw_selector(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    labels: &[&str],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Vec<Rect> {
+    draw_bar(p, pal, r, labels, selected, hovered)
+}
+
+/// [`draw_segments_animated`] for any number of options: the accent fill slides from the option
+/// that was chosen to the one that is, the hover fill fades in and out, and a choice made or
+/// taken away fades. `id` names this bar in `anim`; two bars need two names.
+///
+/// At rest it draws exactly the pixels of [`draw_selector`], and so it does on every frame when
+/// the animator does not animate (reduced motion). The fill moves relative to the bar, so a bar
+/// that moves with its window (a resize, a scroll) does not set it sliding. The rectangles
+/// returned are the options' own: the hits do not move with the fill. The frame that first shows
+/// a bar shows it at rest.
+///
+/// As with every animated drawing, the caller ends its frame with [`Animator::end_frame`] and
+/// draws again when that asks for it.
+#[allow(clippy::too_many_arguments)] // the arguments of `draw_selector`, the animator and a name
+pub fn draw_selector_animated(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl AsId,
+    r: Rect,
+    labels: &[&str],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Vec<Rect> {
+    draw_bar_animated(p, pal, anim, Id::new(id), r, labels, selected, hovered)
+}
+
+/// The pixels both plain drawings make: a switch and a selector bar look the same.
+fn draw_bar(
     p: &mut Painter,
     pal: &Palette,
     r: Rect,
@@ -86,9 +224,9 @@ pub fn draw_segments(
     rects
 }
 
-/// [`draw_segments`] with motion: the accent fill slides from the segment that was chosen to the
-/// one that is, the hover fill fades in and out, and a choice made or taken away fades. `id`
-/// names this switch in `anim`; two switches need two names.
+/// [`draw_segments`] with motion: the accent fill slides from the segment that was
+/// chosen to the one that is, the hover fill fades in and out, and a choice made or taken away
+/// fades. `id` names this switch in `anim`; two switches need two names.
 ///
 /// At rest it draws exactly the pixels of [`draw_segments`], and so it does on every frame when
 /// the animator does not animate (reduced motion). On the way, a label takes the on-accent
@@ -110,10 +248,24 @@ pub fn draw_segments_animated(
     selected: Option<usize>,
     hovered: Option<usize>,
 ) -> Vec<Rect> {
+    draw_bar_animated(p, pal, anim, Id::new(id), r, labels, selected, hovered)
+}
+
+/// The moving pixels both animated drawings make.
+#[allow(clippy::too_many_arguments)] // the arguments of the bar, the animator and its name
+fn draw_bar_animated(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: Id,
+    r: Rect,
+    labels: &[&str],
+    selected: Option<usize>,
+    hovered: Option<usize>,
+) -> Vec<Rect> {
     if labels.is_empty() {
         return Vec::new();
     }
-    let id = Id::new(id);
     let widths: Vec<f32> = labels
         .iter()
         .map(|l| p.measure(Face::Semibold, SEGMENT_TEXT, l) + 2.0 * SEGMENT_PAD)
@@ -170,6 +322,10 @@ pub fn draw_segments_animated(
     }
     rects
 }
+
+#[cfg(test)]
+#[path = "segments_tests.rs"]
+mod selector_tests;
 
 #[cfg(test)]
 mod tests {
