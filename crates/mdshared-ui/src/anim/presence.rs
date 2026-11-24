@@ -110,6 +110,12 @@ impl<T> Transient<T> {
 /// into place as it appears and sink as it goes; `(0.0, 0.0)` is a plain fade. The move is in
 /// whole device pixels, so text stays as sharp on the way as at rest.
 ///
+/// The move is [`Painter::offset`], which moves what is drawn in logical px. It does not move
+/// what `draw` puts down in device px ([`Painter::fill_dev`], [`Painter::blit`]): those calls
+/// say where in the bitmap, so such a part fades with the rest but stays in its place while the
+/// rest moves. A `draw` that uses them adds [`Painter::origin`] to its device coordinates, or
+/// is given no shift.
+///
 /// There is no scaling: a popup that grows from 95 % would need its drawing resampled, which
 /// costs more than it shows at these sizes and times. The Windows popups move and fade.
 pub fn pop(

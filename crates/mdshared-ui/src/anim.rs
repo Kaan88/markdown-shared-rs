@@ -50,6 +50,7 @@ pub use spring::Spring;
 use crate::gfx::{Rect, Rgb};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -349,17 +350,24 @@ impl Motion {
     }
 
     /// The same motion, started `delay` after the target changes; until then the value stays
-    /// where it is, and the window may sleep.
+    /// where it is, and the window sleeps until the delay is over (one wake-up, not a frame
+    /// every sixtieth of a second).
+    ///
+    /// A delay is a wait, not a movement, so it is always kept: `Motion::SNAP.delayed(d)` is
+    /// the old value for `d` and then the new one at once, and with reduced motion every
+    /// delayed motion is exactly that. A tooltip that appears half a second after the pointer
+    /// stops still waits its half second when the system asks for less motion; it only does
+    /// not fade.
     pub const fn delayed(mut self, delay: Duration) -> Motion {
         self.delay = delay;
         self
     }
 
     /// How long a tween takes, its delay included; `None` for a spring, which has no fixed
-    /// length, and zero for [`SNAP`](Motion::SNAP).
+    /// length, and the delay alone (zero unless one was set) for [`SNAP`](Motion::SNAP).
     pub fn length(self) -> Option<Duration> {
         match self.kind {
-            Kind::Snap => Some(Duration::ZERO),
+            Kind::Snap => Some(self.delay),
             Kind::Tween { duration, .. } => Some(self.delay + duration),
             Kind::Spring(_) => None,
         }
@@ -478,8 +486,10 @@ struct Track {
     updated: Duration,
     motion: Motion,
     settled: bool,
-    /// The frame that last asked for it.
+    /// The frame that last asked for it, or kept it.
     seen: u64,
+    /// The frame that last gave it a target: two different ones in one frame are a mistake.
+    asked: u64,
 }
 
 impl Track {
@@ -635,8 +645,10 @@ impl Animator {
     /// The time from one frame to the next while something moves: the deadline
     /// [`end_frame`](Self::end_frame) gives is this long after the frame's start. A sixtieth of
     /// a second unless set; an application that knows its monitor's rate sets it from that.
+    /// Never less than a millisecond: a shorter one (zero, from a monitor that gave no rate)
+    /// would have the window draw without pause for as long as anything moves.
     pub fn set_frame_interval(&mut self, interval: Duration) {
-        self.frame_interval = interval;
+        self.frame_interval = interval.max(Duration::from_millis(1));
     }
 
     // ---- the frame ----
@@ -662,6 +674,14 @@ impl Animator {
     pub fn end_frame(&mut self) -> Option<Instant> {
         let (frame, time) = (self.frame, self.time);
         self.tracks.retain(|_, t| t.seen == frame);
+        // No value leaves a frame behind the frame's time. One that was neither asked for nor
+        // moved by `keep` would otherwise stand still and yet count as on its way, and the
+        // window would draw sixty frames a second for ever for a value that never arrives.
+        for t in self.tracks.values_mut() {
+            if !t.settled && t.updated < time {
+                t.advance(time);
+            }
+        }
         let mut wait: Option<Duration> = None;
         for t in self.tracks.values().filter(|t| !t.settled) {
             let w = t.start.saturating_sub(time).max(self.frame_interval);
@@ -756,6 +776,7 @@ impl Animator {
                 motion: Motion::SNAP,
                 settled: true,
                 seen: frame,
+                asked: 0,
             },
         );
     }
@@ -774,10 +795,23 @@ impl Animator {
     }
 
     /// Keeps `id` through this frame though nothing asked for its value: for a part of the
-    /// window this frame does not draw. A value kept this way goes on moving.
+    /// window this frame does not draw. A value kept this way goes on moving towards the target
+    /// it was last given: it is moved to this frame's time here, so a [`get`](Self::get) after
+    /// it reads the value of this frame, and it arrives and stops asking for frames as if it
+    /// had been asked for. A name not known is not made.
+    ///
+    /// What is on the screen in that part is still the frame that last drew it. An application
+    /// that skips a part while a value in it moves draws the part once more when
+    /// [`settled`](Self::settled) says the value has arrived, or the part is left showing the
+    /// value half way.
     pub fn keep(&mut self, id: impl AsId) {
+        let (now, frame, animates) = (self.time, self.frame, self.animates());
         if let Some(t) = self.tracks.get_mut(&id.as_id().0) {
-            t.seen = self.frame;
+            t.seen = frame;
+            if !animates {
+                t.motion.kind = Kind::Snap;
+            }
+            t.advance(now);
         }
     }
 
@@ -811,9 +845,21 @@ impl Animator {
         precision: f64,
     ) -> [f64; 4] {
         let (now, frame) = (self.time, self.frame);
-        // A target that is not a number cannot be moved to; it is taken as it is.
-        let animates =
-            self.animates() && motion.kind != Kind::Snap && target.iter().all(|v| v.is_finite());
+        let in_frame = self.frame_at.is_some();
+        // A target that is not a number cannot be moved to, nor waited for: it is taken as it
+        // is, at once.
+        let finite = target.iter().all(|v| v.is_finite());
+        // With reduced motion the way to the target is skipped, but not the wait before it: a
+        // delay is not a movement. So the motion becomes a snap that keeps its delay.
+        let instant = !self.animates() || !finite;
+        let motion = if instant {
+            Motion {
+                kind: Kind::Snap,
+                delay: if finite { motion.delay } else { Duration::ZERO },
+            }
+        } else {
+            motion
+        };
         let fresh = |from: [f64; 4]| Track {
             value: from,
             velocity: [0.0; 4],
@@ -825,12 +871,36 @@ impl Animator {
             motion,
             settled: from == target,
             seen: frame,
+            asked: frame,
         };
-        let t = self
-            .tracks
-            .entry(id.0)
-            .or_insert_with(|| fresh(initial.filter(|_| animates).unwrap_or(target)));
-        t.seen = frame;
+        let t = match self.tracks.entry(id.0) {
+            Entry::Vacant(slot) => slot.insert(fresh(initial.filter(|_| finite).unwrap_or(target))),
+            Entry::Occupied(slot) => {
+                let t = slot.into_mut();
+                // Two targets for one name in one frame: two things drawn under the same
+                // name, each of which would start the other's motion again on every frame.
+                // (Targets that are not numbers never compare equal and are let through.)
+                debug_assert!(
+                    !(in_frame
+                        && t.asked == frame
+                        && (0..4).any(|i| {
+                            t.target[i] != target[i]
+                                && t.target[i].is_finite()
+                                && target[i].is_finite()
+                        })),
+                    "anim: one name was given two targets in one frame ({:?} and {:?}); \
+                     two things are drawn under the same name",
+                    t.target,
+                    target,
+                );
+                t
+            }
+        };
+        (t.seen, t.asked, t.precision) = (frame, frame, precision);
+        if instant {
+            // Motion was switched off while this one was on its way: it keeps only its wait.
+            t.motion.kind = Kind::Snap;
+        }
         t.advance(now);
         if t.target != target {
             // Starts again from where it is. A spring keeps its speed; a tween has none.
@@ -848,10 +918,18 @@ impl Animator {
                 velocity,
                 ..fresh(from)
             };
+            if t.settled {
+                // Already there (the target came back to where the value stands): it is at
+                // rest, and must not carry a speed into the next move.
+                t.velocity = [0.0; 4];
+            }
         }
-        if !animates {
-            t.target = target;
+        if motion.kind == Kind::Snap && motion.delay.is_zero() {
+            // Nothing to move through and nothing to wait for: it is there on this frame.
             t.arrive();
+        } else if motion.kind == Kind::Snap {
+            // The wait may be over on this very frame (a delay of nothing left).
+            t.advance(now);
         }
         t.value
     }
@@ -1088,6 +1166,246 @@ mod tests {
         assert_eq!(motion.length(), Some(Duration::from_millis(100)));
         assert_eq!(Motion::spring(Spring::SMOOTH).length(), None);
         assert_eq!(Motion::SNAP.length(), Some(Duration::ZERO));
+        let wait = Duration::from_millis(300);
+        assert_eq!(Motion::SNAP.delayed(wait).length(), Some(wait));
+    }
+
+    #[test]
+    fn a_delay_is_kept_by_a_snap_and_by_reduced_motion() {
+        // A snap after a wait: the old value for the wait, one wake-up at its end, then the new
+        // value at once and no further frame.
+        let wait = Motion::SNAP.delayed(Duration::from_millis(300));
+        let mut r = Rig::new();
+        r.frame(0.0, wait);
+        let (v, deadline) = r.frame(1.0, wait);
+        assert_eq!(v, 0.0);
+        assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(300)));
+        // An event redraws on the way: still the old value, and the same moment to wake at.
+        let (v, deadline) = r.after(100, 1.0, wait);
+        assert_eq!(v, 0.0);
+        assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(200)));
+        assert_eq!(r.after(200, 1.0, wait), (1.0, None));
+        // The target changed back during the wait: nothing ever shows.
+        r.frame(0.0, wait);
+        assert_eq!(r.after(100, 1.0, wait), (1.0, None), "it was there already");
+        let (v, deadline) = r.after(10, 0.0, wait);
+        assert!(v == 1.0 && deadline.is_some());
+        assert_eq!(r.after(100, 1.0, wait), (1.0, None));
+
+        // Reduced motion: a delayed tween keeps its delay and loses only its movement.
+        let delayed = LINEAR_100.delayed(Duration::from_millis(400));
+        for policy in [Policy::System, Policy::Never] {
+            let mut r = Rig::new();
+            r.anim.set_system_reduced(true);
+            r.anim.set_policy(policy);
+            r.frame(0.0, delayed);
+            let (v, deadline) = r.frame(1.0, delayed);
+            assert_eq!(v, 0.0, "{policy:?}");
+            assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(400)));
+            let (v, deadline) = r.after(399, 1.0, delayed);
+            assert_eq!(v, 0.0);
+            assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(10)));
+            // Over: at the target at once, with nothing between and no further frame.
+            assert_eq!(r.after(1, 1.0, delayed), (1.0, None));
+        }
+
+        // A tooltip: it appears half a second after it is asked for, and under reduced motion
+        // it still waits, then is simply there; hidden, it is gone at once.
+        let enter = fluent::ENTER.delayed(Duration::from_millis(500));
+        let mut r = Rig::new();
+        r.anim.set_system_reduced(true);
+        let tip = |r: &mut Rig, ms: u64, shown: bool| {
+            r.clock.advance_ms(ms);
+            r.anim.begin_frame(r.clock.now());
+            let t = r.anim.presence("tip", shown, enter, fluent::EXIT);
+            (t, r.anim.end_frame())
+        };
+        let (t, deadline) = tip(&mut r, 0, true);
+        assert_eq!(t, 0.0);
+        assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(500)));
+        assert_eq!(tip(&mut r, 250, true).0, 0.0);
+        assert_eq!(tip(&mut r, 250, true), (1.0, None));
+        assert_eq!(tip(&mut r, 1000, false), (0.0, None));
+
+        // Motion switched off while a delayed tween is on its way (past its wait): it arrives.
+        let mut r = Rig::new();
+        let short = LINEAR_100.delayed(Duration::from_millis(20));
+        r.frame(0.0, short);
+        r.frame(1.0, short);
+        r.after(20, 1.0, short);
+        assert!(close(r.after(10, 1.0, short).0, 0.1));
+        r.anim.set_policy(Policy::Never);
+        assert_eq!(r.after(10, 1.0, short), (1.0, None));
+    }
+
+    #[test]
+    fn a_value_that_is_kept_goes_on_to_its_target_and_then_the_window_sleeps() {
+        for motion in [LINEAR_100, Motion::spring(Spring::SNAPPY)] {
+            let mut r = Rig::new();
+            r.frame(0.0, motion);
+            r.frame(1.0, motion);
+            // From here on no frame asks for the value: the part it is in is not drawn.
+            let kept = |r: &mut Rig, ms: u64| {
+                r.clock.advance_ms(ms);
+                r.anim.begin_frame(r.clock.now());
+                r.anim.keep("x");
+                // Kept, it is at this frame's time already.
+                let v = r.anim.get::<f32>("x").unwrap();
+                (v, r.anim.end_frame())
+            };
+            let (first, deadline) = kept(&mut r, 30);
+            assert!(first > 0.0 && first < 1.0, "{motion:?}: {first}");
+            assert_eq!(deadline, Some(r.clock.now() + FRAME));
+            if motion == LINEAR_100 {
+                assert!(close(first, 0.3));
+            }
+            // It moves on every kept frame, arrives, and the frames stop: before the fix it
+            // stood still here and asked for a frame every interval for ever.
+            let (mut last, mut frames) = (first, 0);
+            loop {
+                let (v, deadline) = kept(&mut r, 10);
+                assert!(v >= last, "{motion:?}: {v} after {last}");
+                last = v;
+                frames += 1;
+                if deadline.is_none() {
+                    break;
+                }
+                assert!(
+                    frames < 100,
+                    "{motion:?}: a kept value never stops asking for frames"
+                );
+            }
+            assert_eq!(last, 1.0);
+            assert!(r.anim.settled("x") && !r.anim.animating());
+            // Kept at rest: remembered, and nothing asked.
+            assert_eq!(kept(&mut r, 1000), (1.0, None));
+            // Asked for again, it is where it arrived.
+            assert_eq!(r.after(10, 1.0, motion), (1.0, None));
+        }
+
+        // A value kept while it waits out a delay sleeps to the end of the delay, not a frame.
+        let delayed = LINEAR_100.delayed(Duration::from_millis(400));
+        let mut r = Rig::new();
+        r.frame(0.0, delayed);
+        r.frame(1.0, delayed);
+        r.clock.advance_ms(100);
+        r.anim.begin_frame(r.clock.now());
+        r.anim.keep("x");
+        assert_eq!(
+            r.anim.end_frame(),
+            Some(r.clock.now() + Duration::from_millis(300))
+        );
+        // Motion switched off while it is kept: it is there after its wait.
+        r.anim.set_policy(Policy::Never);
+        r.clock.advance_ms(300);
+        r.anim.begin_frame(r.clock.now());
+        r.anim.keep("x");
+        assert_eq!(r.anim.get::<f32>("x"), Some(1.0));
+        assert_eq!(r.anim.end_frame(), None);
+        // A name not known is not made by keeping it.
+        r.anim.begin_frame(r.clock.now());
+        r.anim.keep("nobody");
+        r.anim.end_frame();
+        assert!(r.anim.is_empty());
+    }
+
+    #[test]
+    fn a_spring_that_starts_where_it_already_is_carries_no_speed() {
+        let spring = Motion::spring(Spring::SMOOTH);
+        let mut r = Rig::new();
+        r.frame(0.0, spring);
+        r.frame(100.0, spring);
+        let (a, _) = r.after(30, 100.0, spring);
+        assert!(a > 0.0 && a < 100.0);
+        // The target is moved to exactly where the value stands: it is at rest there, at once.
+        let (b, deadline) = r.after(10, 100.0, spring);
+        assert!(b > a);
+        let here = r.anim.get::<f32>("x").unwrap();
+        assert_eq!(r.frame(here, spring), (here, None));
+        // The next move starts from rest: its first step is small, where a speed carried over
+        // from the flight before would have thrown it on by about as much as the step `a..b`.
+        assert!(deadline.is_some());
+        r.frame(here + 100.0, spring);
+        let (c, _) = r.after(10, here + 100.0, spring);
+        // A second way to the same number: the spring's own step from rest.
+        let (want, _) = Spring::SMOOTH.step(0.0, 0.0, 100.0, 0.01);
+        assert!(close(c - here, want), "{} and {want}", c - here);
+        assert!(
+            c - here < (b - a) * 0.6,
+            "it kept a speed: {} after {}",
+            c - here,
+            b - a
+        );
+    }
+
+    #[test]
+    fn the_frame_interval_is_never_less_than_a_millisecond() {
+        let mut r = Rig::new();
+        r.anim.set_frame_interval(Duration::ZERO);
+        r.frame(0.0, LINEAR_100);
+        let (_, deadline) = r.frame(1.0, LINEAR_100);
+        assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(1)));
+        r.anim.set_frame_interval(Duration::from_millis(4));
+        let (_, deadline) = r.after(4, 1.0, LINEAR_100);
+        assert_eq!(deadline, Some(r.clock.now() + Duration::from_millis(4)));
+    }
+
+    #[test]
+    fn the_same_target_twice_in_a_frame_is_one_value() {
+        let mut r = Rig::new();
+        r.frame(0.0, LINEAR_100);
+        r.clock.advance_ms(10);
+        r.anim.begin_frame(r.clock.now());
+        assert_eq!(r.anim.value("x", 1.0_f32, LINEAR_100), 0.0);
+        assert_eq!(r.anim.value("x", 1.0_f32, LINEAR_100), 0.0);
+        // A jump and then the value from it, as a dragged thumb does, is no mistake either.
+        r.anim.set("x", 0.5_f32);
+        assert_eq!(r.anim.value("x", 0.5_f32, LINEAR_100), 0.5);
+        assert_eq!(r.anim.end_frame(), None);
+        // Nor are targets that are not numbers, which never compare equal.
+        r.anim.begin_frame(r.clock.now());
+        assert!(r.anim.value("x", f32::NAN, LINEAR_100).is_nan());
+        assert!(r.anim.value("x", f32::NAN, LINEAR_100).is_nan());
+        r.anim.end_frame();
+    }
+
+    /// In a debug build the mistake is named where it is made. (A release build takes the
+    /// later target, as it always did.)
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "two targets in one frame")]
+    fn two_targets_for_one_name_in_one_frame_are_caught_in_a_debug_build() {
+        let mut r = Rig::new();
+        r.frame(0.0, LINEAR_100);
+        r.anim.begin_frame(r.clock.now());
+        r.anim.value("x", 1.0_f32, LINEAR_100);
+        r.anim.value("x", 2.0_f32, LINEAR_100);
+    }
+
+    #[test]
+    fn a_spring_with_no_damping_swings_for_as_long_as_it_is_asked_for() {
+        for damping in [0.0, -5.0] {
+            let swing = Motion::spring(Spring::new(400.0, damping));
+            let mut r = Rig::new();
+            r.frame(0.0, swing);
+            r.frame(1.0, swing);
+            let (mut low, mut high) = (f32::MAX, f32::MIN);
+            for _ in 0..500 {
+                let (v, deadline) = r.after(10, 1.0, swing);
+                assert!(deadline.is_some(), "it never comes to rest");
+                (low, high) = (low.min(v), high.max(v));
+            }
+            // It swings between where it started and as far beyond the target, no further.
+            assert!(low > -0.01 && low < 0.05, "damping {damping}: lowest {low}");
+            assert!(
+                high < 2.01 && high > 1.95,
+                "damping {damping}: highest {high}"
+            );
+            // Not asked for: forgotten like any other, and the window sleeps.
+            r.clock.advance_ms(10);
+            r.anim.begin_frame(r.clock.now());
+            assert_eq!(r.anim.end_frame(), None);
+        }
     }
 
     #[test]

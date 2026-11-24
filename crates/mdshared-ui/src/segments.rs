@@ -137,7 +137,8 @@ pub fn draw_segments_animated(
             let rest = Rect::new(at.x - r.x, at.y - r.y, at.w, at.h);
             Some(anim.value(place, rest, fluent::MOVE))
         }
-        // A choice taken away fades out where it was.
+        // A choice taken away fades out where it was. If its fill was on its way from one
+        // segment to another, it goes on there while it fades: `keep` moves it to this frame.
         None if there > 0.0 => {
             anim.keep(place);
             anim.get::<Rect>(place)
@@ -488,6 +489,35 @@ mod tests {
         let (bmp, _, more) = m.frame(10, Some(0), None);
         assert!(!more);
         assert!(bmp.pixels == m.plain(Some(0), None).pixels);
+    }
+
+    #[test]
+    fn a_choice_taken_away_while_its_fill_slides_goes_on_sliding_as_it_fades() {
+        let mut m = Moving::new();
+        m.frame(0, Some(0), None);
+        m.frame(0, Some(2), None);
+        m.frame(40, Some(2), None);
+        // The fill's place, read as the widget keeps it: under the switch's own id.
+        let fill = Id::new("switch").with("fill");
+        let x = |m: &Moving| m.anim.get::<Rect>(fill).map(|r| r.x);
+        let a = x(&m).unwrap();
+        let end = {
+            let (_, rects, _) = Moving::new().frame(0, Some(2), None);
+            rects[2].inset(1.0).x - m.r.x
+        };
+        assert!(a > 1.0 && a < end, "{a} on the way to {end}");
+        // The choice is taken away half way: the fill is no longer asked for, only kept, and
+        // it must not stop where it was while it fades.
+        let (_, _, more) = m.frame(10, None, None);
+        let b = x(&m).unwrap();
+        assert!(more && b > a && b < end, "{b} after {a}");
+        let (_, _, more) = m.frame(10, None, None);
+        let c = x(&m).unwrap();
+        assert!(more && c > b && c <= end, "{c} after {b}");
+        // It comes to rest as the plain switch with no choice, and the fill is forgotten.
+        assert!(m.settle(None, None).pixels == m.plain(None, None).pixels);
+        assert_eq!(x(&m), None);
+        assert!(!m.anim.animating());
     }
 
     #[test]

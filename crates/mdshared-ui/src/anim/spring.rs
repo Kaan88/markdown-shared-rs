@@ -13,6 +13,15 @@ pub struct Spring {
     /// The pull per unit of distance from the target (per second squared, the mass being one).
     pub stiffness: f32,
     /// The drag per unit of speed (per second).
+    ///
+    /// With no damping (zero) the spring swings for ever: from where it started to as far
+    /// beyond its target and back, never slower and never further. It is never
+    /// [`settled`](Spring::settled) unless it starts at rest on its target, so an
+    /// [`Animator`](super::Animator) given one asks for a frame every interval for as long as
+    /// the value is asked for (and stops, like any other, when it no longer is). That is a
+    /// pendulum, not a way to a target; for something that must repeat use
+    /// [`Animator::cycle`](super::Animator::cycle). A negative damping, which would make each
+    /// swing wider than the last, is taken as none.
     pub damping: f32,
     /// How close to the target, in the value's own unit, counts as arrived: see
     /// [`settled`](Spring::settled). The default is 0.001. An
@@ -48,9 +57,10 @@ impl Spring {
     }
 
     /// A spring from how it feels: `response` is the period, in seconds, the spring would swing
-    /// with if nothing damped it (a critically damped one is within a hundredth of its target
-    /// after about one response), and `ratio` is the damping ratio: 1 is critical (the fastest
-    /// arrival without passing the target), below 1 overshoots and rings, above 1 creeps.
+    /// with if nothing damped it, and `ratio` is the damping ratio: 1 is critical (the fastest
+    /// arrival without passing the target), below 1 overshoots and rings, above 1 creeps. A
+    /// critically damped spring has 1.4 % of its way left after one response (exactly
+    /// `(1 + 2π) e^(-2π)`, 0.0136), and a thousandth after about one and a half.
     pub const fn response(response: f32, ratio: f32) -> Spring {
         let omega = std::f32::consts::TAU / response;
         Spring {
@@ -170,9 +180,21 @@ mod tests {
             assert!(p.iter().all(|&x| x <= 1.0 + 1e-6), "it passed its target");
             assert!((p.last().unwrap() - 1.0).abs() < 1e-4);
         }
-        // "Response": about one response after the start it is within a hundredth.
-        let (x, _) = Spring::response(0.25, 1.0).step(0.0, 0.0, 1.0, 0.25);
-        assert!((1.0 - x) < 0.02, "after one response it is at {x}");
+        // "Response": one response after the start 1.36 % of the way is left, whatever the
+        // response; the figure the doc gives, computed the long way here.
+        let tau = std::f64::consts::TAU;
+        let left = ((1.0 + tau) * (-tau).exp()) as f32;
+        assert!((left - 0.0136).abs() < 1e-4, "{left}");
+        for response in [0.15, 0.25, 0.6] {
+            let (x, _) = Spring::response(response, 1.0).step(0.0, 0.0, 1.0, response);
+            assert!((1.0 - x - left).abs() < 1e-4, "after one response {x}");
+            // And a thousandth after about one and a half.
+            let (x, _) = Spring::response(response, 1.0).step(0.0, 0.0, 1.0, response * 1.5);
+            assert!(
+                (1.0 - x) < 0.001 && (1.0 - x) > 0.0005,
+                "after one and a half {x}"
+            );
+        }
     }
 
     #[test]
