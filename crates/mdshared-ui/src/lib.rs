@@ -1,7 +1,9 @@
-//! Shared UI pieces for the Markdown viewer and editor: a software painter, palettes, menu, text
-//! field, file tree, key parsing, OS glue, the generic drawing of the shell (title row and tabs,
-//! panes, scrollbar, tooltips, toasts, dialog frames), and animation ([`anim`]). No window loop;
-//! the application owns that.
+//! Shared UI pieces for the Markdown viewer and editor, and the toolkit of the applications
+//! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
+//! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
+//! scrollbar, tooltips, toasts, dialog frames), sliders, table columns and splitters, the models
+//! of lists, grids and selections, and animation ([`anim`]). No window loop; the application
+//! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
 
 pub mod anim;
 pub mod blur;

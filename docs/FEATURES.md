@@ -190,6 +190,39 @@ No dependency was added. Run: the unit tests, on Windows; `cargo check` and clip
 for Linux. Not verified: anything in a window (how the motions look, the wiring into a winit
 loop), either application, macOS, and the Linux portal read on a real desktop.
 
+## Pieces for the next applications (2026-11-24)
+
+A first batch of general pieces for a music player, a file manager and a terminal, built in one
+go. Each is listed with its entry points in [CATALOGUE.md](CATALOGUE.md); what is still missing
+is in [ROADMAP.md](ROADMAP.md). All of it is additive: no signature changed, no existing
+function draws differently, and neither application uses any of it yet. No dependency was
+added (`mdshared-term` has none at all; the painter's paths use `zeno`, which the icons
+already used).
+
+| Piece | Notes on the design |
+|---|---|
+| `mdshared_app::fmt` | Binary units under everyday names (a KB is 1024 bytes), as `plan::size_text` already wrote them. `plan::thousands`, `plan::size_text` and the private copy in `split::answer` now call it, and a test holds their output to the code they had (`size_text` still goes on in MB past a gigabyte, as it did). Dates take an offset in minutes from the caller: no time zone is read. `natural_cmp` is a total order (ties broken by leading zeros, then the plain string order) |
+| `mdshared_ui::select` | Rows are kept as sorted runs, so "select all" is one run. The rules are those of a Windows file list. `TypeAhead` takes the time as an argument and compares letters with `menu::same_letter` |
+| `mdshared_ui::table` | Spare width goes to columns with a `flex`; too little is taken from them down to their minimums, and then the table is wider than its view. Taking hold of an edge freezes every column at its laid-out width and takes the flex from the dragged one. The settings line holds the widths the columns start from and the sort (`1:240,2:90;sort=2:desc`) |
+| `mdshared_ui::grid`, `rows::Rows::band` | `Grid` mirrors `Rows`. The rubber band is in the frame's coordinates; a caller whose view scrolls during a band keeps the press point in content coordinates |
+| `mdshared_ui::splitter` | The cut holds on to a ratio, or to the size of pane A or B in px (a sidebar keeps its width when the window grows). Side by side, the drawing is `pane::draw_splitter`, pixel for pixel |
+| Painter shapes (`gfx::shapes`) | `image` averages in premultiplied alpha when shrinking and computes only the clipped pixels; it keeps nothing, so a large picture drawn every frame should be scaled once by its owner. Arcs are in turns clockwise from the top, with round ends |
+| `mdshared_ui::slider` | `Scale::Db` is for a gain: the track is linear in decibels over 60 dB, with the minimum of the slider (silence) at the bottom. The marks without an end ask the animator for a value that never arrives, so they move while drawn and the window sleeps when they are not |
+| `mdshared_ui::commands` | Ids are `u32` (as in `palette::Entry`), names are the stable keys of the settings file (`key.<name>=<shortcuts>`), only overrides are written, unknown names in the file are kept and written back |
+| `mdshared_app::pool` | Work is replaced by key while queued, ordered by priority, and dropped or discarded by generation. A panic loses one result and is counted. Dropping the pool does not wait for running work |
+| `mdshared-term` | Parser and screen are apart (`Perform`). No reflow on resize; zero-width characters are dropped; widths come from a small hand-written table. The crate doc lists the gaps |
+
+Run on Windows: the unit tests of every crate, clippy with warnings as errors, and those of
+the `recycle` feature. Sheets were rendered and looked at once at scale 1:
+`target/specimen/shapes.png` and `slider.png` (`cargo test -p mdshared-ui shapes_sheet --
+--ignored`, `slider_sheet`).
+
+Not verified: any of it in a window or under a real pointer and keyboard; how the table
+header, the slider and the splitter feel; Linux (the whole workspace was type-checked and
+linted for it from Windows, nothing was run) and macOS (not built here; CI builds and tests
+both); `mdshared-term` against a real terminal or a program running in a pseudo-terminal (there
+is none here); `pool` under real load.
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
