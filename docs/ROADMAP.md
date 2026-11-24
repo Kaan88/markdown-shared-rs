@@ -52,7 +52,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | Phase | What | Items |
 |---|---|---|
 | 0 | The animation module's review fixes | done on `feat/anim` (`6027946..bc8fa9f`); the breaking changes for mdmix are listed in [FEATURES.md](FEATURES.md), "The review's fixes" |
-| 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5 |
+| 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens; then the menu's look, which mdplay's mockup asked for (the owner, 2026-11-24) | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5, L11 |
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
@@ -85,6 +85,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | L7 | **Drag and drop inside a window.** A drag that starts after a threshold, a drag image, drop targets that light up, drop position between rows, auto-scroll at the edges, files dropped from the system (winit's hover and drop of paths) | M | medium | none | `rows`, `grid`, `select`, `anim` | open |
 | L8 | **Dragging files out to other applications**, which winit does not do and needs OLE, XDND/Wayland data devices and NSDraggingSource | L | high | none (three systems' glue, `unsafe`) | L7, `platform` | open |
 | L9 | **Files and images on the clipboard.** Copy and cut of file lists (with the "cut" flag file managers honour), paste of them; an image as pixels, both ways | M | high | decided: hand-written formats | `platform` clipboard, `cf_html` as the pattern for a pure format | open |
+| L11 | **A menu's look.** The corners, the shadow, the row height, the padding, the hover's shape, the separator's gap and the submenu's gap of `menu::Menu` and `submenu::Cascade` as an opt-in `menu::Look`, for an application whose own chrome is square and flat (mdplay: its toolbar has no shadows, and the rounded, shadowed drop-down clashed with it). The default is today's look, pixel for pixel; a flat preset beside it | S | low | none (the look changes only for an application that opts in) | `menu`, `submenu`, `tokens::Sizes::radius_popup` | claimed: Claude Opus 5.5 for mdplay, 2026-11-24, branch `wk/menulook` |
 | L10 | **Settings form with motion and the new widgets.** `settings::Form` draws its own switches, ticks and scrollbar; give it an animator and a slider row | M | medium | none | `settings`, `slider`, `anim`; must stay pixel-identical when not opted in | open |
 
 ## Files
