@@ -67,6 +67,9 @@ pub const RECORD: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM6.425 8a1.575 1.57
 pub const STOP: &str = "M2 8a6 6 0 1 0 12 0a6 6 0 1 0-12 0zM6 6h4v4H6z";
 pub const PLAY: &str = "M4.5 3l8.5 5-8.5 5z";
 pub const PLAY_END: &str = "M3 3.5l7 4.5-7 4.5zM13 3.5v9";
+/// A music note: two heads on stems joined by a beam.
+pub const MUSIC: &str =
+    "M6 12V3.5l7-1.5V10.5M6 12a2 2 0 1 1-4 0a2 2 0 1 1 4 0zM13 10.5a2 2 0 1 1-4 0a2 2 0 1 1 4 0z";
 pub const UNDO: &str = "M3 6.5h6.5a3.5 3.5 0 0 1 0 7H6M5.5 4L3 6.5 5.5 9";
 pub const REDO: &str = "M13 6.5H6.5a3.5 3.5 0 0 0 0 7H10M10.5 4L13 6.5 10.5 9";
 pub const DUPLICATE_LINE: &str = "M2.5 4.5h9M2.5 8h5M11.5 8.5v5M9 11h5";
@@ -178,6 +181,7 @@ pub const ALL: &[(&str, &str)] = &[
     ("STOP", STOP),
     ("PLAY", PLAY),
     ("PLAY_END", PLAY_END),
+    ("MUSIC", MUSIC),
     ("UNDO", UNDO),
     ("REDO", REDO),
     ("DUPLICATE_LINE", DUPLICATE_LINE),

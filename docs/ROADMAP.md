@@ -107,7 +107,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | M2 | **Meters, waveform and spectrum.** Level meters with ballistics and peak hold that sleep when at rest (mdmix, the player); peaks of a track reduced to one (min, max) a pixel on a worker, cached at several resolutions; spectrum bars on a log axis from the caller's bins | M | low | none (decoding audio is the player's) | `Painter::columns`, `pool`, `slider` | open |
 | M3 | **A seek bar with a hover time and chapter marks.** | S | low | none | `slider` (`Look::buffered`), `overlay::Bubble::tip`, `fmt::duration` | done: `seek` (the commit that adds it) |
 | M4 | **Knob and fader.** A rotary knob (drag, Shift for fine, double click to reset, wheel, bipolar for pan) and a fader with a dB scale of ticks, both on `slider::Slider`'s value model | M | medium | none | `slider`, `Painter::arc`/`ring` | open |
-| M5 | **Cover art and its colours.** The dominant, text and accent colours of a picture (text at 4.5:1 contrast), and the cover drawn with a placeholder when there is none | S | low | none (JPEG covers need F6) | `Painter::image`, `glyph` | open |
+| M5 | **Cover art and its colours.** The dominant, text and accent colours of a picture (text at 4.5:1 contrast), and the cover drawn with a placeholder when there is none | S | low | none (JPEG covers need F6) | `Painter::image`, `glyph` | done: `cover` (the commit that adds it) |
 | M6 | **Decoding audio** (MP3, FLAC, AAC) | XL | high | none decided | the player | deferred by the owner |
 
 ## Terminal

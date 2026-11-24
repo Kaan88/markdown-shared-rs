@@ -12,6 +12,7 @@ pub mod check;
 pub mod chrome;
 pub mod commands;
 pub mod corners;
+pub mod cover;
 pub mod desktop_entry;
 pub mod frost;
 pub mod gfx;

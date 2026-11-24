@@ -45,6 +45,7 @@ the row says the widget holds state.
 | `menu_bar` | The native menu bar of a Mac application | `install`, `AppCommand` |
 | `overlay` | Toast, tooltip and link-hint bubbles; the pieces of a modal dialog | `Bubble::toast` / `tip` / `hint`, `draw`, `draw_presence`; `dialog_card`, `draw_backdrop`, `draw_dialog_card`, `draw_dialog_button`, `draw_keycaps`, `dialog_bounds` |
 | `notice` | Bars across the top of the page: update, crash report, an offer with two buttons | `draw_update_bar`, `draw_crash_bar`, `draw_offer_bar`, `bar_button` |
+| `cover` | Cover art: the colours a picture suggests (background, text at 4.5:1 or better, a saturated accent) and the picture drawn letterboxed, or a music note when there is none (provisional) | `colors(rgba, w, h) -> Option<CoverColors>` (once per picture, not per frame), `draw_cover(p, pal, picture, r, radius)`, `contrast`, `luminance`; `glyph::MUSIC` |
 | `segments` | A segmented switch of two or three options | `switch_width`, `draw_segments`, `draw_segments_animated`, `segment_at` |
 | `check` | A tick box | `Tick::new(on)`, `draw_tick`, `draw_tick_animated` |
 | `slider` | A slider (linear, log or decibel scale), a seek bar, progress bars, a spinner. Holds the value | `Slider::new(min, max, value).step().vertical().scale()`, `press`/`drag`/`release`, `step_by(Step)`, `wheel`, `draw`, `draw_animated`, `Look { buffered, .. }`; `draw_progress`, `draw_progress_indeterminate`, `draw_spinner` (both on `anim::cycle`), `draw_progress_indeterminate_at`, `draw_spinner_at` (at a phase, no animator) |
