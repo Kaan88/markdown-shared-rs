@@ -141,8 +141,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM, SetLastError,
+    BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, SetLastError,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Memory::{
@@ -494,7 +494,10 @@ impl Running {
         // closed below when there is one.
         let mutex = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
         if mutex.is_null() {
-            return true;
+            // Only a mutex that is not there is gone. One this process may not open (an elevated
+            // first instance, whose record cannot be read either) is still running.
+            // SAFETY: reads this thread's last error, set by the call just above.
+            return unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND;
         }
         // SAFETY: the handle was opened here and nothing else holds it.
         unsafe { CloseHandle(mutex) };
