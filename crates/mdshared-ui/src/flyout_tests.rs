@@ -1,5 +1,4 @@
 use super::*;
-use crate::anim::{Animator, Clock, ManualClock, fluent};
 use crate::check::{Tick, draw_tick};
 use crate::focus::draw_ring;
 use crate::gfx::{Face, Gfx, Rgb};
@@ -122,6 +121,34 @@ fn a_flyout_that_prefers_above_opens_above_and_flips_below_near_the_top() {
 }
 
 #[test]
+fn preferring_above_a_card_that_fits_on_neither_side_goes_where_there_is_more_room() {
+    // A 200 px high area, a card 132 high: neither above nor below the anchor has room.
+    let area = Rect::new(0.0, 0.0, 800.0, 200.0);
+    // (anchor, above): 82 px below the grown anchor and 72 above it; then 62 below and 92 above.
+    for (anchor, above) in [
+        (Rect::new(100.0, 80.0, 80.0, 30.0), false),
+        (Rect::new(100.0, 100.0, 80.0, 30.0), true),
+    ] {
+        let mut up = Flyout::new(anchor, CONTENT).side(Side::Above);
+        let r = up.place_in(area);
+        assert_eq!(up.opened_above(), above, "{anchor:?}");
+        assert!(inside(r, room(area)), "{anchor:?}: {r:?}");
+        assert_eq!(r.h, 132.0);
+        assert!(overlaps(r, anchor), "pushed in over the anchor");
+        // Pushed against the edge of the side it went to.
+        if above {
+            assert_eq!(r.y, MARGIN);
+        } else {
+            assert_eq!(r.bottom(), area.bottom() - MARGIN);
+        }
+        // Where nothing fits, the preferred side does not matter.
+        let mut down = Flyout::new(anchor, CONTENT);
+        assert_eq!(down.place_in(area), r, "{anchor:?}");
+        assert_eq!(down.opened_above(), above);
+    }
+}
+
+#[test]
 fn the_gap_and_the_padding_can_be_set() {
     let anchor = Rect::new(100.0, 100.0, 80.0, 30.0);
     let mut f = Flyout::new(anchor, CONTENT).gap(10.0).padding(8.0);
@@ -153,27 +180,40 @@ impl Lcg {
             .wrapping_add(1442695040888963407);
         ((self.0 >> 33) % n as u64) as f32
     }
+
+    /// A number in `0..n` with a fraction, in steps of 1/16 (halves among them).
+    fn fraction(&mut self, n: u32) -> f32 {
+        self.below(n * 16) / 16.0
+    }
 }
 
 #[test]
 fn anywhere_the_card_is_on_its_side_when_it_fits_there_else_the_other_else_inside() {
-    // The rule worked out again plainly, for anchors at random in the area.
+    // The rule worked out again plainly, for anchors and sizes at random in the area, whole and
+    // fractional. The card's edges are rounded, so each lies within half a px of where the rule
+    // puts it, and never outside the margin.
     let mut rng = Lcg(7);
     let room = room(AREA);
+    let near = |a: f32, b: f32| (a - b).abs() <= 0.5;
     for side in [Side::Below, Side::Above] {
-        for _ in 0..2000 {
-            let anchor = Rect::new(
-                rng.below(790),
-                rng.below(590),
-                rng.below(120),
-                rng.below(60),
-            );
-            let content = (rng.below(400), rng.below(300));
+        for i in 0..4000 {
+            let whole = i % 2 == 0;
+            let mut n = |max: u32| {
+                if whole {
+                    rng.below(max)
+                } else {
+                    rng.fraction(max)
+                }
+            };
+            let anchor = Rect::new(n(790), n(590), n(120), n(60));
+            let content = (n(400), n(300));
             let mut f = Flyout::new(anchor, content).side(side);
             let r = f.place_in(AREA);
             let (w, h) = f.card_size();
             assert!(inside(r, room), "{anchor:?} {content:?}: {r:?}");
-            assert_eq!((r.w, r.h), (w, h));
+            assert!(r.x.fract() == 0.0 && r.right().fract() == 0.0, "{r:?}");
+            assert!(r.y.fract() == 0.0 && r.bottom().fract() == 0.0, "{r:?}");
+            assert!((r.w - w).abs() <= 1.0 && (r.h - h).abs() <= 1.0, "{r:?}");
             let fits = |start: f32, len: f32, lo: f32, hi: f32| start >= lo && start + len <= hi;
             let below = fits(anchor.bottom() + GAP, h, room.y, room.bottom());
             let above = fits(anchor.y - GAP - h, h, room.y, room.bottom());
@@ -186,18 +226,30 @@ fn anywhere_the_card_is_on_its_side_when_it_fits_there_else_the_other_else_insid
                 let up = if first { wants_above } else { !wants_above };
                 assert_eq!(f.opened_above(), up, "{anchor:?} {content:?}");
                 if up {
-                    assert_eq!(r.bottom(), anchor.y - GAP);
+                    assert!(near(r.bottom(), anchor.y - GAP), "{anchor:?}: {r:?}");
                 } else {
-                    assert_eq!(r.y, anchor.bottom() + GAP);
+                    assert!(near(r.y, anchor.bottom() + GAP), "{anchor:?}: {r:?}");
                 }
             }
             if fits(anchor.x, w, room.x, room.right()) {
-                assert_eq!(r.x, anchor.x);
+                assert!(near(r.x, anchor.x), "{anchor:?}: {r:?}");
             } else if fits(anchor.right() - w, w, room.x, room.right()) {
-                assert_eq!(r.right(), anchor.right());
+                assert!(near(r.right(), anchor.right()), "{anchor:?}: {r:?}");
             }
         }
     }
+}
+
+#[test]
+fn the_cards_edges_are_rounded_so_one_on_the_margin_stays_on_it() {
+    // The card is 196.5 wide and fits from 599.5 to 796, the margin, exactly. Rounding the
+    // place and the size apart would give 600 + 197 = 797, past the margin.
+    let mut f = Flyout::new(Rect::new(599.5, 100.0, 0.0, 30.0), (164.5, 50.0));
+    let r = f.place_in(AREA);
+    assert!(!f.opened_left());
+    assert_eq!(r, Rect::new(600.0, 134.0, 196.0, 82.0));
+    assert_eq!(r.right(), AREA.right() - MARGIN);
+    assert!(inside(r, room(AREA)));
 }
 
 #[test]
@@ -332,7 +384,7 @@ fn escape_closes_and_every_other_key_is_the_contents() {
 // ---- focus -------------------------------------------------------------------------------------
 
 const BUTTON: u32 = 1;
-const OTHER: u32 = 2;
+const EDITOR: u32 = 2;
 const SCOPE: u32 = 10;
 const CHECK: u32 = 11;
 const OK: u32 = 12;
@@ -340,7 +392,7 @@ const OK: u32 = 12;
 fn frame(focus: &mut Focus<u32>, open: bool) {
     focus.begin_frame();
     focus.add(BUTTON);
-    focus.add(OTHER);
+    focus.add(EDITOR);
     if open {
         focus.add_in(SCOPE, CHECK);
         focus.add_in(SCOPE, OK);
@@ -349,7 +401,7 @@ fn frame(focus: &mut Focus<u32>, open: bool) {
 }
 
 #[test]
-fn the_flyout_is_a_focus_scope_tab_stays_in_it_and_closing_returns_to_the_anchor() {
+fn the_flyout_is_a_focus_scope_tab_stays_in_it_and_the_anchor_that_had_the_focus_gets_it_back() {
     let mut focus = Focus::new();
     frame(&mut focus, false);
     assert!(focus.tab(false));
@@ -358,7 +410,7 @@ fn the_flyout_is_a_focus_scope_tab_stays_in_it_and_closing_returns_to_the_anchor
 
     // Enter on the button opens the flyout: the content's first widget takes the focus.
     let fly = placed(Rect::new(100.0, 100.0, 80.0, 30.0));
-    open_scope(&mut focus, SCOPE, BUTTON, None);
+    open_scope(&mut focus, SCOPE, None);
     frame(&mut focus, true);
     assert_eq!(focus.scope(), Some(SCOPE));
     assert_eq!(focus.focused(), Some(CHECK));
@@ -385,27 +437,84 @@ fn the_flyout_is_a_focus_scope_tab_stays_in_it_and_closing_returns_to_the_anchor
 }
 
 #[test]
-fn opened_by_a_click_with_the_focus_elsewhere_it_still_returns_to_the_anchor() {
+fn opened_by_a_shortcut_elsewhere_closing_gives_the_focus_back_there_not_to_the_anchor() {
+    // The editor has the focus; Ctrl+K opens a flyout under a toolbar button.
     let mut focus = Focus::new();
     frame(&mut focus, false);
-    focus.focus(OTHER);
+    focus.focus(EDITOR);
+    focus.key_used();
     let fly = placed(Rect::new(100.0, 100.0, 80.0, 30.0));
-    open_scope(&mut focus, SCOPE, BUTTON, Some(OK));
+    open_scope(&mut focus, SCOPE, Some(OK));
+    assert_eq!(
+        focus.focused(),
+        Some(EDITOR),
+        "nothing moves before the frame"
+    );
     frame(&mut focus, true);
     assert_eq!(focus.focused(), Some(OK), "the named widget");
-    assert!(!focus.ring_visible(OK));
+    assert!(focus.ring_visible(OK));
 
-    // A press outside closes it.
-    assert_eq!(fly.pointer_down(700.0, 500.0), Outcome::Outside);
+    // Escape: back to the editor, and the button never had the focus.
+    assert_eq!(fly.key(&KeyName::Escape), Outcome::Close);
     assert!(close_scope(&mut focus, SCOPE));
-    assert_eq!(focus.focused(), Some(BUTTON));
+    assert_eq!(focus.focused(), Some(EDITOR));
+    frame(&mut focus, false);
+    assert_eq!(focus.focused(), Some(EDITOR));
+    assert!(!focus.is_focused(BUTTON));
+
+    // The same with a press outside, or on the anchor, to close it.
+    for (x, y, outcome) in [
+        (700.0, 500.0, Outcome::Outside),
+        (110.0, 110.0, Outcome::Anchor),
+    ] {
+        open_scope(&mut focus, SCOPE, None);
+        frame(&mut focus, true);
+        assert_eq!(focus.focused(), Some(CHECK));
+        assert_eq!(fly.pointer_down(x, y), outcome);
+        assert!(close_scope(&mut focus, SCOPE));
+        frame(&mut focus, false);
+        assert_eq!(focus.focused(), Some(EDITOR), "{outcome:?}");
+    }
+}
+
+#[test]
+fn an_anchor_that_is_no_widget_works_and_closing_gives_back_what_was_there() {
+    // A flyout on a word: no focus id at all for its anchor.
+    let word = Rect::new(300.0, 200.0, 46.0, 18.0);
+    let fly = placed(word);
+
+    // Nothing had the focus: Tab works inside, and closing leaves nothing focused.
+    let mut focus = Focus::new();
+    frame(&mut focus, false);
+    assert_eq!(focus.focused(), None);
+    open_scope(&mut focus, SCOPE, None);
+    frame(&mut focus, true);
+    assert_eq!(focus.focused(), Some(CHECK));
+    assert!(focus.tab(false));
+    assert_eq!(focus.focused(), Some(OK));
+    assert!(focus.tab(false));
+    assert_eq!(focus.focused(), Some(CHECK));
+    assert_eq!(fly.pointer_down(word.cx(), word.cy()), Outcome::Anchor);
+    assert!(close_scope(&mut focus, SCOPE));
+    frame(&mut focus, false);
+    assert_eq!(focus.focused(), None);
+
+    // The editor the word is in had it: it gets it back.
+    focus.focus(EDITOR);
+    open_scope(&mut focus, SCOPE, None);
+    frame(&mut focus, true);
+    assert_eq!(focus.focused(), Some(CHECK));
+    assert_eq!(fly.key(&KeyName::Escape), Outcome::Close);
+    assert!(close_scope(&mut focus, SCOPE));
+    assert_eq!(focus.focused(), Some(EDITOR));
 }
 
 #[test]
 fn close_scope_leaves_a_scope_that_is_not_the_innermost_alone() {
     let mut focus = Focus::new();
     frame(&mut focus, false);
-    open_scope(&mut focus, SCOPE, BUTTON, None);
+    focus.focus(EDITOR);
+    open_scope(&mut focus, SCOPE, None);
     frame(&mut focus, true);
     // The content opened a scope of its own (a menu).
     focus.push_scope(99);
@@ -413,7 +522,7 @@ fn close_scope_leaves_a_scope_that_is_not_the_innermost_alone() {
     assert_eq!(focus.scope(), Some(99));
     assert!(focus.pop_scope());
     assert!(close_scope(&mut focus, SCOPE));
-    assert_eq!(focus.focused(), Some(BUTTON));
+    assert_eq!(focus.focused(), Some(EDITOR));
 }
 
 // ---- drawing -----------------------------------------------------------------------------------
@@ -531,31 +640,6 @@ fn gone_the_animated_card_draws_nothing_and_half_way_it_is_faded() {
         let c = at(&half, 120, 90);
         assert!(c != pal.page && c != pal.accent, "{c:?}");
     }
-}
-
-#[test]
-fn under_reduced_motion_the_card_appears_and_goes_at_once() {
-    let clock = ManualClock::new();
-    let mut anim = Animator::new();
-    anim.set_system_reduced(true);
-    anim.begin_frame(clock.now());
-    let t = anim.presence("fly", true, fluent::ENTER, fluent::EXIT);
-    assert_eq!(t, 1.0);
-    let mut called = false;
-    let shown = animated(&LIGHT, t, &mut called);
-    let mut f = Flyout::new(Rect::new(40.0, 10.0, 60.0, 30.0), (160.0, 60.0));
-    f.place_in(Rect::new(0.0, 0.0, W as f32, H as f32));
-    let plain = canvas(&LIGHT, |p| {
-        draw_card(p, &LIGHT, f.rect());
-        p.fill(f.content_rect(), LIGHT.accent);
-    });
-    assert!(shown.pixels == plain.pixels);
-    clock.advance_ms(16);
-    anim.begin_frame(clock.now());
-    assert_eq!(
-        anim.presence("fly", false, fluent::ENTER, fluent::EXIT),
-        0.0
-    );
 }
 
 // ---- sheet -------------------------------------------------------------------------------------

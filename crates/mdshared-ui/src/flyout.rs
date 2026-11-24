@@ -29,21 +29,29 @@
 //! The focus: a flyout is a focus scope of its own in [`focus::Focus`](crate::focus::Focus).
 //! The application picks an id for the scope, of its own id type, and:
 //!
-//! 1. opens it with [`open_scope`] when the flyout opens, naming the anchor's id (and,
-//!    optionally, the widget of the content that takes the focus first);
-//! 2. each frame, declares the anchor as before and the content's widgets inside the scope
+//! 1. opens it with [`open_scope`] when the flyout opens (and, optionally, names the widget
+//!    of the content that takes the focus first);
+//! 2. each frame, declares its widgets as before and the content's widgets inside the scope
 //!    ([`Focus::add_in`](crate::focus::Focus::add_in)): Tab then visits only those, wrapping
 //!    inside the card;
 //! 3. closes it with [`close_scope`] when the flyout closes, for whatever reason (Escape, a
 //!    press outside or on the anchor, a button of the content): the focus goes back to the
-//!    anchor.
+//!    widget that had it when the flyout opened, as in WinUI.
+//!
+//! That widget is not always the anchor. A flyout opened by a click or Enter on a button that
+//! has the focus gives it back to the button; one opened by a shortcut (Ctrl+K in an editor)
+//! on a toolbar button gives it back to the editor. The anchor is only a rectangle here and
+//! need not be a widget that takes the focus at all (a cell, a word). Nothing here moves the
+//! focus to the anchor; an application that wants that calls
+//! [`Focus::focus`](crate::focus::Focus::focus) itself before [`open_scope`].
 //!
 //! ```text
-//! // Opening, on the anchor's click or its Enter:
+//! // Opening, on the anchor's click, its Enter or a shortcut:
 //! fly = Some(Flyout::new(button, (240.0, 96.0)));
-//! flyout::open_scope(&mut focus, Id::Flyout, Id::Button, None);
+//! flyout::open_scope(&mut focus, Id::Flyout, None);
 //! // Each frame:
 //! focus.begin_frame();
+//! focus.add(Id::Editor);
 //! focus.add(Id::Button);
 //! if fly.is_some() { focus.add_in(Id::Flyout, Id::Check); focus.add_in(Id::Flyout, Id::Ok); }
 //! focus.end_frame();
@@ -214,7 +222,7 @@ impl Flyout {
     }
 
     /// Places the card inside `area` (the window, or the part of it a popup may use) and
-    /// returns its rectangle, in whole logical px. The geometry is
+    /// returns its rectangle, its edges at whole logical px. The geometry is
     /// [`submenu::around`](crate::submenu::around), with the anchor grown by the gap above and
     /// below: the card opens on its [`Side`], flips to the other side where it would leave the
     /// area, flips to the left (its right edge at the anchor's right) where it would cross the
@@ -248,12 +256,11 @@ impl Flyout {
                 (mirrored(placed.rect), placed.left, !placed.above)
             }
         };
-        self.rect = Rect::new(
-            rect.x.round(),
-            rect.y.round(),
-            rect.w.round(),
-            rect.h.round(),
-        );
+        // The edges are rounded, not the place and the size apart: an edge that lies on the
+        // margin stays on it.
+        let (x0, x1) = (rect.x.round(), rect.right().round());
+        let (y0, y1) = (rect.y.round(), rect.bottom().round());
+        self.rect = Rect::new(x0, y0, x1 - x0, y1 - y0);
         self.went_left = left;
         self.went_up = above;
         self.rect
@@ -313,24 +320,22 @@ impl Flyout {
     }
 }
 
-/// Opens the flyout's focus scope `scope` in `focus`, for a flyout by the widget `anchor`. The
-/// anchor takes the focus first if it has not got it (as a press on it gives it, with the rings
-/// hidden; an anchor opened from the keyboard has it already and keeps its rings), so that
-/// closing the scope returns the focus to it. Then the scope is pushed: at the next
+/// Opens the flyout's focus scope `scope` in `focus`. It does not move the focus first: the
+/// widget that has it now, wherever it is (the anchor, or an editor a shortcut opened the
+/// flyout from), or none, is the one [`close_scope`] gives it back to. At the next
 /// [`end_frame`](Focus::end_frame) the focus moves to `first` if the content declares it, else
-/// to the content's first widget, and Tab visits only the content's widgets.
-pub fn open_scope<K: Copy + Eq>(focus: &mut Focus<K>, scope: K, anchor: K, first: Option<K>) {
-    if !focus.is_focused(anchor) {
-        focus.focus(anchor);
-    }
+/// to the content's first widget, and Tab visits only the content's widgets. The rings stay as
+/// they were: shown when a key opened the flyout, hidden after a click.
+pub fn open_scope<K: Copy + Eq>(focus: &mut Focus<K>, scope: K, first: Option<K>) {
     match first {
         Some(id) => focus.push_scope_on(scope, id),
         None => focus.push_scope(scope),
     }
 }
 
-/// Closes the flyout's focus scope `scope` in `focus`, returning the focus to the anchor (or,
-/// if the anchor is no longer declared, to where [`Focus::pop_scope`] sends it). It closes only
+/// Closes the flyout's focus scope `scope` in `focus`, returning the focus to the widget that
+/// had it when [`open_scope`] opened the scope (nothing, if nothing had it; if that widget is no
+/// longer declared, wherever [`Focus::pop_scope`] sends it). It closes only
 /// a scope that is the innermost one open: a scope the content opened inside the flyout (a menu
 /// of its own) is closed by its owner first. Returns whether a scope was closed.
 pub fn close_scope<K: Copy + Eq>(focus: &mut Focus<K>, scope: K) -> bool {
@@ -357,7 +362,8 @@ pub fn draw_card(p: &mut Painter, pal: &Palette, r: Rect) {
 /// (and for a NaN) this is [`draw_card`] then `content`, pixel for pixel; at 0 nothing is drawn
 /// and `content` is not called. Under reduced motion the animator's presence is only 0 or 1,
 /// so the card appears and goes at once. The flyout must have been placed
-/// ([`Flyout::place_in`]).
+/// ([`Flyout::place_in`]). `content` is called at once, inside this call, as
+/// [`anim::pop`](crate::anim::pop) calls its own; nothing keeps it.
 pub fn draw_card_animated(
     p: &mut Painter,
     pal: &Palette,
