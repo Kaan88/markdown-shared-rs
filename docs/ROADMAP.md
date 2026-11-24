@@ -39,8 +39,8 @@ something that cannot be tested headless).
 | The tray icon (W6) | Hand-written per system, no new crate: `Shell_NotifyIcon`, StatusNotifierItem over zbus, `NSStatusItem` through objc2-app-kit (the agent's choice; no dependency involved) |
 | Unicode widths for the terminal (T4) | Generated into the source from the data of `unicode-width` 0.2.3; no run-time dependency (the agent's choice) |
 | The shell's context menu for files, audio decoding | Deferred (rows F7 and M6) until the owner says otherwise |
-| The order of work | mdmix's pieces first, put into mdmix and looked at, then the music player, the file manager and the terminal, one application's batch at a time (below) |
-| How the work is run | One agent at a time; no parallel fan-out of workers |
+| The order of work | The music player's pieces first (the owner, 2026-11-24: mdmix is made usable from what exists by its own session), then the file manager and the terminal, one application's batch at a time (below) |
+| How the work is run | One item at a time and at most one helper agent at a time; DeepSeek Flash for safe, low-risk items, the coordinating agent itself for risky ones; no parallel fan-out |
 
 `feat/hosted` (the worktree `mdshared-hosted`, uncommitted) is a Win32 "hosted mode" for a
 component that draws into a window whose loop belongs to another program. It is not the base of
@@ -52,8 +52,8 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | Phase | What | Items |
 |---|---|---|
 | 0 | The animation module's review fixes | done on `feat/anim` (`6027946..bc8fa9f`); the breaking changes for mdmix are listed in [FEATURES.md](FEATURES.md), "The review's fixes" |
-| 1 | **mdmix.** Adapt mdmix to the new animation API (in the mdmix repository, by its own session). Then build, one at a time: the knob and fader, submenus and context menus, window-state persistence, the tray icon and notifications, the focus model, and level meters if mdmix has a level to show. Put each into mdmix, let the owner look at it, fix, promote to `main` | M4, L1, W3, W6, W7, W2, M2 (meters) |
-| 2 | **Music player** | M3, F6, M5, M1, M2 (waveform, spectrum), L2, W4, L3, W5 |
+| 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5 |
+| 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
@@ -105,7 +105,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 |---|---|---|---|---|---|---|
 | M1 | **Media session.** The system's now-playing surface and media keys: SMTC on Windows, MPRIS on Linux, MPNowPlayingInfoCenter on macOS; title, artist, art, position, play/pause/next from the system | L | high | decided: `windows` WinRT feature `media-session`, objc2-media-player 0.3, zbus | `platform`, zbus | open |
 | M2 | **Meters, waveform and spectrum.** Level meters with ballistics and peak hold that sleep when at rest (mdmix, the player); peaks of a track reduced to one (min, max) a pixel on a worker, cached at several resolutions; spectrum bars on a log axis from the caller's bins | M | low | none (decoding audio is the player's) | `Painter::columns`, `pool`, `slider` | open |
-| M3 | **A seek bar with a hover time and chapter marks.** | S | low | none | `slider` (`Look::buffered`), `overlay::Bubble::tip`, `fmt::duration` | open |
+| M3 | **A seek bar with a hover time and chapter marks.** | S | low | none | `slider` (`Look::buffered`), `overlay::Bubble::tip`, `fmt::duration` | claimed: Claude Opus 5.5 with DeepSeek Flash, 2026-11-24 |
 | M4 | **Knob and fader.** A rotary knob (drag, Shift for fine, double click to reset, wheel, bipolar for pan) and a fader with a dB scale of ticks, both on `slider::Slider`'s value model | M | medium | none | `slider`, `Painter::arc`/`ring` | open |
 | M5 | **Cover art and its colours.** The dominant, text and accent colours of a picture (text at 4.5:1 contrast), and the cover drawn with a placeholder when there is none | S | low | none (JPEG covers need F6) | `Painter::image`, `glyph` | open |
 | M6 | **Decoding audio** (MP3, FLAC, AAC) | XL | high | none decided | the player | deferred by the owner |
