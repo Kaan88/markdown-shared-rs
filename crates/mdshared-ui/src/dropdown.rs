@@ -15,20 +15,26 @@
 //! Keys, as a Windows combo box has them. Closed: Space, Enter, Alt+Down, Alt+Up and F4 open
 //! it; Up and Left choose the option before, Down and Right the one after, Home and End the
 //! first and the last, and a letter the next option that begins with it, all without opening.
-//! Open: Up and Down move the highlight, Home and End go to the ends, a letter to the next
+//! Open: Up and Down move the highlight and stop at the first and the last option (as WinUI's
+//! ComboBox does; a plain menu goes round), Home and End go to the ends, a letter to the next
 //! option that begins with it; Enter, Space, Alt+Up, Alt+Down and F4 choose the highlighted
 //! option and close; Escape and Tab close with no change. The pointer: a click on the field
 //! opens it (the press and the release both on the field, as in the dialog), a click on a row
 //! chooses it, a press anywhere else closes the menu with no change.
 //!
-//! The menu is placed with [`Menu::around`](crate::menu::Menu::around), round the field grown
-//! by [`MENU_GAP`] above and below: under the field with its left edges level and a gap of
-//! [`MENU_GAP`] px, above it where there is no room below, and leftwards where there is no room
-//! to the right. It is at least as wide as the field, opens with the chosen option ticked and
-//! highlighted, and scrolls when it is taller than the window.
+//! The menu is placed as [`Menu::around`](crate::menu::Menu::around) places a menu, round the
+//! field grown by [`MENU_GAP`] above and below: under the field with its left edges level and a
+//! gap of [`MENU_GAP`] px, above it where there is no room below, and leftwards where there is no
+//! room to the right. One rule is added: it never covers the field. Where it fits neither below
+//! nor above, it goes to the side with more room and is cut to that room, and scrolls. It is at
+//! least as wide as the field, opens with the chosen option ticked and highlighted (brought into
+//! view when it scrolls), and scrolls when it is taller than the window.
 //!
 //! The field's pixels are the settings dialog's: both draw it with the same function, and a test
-//! draws a form's choice row and this field over the same ground and compares every pixel. The
+//! draws a form's choice row and this field over the same ground and compares every pixel.
+//! That the dialogs still draw what they drew before the function was shared is tested against
+//! frozen copies of the old code (`settings::unchanged` for the single-page form, a frozen copy
+//! in this module's tests for the categorised one). The
 //! focus ring is the exception: the dialog paints its own ring with the row's colour inside it,
 //! and this field uses [`focus::draw_ring`](crate::focus::draw_ring), which needs to know nothing
 //! of what is behind it.
@@ -66,7 +72,7 @@ use crate::focus::draw_ring;
 use crate::gfx::{Face, Painter, Rect, Rgb, mix};
 use crate::glyph;
 use crate::keys::{KeyName, Mods};
-use crate::menu::{Item, Menu, same_letter};
+use crate::menu::{Around, Item, Menu, same_letter};
 use crate::theme::Palette;
 
 /// The height of the field, in logical px, as the settings dialog draws it.
@@ -214,8 +220,9 @@ impl<T> Dropdown<T> {
     }
 
     /// Opens the menu under `field` and returns it: one row per option, the chosen one ticked
-    /// and highlighted, placed by [`Menu::around`] round `field` grown by [`MENU_GAP`] above and
-    /// below, and at least as wide as `field`. An open menu is opened again in the new place.
+    /// and highlighted, placed as [`Menu::around`] places a menu round `field` grown by
+    /// [`MENU_GAP`] above and below, but never over the field (see the module doc), and at least
+    /// as wide as `field`. An open menu is opened again in the new place.
     /// With no options, or a `field` that is not finite or has no area, nothing opens and the
     /// answer is None.
     pub fn open_menu(&mut self, field: Rect) -> Option<&mut Menu<usize>> {
@@ -234,9 +241,8 @@ impl<T> Dropdown<T> {
             field.w,
             field.h + 2.0 * MENU_GAP,
         );
-        let mut menu = Menu::new(items, field.x, field.bottom(), false)
-            .around(anchor)
-            .min_width(field.w);
+        let mut menu = Menu::new(items, field.x, field.bottom(), false).min_width(field.w);
+        menu.set_around(Around::Clear(anchor));
         menu.highlight(self.selected);
         self.pressed = false;
         self.menu_pressed = None;
@@ -264,12 +270,13 @@ impl<T> Dropdown<T> {
                 }
                 _ if swing => return self.commit(),
                 KeyName::Enter | KeyName::Space => return self.commit(),
-                KeyName::Up | KeyName::Down => {
-                    if let Some(menu) = &mut self.menu {
-                        menu.step(*key == KeyName::Down);
-                    }
-                    return Outcome::Redraw;
-                }
+                // The highlight stops at the ends, as WinUI's ComboBox does.
+                KeyName::Up => hover.map_or(Some(self.selected), |k| k.checked_sub(1)),
+                KeyName::Down => match hover {
+                    None => Some(self.selected),
+                    Some(k) if k + 1 < self.options.len() => Some(k + 1),
+                    Some(_) => None,
+                },
                 KeyName::Home => Some(0),
                 KeyName::End => Some(self.options.len().saturating_sub(1)),
                 KeyName::Char(c) if !mods.ctrl && !mods.alt && !mods.control => {

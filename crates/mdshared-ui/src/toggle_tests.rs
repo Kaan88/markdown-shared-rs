@@ -351,7 +351,9 @@ fn the_switch_is_the_settings_dialogs_toggle_pixel_for_pixel() {
 }
 
 /// The categorised settings dialog's toggle rows, disabled ones included, are this switch's
-/// pixels too.
+/// pixels too. Both draw with `switch` now, so this says the standalone switch is the dialog's;
+/// that the dialog still draws what it drew is
+/// `the_categorised_dialogs_toggles_are_still_drawn_as_before_the_move`, against a frozen copy.
 #[test]
 fn the_switch_is_the_categorised_dialogs_toggle_and_its_disabled_look() {
     for pal in [&LIGHT, &DARK] {
@@ -534,5 +536,115 @@ fn toggle_sheet() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen");
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
+    }
+}
+
+// ---- the frozen reference ------------------------------------------------------------------
+
+/// FROZEN REFERENCE, not to be edited: the categorised settings form's toggle as it was drawn on
+/// `feat/anim` (6e0b9c0), before the switch moved to [`switch`]. The body is
+/// `settings::draw_toggle` of that commit, word for word, and the wash after it is the toggle row
+/// of `settings/pages.rs` there (its `TOGGLE_H` was 20). `hovered` and `pressed` are what that
+/// row passed: false for a disabled row.
+fn frozen_pages_toggle(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    on: bool,
+    hovered: bool,
+    pressed: bool,
+    off: bool,
+) {
+    let knob = if pressed {
+        14.0
+    } else if hovered {
+        13.0
+    } else {
+        12.0
+    };
+    if on {
+        let fill = if hovered {
+            mix(pal.accent, pal.popup, 0.1)
+        } else {
+            pal.accent
+        };
+        p.rbox(r, r.h / 2.0, fill);
+        p.rbox(
+            Rect::new(r.right() - 4.0 - knob, r.cy() - knob / 2.0, knob, knob),
+            knob / 2.0,
+            pal.on_accent,
+        );
+    } else {
+        let edge = if hovered {
+            mix(pal.muted, pal.popup, 0.2)
+        } else {
+            mix(pal.muted, pal.popup, 0.35)
+        };
+        p.frame(
+            r,
+            r.h / 2.0,
+            if hovered {
+                mix(pal.field, pal.text, 0.05)
+            } else {
+                pal.field
+            },
+            edge,
+        );
+        p.rbox(
+            Rect::new(r.x + 4.0, r.cy() - knob / 2.0, knob, knob),
+            knob / 2.0,
+            pal.muted,
+        );
+    }
+    if off {
+        p.rbox_a(r.inset(-1.0), 20.0 / 2.0, pal.popup, 0.55);
+    }
+}
+
+/// The categorised form draws its toggle rows as it did before the switch was shared: its frame
+/// now, with each switch wiped and drawn again by the frozen copy of the old code, is the same
+/// frame, pixel for pixel. Off, on and disabled; at rest, under the pointer and pressed; light
+/// and dark; scales 1 and 1.5.
+#[test]
+fn the_categorised_dialogs_toggles_are_still_drawn_as_before_the_move() {
+    for pal in [&LIGHT, &DARK] {
+        for scale in [1.0, 1.5] {
+            for (id, on, off) in [(1, false, false), (2, true, false), (3, true, true)] {
+                for state in 0..3 {
+                    let mut f = pages::Form::new(
+                        "Settings",
+                        vec![Page::new(
+                            "General",
+                            vec![
+                                Item::new(Row::toggle(1, "Word wrap", false)),
+                                Item::new(Row::toggle(2, "Line numbers", true)),
+                                Item::new(Row::toggle(3, "Minimap", true)).disabled("Needs more"),
+                            ],
+                        )],
+                    );
+                    let a = frame_of(scale, |p, win| {
+                        f.layout(p, win);
+                        let c = f.control_rect(id);
+                        if state >= 1 {
+                            f.pointer_move(c.cx(), c.cy());
+                        }
+                        if state == 2 {
+                            f.press(c.cx(), c.cy(), Mods::default(), 1);
+                        }
+                        f.draw(p, pal, win, false);
+                    });
+                    let ctrl = f.control_rect(id);
+                    let (hovered, pressed) = (state >= 1 && !off, state == 2 && !off);
+                    let b = redrawn_over(&a, scale, ctrl, |p| {
+                        frozen_pages_toggle(p, pal, ctrl, on, hovered, pressed, off);
+                    });
+                    assert!(
+                        a.pixels == b.pixels,
+                        "id {id}, state {state}, scale {scale}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
     }
 }

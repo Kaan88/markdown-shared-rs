@@ -11,7 +11,10 @@
 //! slides and whose fill fades in; at rest that is [`draw_toggle`] pixel for pixel.
 //!
 //! The pixels are the settings dialog's: both draw the switch with the same function, and a test
-//! draws a form's toggle row and this switch over the same ground and compares every pixel. The
+//! draws a form's toggle row and this switch over the same ground and compares every pixel.
+//! That the dialogs still draw what they drew before the function was shared is tested against
+//! frozen copies of the old code (`settings::unchanged` for the single-page form, a frozen copy
+//! in this module's tests for the categorised one). The
 //! focus ring is the exception: the dialog paints its own ring with the row's colour inside it,
 //! and this switch uses [`focus::draw_ring`](crate::focus::draw_ring), which needs to know
 //! nothing of what is behind it.

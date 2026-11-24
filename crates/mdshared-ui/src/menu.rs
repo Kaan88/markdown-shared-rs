@@ -144,6 +144,10 @@ pub(crate) enum Around {
     Below(Rect),
     /// Beside the rectangle (an item as wide as its menu), on the left first when `true`.
     Beside(Rect, bool),
+    /// Below the rectangle, flipped above or to the left when it does not fit, and never over
+    /// it: where it fits on neither side it is cut to the room on the roomier side and scrolls
+    /// (a drop-down's list, which must not hide its field).
+    Clear(Rect),
 }
 
 pub struct Menu<T> {
@@ -376,6 +380,7 @@ impl<T: Clone> Menu<T> {
             Some(around) => {
                 let placed = match around {
                     Around::Below(anchor) => crate::submenu::around(w, h, anchor, area),
+                    Around::Clear(anchor) => crate::submenu::around_clear(w, h, anchor, area),
                     Around::Beside(item, leftward) => {
                         crate::submenu::beside(w, h, item, area, leftward)
                     }

@@ -374,16 +374,27 @@ it on the release, as the settings dialog does.
 
 Both draw the settings dialog's pixels. Its switch and its drop-down field were moved, unchanged,
 to `toggle::switch` and `dropdown::field` (crate-private), and the single-page and the
-categorised forms now draw with them. The proof is in two parts: `settings::unchanged` still
-compares the single-page form with its frozen copy, and four tests draw each form's toggle and
-drop-down rows (at rest, under the pointer, pressed, disabled; light and dark; scales 1 and 1.5),
-wipe the control to the ground beside it, draw the standalone widget there and compare every
-pixel. Those four passed before the move as well as after it. The focus ring is the one
+categorised forms now draw with them. That the forms still draw what they drew is tested
+against frozen copies of the old code: `settings::unchanged` compares the single-page form with
+its frozen copy, and for the categorised form the tests of `toggle` and `dropdown` hold frozen
+copies of its old switch and field (from `feat/anim`, 6e0b9c0). They draw the form's rows (at
+rest, under the pointer, pressed, disabled; light and dark; scales 1 and 1.5), wipe each control
+to the ground beside it, draw it again with the frozen code and compare every pixel; nudging
+the shared code by one px or one colour step makes them fail. Four more tests do the same with
+the standalone widgets, which shows they are the forms' controls; those passed before the move
+too, but after it they compare shared code with itself. The focus ring is the one
 difference: the dialog paints its own with the row's colour inside it; these use
 `focus::draw_ring`, which needs no background.
 
 Added to `menu::Menu`: `min_width(w)` (a drop-down's list is at least as wide as its field;
 off unless asked) and `highlight(i)` (the keyboard highlight set by index and brought into view).
+
+The list never covers its field. It is placed as `Menu::around` places a menu, but where it fits
+neither below nor above the field it goes to the side with more room, cut to that room, and
+scrolls, instead of being pushed over the field (`submenu::around_clear`, crate-private, used
+through a crate-private placement of `Menu`; `Menu::around` itself is unchanged). While the list
+is open, Up and Down stop at the first and the last option, as WinUI's ComboBox does; a plain
+menu still goes round.
 
 Not here: an editable combo box, the labels beside the controls, the menu's closing fade, the
 wheel changing a closed drop-down, and the accessibility layer, which (W8) will read the role

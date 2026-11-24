@@ -675,7 +675,9 @@ fn the_field_is_the_settings_dialogs_dropdown_pixel_for_pixel() {
 }
 
 /// The categorised settings dialog's drop-down rows, a disabled one included, are this field's
-/// pixels too.
+/// pixels too. Both draw with `field` now, so this says the standalone field is the dialog's;
+/// that the dialog still draws what it drew is
+/// `the_categorised_dialogs_dropdowns_are_still_drawn_as_before_the_move`, against a frozen copy.
 #[test]
 fn the_field_is_the_categorised_dialogs_dropdown_and_its_disabled_look() {
     for pal in [&LIGHT, &DARK] {
@@ -894,4 +896,200 @@ fn dropdown_sheet() {
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
     }
+}
+
+// ---- the frozen reference ------------------------------------------------------------------
+
+/// FROZEN REFERENCE, not to be edited: the categorised settings form's drop-down field as
+/// `settings/pages.rs` drew it on `feat/anim` (6e0b9c0), before it moved to [`field`]: the body
+/// of its `Row::Choice` arm, word for word, but the focus ring and the lookup of the label (its
+/// `CONTROL_SIZE` was 13). `h` is the pointer over it or its menu open, `off` a disabled row.
+fn frozen_pages_field(p: &mut Painter, pal: &Palette, ctrl: Rect, shown: &str, h: bool, off: bool) {
+    let fill = if h {
+        mix(pal.field, pal.text, 0.05)
+    } else {
+        pal.field
+    };
+    let edge = if h {
+        mix(pal.line, pal.text, 0.18)
+    } else {
+        pal.line
+    };
+    p.frame(ctrl, 6.0, fill, edge);
+    p.text(
+        Face::Ui,
+        13.0,
+        ctrl.x + 11.0,
+        ctrl.cy(),
+        shown,
+        if off { pal.faint } else { pal.text },
+        ctrl.w - 36.0,
+    );
+    let arrow = if off { pal.faint } else { pal.muted };
+    p.icon(glyph::DOWN, 10.0, ctrl.right() - 15.0, ctrl.cy(), arrow);
+}
+
+/// The categorised form draws its drop-down rows as it did before the field was shared: its
+/// frame now, with each field wiped and drawn again by the frozen copy of the old code, is the
+/// same frame, pixel for pixel. Live and disabled; at rest and under the pointer; light and
+/// dark; scales 1 and 1.5.
+#[test]
+fn the_categorised_dialogs_dropdowns_are_still_drawn_as_before_the_move() {
+    let themes = ["System", "Light", "Dark"];
+    for pal in [&LIGHT, &DARK] {
+        for scale in [1.0, 1.5] {
+            for (id, off) in [(1, false), (2, true)] {
+                for hover in [false, true] {
+                    let mut f = pages::Form::new(
+                        "Settings",
+                        vec![Page::new(
+                            "General",
+                            vec![
+                                PageItem::new(Row::choice(1, "Theme", &themes, 2)).dropdown(),
+                                PageItem::new(Row::choice(2, "Accent", &themes, 0))
+                                    .dropdown()
+                                    .disabled("Follows the system"),
+                            ],
+                        )],
+                    );
+                    let a = frame_of(scale, |p, win| {
+                        f.layout(p, win);
+                        let c = f.control_rect(id);
+                        if hover {
+                            f.pointer_move(c.cx(), c.cy());
+                        }
+                        f.draw(p, pal, win, false);
+                    });
+                    let ctrl = f.control_rect(id);
+                    let shown = if id == 1 { "Dark" } else { "System" };
+                    let b = redrawn_over(&a, scale, ctrl, |p| {
+                        frozen_pages_field(p, pal, ctrl, shown, hover && !off, off);
+                    });
+                    assert!(
+                        a.pixels == b.pixels,
+                        "id {id}, hover {hover}, scale {scale}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---- Up and Down at the ends, and a menu with no room -------------------------------------
+
+#[test]
+fn open_up_and_down_stop_at_the_first_and_the_last_option() {
+    let mut d = widths();
+    key(&mut d, KeyName::Space, NONE);
+    assert_eq!(key(&mut d, KeyName::Up, NONE), Outcome::Redraw);
+    assert_eq!(d.menu().unwrap().hover, Some(0));
+    assert_eq!(
+        key(&mut d, KeyName::Up, NONE),
+        Outcome::None,
+        "no going round"
+    );
+    assert_eq!(d.menu().unwrap().hover, Some(0));
+    key(&mut d, KeyName::End, NONE);
+    assert_eq!(d.menu().unwrap().hover, Some(4));
+    assert_eq!(
+        key(&mut d, KeyName::Down, NONE),
+        Outcome::None,
+        "no going round"
+    );
+    assert_eq!(d.menu().unwrap().hover, Some(4));
+    assert_eq!(key(&mut d, KeyName::Up, NONE), Outcome::Redraw);
+    assert_eq!(d.menu().unwrap().hover, Some(3));
+    // With no highlight (the pointer left the rows), an arrow starts from the choice.
+    if let Some(m) = d.menu_mut() {
+        m.hover = None;
+    }
+    assert_eq!(key(&mut d, KeyName::Down, NONE), Outcome::Redraw);
+    assert_eq!(d.menu().unwrap().hover, Some(1));
+    assert_eq!(d.selected(), Some(1));
+    // A single option: the arrows have nowhere to go.
+    let mut one = Dropdown::new([(0, "Only")], 0);
+    key(&mut one, KeyName::Space, NONE);
+    assert_eq!(key(&mut one, KeyName::Up, NONE), Outcome::None);
+    assert_eq!(key(&mut one, KeyName::Down, NONE), Outcome::None);
+}
+
+#[test]
+fn a_menu_with_room_neither_below_nor_above_goes_to_the_roomier_side_and_keeps_off_the_field() {
+    // Five rows want 170 px; this area leaves less than that on either side of the field.
+    let area = Rect::new(0.0, 0.0, 500.0, 300.0);
+    for (top, up) in [(120.0, false), (150.0, true)] {
+        let field = Rect::new(40.0, top, 160.0, DROPDOWN_H);
+        let mut d = widths();
+        d.select(4);
+        d.open_menu(field);
+        place(&mut d, area);
+        let menu = d.menu().unwrap();
+        let r = menu.rect();
+        assert_eq!(menu.opened_above(), up, "top {top}");
+        assert!(
+            r.y >= area.y && r.bottom() <= area.bottom(),
+            "inside: {r:?}"
+        );
+        if up {
+            assert_eq!(r.bottom(), field.y - MENU_GAP);
+        } else {
+            assert_eq!(r.y, field.bottom() + MENU_GAP);
+        }
+        assert!(menu.scrolls());
+        let row = menu.row_rect(4);
+        assert!(
+            row.y >= r.y && row.bottom() <= r.bottom(),
+            "the choice in view"
+        );
+    }
+}
+
+/// The placement against `Menu::around`'s on pseudo-random menus and anchors: the same where the
+/// menu fits on one side; elsewhere inside the room, no taller than asked, as wide and as far
+/// across as `around` puts it, and clear of an anchor that lies inside the room.
+#[test]
+fn the_clear_placement_is_arounds_but_never_over_the_anchor() {
+    let mut seed: u32 = 7;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let room = AREA.inset(crate::submenu::MARGIN);
+    let mut cut = 0;
+    for _ in 0..4000 {
+        let anchor = Rect::new(
+            next() * 500.0,
+            next() * 400.0,
+            20.0 + next() * 200.0,
+            next() * 40.0,
+        );
+        let (w, h) = (100.0 + next() * 200.0, next() * 450.0);
+        let plain = crate::submenu::around(w, h, anchor, AREA);
+        let clear = crate::submenu::around_clear(w, h, anchor, AREA);
+        let below = anchor.bottom() >= room.y && anchor.bottom() + h <= room.bottom();
+        let above = anchor.y - h >= room.y && anchor.y <= room.bottom();
+        if below || above {
+            assert_eq!(clear, plain);
+            continue;
+        }
+        cut += 1;
+        let r = clear.rect;
+        assert!(
+            r.y >= room.y && r.bottom() <= room.bottom() + 0.01,
+            "{anchor:?} {r:?}"
+        );
+        assert!(r.h <= h);
+        assert_eq!(
+            (r.x, r.w, clear.left),
+            (plain.rect.x, plain.rect.w, plain.left)
+        );
+        if anchor.y >= room.y && anchor.bottom() <= room.bottom() {
+            assert!(
+                r.bottom() <= anchor.y + 0.01 || r.y >= anchor.bottom() - 0.01,
+                "{anchor:?} {r:?}"
+            );
+        }
+    }
+    assert!(cut > 100, "the run reached the case it is about ({cut})");
 }
