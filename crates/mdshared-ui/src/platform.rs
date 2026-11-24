@@ -460,6 +460,37 @@ mod imp {
         ok != 0 && animates == 0
     }
 
+    /// The desktop's accent (Settings, Personalisation, Colours): the DWM's `AccentColor`,
+    /// kept as 0xAABBGGRR. None where it was never set.
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        let v = reg_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor")?;
+        Some([v as u8, (v >> 8) as u8, (v >> 16) as u8])
+    }
+
+    /// Whether a high-contrast theme is on (`SPI_GETHIGHCONTRAST`). A call that fails says no.
+    pub fn system_high_contrast() -> bool {
+        use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETHIGHCONTRAST, SystemParametersInfoW,
+        };
+        let mut hc = HIGHCONTRASTW {
+            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+            dwFlags: 0,
+            lpszDefaultScheme: std::ptr::null_mut(),
+        };
+        // SAFETY: this action fills the HIGHCONTRASTW whose size is in its first field; the
+        // scheme name it points to belongs to the system and is not read here.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                hc.cbSize,
+                (&mut hc as *mut HIGHCONTRASTW).cast(),
+                0,
+            )
+        };
+        ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+
     pub fn double_click_time() -> Duration {
         // SAFETY: no preconditions.
         let ms = unsafe { GetDoubleClickTime() };
@@ -758,6 +789,74 @@ mod imp {
             .spawn()
             .is_ok()
     }
+    /// The desktop's accent: not read on macOS yet (`NSColor.controlAccentColor`).
+    #[cfg(target_os = "macos")]
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        None
+    }
+
+    /// Whether high contrast is asked for: not read on macOS yet ("Increase contrast").
+    #[cfg(target_os = "macos")]
+    pub fn system_high_contrast() -> bool {
+        false
+    }
+
+    /// The desktop's accent from the settings portal (`org.freedesktop.appearance`
+    /// `accent-color`, three numbers from 0 to 1; one outside that range means none was
+    /// chosen), read on a helper thread and given up after half a second.
+    #[cfg(not(target_os = "macos"))]
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        use zbus::zvariant::Value;
+        portal_read(Duration::from_millis(500), || {
+            let bus = zbus::blocking::Connection::session().ok()?;
+            read_setting(&bus, "org.freedesktop.appearance", "accent-color", |v| {
+                let Value::Structure(s) = v else {
+                    return None;
+                };
+                let mut out = [0u8; 3];
+                let fields = s.fields();
+                if fields.len() != 3 {
+                    return None;
+                }
+                for (o, f) in out.iter_mut().zip(fields) {
+                    let x = f64::try_from(f).ok()?;
+                    if !(0.0..=1.0).contains(&x) {
+                        return None;
+                    }
+                    *o = (x * 255.0).round() as u8;
+                }
+                Some(out)
+            })
+        })
+    }
+
+    /// Whether the settings portal asks for high contrast (`org.freedesktop.appearance`
+    /// `contrast` is 1), read as [`system_accent`] is.
+    #[cfg(not(target_os = "macos"))]
+    pub fn system_high_contrast() -> bool {
+        portal_read(Duration::from_millis(500), || {
+            let bus = zbus::blocking::Connection::session().ok()?;
+            read_setting(&bus, "org.freedesktop.appearance", "contrast", |v| {
+                u32::try_from(v).ok()
+            })
+        }) == Some(1)
+    }
+
+    /// Runs `read` on a helper thread and waits for it at most `timeout`: a portal that is not
+    /// running may be started by the bus, and that can take long.
+    #[cfg(not(target_os = "macos"))]
+    fn portal_read<T: Send + 'static>(
+        timeout: Duration,
+        read: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mdshared-portal".into())
+            .spawn(move || _ = tx.send(read()))
+            .ok()?;
+        rx.recv_timeout(timeout).ok().flatten()
+    }
+
     /// The system's appearance: `AppleInterfaceStyle` in the global defaults is "Dark" while dark
     /// mode is on (also while "Auto" is in its dark half) and absent otherwise. A read of the
     /// defaults database, cheap enough for every call and safe off the main thread.
@@ -1288,6 +1387,16 @@ pub fn note_recent_document(path: &Path) {
 /// Whether apps should use the dark theme.
 pub fn system_is_dark() -> bool {
     imp::system_is_dark()
+}
+/// The desktop's accent colour, where the system gives one: the DWM's on Windows, the
+/// settings portal's on Linux; none on macOS yet. For [`crate::tokens::Tokens::from_system`].
+pub fn system_accent() -> Option<crate::gfx::Rgb> {
+    imp::system_accent()
+}
+/// Whether the system asks for high contrast: a high-contrast theme on Windows, the settings
+/// portal's `contrast` on Linux; never on macOS yet.
+pub fn system_high_contrast() -> bool {
+    imp::system_high_contrast()
 }
 /// The system double-click interval, default 500 ms.
 pub fn double_click_time() -> Duration {

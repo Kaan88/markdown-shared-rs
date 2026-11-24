@@ -51,6 +51,7 @@ pub mod table;
 pub mod textfield;
 pub mod theme;
 pub mod thumbs;
+pub mod tokens;
 pub mod tree;
 pub mod waveform;
 pub mod window;

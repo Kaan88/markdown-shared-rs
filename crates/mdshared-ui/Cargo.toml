@@ -32,6 +32,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
 ] }
 # The system's media controls (src/media_session/smtc.rs), only with the media-session feature.
 windows = { version = "=0.62.2", optional = true, features = [
