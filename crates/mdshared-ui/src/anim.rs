@@ -126,35 +126,74 @@ impl Clock for ManualClock {
 // ---- names -------------------------------------------------------------------------------------
 
 /// The name of one animated value. Anything that hashes names a value, so the calls take
-/// `impl Hash` and a string, a number or a tuple of them does (`"sidebar"`, `("tab", 3)`); an
+/// `impl AsId` and a string, a number or a tuple of them does (`"sidebar"`, `("tab", 3)`); an
 /// `Id` is that name already hashed, for a widget that is handed one name and needs several
 /// values under it ([`with`](Id::with)). The hash has fixed keys: the same name is the same id in
 /// every run.
 ///
-/// An `Id` given where a name is asked for is a name like any other and is hashed once more:
-/// `anim.get(Id::new("a"))` is not `anim.get("a")`. A widget that makes an `Id` uses that `Id`
-/// in every call, as the ones in this crate do.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// An `Id` given where a name is asked for is itself, not hashed again: `anim.get(Id::new("a"))`
+/// is `anim.get("a")`, and a value a widget keeps under `Id::new(name).with("fill")` can be read
+/// by anyone who makes the same `Id`. For that an `Id` does not implement `Hash` (a thing that
+/// hashes is a name to be hashed): a name under an `Id` is `id.with(part)`, not `(id, part)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Id(u64);
 
 impl Id {
-    pub fn new(name: impl Hash) -> Id {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        name.hash(&mut h);
-        Id(h.finish())
+    /// The id of `name`: its hash, or `name` itself when it is an `Id` already.
+    pub fn new(name: impl AsId) -> Id {
+        name.as_id()
     }
 
     /// A value under this name: `Id::new("switch").with("pill")`.
     pub fn with(self, part: impl Hash) -> Id {
-        Id::new((self.0, part))
+        hashed(&(self.0, part))
+    }
+}
+
+fn hashed(name: &(impl Hash + ?Sized)) -> Id {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut h);
+    Id(h.finish())
+}
+
+/// What can name an animated value: anything that hashes (a string, a number, a tuple of
+/// them), which is hashed to its [`Id`], and an [`Id`], which is itself. Every call that takes
+/// a name takes `impl AsId`, so a widget that has made an `Id` passes it on at no cost and with
+/// no second hash.
+pub trait AsId {
+    /// The id this names.
+    fn as_id(&self) -> Id;
+}
+
+impl AsId for Id {
+    fn as_id(&self) -> Id {
+        *self
+    }
+}
+
+impl AsId for &Id {
+    fn as_id(&self) -> Id {
+        **self
+    }
+}
+
+impl<T: Hash + ?Sized> AsId for T {
+    fn as_id(&self) -> Id {
+        hashed(self)
     }
 }
 
 // ---- what can move -----------------------------------------------------------------------------
 
 /// A value an [`Animator`] can move: one that is up to four numbers, each of which moves on its
-/// own. Implemented for `f32`, a pair of them (a point or a size), a [`Rect`], an [`Rgb`] colour
-/// and `[f32; 4]`.
+/// own. Implemented for `f32` and `f64`, a pair of `f32` (a point or a size), a [`Rect`], an
+/// [`Rgb`] colour and `[f32; 4]`.
+///
+/// The numbers are kept as `f64` while they move, whatever the value's own type. An `f32` holds
+/// whole numbers only up to sixteen million, and has steps of four at fifty million: a scroll
+/// offset far down a long list (a terminal's scrollback, a folder of a hundred thousand rows)
+/// would move in jumps, or not at all. A value that can be that large is asked for as an `f64`;
+/// the usual values of a widget (a fraction, a width, a colour) stay `f32` and lose nothing.
 ///
 /// A colour moves channel by channel in the stored (gamma) space, the space
 /// [`gfx::mix`](crate::gfx::mix) and every blend of the painter work in. That is on purpose: a
@@ -163,9 +202,21 @@ impl Id {
 /// the same. The channels are kept as fractions while they move and rounded only when read.
 pub trait Animatable: Copy {
     /// The value as numbers; the ones it does not use are zero.
-    fn parts(self) -> [f32; 4];
+    fn parts(self) -> [f64; 4];
     /// The value those numbers stand for.
-    fn from_parts(parts: [f32; 4]) -> Self;
+    fn from_parts(parts: [f64; 4]) -> Self;
+
+    /// How close to its target, in the numbers' own unit, a value of this type is as good as
+    /// there: a difference that small cannot be seen. A spring has no fixed end, so this is
+    /// what ends it: the value is put on its target, and the window stops drawing frames, once
+    /// every number is this close (and too slow to leave again). It is a thousandth unless the
+    /// type says otherwise, which suits a fraction from 0 to 1; a position in pixels says a
+    /// quarter of a pixel, a colour just under half a step of a channel (the colour read is
+    /// then already the target's). A spring given a coarser
+    /// [`threshold`](Spring::with_threshold) of its own uses that.
+    fn precision() -> f64 {
+        0.001
+    }
 
     /// The value `t` of the way from `self` to `to` (`t` is not clamped: an easing that
     /// overshoots is followed).
@@ -174,53 +225,80 @@ pub trait Animatable: Copy {
     }
 }
 
-fn lerp_parts(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+fn lerp_parts(a: [f64; 4], b: [f64; 4], t: f32) -> [f64; 4] {
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t as f64)
 }
 
+/// A bare number is taken for a fraction or another small quantity: its
+/// [`precision`](Animatable::precision) is a thousandth. One that is a position in pixels on a
+/// spring is given a spring with a threshold of its own (`Spring::with_threshold(0.25)`), or it
+/// asks for a few frames more than can be seen.
 impl Animatable for f32 {
-    fn parts(self) -> [f32; 4] {
+    fn parts(self) -> [f64; 4] {
+        [self as f64, 0.0, 0.0, 0.0]
+    }
+    fn from_parts(p: [f64; 4]) -> f32 {
+        p[0] as f32
+    }
+}
+
+/// A number that may be too large for an `f32` to hold exactly: a scroll offset in a very long
+/// list. As for `f32`, its [`precision`](Animatable::precision) is a thousandth.
+impl Animatable for f64 {
+    fn parts(self) -> [f64; 4] {
         [self, 0.0, 0.0, 0.0]
     }
-    fn from_parts(p: [f32; 4]) -> f32 {
+    fn from_parts(p: [f64; 4]) -> f64 {
         p[0]
     }
 }
 
+/// A point or a size in pixels: as good as there within a quarter of a pixel.
 impl Animatable for (f32, f32) {
-    fn parts(self) -> [f32; 4] {
-        [self.0, self.1, 0.0, 0.0]
+    fn parts(self) -> [f64; 4] {
+        [self.0 as f64, self.1 as f64, 0.0, 0.0]
     }
-    fn from_parts(p: [f32; 4]) -> (f32, f32) {
-        (p[0], p[1])
+    fn from_parts(p: [f64; 4]) -> (f32, f32) {
+        (p[0] as f32, p[1] as f32)
+    }
+    fn precision() -> f64 {
+        0.25
     }
 }
 
 impl Animatable for [f32; 4] {
-    fn parts(self) -> [f32; 4] {
-        self
+    fn parts(self) -> [f64; 4] {
+        self.map(f64::from)
     }
-    fn from_parts(p: [f32; 4]) -> [f32; 4] {
-        p
+    fn from_parts(p: [f64; 4]) -> [f32; 4] {
+        p.map(|v| v as f32)
     }
 }
 
+/// A rectangle in pixels: as good as there within a quarter of a pixel.
 impl Animatable for Rect {
-    fn parts(self) -> [f32; 4] {
-        [self.x, self.y, self.w, self.h]
+    fn parts(self) -> [f64; 4] {
+        [self.x as f64, self.y as f64, self.w as f64, self.h as f64]
     }
-    fn from_parts(p: [f32; 4]) -> Rect {
-        Rect::new(p[0], p[1], p[2], p[3])
+    fn from_parts(p: [f64; 4]) -> Rect {
+        Rect::new(p[0] as f32, p[1] as f32, p[2] as f32, p[3] as f32)
+    }
+    fn precision() -> f64 {
+        0.25
     }
 }
 
+/// A colour: as good as there once every channel rounds to the target's.
 impl Animatable for Rgb {
-    fn parts(self) -> [f32; 4] {
-        [self[0] as f32, self[1] as f32, self[2] as f32, 0.0]
+    fn parts(self) -> [f64; 4] {
+        [self[0] as f64, self[1] as f64, self[2] as f64, 0.0]
     }
-    fn from_parts(p: [f32; 4]) -> Rgb {
-        let ch = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    fn from_parts(p: [f64; 4]) -> Rgb {
+        let ch = |v: f64| v.round().clamp(0.0, 255.0) as u8;
         [ch(p[0]), ch(p[1]), ch(p[2])]
+    }
+    fn precision() -> f64 {
+        0.49
     }
 }
 
@@ -386,12 +464,14 @@ pub enum Policy {
 /// One named value on its way.
 #[derive(Clone, Copy, Debug)]
 struct Track {
-    value: [f32; 4],
+    value: [f64; 4],
     /// Per second; only a spring uses it.
     velocity: [f32; 4],
-    target: [f32; 4],
+    target: [f64; 4],
     /// Where the tween in flight started.
-    from: [f32; 4],
+    from: [f64; 4],
+    /// How close to the target counts as there, from the value's type: what ends a spring.
+    precision: f64,
     /// The animator's time at which the motion in flight starts (its delay is in it).
     start: Duration,
     /// The animator's time `value` is of.
@@ -424,11 +504,19 @@ impl Track {
             }
             Kind::Spring(spring) => {
                 let dt = (now - self.updated.max(self.start)).as_secs_f32();
+                // The coarser of what the type can show and what the spring was told.
+                let near = spring.threshold.max(self.precision as f32);
                 let mut settled = true;
                 for i in 0..4 {
-                    let (x, v) = spring.step(self.value[i], self.velocity[i], self.target[i], dt);
-                    (self.value[i], self.velocity[i]) = (x, v);
-                    settled &= spring.settled(x, v, self.target[i]);
+                    // The spring is stepped on the distance from the target, which is small
+                    // when it matters, and not on the value, which may be too large for the
+                    // spring's `f32`: at an offset of fifty million the value itself has
+                    // steps of four, the distance has all its digits.
+                    let away = (self.value[i] - self.target[i]) as f32;
+                    let (x, v) = spring.step(away, self.velocity[i], 0.0, dt);
+                    self.value[i] = self.target[i] + x as f64;
+                    self.velocity[i] = v;
+                    settled &= spring.settled_within(x, v, 0.0, near);
                 }
                 if settled {
                     self.arrive();
@@ -463,7 +551,7 @@ impl Track {
 /// they run in real time.
 #[derive(Debug)]
 pub struct Animator {
-    tracks: HashMap<Id, Track>,
+    tracks: HashMap<u64, Track>,
     /// The animator's own time: the sum of the frames' clamped steps.
     time: Duration,
     /// The real time of the frame in progress (or of the last one).
@@ -611,25 +699,31 @@ impl Animator {
     /// again (the frame that brings the new target still draws the old place, the next one
     /// moves), a spring keeps its speed. `motion` is read when the target changes; a different
     /// motion with the same target changes nothing in flight.
-    pub fn value<T: Animatable>(&mut self, id: impl Hash, target: T, motion: Motion) -> T {
-        T::from_parts(self.track(Id::new(id), None, target.parts(), motion))
+    pub fn value<T: Animatable>(&mut self, id: impl AsId, target: T, motion: Motion) -> T {
+        T::from_parts(self.track(id.as_id(), None, target.parts(), motion, T::precision()))
     }
 
     /// As [`value`](Self::value), but the first time `id` is seen the value is `initial` and
     /// sets off for `target`: for a thing that enters.
     pub fn value_from<T: Animatable>(
         &mut self,
-        id: impl Hash,
+        id: impl AsId,
         initial: T,
         target: T,
         motion: Motion,
     ) -> T {
-        T::from_parts(self.track(Id::new(id), Some(initial.parts()), target.parts(), motion))
+        T::from_parts(self.track(
+            id.as_id(),
+            Some(initial.parts()),
+            target.parts(),
+            motion,
+            T::precision(),
+        ))
     }
 
     /// A switch as a number: on its way to 1 while `on`, to 0 while not. For a hover or press
     /// fade, a tick, a pane that opens. First seen, it is where it is going.
-    pub fn toggle(&mut self, id: impl Hash, on: bool, motion: Motion) -> f32 {
+    pub fn toggle(&mut self, id: impl AsId, on: bool, motion: Motion) -> f32 {
         self.value(id, if on { 1.0 } else { 0.0 }, motion)
     }
 
@@ -638,24 +732,25 @@ impl Animator {
     /// `enter`; when `shown` turns false it leaves by `exit`. The caller draws the thing while
     /// the result is above 0 and stops asking once it is 0 and not shown. See
     /// [`Transient`], which also keeps the thing itself until it has left.
-    pub fn presence(&mut self, id: impl Hash, shown: bool, enter: Motion, exit: Motion) -> f32 {
+    pub fn presence(&mut self, id: impl AsId, shown: bool, enter: Motion, exit: Motion) -> f32 {
         let (target, motion) = if shown { (1.0, enter) } else { (0.0, exit) };
-        self.value_from(id, 0.0, target, motion).clamp(0.0, 1.0)
+        self.value_from(id, 0.0_f32, target, motion).clamp(0.0, 1.0)
     }
 
     /// Puts `id` at `value`, at rest, now: for a jump that must not animate (a scroll thumb
     /// dragged, a document opened at a heading). A [`value`](Self::value) asked for afterwards
     /// with another target moves from here.
-    pub fn set<T: Animatable>(&mut self, id: impl Hash, value: T) {
+    pub fn set<T: Animatable>(&mut self, id: impl AsId, value: T) {
         let parts = value.parts();
         let (time, frame) = (self.time, self.frame);
         self.tracks.insert(
-            Id::new(id),
+            id.as_id().0,
             Track {
                 value: parts,
                 velocity: [0.0; 4],
                 target: parts,
                 from: parts,
+                precision: T::precision(),
                 start: time,
                 updated: time,
                 motion: Motion::SNAP,
@@ -667,28 +762,28 @@ impl Animator {
 
     /// The value of `id` as the last frame that asked for it left it, without asking for it:
     /// `None` for a name not known. For hit testing against what was drawn.
-    pub fn get<T: Animatable>(&self, id: impl Hash) -> Option<T> {
+    pub fn get<T: Animatable>(&self, id: impl AsId) -> Option<T> {
         self.tracks
-            .get(&Id::new(id))
+            .get(&id.as_id().0)
             .map(|t| T::from_parts(t.value))
     }
 
     /// Whether `id` is at its target (or not known at all).
-    pub fn settled(&self, id: impl Hash) -> bool {
-        self.tracks.get(&Id::new(id)).is_none_or(|t| t.settled)
+    pub fn settled(&self, id: impl AsId) -> bool {
+        self.tracks.get(&id.as_id().0).is_none_or(|t| t.settled)
     }
 
     /// Keeps `id` through this frame though nothing asked for its value: for a part of the
     /// window this frame does not draw. A value kept this way goes on moving.
-    pub fn keep(&mut self, id: impl Hash) {
-        if let Some(t) = self.tracks.get_mut(&Id::new(id)) {
+    pub fn keep(&mut self, id: impl AsId) {
+        if let Some(t) = self.tracks.get_mut(&id.as_id().0) {
             t.seen = self.frame;
         }
     }
 
     /// Forgets `id` now: the next time it is asked for, it is first seen.
-    pub fn forget(&mut self, id: impl Hash) {
-        self.tracks.remove(&Id::new(id));
+    pub fn forget(&mut self, id: impl AsId) {
+        self.tracks.remove(&id.as_id().0);
     }
 
     /// Puts every value at its target, now.
@@ -710,19 +805,21 @@ impl Animator {
     fn track(
         &mut self,
         id: Id,
-        initial: Option<[f32; 4]>,
-        target: [f32; 4],
+        initial: Option<[f64; 4]>,
+        target: [f64; 4],
         motion: Motion,
-    ) -> [f32; 4] {
+        precision: f64,
+    ) -> [f64; 4] {
         let (now, frame) = (self.time, self.frame);
         // A target that is not a number cannot be moved to; it is taken as it is.
         let animates =
             self.animates() && motion.kind != Kind::Snap && target.iter().all(|v| v.is_finite());
-        let fresh = |from: [f32; 4]| Track {
+        let fresh = |from: [f64; 4]| Track {
             value: from,
             velocity: [0.0; 4],
             target,
             from,
+            precision,
             start: now + motion.delay,
             updated: now,
             motion,
@@ -731,7 +828,7 @@ impl Animator {
         };
         let t = self
             .tracks
-            .entry(id)
+            .entry(id.0)
             .or_insert_with(|| fresh(initial.filter(|_| animates).unwrap_or(target)));
         t.seen = frame;
         t.advance(now);
@@ -768,13 +865,150 @@ mod tests {
     const FRAME: Duration = Duration::from_millis(10);
 
     #[test]
-    fn an_id_used_as_a_name_is_not_the_name_it_was_made_from() {
+    fn an_id_used_as_a_name_is_the_name_it_was_made_from() {
         let mut anim = Animator::new();
         anim.set("a", 1.0);
         assert_eq!(anim.get::<f32>("a"), Some(1.0));
-        assert_eq!(anim.get::<f32>(Id::new("a")), None);
-        // A borrowed name is the name.
+        // An id is itself, however often it is passed on: nothing hashes it again.
+        let id = Id::new("a");
+        assert_eq!(anim.get::<f32>(id), Some(1.0));
+        assert_eq!(anim.get::<f32>(&id), Some(1.0));
+        assert_eq!(Id::new(id), id);
+        assert_eq!(Id::new(Id::new(id)), id);
+        assert_eq!((id.as_id(), "a".as_id()), (id, id));
+        // A borrowed name is the name, and so is an owned one.
         assert_eq!(anim.get::<f32>(&"a"), Some(1.0));
+        assert_eq!(anim.get::<f32>(String::from("a").as_str()), Some(1.0));
+        // A value kept under an id by one call is found by every other call given that id.
+        let part = id.with("fill");
+        anim.begin_frame(Instant::now());
+        assert_eq!(anim.value(part, 3.0_f32, LINEAR_100), 3.0);
+        assert_eq!(anim.toggle(id.with("on"), true, LINEAR_100), 1.0);
+        assert_eq!(
+            anim.presence(id.with("there"), false, LINEAR_100, LINEAR_100),
+            0.0
+        );
+        anim.keep(id);
+        assert_eq!(anim.end_frame(), None);
+        assert_eq!(anim.get::<f32>(part), Some(3.0));
+        assert!(anim.settled(part));
+        assert_eq!(anim.len(), 4);
+        anim.forget(part);
+        assert_eq!(anim.get::<f32>(part), None);
+        assert_eq!(
+            anim.get::<f32>(("a", "fill")),
+            None,
+            "a part is not a tuple"
+        );
+    }
+
+    #[test]
+    fn a_value_too_large_for_an_f32_moves_smoothly_and_lands_exactly() {
+        // Fifty million: an `f32` there has steps of four.
+        const FAR: f64 = 5.0e7;
+        assert_eq!((FAR + 1.0) as f32, FAR as f32, "the test's own premise");
+        for motion in [LINEAR_100, Motion::spring(Spring::SNAPPY)] {
+            let clock = ManualClock::new();
+            let mut anim = Animator::new();
+            let frame = |anim: &mut Animator, ms: u64, target: f64| {
+                clock.advance_ms(ms);
+                anim.begin_frame(clock.now());
+                let v = anim.value("offset", target, motion);
+                (v, anim.end_frame().is_some())
+            };
+            frame(&mut anim, 0, FAR);
+            let target = FAR + 30.5;
+            let (mut last, mut steps) = (FAR, Vec::new());
+            for n in 0.. {
+                let (v, more) = frame(&mut anim, if n == 0 { 0 } else { 5 }, target);
+                assert!(v >= last && v <= target, "{motion:?}: {v} after {last}");
+                if v > last {
+                    steps.push(v - last);
+                }
+                last = v;
+                if !more {
+                    break;
+                }
+                assert!(n < 400, "{motion:?} never arrives");
+            }
+            // It ends on the target to the last digit, not on the nearest `f32`.
+            assert_eq!(last, target, "{motion:?}");
+            assert_eq!(anim.get::<f64>("offset"), Some(target));
+            // And on the way it moved in steps an `f32` could not take there: many of them,
+            // most smaller than four, none a jump.
+            let fine = steps.iter().filter(|s| **s < 4.0).count();
+            assert!(steps.len() >= 15 && fine >= 10, "{motion:?}: {steps:?}");
+            assert!(steps.iter().all(|s| *s < 8.0), "{motion:?}: {steps:?}");
+        }
+    }
+
+    #[test]
+    fn a_spring_stops_asking_for_frames_when_the_value_can_no_longer_be_seen_to_change() {
+        // A colour: once the colour read is the target's, at most one more frame.
+        let spring = Motion::spring(Spring::SMOOTH);
+        let (from, to): (Rgb, Rgb) = ([0, 0, 0], [255, 100, 1]);
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let frame = |anim: &mut Animator, ms: u64, colour: Rgb| {
+            clock.advance_ms(ms);
+            anim.begin_frame(clock.now());
+            let c = anim.value("colour", colour, spring);
+            (c, anim.end_frame().is_some())
+        };
+        frame(&mut anim, 0, from);
+        frame(&mut anim, 0, to);
+        let (mut frames, mut same) = (0, 0);
+        loop {
+            let (c, more) = frame(&mut anim, 10, to);
+            frames += 1;
+            same += usize::from(c == to);
+            if !more {
+                assert_eq!(c, to);
+                break;
+            }
+            assert!(frames < 200, "the colour never settles");
+        }
+        assert!(same <= 2, "{same} frames drew the same colour");
+        // About a third of a second for the default spring; it was twice that when a colour
+        // was held to a thousandth of a step.
+        assert!((25..=38).contains(&frames), "{frames} frames of 10 ms");
+
+        // The precisions the types give, and that a spring's own coarser threshold wins.
+        assert_eq!(<f32 as Animatable>::precision(), 0.001);
+        assert_eq!(<f64 as Animatable>::precision(), 0.001);
+        assert_eq!(<[f32; 4] as Animatable>::precision(), 0.001);
+        assert_eq!(<(f32, f32) as Animatable>::precision(), 0.25);
+        assert_eq!(<Rect as Animatable>::precision(), 0.25);
+        assert!(<Rgb as Animatable>::precision() < 0.5);
+        let frames_for = |target: Rect, spring: Spring| {
+            let clock = ManualClock::new();
+            let mut anim = Animator::new();
+            let rest = Rect::new(0.0, 0.0, 10.0, 10.0);
+            anim.begin_frame(clock.now());
+            anim.value("r", rest, Motion::spring(spring));
+            anim.end_frame();
+            let mut frames = 0;
+            loop {
+                clock.advance_ms(10);
+                anim.begin_frame(clock.now());
+                let r = anim.value("r", target, Motion::spring(spring));
+                frames += 1;
+                if anim.end_frame().is_none() {
+                    assert_eq!(r, target);
+                    return frames;
+                }
+                assert!(frames < 400);
+            }
+        };
+        let far = Rect::new(300.0, 0.0, 10.0, 10.0);
+        let by_type = frames_for(far, Spring::SMOOTH);
+        let coarse = frames_for(far, Spring::SMOOTH.with_threshold(5.0));
+        let fine = frames_for(far, Spring::SMOOTH.with_threshold(1e-6));
+        assert!(coarse < by_type, "{coarse} and {by_type}");
+        assert_eq!(
+            fine, by_type,
+            "a finer threshold than can be seen is not followed"
+        );
     }
 
     /// An animator on a clock that is moved by hand, with frames of 10 ms.

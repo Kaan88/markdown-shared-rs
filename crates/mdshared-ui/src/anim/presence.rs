@@ -5,9 +5,8 @@
 //! that enters or leaves is drawn faded and a little out of place, whatever it is made of:
 //! [`pop`] wraps any drawing in that.
 
-use super::{Animator, Motion, fluent};
+use super::{Animator, AsId, Motion, fluent};
 use crate::gfx::{Painter, Rect};
-use std::hash::Hash;
 
 /// One slot for a thing that comes and goes (the toast, the tooltip, the open menu), which keeps
 /// the thing alive while it leaves.
@@ -90,7 +89,7 @@ impl<T> Transient<T> {
     /// The thing to draw this frame and how present it is (above 0, up to 1), or `None` when
     /// there is nothing to draw. `id` names the presence in the animator. An empty slot asks
     /// the animator nothing.
-    pub fn frame(&mut self, anim: &mut Animator, id: impl Hash) -> Option<(&T, f32)> {
+    pub fn frame(&mut self, anim: &mut Animator, id: impl AsId) -> Option<(&T, f32)> {
         self.item.as_ref()?;
         let t = anim.presence(id, self.shown, self.enter, self.exit);
         if !self.shown && t <= 0.0 {

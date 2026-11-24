@@ -1,10 +1,9 @@
 //! The overlay scrollbar: geometry (pure functions of rectangles and lengths) and drawing; and
 //! a scroll offset that glides to where the wheel sent it.
 
-use crate::anim::{Animator, Id, Motion, Spring, fluent};
+use crate::anim::{Animator, AsId, Motion, Spring, fluent};
 use crate::gfx::{Painter, Rect};
 use crate::theme::Palette;
-use std::hash::Hash;
 
 /// The track and thumb of an overlay scrollbar for `area`, or `None` when everything fits.
 /// `content`, `view` and `offset` may be in any one unit.
@@ -48,7 +47,7 @@ pub fn draw_scrollbar_animated(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl Hash,
+    id: impl AsId,
     track: Rect,
     thumb: Rect,
     active: bool,
@@ -78,13 +77,21 @@ pub fn draw_scrollbar_animated(
 /// drawing asks [`offset`](Self::offset) once a frame and draws there. Everything is in one
 /// unit of the caller's choice, as the functions above are.
 ///
+/// The offset is kept as an `f64`, and every number given may be an `f32` or an `f64`. A view
+/// whose content is a few screens long loses nothing by reading it back as an `f32`
+/// ([`offset`](Self::offset), [`target`](Self::target), [`current`](Self::current)). One whose
+/// content is very long (a terminal's scrollback, a folder of a hundred thousand rows) reads
+/// it as an `f64` ([`offset_f64`](Self::offset_f64), [`target_f64`](Self::target_f64),
+/// [`current_f64`](Self::current_f64)) and subtracts the first visible row's position before
+/// it goes to `f32`: past sixteen million an `f32` no longer holds every whole pixel.
+///
 /// It glides on a critically damped spring, so a wheel that keeps turning gives one smooth
 /// run, not a start and stop a notch: each notch moves the target and the offset keeps its
 /// speed. With reduced motion the offset is the target on every frame, which is what an
 /// application without this type has today.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SmoothScroll {
-    target: f32,
+    target: f64,
     /// The next `offset` goes straight to the target.
     jump: bool,
     motion: Motion,
@@ -117,25 +124,44 @@ impl SmoothScroll {
     /// that asks "what is in view" should use, so that a second key press acts on where the
     /// first one leads.
     pub fn target(&self) -> f32 {
+        self.target as f32
+    }
+
+    /// [`target`](Self::target) with all its digits, for content too long for an `f32`.
+    pub fn target_f64(&self) -> f64 {
         self.target
     }
 
-    /// The furthest offset: `content` longer than `view` by this much, or zero.
-    fn max(content: f32, view: f32) -> f32 {
-        (content - view).max(0.0)
+    /// The furthest offset: `content` longer than `view` by this much, or zero (also when
+    /// either is not a number).
+    fn max(content: f64, view: f64) -> f64 {
+        let max = content - view;
+        if max > 0.0 { max } else { 0.0 }
     }
 
     /// Moves the target by `delta`, kept inside what `content` and `view` allow. Returns
     /// whether it moved (if not, the wheel event is one for something else: the caller's
     /// parent).
-    pub fn scroll_by(&mut self, delta: f32, content: f32, view: f32) -> bool {
-        self.scroll_to(self.target + delta, content, view)
+    pub fn scroll_by(
+        &mut self,
+        delta: impl Into<f64>,
+        content: impl Into<f64>,
+        view: impl Into<f64>,
+    ) -> bool {
+        self.scroll_to(self.target + delta.into(), content, view)
     }
 
     /// Moves the target to `offset`, kept inside what `content` and `view` allow, to glide
     /// there. Returns whether it moved.
-    pub fn scroll_to(&mut self, offset: f32, content: f32, view: f32) -> bool {
-        let next = offset.clamp(0.0, SmoothScroll::max(content, view));
+    pub fn scroll_to(
+        &mut self,
+        offset: impl Into<f64>,
+        content: impl Into<f64>,
+        view: impl Into<f64>,
+    ) -> bool {
+        let next = offset
+            .into()
+            .clamp(0.0, SmoothScroll::max(content.into(), view.into()));
         // A target that is not a number stays where it was.
         let moved = next != self.target && !next.is_nan();
         if moved {
@@ -145,7 +171,12 @@ impl SmoothScroll {
     }
 
     /// Puts the offset at `offset` at once, with no glide.
-    pub fn jump_to(&mut self, offset: f32, content: f32, view: f32) {
+    pub fn jump_to(
+        &mut self,
+        offset: impl Into<f64>,
+        content: impl Into<f64>,
+        view: impl Into<f64>,
+    ) {
         self.scroll_to(offset, content, view);
         self.jump = true;
     }
@@ -153,20 +184,59 @@ impl SmoothScroll {
     /// The offset to draw at this frame. `id` names it in `anim`. `content` and `view` are
     /// this frame's: a target left past the end by content that shrank is pulled in (and
     /// glides there), and the offset given is never outside them.
-    pub fn offset(&mut self, anim: &mut Animator, id: impl Hash, content: f32, view: f32) -> f32 {
-        let max = SmoothScroll::max(content, view);
+    pub fn offset(
+        &mut self,
+        anim: &mut Animator,
+        id: impl AsId,
+        content: impl Into<f64>,
+        view: impl Into<f64>,
+    ) -> f32 {
+        self.offset_f64(anim, id, content, view) as f32
+    }
+
+    /// [`offset`](Self::offset) with all its digits, for content too long for an `f32`: far
+    /// down such content the glide moves by fractions of a pixel that an `f32` cannot hold,
+    /// and ends exactly on its target.
+    pub fn offset_f64(
+        &mut self,
+        anim: &mut Animator,
+        id: impl AsId,
+        content: impl Into<f64>,
+        view: impl Into<f64>,
+    ) -> f64 {
+        let max = SmoothScroll::max(content.into(), view.into());
         self.target = self.target.clamp(0.0, max);
-        let id = Id::new(id);
+        let id = id.as_id();
         if std::mem::take(&mut self.jump) {
             anim.set(id, self.target);
         }
         anim.value(id, self.target, self.motion).clamp(0.0, max)
     }
 
+    /// The offset as it is now, between frames: what the last [`offset`](Self::offset) gave
+    /// (or where a jump made since will put it), without asking the animator for anything, so
+    /// no frame is asked for and the glide is not touched. For hit testing during a glide: a
+    /// click lands on the row that is drawn under the pointer, not on the row that will be
+    /// there once the glide ends, which is what [`target`](Self::target) would give. Before
+    /// the first frame it is the target.
+    pub fn current(&self, anim: &Animator, id: impl AsId) -> f32 {
+        self.current_f64(anim, id) as f32
+    }
+
+    /// [`current`](Self::current) with all its digits, for content too long for an `f32`.
+    pub fn current_f64(&self, anim: &Animator, id: impl AsId) -> f64 {
+        if self.jump {
+            return self.target;
+        }
+        anim.get::<f64>(id)
+            .filter(|v| v.is_finite())
+            .unwrap_or(self.target)
+    }
+
     /// Whether the offset has come to rest at its target (as of the last frame that asked).
-    pub fn at_rest(&self, anim: &Animator, id: impl Hash) -> bool {
-        let id = Id::new(id);
-        !self.jump && anim.settled(id) && anim.get::<f32>(id) == Some(self.target)
+    pub fn at_rest(&self, anim: &Animator, id: impl AsId) -> bool {
+        let id = id.as_id();
+        !self.jump && anim.settled(id) && anim.get::<f64>(id) == Some(self.target)
     }
 }
 
@@ -303,6 +373,91 @@ mod tests {
         // And another motion can be asked for.
         let tween = SmoothScroll::new().with_motion(fluent::MOVE);
         assert_ne!(tween, SmoothScroll::default());
+    }
+
+    #[test]
+    fn the_offset_now_is_what_was_drawn_and_reading_it_asks_for_nothing() {
+        let mut r = Rig::new();
+        // Before any frame: the target.
+        r.scroll.jump_to(300.0, 2000.0, 400.0);
+        assert_eq!(r.scroll.current(&r.anim, "page"), 300.0);
+        assert_eq!(r.frame(0, 2000.0), (300.0, false));
+        r.scroll.scroll_by(120.0, 2000.0, 400.0);
+        r.frame(0, 2000.0);
+        let (drawn, more) = r.frame(32, 2000.0);
+        assert!(more && drawn > 300.0 && drawn < 420.0);
+        // During the glide: where the last frame drew, not where it is going; and asking any
+        // number of times moves nothing and asks for no frame.
+        for _ in 0..3 {
+            assert_eq!(r.scroll.current(&r.anim, "page"), drawn);
+            assert_eq!(r.scroll.current_f64(&r.anim, "page") as f32, drawn);
+        }
+        assert_eq!(r.scroll.target(), 420.0);
+        let (next, _) = r.frame(16, 2000.0);
+        assert!(next > drawn, "the glide went on from where it was");
+        // An id made from the name reads the same value.
+        let id = crate::anim::Id::new("page");
+        assert_eq!(r.scroll.current(&r.anim, id), next);
+        // A jump made since the last frame is where the next frame will draw.
+        r.scroll.jump_to(50.0, 2000.0, 400.0);
+        assert_eq!(r.scroll.current(&r.anim, "page"), 50.0);
+        // A name the animator does not know: the target.
+        assert_eq!(SmoothScroll::new().current(&r.anim, "other"), 0.0);
+    }
+
+    #[test]
+    fn a_glide_fifty_million_pixels_down_moves_by_fractions_and_ends_exactly() {
+        // A list of five million rows of 24 px, scrolled far down: an `f32` there has steps of
+        // four pixels.
+        let (content, view) = (1.2e8_f64, 800.0_f64);
+        let start = 5.0e7_f64;
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut scroll = SmoothScroll::new();
+        let mut frame = |scroll: &mut SmoothScroll, ms: u64| {
+            clock.advance_ms(ms);
+            anim.begin_frame(clock.now());
+            let y = scroll.offset_f64(&mut anim, "rows", content, view);
+            (y, anim.end_frame().is_some())
+        };
+        scroll.jump_to(start, content, view);
+        assert_eq!(frame(&mut scroll, 0), (start, false));
+        // Three notches of 40.5 px: a target no `f32` holds.
+        for _ in 0..3 {
+            assert!(scroll.scroll_by(40.5, content, view));
+        }
+        let target = start + 121.5;
+        assert_eq!(scroll.target_f64(), target);
+        assert_ne!(
+            scroll.target() as f64,
+            target,
+            "the `f32` reading is the rounded one"
+        );
+        assert_eq!(frame(&mut scroll, 0), (start, true));
+        let (mut last, mut steps) = (start, Vec::new());
+        loop {
+            let (y, more) = frame(&mut scroll, 8);
+            assert!(y >= last && y <= target, "{y} after {last}");
+            if y > last {
+                steps.push(y - last);
+            }
+            last = y;
+            if !more {
+                break;
+            }
+            assert!(steps.len() < 200, "it never arrives");
+        }
+        assert_eq!(last, target, "it ends exactly on its target");
+        // A second way to the same end: the notches added up by hand.
+        assert_eq!(last, 5.0e7 + 40.5 + 40.5 + 40.5);
+        let fine = steps.iter().filter(|s| **s < 4.0).count();
+        assert!(steps.len() >= 10 && fine >= 5, "{steps:?}");
+        // The numbers may be given as `f32` as well, and nonsense moves nothing.
+        assert!(scroll.scroll_to(100.0_f32, 2000.0_f32, 400.0_f32));
+        assert!(!scroll.scroll_to(f64::NAN, content, view));
+        // Content that is not a number has no room: the target is pulled to the top.
+        assert!(scroll.scroll_by(10.0, f64::NAN, view));
+        assert_eq!(scroll.target_f64(), 0.0);
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub fn draw_tick_animated(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl std::hash::Hash,
+    id: impl crate::anim::AsId,
     r: Rect,
     tick: Tick,
 ) {

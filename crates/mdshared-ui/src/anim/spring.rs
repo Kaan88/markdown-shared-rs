@@ -15,8 +15,11 @@ pub struct Spring {
     /// The drag per unit of speed (per second).
     pub damping: f32,
     /// How close to the target, in the value's own unit, counts as arrived: see
-    /// [`settled`](Spring::settled). A value in 0..=1 is well served by the default of 0.001; a
-    /// position in pixels may take 0.1.
+    /// [`settled`](Spring::settled). The default is 0.001. An
+    /// [`Animator`](super::Animator) uses the coarser of this and the
+    /// [`precision`](super::Animatable::precision) of the value's type (a quarter of a pixel
+    /// for a rectangle, half a step for a colour), so the default leaves it to the type; a
+    /// bare number that is a position in pixels wants 0.25 here.
     pub threshold: f32,
 }
 
@@ -127,11 +130,18 @@ impl Spring {
     /// and too slow to leave it again (the speed is weighed by the spring's own time, so the
     /// test means the same for a stiff spring and a soft one).
     pub fn settled(self, value: f32, velocity: f32, target: f32) -> bool {
+        self.settled_within(value, velocity, target, self.threshold)
+    }
+
+    /// [`settled`](Spring::settled) with a threshold given here in place of the spring's own:
+    /// for a caller that knows how fine its value can be seen. A threshold that is not a
+    /// positive number is the smallest one.
+    pub fn settled_within(self, value: f32, velocity: f32, target: f32, threshold: f32) -> bool {
         let omega = self.omega();
         if !(omega > 0.0 && omega.is_finite()) {
             return true;
         }
-        let threshold = self.threshold.max(f32::EPSILON);
+        let threshold = threshold.max(f32::EPSILON);
         (value - target).abs() <= threshold && velocity.abs() <= threshold * omega
     }
 }
@@ -229,6 +239,15 @@ mod tests {
             sooner += 1;
         }
         assert!(sooner < frames);
+        // The threshold given at the call is the one that counts, and nonsense is the finest.
+        assert!(spring.settled_within(1.04, 0.0, 1.0, 0.05));
+        assert!(!spring.settled_within(1.04, 0.0, 1.0, 0.01));
+        assert!(!spring.settled_within(1.04, 0.0, 1.0, f32::NAN));
+        assert!(spring.settled_within(1.0, 0.0, 1.0, -3.0));
+        assert_eq!(
+            spring.settled(1.0005, 0.0, 1.0),
+            spring.settled_within(1.0005, 0.0, 1.0, spring.threshold)
+        );
     }
 
     #[test]

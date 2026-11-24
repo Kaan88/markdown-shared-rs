@@ -7,10 +7,9 @@
 //! place. The cost is one copy of the region at the switch and one pass over it per frame, for
 //! a quarter of a second.
 
-use super::{Animator, Easing, Id, Motion, Snapshot, fluent};
+use super::{Animator, AsId, Easing, Id, Motion, Snapshot, fluent};
 use crate::gfx::{Painter, Rect};
 use mdshared_text::Bitmap;
-use std::hash::Hash;
 use std::time::Duration;
 
 /// A side of the region.
@@ -79,7 +78,7 @@ pub struct PageTransition {
 impl PageTransition {
     /// A transition that is not running. `id` names its progress in the [`Animator`]; two
     /// regions need two names. It takes [`fluent::NORMAL`] (250 ms) and decelerates.
-    pub fn new(id: impl Hash) -> PageTransition {
+    pub fn new(id: impl AsId) -> PageTransition {
         PageTransition {
             id: Id::new(id),
             old: None,

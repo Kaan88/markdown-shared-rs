@@ -13,11 +13,10 @@
 //! caller draws them from [`Slider::thumb_center`] and [`Slider::fraction_of`]), and a value
 //! shown as text.
 
-use crate::anim::{Animator, Easing, Id, Motion, fluent};
+use crate::anim::{Animator, AsId, Easing, Id, Motion, fluent};
 use crate::gfx::{Painter, Rect, mix};
 pub use crate::splitter::Axis;
 use crate::theme::Palette;
-use std::hash::Hash;
 use std::time::Duration;
 
 /// The thumb's diameter, and so the least height (or width, upright) a slider wants.
@@ -456,7 +455,7 @@ pub fn draw_animated(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl Hash,
+    id: impl AsId,
     r: Rect,
     slider: &Slider,
     look: Look,
@@ -511,7 +510,7 @@ pub fn draw_progress_indeterminate(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl Hash,
+    id: impl AsId,
     r: Rect,
 ) {
     let radius = r.h / 2.0;
@@ -542,7 +541,7 @@ pub fn draw_spinner(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl Hash,
+    id: impl AsId,
     cx: f32,
     cy: f32,
     r: f32,

@@ -4,10 +4,9 @@
 //! read left to right and every option must stay readable, so a longer list belongs in a menu or
 //! a dropdown.
 
-use crate::anim::{Animator, Id, fluent};
+use crate::anim::{Animator, AsId, Id, fluent};
 use crate::gfx::{Face, Painter, Rect, mix};
 use crate::theme::Palette;
-use std::hash::Hash;
 
 /// The height a switch wants, and what each side of a label keeps inside its own segment.
 pub const SEGMENT_H: f32 = 28.0;
@@ -105,7 +104,7 @@ pub fn draw_segments_animated(
     p: &mut Painter,
     pal: &Palette,
     anim: &mut Animator,
-    id: impl Hash,
+    id: impl AsId,
     r: Rect,
     labels: &[&str],
     selected: Option<usize>,
