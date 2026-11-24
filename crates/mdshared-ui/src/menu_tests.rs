@@ -523,6 +523,111 @@ fn sizes_out_of_reason_are_the_rounded_looks_own() {
     assert_eq!(made.row_rect(0).h, Look::FLAT.row);
 }
 
+/// The shadow as `Painter::shadow` drew it before it had a strength, copied here.
+fn old_shadow(p: &mut Painter, r: Rect, radius: f32, dark: bool) {
+    let steps = 10;
+    let strength = if dark { 0.024 } else { 0.010 };
+    for i in (1..=steps).rev() {
+        let d = i as f32 * 1.4;
+        let rr = Rect::new(r.x - d, r.y - d + 3.0, r.w + 2.0 * d, r.h + 2.0 * d);
+        p.rbox_a(rr, radius + d, [0, 0, 0], strength);
+    }
+}
+
+fn shadow_drawn(scale: f32, dark: bool, draw: impl Fn(&mut Painter, Rect)) -> Bitmap {
+    let mut bmp = Bitmap::new((160.0 * scale) as u32, (120.0 * scale) as u32);
+    // A light ground in both, so that the integer blends of a faint shadow still differ.
+    bmp.clear(if dark {
+        [200, 200, 200]
+    } else {
+        [250, 250, 250]
+    });
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+    draw(&mut p, Rect::new(30.0, 25.0, 90.0, 60.0));
+    bmp
+}
+
+#[test]
+fn a_shadow_at_strength_one_is_the_old_shadow_and_at_zero_is_none() {
+    for scale in [1.0, 1.5] {
+        for dark in [false, true] {
+            let old = shadow_drawn(scale, dark, |p, r| old_shadow(p, r, 8.0, dark));
+            let plain = shadow_drawn(scale, dark, |p, r| p.shadow(r, 8.0, dark));
+            let one = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, 1.0));
+            assert!(old.pixels == plain.pixels, "scale {scale} dark {dark}");
+            assert!(old.pixels == one.pixels, "scale {scale} dark {dark}");
+            let blank = shadow_drawn(scale, dark, |_, _| {});
+            for k in [0.0, -1.0, f32::NAN, f32::NEG_INFINITY] {
+                let none = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, k));
+                assert!(none.pixels == blank.pixels, "k {k}");
+            }
+            // Half as dark is lighter than the old shadow and twice as dark is darker, under
+            // the box where the shadow is deepest.
+            let at = |b: &Bitmap| {
+                let (x, y) = ((75.0 * scale) as usize, (87.0 * scale) as usize);
+                b.pixels[(y * b.width as usize + x) * 4] as i32
+            };
+            let half = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, 0.5));
+            let twice = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, 2.0));
+            assert!(at(&blank) > at(&half) && at(&half) > at(&one) && at(&one) > at(&twice));
+            // Held to four times: a hundred is four.
+            let four = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, 4.0));
+            let many = shadow_drawn(scale, dark, |p, r| p.shadow_with(r, 8.0, dark, 100.0));
+            assert!(four.pixels == many.pixels);
+        }
+    }
+}
+
+#[test]
+fn a_menu_draws_its_shadow_at_the_looks_strength() {
+    use crate::theme::LIGHT;
+    let (rounded, rm) = look_drawn(None, None);
+    assert_eq!(Look::ROUNDED.shadow_strength, 1.0);
+    assert_eq!(Look::FLAT.shadow_strength, 1.0);
+    let with = |k: f32| {
+        let mut look = Look::ROUNDED;
+        look.shadow_strength = k;
+        look_drawn(Some(look), None).0
+    };
+    let below = |b: &Bitmap| pixel(b, rm.rect().cx(), rm.rect().bottom() + 2.0)[0];
+    // Strength one is the menu every caller has had.
+    assert!(with(1.0).pixels == rounded.pixels);
+    // None: the page under the menu is untouched, and the menu itself is the same.
+    let none = with(0.0);
+    assert_eq!(
+        pixel(&none, rm.rect().cx(), rm.rect().bottom() + 2.0),
+        LIGHT.page
+    );
+    assert_eq!(
+        pixel(&none, rm.rect().cx(), rm.rect().cy()),
+        pixel(&rounded, rm.rect().cx(), rm.rect().cy())
+    );
+    assert!(below(&none) > below(&with(0.5)));
+    assert!(below(&with(0.5)) > below(&rounded));
+    assert!(below(&rounded) > below(&with(2.0)));
+}
+
+#[test]
+fn a_shadow_strength_out_of_reason_is_held_to_zero_to_two() {
+    let with = |k: f32| {
+        let mut look = Look::ROUNDED;
+        look.shadow_strength = k;
+        look.sane().shadow_strength
+    };
+    assert_eq!(with(0.5), 0.5);
+    assert_eq!(with(2.0), 2.0);
+    assert_eq!(with(5.0), 2.0);
+    assert_eq!(with(-1.0), 0.0);
+    assert_eq!(with(f32::NAN), 1.0);
+    assert_eq!(with(f32::INFINITY), 1.0);
+    // Through a menu, as every other size.
+    let mut look = Look::ROUNDED;
+    look.shadow_strength = 9.0;
+    let menu = Menu::new(many(2), 0.0, 0.0, false).with_look(look);
+    assert_eq!(menu.look().shadow_strength, 2.0);
+}
+
 /// The two looks side by side, light and dark, a row lit and a separator in each: run with
 /// `cargo test -p mdshared-ui menu_look_sheet -- --ignored`, then open
 /// target/specimen/menu-look.png and menu-look-150.png.

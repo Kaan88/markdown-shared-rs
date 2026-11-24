@@ -149,7 +149,8 @@ const ARROW: f32 = 28.0;
 ///
 /// A size that is not finite, is negative, or is out of all reason (a row under 1 px or over
 /// 256, any other size over 64) is taken as the rounded look's own, so a look read from a
-/// settings line cannot break a menu.
+/// settings line cannot break a menu. The shadow's strength is held to 0..=2, and one that is
+/// not finite is 1.
 ///
 /// Deliberately not here: colours (they are the palette's, or [`crate::tokens`]'), the text's
 /// size, and the motion of [`Menu::draw_in_presence`], which every look shares.
@@ -160,6 +161,9 @@ pub struct Look {
     pub radius: f32,
     /// Whether a soft shadow is drawn round the menu.
     pub shadow: bool,
+    /// How dark that shadow is ([`Painter::shadow_with`]): 1 is the shadow menus have always
+    /// had, 0.5 half as dark, 0 none; [`sane`](Look::sane) holds it to 0..=2.
+    pub shadow_strength: f32,
     /// The height of a row.
     pub row: f32,
     /// The room above the first row and below the last.
@@ -182,6 +186,7 @@ impl Look {
     pub const ROUNDED: Look = Look {
         radius: 8.0,
         shadow: true,
+        shadow_strength: 1.0,
         row: ROW,
         pad: PAD,
         inset: PAD,
@@ -196,6 +201,7 @@ impl Look {
     pub const FLAT: Look = Look {
         radius: 0.0,
         shadow: false,
+        shadow_strength: 1.0,
         row: 26.0,
         pad: 4.0,
         inset: 1.0,
@@ -204,7 +210,8 @@ impl Look {
         gap: 0.0,
     };
 
-    /// This look with every size that is out of reason taken from [`Look::ROUNDED`].
+    /// This look with every size that is out of reason taken from [`Look::ROUNDED`], and the
+    /// shadow's strength held to 0..=2 (1 when it is not finite).
     pub fn sane(self) -> Look {
         let d = Look::ROUNDED;
         let ok = |v: f32, lo: f32, hi: f32, d: f32| {
@@ -217,6 +224,11 @@ impl Look {
         Look {
             radius: ok(self.radius, 0.0, 64.0, d.radius),
             shadow: self.shadow,
+            shadow_strength: if self.shadow_strength.is_finite() {
+                self.shadow_strength.clamp(0.0, 2.0)
+            } else {
+                d.shadow_strength
+            },
             row: ok(self.row, 1.0, 256.0, d.row),
             pad: ok(self.pad, 0.0, 64.0, d.pad),
             inset: ok(self.inset, 0.0, 64.0, d.inset),
@@ -559,7 +571,7 @@ impl<T: Clone> Menu<T> {
         let (marks, icons) = self.columns();
         let look = self.look;
         if look.shadow {
-            p.shadow(self.rect, look.radius, pal.dark);
+            p.shadow_with(self.rect, look.radius, pal.dark, look.shadow_strength);
         }
         p.frame(self.rect, look.radius, pal.popup, pal.popup_line);
         let old = p.clip(self.rect);
