@@ -168,6 +168,28 @@ Wayland the app must present with `set_premultiplied_alpha(true)` (patched softb
 only). Details, limits and what each app does: [LINUX.md](LINUX.md#window-backdrop-mdshared_uiblur)
 and [next/linux-frost.md](next/linux-frost.md).
 
+## Animation (`mdshared_ui::anim`)
+
+Opt-in, and described in full in [ANIMATION.md](ANIMATION.md). `anim::Animator` holds values
+that move to their targets, named by the caller and asked for while drawing
+(`value`, `toggle`, `presence`), with tweens along easing curves (the CSS cubic-bezier among
+them), springs, and the Windows 11 timings in `anim::fluent`; `end_frame()` gives the deadline of
+the next frame, or none when everything has arrived, so an idle window still does no work.
+`anim::PageTransition` cross-fades, slides or pushes a region from its old content to its new;
+`anim::Transient` and `anim::pop` are for what appears and disappears. The painter gained
+`offset`, `snapshot` and `fade`. `platform::motion_reduced()` reads the system's wish for less
+motion on Windows, macOS and Linux, and an animator told of it moves nothing.
+
+Widgets with motion, each beside the function that existed: `segments::draw_segments_animated`,
+`scroll::draw_scrollbar_animated` and `scroll::SmoothScroll`, `check::draw_tick_animated`,
+`overlay::Bubble::draw_presence`, `overlay::draw_backdrop_presence` and `dialog_bounds`,
+`menu::Menu::draw_in_presence`. No signature changed and no existing function draws differently;
+`Painter` gained a private field, which no application can have named.
+
+No dependency was added. Run: the unit tests, on Windows; `cargo check` and clippy of the crate
+for Linux. Not verified: anything in a window (how the motions look, the wiring into a winit
+loop), either application, macOS, and the Linux portal read on a real desktop.
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
