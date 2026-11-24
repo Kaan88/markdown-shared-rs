@@ -1,10 +1,8 @@
 //! Shared UI pieces for the Markdown viewer and editor, and the toolkit of the applications
 //! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
-//! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, drop-down lists and
-//! toggle switches ([`dropdown`], [`toggle`]), expanders, anchored flyouts, table columns and
-//! splitters, link buttons, the cursors the widgets ask for, the models
-//! scrollbar, tooltips, toasts, dialog frames), info bars, sliders, knobs and faders, table
+//! scrollbar, tooltips, toasts, dialog frames), info bars, sliders, knobs and faders, drop-down
+//! lists and toggle switches ([`dropdown`], [`toggle`]), expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), and animation ([`anim`]). No window loop; the application
