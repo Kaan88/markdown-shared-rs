@@ -190,6 +190,77 @@ No dependency was added. Run: the unit tests, on Windows; `cargo check` and clip
 for Linux. Not verified: anything in a window (how the motions look, the wiring into a winit
 loop), either application, macOS, and the Linux portal read on a real desktop.
 
+### The review's fixes (2026-11-24, `6027946..bc8fa9f`)
+
+An Opus review of the three animation commits found ten problems; all are fixed, and a second
+review of the fixes found five more, also fixed (`bc8fa9f`). The API changed where a fix needed
+it: `anim` is not on `main`, so neither Markdown application can see it, but **mdmix uses it as of
+`da70818` and must be adapted** (list below).
+
+Design decisions:
+
+- *Values are kept as `f64`.* `Animatable` would otherwise need a breaking change the day a file
+  manager or a terminal scrolls past sixteen million pixels. Springs are stepped on the distance
+  to the target, so `Spring` keeps its `f32` API; widget values stay `f32`; `f64` is animatable.
+- *`AsId`, and `Id` is not `Hash`.* An `Id` passed as a name is itself, not hashed again; anything
+  that hashes still works. The two impls can only coexist if `Id` is not `Hash`.
+- *Settle precision per type*: `Animatable::precision()`; a spring ends at the coarser of its own
+  threshold and the type's, so an `Rgb` spring stops asking for frames when the colour stops
+  visibly changing.
+- *A delay is a wait*, kept under reduced motion and on `Motion::SNAP`: a tooltip written the
+  obvious way (`presence(id, shown, ENTER.delayed(d), EXIT)`) keeps its delay. A delay too long
+  for the clock waits for ever and asks for no frame. `SNAP` with an unchanged target leaves a
+  motion in flight alone.
+- *`keep` moves the value*, and `end_frame` moves every unfinished track to the frame time, so a
+  kept value never asks for frames without moving.
+- *The cubic bezier only exists checked*: `Easing::cubic_bezier(..) -> Option` for values from
+  outside, `Easing::bezier(..)` (const, clamps, never panics) for constants.
+- *A page switch ends when the bitmap size, the scale or the region changes under it*; `apply`
+  takes the painter and the region (which also makes the documented example compile).
+- *What repeats is a clock*: `Animator::cycle(id, period)` and `Animator::blink(id, on, off)` (wakes
+  only at the toggles), `Periodic`; the spinner and the indeterminate bar are drawn from `cycle`,
+  pixel for pixel as before at the same phase.
+- *Linux reduced motion never blocks*: read on a helper thread that stays to listen for the
+  portal's `SettingChanged`; the last good answer is kept, a stale reading loses to a newer one,
+  and `platform::watch_motion_reduced(wake)` signals changes (a wake given after the first answer
+  is called once at once). `system_is_dark` has the same blocking shape and was left alone, since
+  the Markdown applications call it (roadmap X10).
+
+**Breaking changes for mdmix** (old form → new form):
+
+1. `Easing::CubicBezier(a, b, c, d)` → `Easing::bezier(a, b, c, d)`, or `Easing::cubic_bezier(..)?`
+   for a curve read from outside. A `match` binds one `Bezier`; `curve.points()` gives the numbers.
+2. `PageTransition::apply(&mut anim, &mut bitmap)` → `apply(&mut anim, &mut p, region)` with the
+   painter that drew the page and the rectangle given to `begin`; or `apply_dev(&mut anim, &mut
+   bitmap, dev_rect, scale)`.
+3. `Animatable::parts`/`from_parts` take `[f64; 4]` (was `[f32; 4]`): only for a type mdmix
+   implements it for (`as f64` in, `as f32` out; optionally `fn precision()`).
+4. `Id` is no longer `Hash`: a name `(id, "part")` → `id.with("part")`; an `Id` as a map key → key
+   by the name. The compiler names each place.
+5. An `Id` given as a name is no longer hashed again (`anim.get(Id::new("a"))` reads what
+   `anim.get("a")` reads). Compiles unchanged.
+6. A bare float literal given to `value`/`value_from`/`set` is an `f64` when nothing else types
+   it: `anim.value("x", 240.0, m).round()` fails with E0689 → `240.0_f32`.
+7. `Snapshot::fits` is false for a bitmap of another size than the one it was taken from.
+8. `SmoothScroll` takes `impl Into<f64>`; no break expected, except an argument whose type was
+   inferred from the old `f32` parameter (`x.into()`): give it a type.
+9. A delay is kept under reduced motion and on `SNAP` (behaviour): drop `.delayed` when
+   `!anim.animates()` if skipping it was intended. `SNAP` with an unchanged target no longer
+   finishes a motion in flight.
+10. In a debug build, one name given two different targets in one frame panics.
+11. Linux: `motion_reduced()` answers false until the helper thread's first reading; call
+    `watch_motion_reduced(wake)` once and read again when woken.
+
+Also seen, not breaking: `Rgb`, `Rect` and point springs settle sooner; `set_frame_interval`
+below 1 ms is 1 ms; `Animator::len` counts cycles and blinks.
+
+Run on Windows: `cargo fmt --all --check`, workspace clippy with warnings as errors, the same for
+`mdshared-ui` with `recycle`, `cargo test --release -p mdshared-ui` (389 passed, 7 ignored, 4
+doc-tests; 31 tests added); the Linux clippy with a stub `pkg-config` (type-checked, nothing
+linked). Not verified: anything in a window; the Linux portal thread on a real bus; macOS (not
+compiled); mdmix against this branch (break 6 is the one whose reach is unknown); the full
+workspace test run.
+
 ## Pieces for the next applications (2026-11-24)
 
 A first batch of general pieces for a music player, a file manager and a terminal, built in one

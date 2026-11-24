@@ -47,8 +47,8 @@ the row says the widget holds state.
 | `notice` | Bars across the top of the page: update, crash report, an offer with two buttons | `draw_update_bar`, `draw_crash_bar`, `draw_offer_bar`, `bar_button` |
 | `segments` | A segmented switch of two or three options | `switch_width`, `draw_segments`, `draw_segments_animated`, `segment_at` |
 | `check` | A tick box | `Tick::new(on)`, `draw_tick`, `draw_tick_animated` |
-| `slider` | A slider (linear, log or decibel scale), a seek bar, progress bars, a spinner. Holds the value | `Slider::new(min, max, value).step().vertical().scale()`, `press`/`drag`/`release`, `step_by(Step)`, `wheel`, `draw`, `draw_animated`, `Look { buffered, .. }`; `draw_progress`, `draw_progress_indeterminate`, `draw_spinner` |
-| `scroll` | The overlay scrollbar, and an offset that glides | `scrollbar(area, content, view, offset)`, `offset_for_thumb`, `draw_scrollbar`, `draw_scrollbar_animated`, `SmoothScroll` |
+| `slider` | A slider (linear, log or decibel scale), a seek bar, progress bars, a spinner. Holds the value | `Slider::new(min, max, value).step().vertical().scale()`, `press`/`drag`/`release`, `step_by(Step)`, `wheel`, `draw`, `draw_animated`, `Look { buffered, .. }`; `draw_progress`, `draw_progress_indeterminate`, `draw_spinner` (both on `anim::cycle`), `draw_progress_indeterminate_at`, `draw_spinner_at` (at a phase, no animator) |
+| `scroll` | The overlay scrollbar, and an offset that glides (kept as `f64`) | `scrollbar(area, content, view, offset)`, `offset_for_thumb`, `draw_scrollbar`, `draw_scrollbar_animated`, `SmoothScroll` (`scroll_by`, `jump_to`, `offset` / `offset_f64`, `current` for hit tests during a glide) |
 | `textfield` | A single-line text field: text, caret, selection, IME preedit. Holds state | `TextField`, `EditKey`, `FieldColors`, `Preedit` |
 | `palette` | The command palette: a text field over a ranked list. Holds state | `Palette`, `Entry::new(id, label).hint().icon().group()`, `Outcome` |
 | `settings` | A settings dialog described by rows of data. Holds state | `Form::new(title, rows)`, `Row::toggle` / `choice` / `number` / `text` / `action` / `header`, `layout`, `key`, `press`, `release`, `wheel`, `Outcome`, `Value` |
@@ -78,10 +78,12 @@ Full account: [ANIMATION.md](ANIMATION.md).
 
 | Piece | For | Start at |
 |---|---|---|
-| `anim::Animator` | Named values that move to their targets, asked for while drawing; says when the next frame is needed | `begin_frame(now)`, `value`, `value_from`, `toggle`, `presence`, `set`, `end_frame() -> Option<Instant>`, `set_system_reduced`, `set_policy` |
-| `anim::Motion`, `Easing`, `Spring`, `fluent` | How a value moves; the Windows 11 timings | `Motion::tween`, `Motion::spring`, `fluent::FADE` / `ENTER` / `EXIT` / `MOVE` / `PAGE` |
+| `anim::Animator` | Named values that move to their targets, asked for while drawing; says when the next frame is needed. A name is anything that hashes, or an `Id`, which is itself (provisional) | `begin_frame(now)`, `value`, `value_from`, `toggle`, `presence`, `set`, `get`, `keep`, `forget`, `end_frame() -> Option<Instant>`, `set_system_reduced`, `set_policy`; `Id::new(name).with(part)`, `AsId` |
+| `anim::Motion`, `Easing`, `Spring`, `fluent` | How a value moves; the Windows 11 timings. A delay is kept under reduced motion; a bezier only exists checked (provisional) | `Motion::tween`, `Motion::spring`, `.delayed`, `Easing::cubic_bezier(..) -> Option`, `Easing::bezier(..)` (const), `Spring::with_threshold`, `fluent::FADE` / `ENTER` / `EXIT` / `MOVE` / `PAGE` |
+| `anim::Animatable` | What can move: `f32`, `f64`, a point, `Rect`, `Rgb`, `[f32; 4]`; kept as `f64`, with a settle precision per type (provisional) | `parts`, `from_parts`, `precision()`, `lerp` |
+| `anim::cycle` | What repeats while shown: a running phase, and a blink that wakes the window only when it changes (provisional) | `Animator::cycle(id, period) -> f32`, `Animator::blink(id, on, off) -> bool`, `Periodic::new(period).ping_pong().still_at(phase)`, `.phase(anim, id)`, `.at(elapsed)` |
 | `anim::Clock` | Where time comes from; a clock moved by hand for tests | `SystemClock`, `ManualClock` |
-| `anim::Snapshot`, `PageTransition` | A saved piece of the bitmap; cross-fade, slide or push between an old page and a new one | `Painter::snapshot`, `PageTransition::begin` / `apply`, `PageEffect` |
+| `anim::Snapshot`, `PageTransition` | A saved piece of the bitmap; cross-fade, slide or push between an old page and a new one; ends when the bitmap size, scale or region changes (provisional) | `Painter::snapshot`, `PageTransition::begin` / `apply(anim, p, region)` / `apply_dev`, `PageEffect` |
 | `anim::Transient`, `pop` | Things that appear and disappear, kept alive while they leave; any drawing faded and moved as one | `Transient::show` / `hide` / `frame`, `pop(p, bounds, t, shift, draw)` |
 
 ## Platform (`mdshared-ui`)
@@ -90,7 +92,7 @@ The only modules that call the system. Each fails soft where the system lacks th
 
 | Module | For | Start at |
 |---|---|---|
-| `platform` | Clipboard (text and HTML), opening URLs and files, the file manager, file dialogs, system theme, reduced motion, double-click and caret times, display scale, DWM window styling and backdrop | `clipboard_text`, `set_clipboard_text`, `clipboard_html`, `open_url`, `open_file`, `reveal_in_file_manager`, `pick_files_async`, `pick_folder_async`, `pick_save_async`, `system_is_dark`, `motion_reduced`, `double_click_time`, `caret_blink_time`, `system_scale`, `style_window`, `set_backdrop` |
+| `platform` | Clipboard (text and HTML), opening URLs and files, the file manager, file dialogs, system theme, reduced motion, double-click and caret times, display scale, DWM window styling and backdrop | `clipboard_text`, `set_clipboard_text`, `clipboard_html`, `open_url`, `open_file`, `reveal_in_file_manager`, `pick_files_async`, `pick_folder_async`, `pick_save_async`, `system_is_dark`, `motion_reduced` and `watch_motion_reduced(wake)` (never blocks; Linux reads the portal on a helper thread), `double_click_time`, `caret_blink_time`, `system_scale`, `style_window`, `set_backdrop` |
 | `platform::recycle` (feature `recycle`) | Moving files to the Recycle Bin or Trash | `recycle`, `recycle_refusal`, `open_recycle_bin` |
 | `corners`, `shadow`, `blur`, `frost` | Rounded window corners; the drop shadow of an undecorated window (Linux routes in LINUX.md); blur behind the window on KDE; a system backdrop behind the chrome | `corners::set_window_corners`, `shadow::Shadow::attach`, `blur::set`, `frost::Frost` |
 | `snap` | The Windows 11 snap-layouts flyout over a hand-drawn maximize button | `set_maximize_button_rect` |
