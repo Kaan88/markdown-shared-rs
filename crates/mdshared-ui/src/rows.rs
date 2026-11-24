@@ -159,11 +159,92 @@ impl Rows {
         };
         self.clamp_scroll(to)
     }
+
+    /// The rows a rubber band touches: the first, and one past the last; every row whose
+    /// rectangle the band overlaps, on screen or not. `band` is in the coordinates of `area`
+    /// and of this frame ([`grid::band_rect`](crate::grid::band_rect) makes one from two
+    /// corners); only its vertical extent and whether it reaches the area sideways count. A
+    /// band with no height still touches the row it lies in. Empty when the band is beside the
+    /// area, above the first row or below the last. The same question for a grid is
+    /// [`Grid::band`](crate::grid::Grid::band); the answer goes to
+    /// [`Selection::set_band`](crate::select::Selection::set_band).
+    pub fn band(&self, area: Rect, band: Rect) -> Range<usize> {
+        let finite = [band.x, band.y, band.w, band.h]
+            .iter()
+            .all(|v| v.is_finite());
+        if self.count == 0 || self.row_h <= 0.0 || !finite {
+            return 0..0;
+        }
+        if band.x + band.w.max(0.0) < area.x || band.x >= area.right() {
+            return 0..0;
+        }
+        let top = band.y - area.y + self.scroll;
+        let bottom = top + band.h.max(0.0);
+        if bottom < 0.0 {
+            return 0..0;
+        }
+        let first = ((top.max(0.0) / self.row_h).floor() as usize).min(self.count);
+        // A bottom edge exactly on a boundary does not touch the row below it, unless the band
+        // has no height at all.
+        let end = if bottom > top {
+            (bottom / self.row_h).ceil() as usize
+        } else {
+            (bottom / self.row_h).floor() as usize + 1
+        };
+        let end = end.min(self.count);
+        if first < end { first..end } else { 0..0 }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rubber_band_takes_the_rows_it_touches() {
+        // Ten rows of 25 px in an area at y 200, scrolled by 30.
+        let rows = Rows {
+            scroll: 30.0,
+            ..Rows::new(25.0, 100.0, 10)
+        };
+        let band =
+            |y0: f32, y1: f32| rows.band(AREA, crate::grid::band_rect((50.0, y0), (120.0, y1)));
+        // Row 1 is drawn from 195 to 220, row 2 from 220 to 245.
+        assert_eq!(band(200.0, 210.0), 1..2);
+        assert_eq!(band(210.0, 210.0), 1..2, "a press that has not moved");
+        assert_eq!(band(210.0, 220.0), 1..2, "ending on the boundary");
+        assert_eq!(band(210.0, 220.1), 1..3);
+        assert_eq!(band(246.0, 205.0), 1..4, "drawn upwards");
+        // Past the screen and past the list: every row there is, and no more.
+        assert_eq!(band(-500.0, 5000.0), 0..10);
+        assert_eq!(band(400.0, 5000.0), 9..10);
+        assert_eq!(band(430.0, 5000.0), 0..0, "below the last row");
+        assert_eq!(band(-500.0, 100.0), 0..0, "above the first row");
+        // Beside the area: nothing. Reaching into it from the left: the rows.
+        let beside = Rect::new(-50.0, 200.0, 40.0, 50.0);
+        assert_eq!(rows.band(AREA, beside), 0..0);
+        assert_eq!(rows.band(AREA, Rect::new(-50.0, 200.0, 60.0, 50.0)), 1..4);
+        assert_eq!(rows.band(AREA, Rect::new(200.0, 200.0, 60.0, 50.0)), 0..0);
+        // Against the plain test of each row's rectangle.
+        for y0 in (150..480).step_by(7) {
+            for h in [0, 1, 24, 25, 26, 60, 400] {
+                let b = Rect::new(10.0, y0 as f32, 30.0, h as f32);
+                let plain: Vec<usize> = (0..rows.count)
+                    .filter(|&i| {
+                        let r = rows.rect(AREA, i);
+                        if h == 0 {
+                            b.y >= r.y && b.y < r.bottom()
+                        } else {
+                            b.y < r.bottom() && b.bottom() > r.y
+                        }
+                    })
+                    .collect();
+                assert_eq!(rows.band(AREA, b).collect::<Vec<_>>(), plain, "{b:?}");
+            }
+        }
+        assert_eq!(rows.band(AREA, Rect::new(f32::NAN, 0.0, 1.0, 1.0)), 0..0);
+        assert_eq!(Rows::new(25.0, 100.0, 0).band(AREA, AREA), 0..0);
+    }
 
     const AREA: Rect = Rect::new(0.0, 200.0, 200.0, 100.0);
 

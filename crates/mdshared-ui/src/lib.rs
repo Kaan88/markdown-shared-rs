@@ -13,6 +13,7 @@ pub mod desktop_entry;
 pub mod frost;
 pub mod gfx;
 pub mod glyph;
+pub mod grid;
 pub mod keys;
 pub mod menu;
 pub mod menu_bar;
