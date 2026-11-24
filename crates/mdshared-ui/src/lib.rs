@@ -36,6 +36,7 @@ pub mod plan;
 pub mod platform;
 pub mod rows;
 pub mod scroll;
+pub mod sections;
 pub mod seek;
 pub mod segments;
 pub mod select;
