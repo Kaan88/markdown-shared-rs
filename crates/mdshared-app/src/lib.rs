@@ -1,7 +1,8 @@
 //! Application plumbing shared by the Markdown viewer and editor: path handling, reading files,
 //! creating a new file without replacing one, the recent-files list, the place left in each
 //! file, the key=value settings file layer, one-window-per-user hand-over, the hand-off between
-//! the two applications, file watching, a worker thread's handle, the small texts of sizes, counts, times and dates (`fmt`), and updating the application
+//! the two applications, file watching, a worker thread's handle and a pool of worker threads
+//! (`pool`), the small texts of sizes, counts, times and dates (`fmt`), updating the application
 //! in place, crash reports, and the cut of a document into notes at its headings (`split`). No
 //! window system and no Markdown parser.
 
@@ -22,6 +23,7 @@ pub mod moves;
 pub mod notes;
 pub mod paths;
 pub mod places;
+pub mod pool;
 pub mod recents;
 pub mod relaunch;
 pub mod runs;
