@@ -40,7 +40,7 @@ something that cannot be tested headless).
 | Unicode widths for the terminal (T4) | Generated into the source from the data of `unicode-width` 0.2.3; no run-time dependency (the agent's choice) |
 | The shell's context menu for files, audio decoding | Deferred (rows F7 and M6) until the owner says otherwise |
 | The order of work | The music player's pieces first (the owner, 2026-11-24: mdmix is made usable from what exists by its own session), then the file manager and the terminal, one application's batch at a time (below) |
-| How the work is run | At most three agents at once (the owner, 2026-11-24): the coordinating agent on one item, DeepSeek Flash on a safe, low-risk one, and one Claude Opus helper (high effort) on a medium one in its own worktree; risky items stay with the coordinating agent; no wider fan-out |
+| How the work is run | Since 2026-11-25 (the owner): the coordinating agent, three Claude Opus jobs, one Claude reviewer (high effort, read-only) and two DeepSeek Flash jobs on safe items, all run through opencode; risky items stay with the coordinating agent. Before that (2026-11-24): at most three agents |
 
 `feat/hosted` (the worktree `mdshared-hosted`, uncommitted) is a Win32 "hosted mode" for a
 component that draws into a window whose loop belongs to another program. It is not the base of
@@ -51,6 +51,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 
 | Phase | What | Items |
 |---|---|---|
+| P | **Purge fast track** (the owner, 2026-11-25), ahead of the rest: merge `feat/anim` to `main`, then W8 (Windows UIA at Purge's scope), W1 (one window), W5b, X8, P1-P7, P8 last and optional; the consumer is `examples/purge_shape.rs`; the checks C1-C3 below | W8, W1, W5b, X8, P1-P8 |
 | 0 | The animation module's review fixes | done on `feat/anim` (`6027946..bc8fa9f`); the breaking changes for mdmix are listed in [FEATURES.md](FEATURES.md), "The review's fixes" |
 | 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5 |
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
@@ -121,6 +122,51 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | T5 | **The rest of xterm that people meet.** OSC 8 hyperlinks, OSC 52 clipboard, colour queries (OSC 4/10/11), synchronized output (2026), underline styles and colours, the kitty keyboard protocol | M each | low | none | `mdshared_term::parse`, `screen`, `input` | open |
 | T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | open |
 | T7 | **Colour schemes and IME at the cursor.** The 16 colours and the default pair as a scheme (with the palette's light and dark), and the IME composition window placed at the terminal's cursor with the preedit drawn in the cells | M | medium | none | T1, `textfield::Preedit`, winit `set_ime_cursor_area` | open |
+
+## Purge (fast track, 2026-11-25)
+
+Purge (`Kaan88/purge`), an uninstaller, ports its WinUI 3 UI to `mdshared-ui` once this toolkit meets
+the checklist in section 0 of Purge's `docs/UI_RUST_ASSESSMENT.md`. Its sections 2, 3 and 6 say why
+each piece is needed. "Ready" means:
+- every item below and W8, W1, W5b and X8 is on `main`;
+- `feat/anim` is merged;
+- Windows CI is green;
+- C1-C3 are measured.
+
+The rule "a piece reaches `main` once one application really uses it" cannot be met by Purge, because
+Purge starts only after the merge. The proposed consumer instead is **`examples/purge_shape.rs`**. It
+grows with each item, and C1-C3 measure it. It is:
+- one window;
+- a 2,000-row multi-select virtualized list with a column header;
+- a search field (Ctrl+F);
+- a grouped collapsible list;
+- a modal dialog;
+- a progress bar.
+
+Purge's scope narrows two existing rows:
+- **W8:** Windows UI Automation only. AT-SPI and macOS stay open as a row of their own. Author ids
+  become UIA AutomationIds. A virtualized list reports its full row count and ScrollItem works.
+- **W1:** one window only. No tabs and no several windows.
+
+| Id | What | Size | Risk | Deps | Builds on | Done when | Status |
+|---|---|---|---|---|---|---|---|
+| W5b | **The system's high-contrast colours.** Extends W5 | S | medium | none | `tokens`, `platform::system_high_contrast` | Under Windows HC the tokens use the active scheme's `GetSysColor` colours (window, text, highlight, hotlight, gray text, button face and text); Mica, Acrylic and frost are off; switching HC while running repaints | open |
+| P1 | **Selector bar with N options** (tabs) | S | low | none | `segments` | `segments` with any count; arrow keys; each option one UIA tab or radio item | open |
+| P2 | **InfoBar.** Extends `notice` | S | low | none | `notice`, `overlay` | Info, success, warning and error colours and glyphs; a title, a message and up to two action buttons; a close button; several stacked; in a page, not only at the top | open |
+| P3 | **Expander** | S | low | none | `anim::Transient`, `tree`'s disclosure | A header with a chevron; an animated body that respects reduced motion; the UIA ExpandCollapse state | open |
+| P4 | **Dropdown (combo box) and toggle switch, standalone** | S | low | none | `settings::Form`'s choice and toggle, `menu::Menu::around`, `anim` switch | Usable outside `settings::Form`; the dropdown opens a `menu` under itself; keyboard operable | open |
+| P5 | **Hyperlink button** | S | low | none | `cursor`, `text` | Underlined on hover; the hand cursor; Invoke in UIA | open |
+| P6 | **Anchored flyout card** | S | medium | none | `menu::Menu::around`, `overlay`, `focus` scopes | Any content (text, a check box, a button) in a card placed like `Menu::around`; Esc and a click outside close it; it is its own focus scope | open |
+| P7 | **Read-only selectable text** | M | medium | none | `text`, `textfield`'s selection | Selection by drag, double click and Shift in a paragraph that cannot be edited (wrapped, and monospace); Ctrl+C; Copy in a context menu; the UIA Text pattern is optional | open |
+| P8 | **Single instance through a named mutex,** in `mdshared-app` (optional, last) | S | medium | none | `mdshared_app::single` (loopback TCP, which Purge must not use) | A second launch brings the first window forward through a named mutex and `FindWindow`, with no TCP listener | open |
+
+Checks for the ready toolkit (Purge's gates):
+
+| Id | Check | Pass |
+|---|---|---|
+| C1 | Launch time of `purge_shape`, first frame and names visible; a bare winit+softbuffer window as the reference | Names visible within 400 ms on Purge's laptop with the real engine (Purge measures that one); here: the numbers on this machine, against the bare window |
+| C2 | The UIA script from W8 (`tests/uia/purge_shape.ps1`), run on the host | Every action W8 lists works |
+| C3 | Size of the `purge_shape` release exe | Under 10 MB |
 
 ## Left over from what exists
 
