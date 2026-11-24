@@ -6,7 +6,7 @@ use super::*;
 use std::cell::RefCell;
 use windows_sys::Win32::Foundation::{LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_POPUP, WS_VISIBLE,
 };
 
 /// An id no other test, and no other run of the tests, uses.
@@ -57,6 +57,16 @@ fn handed() -> Vec<Vec<OsString>> {
 
 /// A hidden top-level window of this thread, with a class of its own.
 fn window() -> isize {
+    make_window(false)
+}
+
+/// A visible top-level window of this thread: the kind [`main_window_of`] picks when it looks
+/// through the windows of a process.
+fn shown_window() -> isize {
+    make_window(true)
+}
+
+fn make_window(visible: bool) -> isize {
     let name: Vec<u16> = "mdshared_single_mutex_test\0".encode_utf16().collect();
     let class = WNDCLASSW {
         style: 0,
@@ -70,6 +80,11 @@ fn window() -> isize {
         lpszMenuName: std::ptr::null(),
         lpszClassName: name.as_ptr(),
     };
+    let style = if visible {
+        WS_POPUP | WS_VISIBLE
+    } else {
+        WS_POPUP
+    };
     // SAFETY: `class` and the name outlive the calls; registering twice (another test in the same
     // process) fails harmlessly and the class is already there.
     let hwnd = unsafe {
@@ -78,7 +93,7 @@ fn window() -> isize {
             0,
             name.as_ptr(),
             name.as_ptr(),
-            WS_POPUP,
+            style,
             0,
             0,
             100,
@@ -96,6 +111,16 @@ fn window() -> isize {
 fn destroy(hwnd: isize) {
     // SAFETY: a window of this thread that the test made.
     unsafe { DestroyWindow(hwnd as HWND) };
+}
+
+/// Held by a test that depends on which visible windows this process has: there is only one test
+/// process, and a visible window of one test is a window of every other.
+static LOOKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn looking() -> std::sync::MutexGuard<'static, ()> {
+    LOOKING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The bytes `send` hands Windows, given to `received` as a window procedure would get them.
@@ -145,10 +170,63 @@ fn after_the_first_is_dropped_the_next_launch_is_first() {
 }
 
 #[test]
+fn a_record_that_was_already_there_is_not_written_into() {
+    let app = id("squat");
+    let name = object_name(&app, "window");
+    // The record a squatter made first: a mapping that is never written whole, so every launch
+    // that finds it learns nothing.
+    // SAFETY: a mapping backed by the paging file (`INVALID_HANDLE_VALUE`) of `RECORD` bytes,
+    // named by a NUL-terminated string that outlives the call; default security. The handle is
+    // closed at the end of the test.
+    let squatter = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            RECORD as u32,
+            name.as_ptr(),
+        )
+    };
+    assert!(!squatter.is_null(), "the squatter's mapping was not made");
+    let guard = first(acquire(&app));
+    assert!(guard.held(), "the mutex is still this instance's");
+    // The window stays unpublished: the record is the squatter's, and this instance left it alone.
+    let hwnd = window();
+    guard.publish_window(hwnd);
+    // SAFETY: `squatter` is open until the end of the test; the view is page-aligned and `RECORD`
+    // bytes long, which the three atomics fit, and it is unmapped below.
+    unsafe {
+        let view = MapViewOfFile(squatter, FILE_MAP_READ, 0, 0, RECORD);
+        assert_ne!(view.Value as usize, 0);
+        let (magic, pid, window) = record_fields(view.Value as usize);
+        assert_eq!(magic.load(Ordering::Relaxed), 0, "no record was written");
+        assert_eq!(pid.load(Ordering::Relaxed), 0);
+        assert_eq!(window.load(Ordering::Relaxed), 0);
+        UnmapViewOfFile(view);
+    }
+    let other = running(acquire(&app));
+    assert_eq!(
+        other.pid(),
+        None,
+        "a launch finds no record of this instance"
+    );
+    assert_eq!(other.published_window(), None);
+
+    drop(guard);
+    destroy(hwnd);
+    // SAFETY: the handle was opened here and nothing else holds it.
+    unsafe { CloseHandle(squatter) };
+    // With the squatter's mapping gone, the next launch is the first instance, with a record.
+    let again = first(acquire(&app));
+    assert!(running(acquire(&app)).pid().is_some());
+    drop(again);
+}
+
+#[test]
 fn odd_ids_still_name_one_instance() {
     let long = "x".repeat(1000);
     for app in [
-        String::new(),
         format!("{}\\with\\backslashes", id("odd")),
         format!("{}{long}", id("long")),
         format!("{} \u{e9}\u{1f600} spaces", id("unicode")),
@@ -174,6 +252,16 @@ fn object_names_are_in_the_session_and_within_the_limit() {
     );
     assert_ne!(object_name("a", "mutex"), object_name("b", "mutex"));
     assert_ne!(object_name("a", "mutex"), object_name("a", "window"));
+    // The empty id names one object like any other id; it is tested here only, because through
+    // `acquire` it would be one instance for the whole machine, and two test runs would race.
+    assert_eq!(
+        String::from_utf16(&object_name("", "mutex")).unwrap(),
+        "Local\\mdshared-single..mutex\0"
+    );
+    assert_eq!(
+        String::from_utf16(&object_name("", "window")).unwrap(),
+        "Local\\mdshared-single..window\0"
+    );
 }
 
 #[test]
@@ -315,6 +403,7 @@ fn the_window_of_this_process_is_found_published_or_among_its_windows() {
 
 #[test]
 fn waiting_for_a_window_that_never_comes_ends_at_the_timeout() {
+    let _looking = looking();
     let app = id("wait");
     let _guard = first(acquire(&app));
     let other = running(acquire(&app));
@@ -327,6 +416,69 @@ fn waiting_for_a_window_that_never_comes_ends_at_the_timeout() {
     assert_eq!(other.wait_window(Duration::from_millis(60)), None);
     assert!(started.elapsed() >= Duration::from_millis(60));
     assert_eq!(other.wait_window(Duration::ZERO), None);
+}
+
+#[test]
+fn waiting_gives_the_window_published_late_and_not_a_visible_one_of_the_process() {
+    let _looking = looking();
+    let app = id("late");
+    // A visible window of this process, the kind looking through the process would pick, and the
+    // hidden one the first instance publishes 100 ms in.
+    let visible = shown_window();
+    let late = window();
+    let guard = first(acquire(&app));
+    let other = running(acquire(&app));
+    // SAFETY: no pointers.
+    let me = unsafe { GetCurrentProcessId() };
+    assert_eq!(
+        main_window_of(me),
+        Some(visible),
+        "the visible window is what looking through the process gives"
+    );
+    assert_ne!(other.window(), Some(late), "nothing published yet");
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            guard.publish_window(late);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            other.wait_window(Duration::from_secs(1)),
+            Some(late),
+            "the published window, not the visible one"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "it waited for the publication: {:?}",
+            started.elapsed()
+        );
+    });
+    assert_eq!(other.window(), Some(late), "and still the published one");
+    assert_eq!(other.wait_window(Duration::ZERO), Some(late));
+    destroy(late);
+    destroy(visible);
+}
+
+#[test]
+fn waiting_ends_at_once_when_the_instance_goes() {
+    let app = id("gone");
+    let guard = first(acquire(&app));
+    let other = running(acquire(&app));
+    let dropper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+    });
+    let started = Instant::now();
+    assert_eq!(other.wait_window(Duration::from_secs(10)), None);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "it waited {:?}, not the whole timeout",
+        started.elapsed()
+    );
+    dropper.join().unwrap();
+    // The instance is gone, so the next acquire is the first instance.
+    assert_eq!(other.pid(), None);
+    assert!(first(acquire(&app)).held());
 }
 
 #[test]

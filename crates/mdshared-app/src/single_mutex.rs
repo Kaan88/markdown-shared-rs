@@ -61,16 +61,23 @@
 //! has no owner and is not a tool window. winit and the input method make hidden top-level windows
 //! of their own in every process, which is why a hidden window is never picked that way.
 //!
+//! [`Running::wait_window`] waits for the published window only. A first instance that is still
+//! starting may have a window of its own up (a splash, a hidden one) that is not its main window
+//! yet, and a launch that took it would hand its command line to the wrong window and lose the
+//! hand-over. So the looking through happens once, at the deadline, for an application that never
+//! publishes a window; [`Running::window`] does it at once, for an application that asks now.
+//!
 //! # Bringing forward
 //!
-//! [`bring_forward`] restores the window if it is minimized (`ShowWindow(SW_RESTORE)`) and then
-//! calls `SetForegroundWindow`. Windows lets a process take the foreground only in some cases; the
-//! ones that matter here are: the process is the foreground process, it was started by the
-//! foreground process, or it received the last input event. A second launch from Explorer, the
-//! Start menu, a shortcut or a terminal the user typed in is started by the foreground process and
-//! may set the foreground window. One started from a background process (a scheduled task, a
-//! service, a script running unseen) may not: Windows then flashes the window's taskbar button
-//! instead, and `SetForegroundWindow` answers false.
+//! [`bring_forward`] restores the window if it is minimized (`ShowWindowAsync(SW_RESTORE)`, which
+//! asks the window's own thread to do it and returns at once, so a hung first instance cannot hang
+//! the second launch) and then calls `SetForegroundWindow`. Windows lets a process take the
+//! foreground only in some cases; the ones that matter here are: the process is the foreground
+//! process, it was started by the foreground process, or it received the last input event. A
+//! second launch from Explorer, the Start menu, a shortcut or a terminal the user typed in is
+//! started by the foreground process and may set the foreground window. One started from a
+//! background process (a scheduled task, a service, a script running unseen) may not: Windows then
+//! flashes the window's taskbar button instead, and `SetForegroundWindow` answers false.
 //!
 //! The second launch also calls `AllowSetForegroundWindow` for the first instance's process before
 //! it sends anything, which passes its right on: the first instance may then bring forward a
@@ -110,7 +117,11 @@
 //!   runs elevated every time (its manifest asks for it) never meets the case.
 //! - Protection from a squatter. A process of the same user that creates the mutex first makes
 //!   every launch think the application runs. Private namespaces with a boundary descriptor would
-//!   prevent it; an application that needs that is beyond this module.
+//!   prevent it; an application that needs that is beyond this module. The same goes for the
+//!   record: a process that makes the mapping of that name first is found by the next launch, and
+//!   a first instance that finds a mapping already there does not write into it (see
+//!   `create_record`): it keeps its mutex, publishes no window, and every launch finds the windows
+//!   of the process instead. Neither is prevented, only not made worse.
 //! - Waiting for the first instance to answer anything beyond the message: [`send`] says whether
 //!   the window procedure took the hand-over, not what the application did with it.
 //! - A listener thread or a message-only window of its own. The first instance's own window
@@ -126,23 +137,25 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     BOOL, CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
-    INVALID_HANDLE_VALUE, LPARAM,
+    INVALID_HANDLE_VALUE, LPARAM, SetLastError,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
-use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetWindow, GetWindowLongW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SMTO_ABORTIFHUNG, SW_RESTORE,
-    SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_COPYDATA, WS_EX_TOOLWINDOW,
+    SendMessageTimeoutW, SetForegroundWindow, ShowWindowAsync, WM_COPYDATA, WS_EX_TOOLWINDOW,
 };
 
 /// The most bytes a hand-over carries, both ways: 1 MiB. A Windows command line is at most 32,767
@@ -241,9 +254,14 @@ pub fn acquire(app_id: &str) -> Instance {
 }
 
 /// Makes the record of this process and maps it: (mapping, address of the view), each 0 or null
-/// when it could not be made. Writes this process's id and no window.
+/// when it could not be made, and also when a mapping of that name was already there. Writes this
+/// process's id and no window.
 fn create_record(app_id: &str) -> (HANDLE, usize) {
     let name = object_name(app_id, "window");
+    // SAFETY: `SetLastError` takes a value and has no other effect. Clearing it makes the
+    // `ERROR_ALREADY_EXISTS` read below about this call alone: `CreateFileMappingW` sets it only
+    // when the mapping existed before, and leaves the last error alone when it did not.
+    unsafe { SetLastError(0) };
     // SAFETY: a mapping backed by the paging file (`INVALID_HANDLE_VALUE`) of `RECORD` bytes,
     // named by a NUL-terminated string that outlives the call; default security.
     let mapping = unsafe {
@@ -257,6 +275,17 @@ fn create_record(app_id: &str) -> (HANDLE, usize) {
         )
     };
     if mapping.is_null() {
+        return (std::ptr::null_mut(), 0);
+    }
+    // SAFETY: `mapping` is the handle just opened.
+    let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if existed {
+        // The mapping was there before this call, so this instance did not make it: a squatter
+        // did (see the module's "Deliberately not here"). Writing the record into it would let a
+        // stranger name the window a launch hands its command line to, so the handle is closed
+        // and nothing is published; the windows of the process are looked through instead.
+        // SAFETY: the handle was opened here and nothing else holds it.
+        unsafe { CloseHandle(mapping) };
         return (std::ptr::null_mut(), 0);
     }
     // SAFETY: `mapping` is the handle just made, at least `RECORD` bytes long.
@@ -322,9 +351,14 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        // The mutex goes first, the mapping last: `wait_window` takes "no record and no mutex" for
+        // the instance having gone, so the mutex must not outlive the record.
         // SAFETY: each value is a handle or a view this guard made and nothing else releases;
         // 0 means there is none.
         unsafe {
+            if self.mutex != 0 {
+                CloseHandle(self.mutex as HANDLE);
+            }
             if self.view != 0 {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: self.view as *mut core::ffi::c_void,
@@ -332,9 +366,6 @@ impl Drop for Guard {
             }
             if self.mapping != 0 {
                 CloseHandle(self.mapping as HANDLE);
-            }
-            if self.mutex != 0 {
-                CloseHandle(self.mutex as HANDLE);
             }
         }
     }
@@ -356,7 +387,13 @@ impl Running {
             return None;
         }
         // SAFETY: `mapping` was just opened; the view is unmapped and the handle closed before
-        // returning; a view is page-aligned and the record is `RECORD` bytes.
+        // returning; a view is page-aligned and the record is `RECORD` bytes, which the three
+        // atomics fit. The memory is shared with other processes: the writer stores every field
+        // with `Relaxed` and the magic last with `Release` (`create_record`), so the reader loads
+        // the magic with `Relaxed`, and the `Acquire` fence after that load pairs with the release
+        // store: the two `Relaxed` loads after the fence cannot be moved before it, and a record
+        // whose magic reads whole has whole fields. Without the fence a relaxed read could see the
+        // new magic beside an old window.
         unsafe {
             let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, RECORD);
             let address = view.Value as usize;
@@ -364,10 +401,12 @@ impl Running {
                 None
             } else {
                 let (magic, pid, window) = record_fields(address);
-                let found = (magic.load(Ordering::Acquire) == MAGIC).then(|| {
+                let whole = magic.load(Ordering::Relaxed) == MAGIC;
+                fence(Ordering::Acquire);
+                let found = whole.then(|| {
                     (
                         pid.load(Ordering::Relaxed),
-                        window.load(Ordering::Acquire) as isize,
+                        window.load(Ordering::Relaxed) as isize,
                     )
                 });
                 UnmapViewOfFile(view);
@@ -389,29 +428,77 @@ impl Running {
     /// [`Guard::publish_window`] while that is still a window of its process, otherwise
     /// [`main_window_of`] its process. `None` when there is no process id or no such window (the
     /// first instance may not have made its window yet: see [`Running::wait_window`]).
+    ///
+    /// This is the "what is there now" question: the windows of the process are looked through at
+    /// once. A launch that waits for a first instance is better served by
+    /// [`Running::wait_window`], which takes only a published window until its deadline, so that a
+    /// window the first instance happens to have up is not taken for its main one.
     pub fn window(&self) -> Option<isize> {
-        let (pid, published) = self.record()?;
-        if published != 0 && window_pid(published) == Some(pid) {
-            return Some(published);
-        }
-        main_window_of(pid)
+        self.published_window()
+            .or_else(|| main_window_of(self.record()?.0))
     }
 
-    /// [`Running::window`], asked again every 20 ms for at most `timeout`, for a first instance
-    /// that is still starting. Blocks the calling thread; a second launch has nothing else to do.
-    /// A zero timeout asks once; one too long to be added to the time now (`Duration::MAX`)
-    /// waits until a window comes.
+    /// The window the first instance published with [`Guard::publish_window`], while it is still a
+    /// window of that process. `None` when none is published, it is gone, or there is no record.
+    /// Never looks at the other windows of the process; [`Running::window`] does that.
+    fn published_window(&self) -> Option<isize> {
+        let (pid, published) = self.record()?;
+        (published != 0 && window_pid(published) == Some(pid)).then_some(published)
+    }
+
+    /// The published window of the first instance, waited for: asked again every 20 ms for at most
+    /// `timeout`, until the window it published is there and is one of its process. Only at the
+    /// deadline are the other windows of the process looked through, once, for a first instance
+    /// that never publishes one ([`main_window_of`]).
+    ///
+    /// The difference from [`Running::window`] is the point of this function: a window the first
+    /// instance happens to have up while it is still starting (a splash, or winit's hidden ones,
+    /// which are not picked at all) is not taken for its main window, so the hand-over reaches the
+    /// window that will handle it.
+    ///
+    /// Blocks the calling thread; a second launch has nothing else to do. A zero timeout asks
+    /// once; one too long to be added to the time now (`Duration::MAX`) waits until a window
+    /// comes.
+    ///
+    /// `None` also when the instance has gone while this waited: neither its record nor its mutex
+    /// can be opened any more. Call [`acquire`] again then; if that gives [`Instance::First`], this
+    /// process is the first instance after all.
     pub fn wait_window(&self, timeout: Duration) -> Option<isize> {
         let end = Instant::now().checked_add(timeout);
         loop {
-            if let Some(window) = self.window() {
+            if let Some(window) = self.published_window() {
                 return Some(window);
             }
-            if end.is_some_and(|end| Instant::now() >= end) {
+            if self.gone() {
                 return None;
+            }
+            if end.is_some_and(|end| Instant::now() >= end) {
+                break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        main_window_of(self.record()?.0)
+    }
+
+    /// Whether the instance has gone: neither its record nor its mutex can be opened any more.
+    /// False while either can be: between taking the mutex and writing the record the first
+    /// instance has the mutex and no record, and a plain launch cannot open an elevated one's
+    /// record but can open its mutex.
+    fn gone(&self) -> bool {
+        if self.record().is_some() {
+            return false;
+        }
+        let name = object_name(&self.app_id, "mutex");
+        // SAFETY: a NUL-terminated name that outlives the call; `SYNCHRONIZE` is asked for because
+        // it is the least that opens a mutex, and only whether one is there matters. The handle is
+        // closed below when there is one.
+        let mutex = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr()) };
+        if mutex.is_null() {
+            return true;
+        }
+        // SAFETY: the handle was opened here and nothing else holds it.
+        unsafe { CloseHandle(mutex) };
+        false
     }
 }
 
@@ -496,14 +583,15 @@ pub fn bring_forward(hwnd: isize) -> bool {
     };
     let window = hwnd as HWND;
     // SAFETY: the calls take a process id and a window handle by value and fail harmlessly for
-    // ones that are gone.
+    // ones that are gone. `ShowWindowAsync` only asks the window's thread to restore it and
+    // returns at once, so a hung first instance cannot hang this launch; its answer is not used.
     unsafe {
         AllowSetForegroundWindow(pid);
         if IsWindowVisible(window) == 0 {
             return false;
         }
         if IsIconic(window) != 0 {
-            ShowWindow(window, SW_RESTORE);
+            ShowWindowAsync(window, SW_RESTORE);
         }
         SetForegroundWindow(window) != 0
     }
