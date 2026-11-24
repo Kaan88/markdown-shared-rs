@@ -435,6 +435,10 @@ mod imp {
         ) == Some(0)
     }
 
+    /// Windows is asked directly and has nothing to watch here: the application reads again on
+    /// winit's `ThemeChanged` or when its window gains the focus.
+    pub fn watch_motion_reduced(_wake: impl Fn() + Send + Sync + 'static) {}
+
     /// "Animation effects" in Settings, Accessibility, Visual effects (before Windows 11:
     /// "Show animations in Windows"), which is `SPI_GETCLIENTAREAANIMATION`: whether a window
     /// animates what is inside it. Off means less motion is asked for. A call that fails says
@@ -837,33 +841,94 @@ mod imp {
     pub fn motion_reduced() -> bool {
         objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
     }
-    /// The desktop's wish for less motion from the settings portal, cached for a second.
+    /// macOS is asked directly and has nothing to watch here: the application reads again on
+    /// winit's `ThemeChanged` or when its window gains the focus.
+    #[cfg(target_os = "macos")]
+    pub fn watch_motion_reduced(_wake: impl Fn() + Send + Sync + 'static) {}
+
+    /// What the settings portal last said about motion, kept between calls.
+    #[cfg(not(target_os = "macos"))]
+    static MOTION: LastGood = LastGood::new();
+
+    /// The least time between two readings of the portal that [`motion_reduced`] starts.
+    #[cfg(not(target_os = "macos"))]
+    const MOTION_EVERY: Duration = Duration::from_secs(1);
+
+    /// The desktop's wish for less motion, as the settings portal last said it. It never waits
+    /// for the portal: it gives the last answer at once (false until there has been one) and,
+    /// at most once a second, starts a helper thread that asks again. A portal that is slow,
+    /// hung or absent costs the caller nothing and leaves the last answer standing.
     #[cfg(not(target_os = "macos"))]
     pub fn motion_reduced() -> bool {
-        use std::sync::Mutex;
         use std::time::Instant;
-        static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, reduced)) = *cache
-            && at.elapsed() < Duration::from_secs(1)
-        {
-            return reduced;
+        if MOTION.claim_reading(Instant::now(), MOTION_EVERY) {
+            let spawned = std::thread::Builder::new()
+                .name("mdshared-motion".into())
+                .spawn(read_and_watch_motion);
+            if spawned.is_err() {
+                MOTION.reading_done(Instant::now());
+            }
         }
-        let reduced = portal_reduces_motion(Duration::from_millis(500));
-        *cache = Some((Instant::now(), reduced));
-        reduced
+        MOTION.get()
     }
 
-    /// Asks the settings portal whether less motion is wanted, on a helper thread, giving up
-    /// after `timeout` as [`portal_prefers_dark`] does. False on any failure.
     #[cfg(not(target_os = "macos"))]
-    pub(super) fn portal_reduces_motion(timeout: Duration) -> bool {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("mdshared-portal".into())
-            .spawn(move || _ = tx.send(read_reduced_motion()));
-        spawned.is_ok() && rx.recv_timeout(timeout).ok().flatten() == Some(true)
+    pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
+        MOTION.set_wake(std::sync::Arc::new(wake));
     }
+
+    /// The body of the helper thread: one reading of the portal, and then, if no other thread
+    /// is doing so already, listening for the portal's `SettingChanged` signal for as long as
+    /// the bus is there, reading again at each change. Every answer goes to [`MOTION`]; no
+    /// answer (no bus, no portal, an error) leaves the last one standing.
+    #[cfg(not(target_os = "macos"))]
+    fn read_and_watch_motion() {
+        use std::time::Instant;
+        use zbus::zvariant::OwnedValue;
+        let bus = zbus::blocking::Connection::session().ok();
+        // The one thread that listens subscribes before it reads, so that a change between the
+        // reading and the subscription is not lost.
+        let watching = bus.is_some() && MOTION.claim_watching();
+        let signals = bus.as_ref().filter(|_| watching).and_then(|bus| {
+            zbus::blocking::Proxy::new(
+                bus,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+            )
+            .and_then(|portal| portal.receive_signal("SettingChanged"))
+            .ok()
+        });
+        MOTION.answer(bus.as_ref().and_then(read_reduced_motion));
+        MOTION.reading_done(Instant::now());
+        if let (Some(bus), Some(signals)) = (&bus, signals) {
+            for change in signals {
+                // The signal carries the namespace, the key and the new value. Only the three
+                // namespaces read below matter; a signal that cannot be read is taken to.
+                let ours = change
+                    .body()
+                    .deserialize::<(String, String, OwnedValue)>()
+                    .map_or(true, |(namespace, _, _)| {
+                        MOTION_NAMESPACES.contains(&namespace.as_str())
+                    });
+                if ours {
+                    MOTION.answer(read_reduced_motion(bus));
+                }
+            }
+        }
+        if watching {
+            // The bus went away, or the portal has no signal: a later reading listens again.
+            MOTION.watching_done();
+        }
+    }
+
+    /// The namespaces of the settings portal that [`read_reduced_motion`] reads.
+    #[cfg(not(target_os = "macos"))]
+    const MOTION_NAMESPACES: [&str; 3] = [
+        "org.freedesktop.appearance",
+        "org.gnome.desktop.interface",
+        "org.kde.kdeglobals.KDE",
+    ];
 
     /// The first of these the portal answers:
     ///
@@ -874,18 +939,20 @@ mod imp {
     ///    pass on;
     /// 3. `org.kde.kdeglobals.KDE` `AnimationDurationFactor` (Plasma's System Settings,
     ///    "Animation speed"; 0 is its "instant" end), which the KDE portal passes on.
+    ///
+    /// `None` when the portal answers none of them: there is then no new answer, and the last
+    /// one is kept.
     #[cfg(not(target_os = "macos"))]
-    fn read_reduced_motion() -> Option<bool> {
+    fn read_reduced_motion(bus: &zbus::blocking::Connection) -> Option<bool> {
         use zbus::zvariant::Value;
-        let bus = zbus::blocking::Connection::session().ok()?;
-        let wish = read_setting(&bus, "org.freedesktop.appearance", "reduced-motion", |v| {
+        let wish = read_setting(bus, "org.freedesktop.appearance", "reduced-motion", |v| {
             u32::try_from(v).ok()
         });
         if let Some(wish) = wish {
             return Some(wish == 1);
         }
         let animations = read_setting(
-            &bus,
+            bus,
             "org.gnome.desktop.interface",
             "enable-animations",
             |v| bool::try_from(v).ok(),
@@ -895,7 +962,7 @@ mod imp {
         }
         // KDE stores its settings as text; a portal may also hand the number over as one.
         let factor = read_setting(
-            &bus,
+            bus,
             "org.kde.kdeglobals.KDE",
             "AnimationDurationFactor",
             |v| match v {
@@ -1008,10 +1075,137 @@ pub fn reveal_in_file_manager(path: &Path) -> bool {
 ///   (`SPI_GETCLIENTAREAANIMATION`).
 /// - macOS: System Settings, Accessibility, Display, "Reduce motion".
 /// - Linux: the settings portal, asked for its own `reduced-motion` key, then GNOME's
-///   `enable-animations`, then Plasma's animation speed at "instant"; cached for a second and
-///   given half a second to answer. Without a portal the answer is false.
+///   `enable-animations`, then Plasma's animation speed at "instant". Without a portal the
+///   answer is false.
+///
+/// It never blocks. On Windows and macOS the system answers at once. On Linux the portal is
+/// another process that may be slow, hung or not there, so it is asked on a helper thread and
+/// this call gives the last answer it gave (false before the first one), taking only a lock
+/// for a moment. Each call starts a new reading, at most once a second, and the first reading
+/// stays to listen for the portal's `SettingChanged` signal, so a change of the setting is
+/// read when it is made. A reading that fails or never ends leaves the last answer standing:
+/// a setting that was on is not taken for off because the portal did not answer in time.
+///
+/// Because the first call on Linux comes before the first answer, an application that wants
+/// the right value from its first frame gives [`watch_motion_reduced`] a wake and reads again
+/// when woken.
 pub fn motion_reduced() -> bool {
     imp::motion_reduced()
+}
+
+/// Has `wake` called whenever the answer of [`motion_reduced`] changes behind the
+/// application's back, which is on Linux only: when the helper thread's first reading of the
+/// settings portal differs from false, and when the user changes the setting. `wake` runs on
+/// that helper thread, so it must only wake the application's loop (send a user event through
+/// winit's `EventLoopProxy`); the loop then calls [`motion_reduced`] and passes the answer to
+/// its animators. Like the wake of a [`Job`](mdshared_app::job), nothing here looks at what it
+/// does. A second call replaces the wake of the first.
+///
+/// On Windows and macOS nothing changes behind the application's back (the system tells the
+/// window, and the application reads again then), so the wake is dropped and never called.
+pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
+    imp::watch_motion_reduced(wake)
+}
+
+/// An answer from a service that may be slow or absent, kept between askings: the last good
+/// answer, who is asking now, and whom to wake when it changes. The part of the Linux
+/// [`motion_reduced`] that is plain logic, apart from the bus so that it is tested on every
+/// system. Time comes in as an argument.
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+struct LastGood {
+    held: std::sync::Mutex<Held>,
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+struct Held {
+    /// The last answer; false until there is one.
+    value: bool,
+    /// A reading is under way.
+    reading: bool,
+    /// When the last reading ended.
+    read_at: Option<std::time::Instant>,
+    /// A thread is listening for changes.
+    watching: bool,
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+impl LastGood {
+    const fn new() -> LastGood {
+        LastGood {
+            held: std::sync::Mutex::new(Held {
+                value: false,
+                reading: false,
+                read_at: None,
+                watching: false,
+                wake: None,
+            }),
+        }
+    }
+
+    /// The lock, also after a thread panicked while holding it: the state is a few plain
+    /// values, all of them valid whatever was half done.
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The last answer.
+    fn get(&self) -> bool {
+        self.held().value
+    }
+
+    /// Takes an answer. `None` (the service did not answer) changes nothing: the last answer
+    /// stands. An answer that differs from the last one calls the wake, after the lock is let
+    /// go, so a wake that reads the value at once does not wait on itself.
+    fn answer(&self, answer: Option<bool>) {
+        let wake = {
+            let mut held = self.held();
+            match answer {
+                Some(value) if value != held.value => {
+                    held.value = value;
+                    held.wake.clone()
+                }
+                _ => None,
+            }
+        };
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    /// Whether the caller should start a reading now: none is under way, and the last one
+    /// ended at least `every` ago (or there was none). When true, the reading is the
+    /// caller's, and it says [`reading_done`](Self::reading_done) when it ends. A reading that
+    /// never ends is never followed by another: one stuck thread, not one a call.
+    fn claim_reading(&self, now: std::time::Instant, every: Duration) -> bool {
+        let mut held = self.held();
+        let due = held
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every);
+        let claim = !held.reading && due;
+        held.reading |= claim;
+        claim
+    }
+
+    fn reading_done(&self, now: std::time::Instant) {
+        let mut held = self.held();
+        held.reading = false;
+        held.read_at = Some(now);
+    }
+
+    /// Whether the caller should listen for changes: no thread does. When true the listening
+    /// is the caller's, and it says [`watching_done`](Self::watching_done) if it ever stops.
+    fn claim_watching(&self) -> bool {
+        !std::mem::replace(&mut self.held().watching, true)
+    }
+
+    fn watching_done(&self) {
+        self.held().watching = false;
+    }
+
+    fn set_wake(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.held().wake = Some(wake);
+    }
 }
 
 /// Whether the system asks for less motion (macOS: Accessibility, Display, Reduce motion), so
@@ -1116,30 +1310,147 @@ pub fn set_backdrop(hwnd: isize, backdrop: Backdrop) -> bool {
 mod motion_tests {
     use super::*;
 
-    /// The system is asked, answers, and answers the same when asked again at once. What it
-    /// answers depends on the machine the test runs on, so only that is held.
+    /// The system is asked and answers. What it answers depends on the machine the test runs
+    /// on, so only that it answers is held; on Windows and macOS, where the system itself is
+    /// asked, also that it answers the same when asked again at once. (On Linux the helper
+    /// thread's first answer may come between the two calls.)
     #[test]
     fn the_wish_for_less_motion_is_read_without_failing() {
         let reduced = motion_reduced();
         println!("the system asks for less motion: {reduced}");
-        assert_eq!(motion_reduced(), reduced);
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(motion_reduced(), reduced);
+        }
         // The older call is what it was: macOS's answer, and false elsewhere.
         if !cfg!(target_os = "macos") {
             assert!(!reduces_motion());
         }
     }
 
-    /// The portal read never hangs: false on any failure, within its time limit.
-    #[cfg(all(not(windows), not(target_os = "macos")))]
+    /// The call does not wait for the portal: asked on a thread of its own, many times over, it
+    /// has answered long before a portal's time limit could run out even once. Whether a
+    /// portal is there or not, and whatever it says.
     #[test]
-    fn the_portal_answer_about_motion_comes_within_the_time_limit() {
+    fn asking_for_the_wish_never_waits_for_the_system() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                motion_reduced();
+            }
+            _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("two hundred calls took longer than twenty seconds: the call waits");
+    }
+
+    /// A wake can be set on every system, and setting it calls nothing by itself on the two
+    /// where nothing changes behind the application's back.
+    #[test]
+    fn a_wake_for_the_wish_can_be_set_and_replaced() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..2 {
+            let calls = calls.clone();
+            watch_motion_reduced(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        if cfg!(any(windows, target_os = "macos")) {
+            motion_reduced();
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn the_last_good_answer_stands_when_the_service_does_not_answer() {
+        let last = LastGood::new();
+        assert!(!last.get(), "false before any answer");
+        last.answer(None);
+        assert!(!last.get());
+        last.answer(Some(true));
+        assert!(last.get());
+        // A reading that failed or timed out is no answer: the setting that was on stays on.
+        for _ in 0..3 {
+            last.answer(None);
+            assert!(last.get(), "a failed reading must not switch the wish off");
+        }
+        last.answer(Some(false));
+        assert!(!last.get());
+        last.answer(None);
+        assert!(!last.get());
+    }
+
+    #[test]
+    fn a_wake_is_called_when_the_answer_changes_and_only_then() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let last = Arc::new(LastGood::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        // The wake reads the value at once, as an application woken by it will: it must not
+        // wait on the lock the answer was stored under.
+        let (reader, count) = (last.clone(), seen.clone());
+        last.set_wake(Arc::new(move || {
+            count.fetch_add(if reader.get() { 100 } else { 1 }, Ordering::SeqCst);
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = last.clone();
+        std::thread::spawn(move || {
+            worker.answer(Some(false)); // as it was: no wake
+            worker.answer(None); // no answer: no wake
+            worker.answer(Some(true)); // changed: woken, and the wake reads true
+            worker.answer(Some(true)); // the same again: no wake
+            worker.answer(None);
+            worker.answer(Some(false)); // changed back: woken, and the wake reads false
+            _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the wake waited on the lock of the answer it was called for");
+        assert_eq!(seen.load(Ordering::SeqCst), 101);
+        // A second wake replaces the first.
+        let count = seen.clone();
+        last.set_wake(Arc::new(move || {
+            count.fetch_add(10_000, Ordering::SeqCst);
+        }));
+        last.answer(Some(true));
+        assert_eq!(seen.load(Ordering::SeqCst), 10_101);
+        // Without a wake an answer is just kept.
+        let quiet = LastGood::new();
+        quiet.answer(Some(true));
+        assert!(quiet.get());
+    }
+
+    #[test]
+    fn one_reading_at_a_time_no_more_than_one_an_interval_and_one_listener() {
+        let every = Duration::from_secs(1);
         let start = std::time::Instant::now();
-        let reduced = imp::portal_reduces_motion(Duration::from_millis(500));
-        println!(
-            "portal asks for less motion: {reduced}, in {:?}",
-            start.elapsed()
-        );
-        assert!(start.elapsed() < Duration::from_millis(900));
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let last = LastGood::new();
+        // The first call reads; while that reading is under way no other is started, however
+        // long it takes (a hung portal is one stuck thread, not one a call).
+        assert!(last.claim_reading(at(0), every));
+        for ms in [0, 10, 5_000, 3_600_000] {
+            assert!(
+                !last.claim_reading(at(ms), every),
+                "a second reading at {ms} ms"
+            );
+        }
+        // It ended: the next is due an interval after its end, not before.
+        last.reading_done(at(400));
+        assert!(!last.claim_reading(at(400), every));
+        assert!(!last.claim_reading(at(1_399), every));
+        assert!(last.claim_reading(at(1_400), every));
+        assert!(!last.claim_reading(at(9_000), every));
+        last.reading_done(at(1_450));
+        // A clock that reads earlier than the last reading's end starts nothing.
+        assert!(!last.claim_reading(at(100), every));
+        assert!(last.claim_reading(at(2_450), every));
+        // One listener: the first to ask is it, until it says it stopped.
+        assert!(last.claim_watching());
+        assert!(!last.claim_watching());
+        assert!(!last.claim_watching());
+        last.watching_done();
+        assert!(last.claim_watching());
+        // None of this touched the answer.
+        assert!(!last.get());
     }
 }
 
