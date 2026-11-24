@@ -451,3 +451,57 @@ A review against parley 0.12.0 found faults, fixed in a second commit (`paragrap
 - `draw` gives a selected empty line a highlight as wide as a space, and places the highlight
   from the rounded corner of the area as the glyphs are, so they agree at a fractional x.
   Select all is disabled on empty text.
+
+## The window host for one window (`mdshared_ui::host`, feature `host`, roadmap W1 at Purge's scope)
+
+`host::run(Config, app)` owns the winit loop, the softbuffer surface, the bitmap, the `Gfx` and
+the window's one `Animator`; the application implements `host::App` (`start`, `event`, `draw`,
+`message`, and with `a11y` on Windows `accessibility`) and keeps its models. Nothing is called
+back into a widget. The application asks for things through the `Cx` each call is given.
+
+- **Events** are winit's reduced to logical px: pointer move and leave, press (with a click
+  count) and release, wheel (a notch is `WHEEL_LINE` = 48 px, Shift turns it sideways by
+  `viewport::wheel_delta`), key presses as `keys::KeyName` with the modifiers and the typed text,
+  input-method text and composition, modifiers, focus, scale, resize, theme, the close request,
+  `Wake` for a timer, and `Action` for an assistive technology. `Event` is `non_exhaustive`.
+- **Damage:** `Cx::request_redraw(rect)` rectangles are joined into one; the frame draws that
+  rectangle (the painter is clipped to it) and presents only it with `present_with_damage`
+  (the whole buffer when its age is not 1). Resize, scale, the backdrop switching and the
+  window being seen again after `Occluded` repaint everything. A covered window is not drawn.
+- **One wake-up:** the animator's `end_frame` deadline (a caret's `blink_caret`, anything in
+  motion) and the application's `Cx::wake_at` timer fold into one `WaitUntil`; with neither the
+  loop waits. At the animator's deadline the host redraws what the frame said was moving
+  (`Cx::animating`), else the whole window; at the timer the application gets `Event::Wake`.
+- **Workers** send with `Proxy::send` (from `Cx::proxy`), which is `EventLoopProxy` underneath.
+- **The window:** undecorated, a minimum size, the system shadow on Windows, the dark title-bar
+  mode and corners from the config; the 8 px edge band of a restored window resizes it
+  (`window::edge_at`, `drag_resize_window`) with the resize cursors; the title row is the
+  application's (`Cx::drag_window`, `title_double_click`, `toggle_maximize`, `minimize`);
+  snap layouts by `Cx::set_maximize_button`, re-sent after a change of scale.
+- **Backdrop:** `Cx::set_backdrop(Backdrop::Mica, &pal)` runs `frost::Frost` (so
+  `platform::set_backdrop`), refused when the system shows none, high contrast included
+  (`platform::backdrop_available`); `Cx::frost(p, rect)` marks chrome for it within the damage.
+  A TODO names `tokens::allowed_backdrop` (branch `wk/hc`), not on this base.
+- **First frame:** created hidden, drawn and presented, shown, presented again. mdview's rules;
+  no DWM cloak, as mdview uses none.
+- **Accessibility** (`host,a11y`, Windows): `accesskit_winit::Adapter::with_mixed_handlers` before
+  the window is shown; the latest tree is kept for the activation handler, as `purge_shape` does;
+  the tree is asked again after every call that asked for a redraw or `accessibility_changed`.
+  The `a11y` feature's Cargo lines (AccessKit 0.25.2, accesskit_winit 0.34.2) and lock change were
+  copied from `wk/spike`; softbuffer 0.4.8, already in the lock, became an optional dependency.
+
+Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and
+corners, macOS specifics, key releases, regions with their own damage.
+
+Run: 28 unit tests of the pure parts (the damage join against a plain min and max over random
+rectangles, the outward device rounding against fine sampling, the folding of an animation's or
+a blinking caret's deadline with a timer, the click count, the reduction of positions, buttons
+and wheels, the copy into the buffer, nonsense input). The example `examples/host.rs` (a title
+row over Mica, a button with a tooltip after 600 ms, a blinking field, a worker ticking every
+second) was compiled and run headless on Windows for 5 seconds with `--seconds 5`: it printed the
+full first frame, then frames of only the footer (24,180 600x24) on each tick and only the field
+(24,128 320x32) on each caret change, and closed itself on the timer after 5.0 s. With
+`host,a11y`, a UI Automation script found the window (framework `mdshared-ui`), the button by
+AutomationId `Hello` and the field as an Edit, and its Invoke reached the app as a Click. **Not
+seen by a person**: the look, Mica and frost, the drag, resize and snap, the tooltip (no pointer
+rested on it), the white-flash rule. Linux and macOS were only type-checked.

@@ -6,8 +6,9 @@
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), animation ([`anim`]), and with the feature `a11y` an accessibility tree
-//! built from the same models (`a11y`). No window loop; the application owns that.
-//! `docs/CATALOGUE.md` lists every module with its entry points.
+//! built from the same models (`a11y`). No window loop; the application owns that, or hands it
+//! for one window to `host` (feature `host`). `docs/CATALOGUE.md` lists every module with its
+//! entry points.
 
 #[cfg(feature = "a11y")]
 pub mod a11y;
@@ -29,6 +30,8 @@ pub mod frost;
 pub mod gfx;
 pub mod glyph;
 pub mod grid;
+#[cfg(feature = "host")]
+pub mod host;
 pub mod infobar;
 pub mod keys;
 pub mod knob;

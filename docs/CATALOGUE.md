@@ -130,6 +130,7 @@ The only modules that call the system. Each fails soft where the system lacks th
 | `platform::recycle` (feature `recycle`) | Moving files to the Recycle Bin or Trash | `recycle`, `recycle_refusal`, `open_recycle_bin` |
 | `corners`, `shadow`, `blur`, `frost` | Rounded window corners; the drop shadow of an undecorated window (Linux routes in LINUX.md); blur behind the window on KDE; a system backdrop behind the chrome | `corners::set_window_corners`, `shadow::Shadow::attach`, `blur::set`, `frost::Frost` |
 | `snap` | The Windows 11 snap-layouts flyout over a hand-drawn maximize button | `set_maximize_button_rect` |
+| `host` (feature `host`) | The winit loop, softbuffer present and timers of ONE undecorated window: winit's events reduced to logical px, damage-only presents, one wake-up for the animator and the app's timers, the hidden first frame, Mica and frost, resize edges and snap; with `a11y` on Windows the AccessKit adapter (provisional) | `host::run(Config, app)`, `trait App { type Message; start, event, draw, message, accessibility }`, `Event`, `Cx::{request_redraw, animating, wake_at, set_cursor, anim, proxy, drag_window, set_maximize_button, set_backdrop, frost, exit}`, `Proxy::send`, `Config::new(..).size(..).min_size(..)`, `access_rect` |
 | `place` | Putting a window on a half of the screen (the two Markdown applications side by side) | `halves`, `work_area`, `set` |
 | `desktop_entry` | The desktop entry and icon of an AppImage | `ensure`, `Spec` |
 | `open_documents` | Files macOS asks a running application to open | `on_open` |
@@ -174,8 +175,8 @@ the kitty keyboard protocol, images).
 
 ## What an application still writes itself
 
-The window loop (winit events, softbuffer present, damage, timers), focus between widgets,
-drag and drop, and everything listed in [ROADMAP.md](ROADMAP.md). A typical frame:
+The window loop (winit events, softbuffer present, damage, timers), unless one window is
+enough and `host` runs it, focus between widgets, drag and drop, and everything listed in [ROADMAP.md](ROADMAP.md). A typical frame:
 
 ```rust
 anim.begin_frame(clock.now());

@@ -17,7 +17,8 @@ panel), and next a music player, a file manager and a terminal emulator.
 
 The toolkit draws everything itself. There is no native widget and no GPU: a software painter
 (`mdshared_ui::gfx::Painter`) draws a whole frame into a `Bitmap` of BGRA bytes, which the
-application shows with softbuffer. **There is no window loop here.** Each application owns its
+application shows with softbuffer. **There is no window loop here**, except the opt-in window
+host `mdshared_ui::host` (feature `host`, one window). Each application owns its
 winit 0.30 loop, redraws only on events (`ControlFlow::Wait` / `WaitUntil`), and calls into
 these crates for geometry, state and drawing. An idle window does no work; keep it so.
 
