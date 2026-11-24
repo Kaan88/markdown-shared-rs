@@ -96,6 +96,15 @@ Pure arithmetic and state; none of them draws.
 | `commands` | An application's command table with the user's own keys over it | `Command::new(id, name, title).keys().group()`, `Keymap::new(&TABLE)`, `lookup(key, mods)`, `hint(id)`, `bind`/`unbind`/`reset`, `conflicts`, `entries` (for the palette), `write`/`read` (settings) |
 | `cf_html` | The Windows clipboard's HTML format, as pure byte arithmetic | `cf_html`, `fragment` |
 
+## Accessibility (`mdshared-ui`, feature `a11y`)
+
+A model like the others: it builds AccessKit nodes from the widgets' models and calls nothing of
+the system. The window's adapter (`accesskit_winit`, Windows only so far) is the application's.
+
+| Module | For | Start at |
+|---|---|---|
+| `a11y` (feature `a11y`) | An AccessKit tree built from the models that draw, for UI Automation: stable ids from author ids (UIA's AutomationId), updates that send only the nodes that changed and only those the root reaches, node helpers for the widgets, a list that puts every row in the tree keyed by its item, scrolls by its transform and gives bounds only to what is in view, a plain list of a group's items with their place in the set. The tree builds on every system (provisional; driven by `tests/uia/purge_shape.ps1`, not yet tried with Narrator) | `id(author)`, `item_id(list, key)`, `Tree::new` / `begin` / `add` / `get_mut` / `end(focus)` / `full`, `request -> Request`; `window`, `group`, `button`, `link`, `check_box`, `switch`, `combo_box`, `expander`, `progress`, `text`, `text_input`, `tab_list`, `tab`, `dialog`; `List`, `Row`, `list`, `RowIndex`, `key_of`; `Item`, `plain_list` |
+
 ## Animation (`mdshared-ui::anim`)
 
 Full account: [ANIMATION.md](ANIMATION.md).
@@ -123,7 +132,6 @@ The only modules that call the system. Each fails soft where the system lacks th
 | `place` | Putting a window on a half of the screen (the two Markdown applications side by side) | `halves`, `work_area`, `set` |
 | `desktop_entry` | The desktop entry and icon of an AppImage | `ensure`, `Spec` |
 | `open_documents` | Files macOS asks a running application to open | `on_open` |
-| `a11y` (feature `a11y`) | An AccessKit tree built from the models that draw, for UI Automation (Windows only so far): stable ids from author ids (UIA's AutomationId), updates that send only the nodes that changed, node helpers for the widgets, a list that puts every row in the tree and scrolls by its transform (provisional; driven by `tests/uia/purge_shape.ps1`, not yet tried with Narrator) | `id(author)`, `item_id`, `Tree::new` / `begin` / `add` / `end(focus)` / `full`, `request -> Request`; `window`, `group`, `button`, `link`, `check_box`, `switch`, `combo_box`, `expander`, `progress`, `text`, `text_input`, `tab_list`, `tab`, `dialog`; `List`, `list`, `RowIndex` |
 
 ## Application plumbing (`mdshared-app`, `mdshared-fetch`)
 

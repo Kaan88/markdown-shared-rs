@@ -1,19 +1,30 @@
 //! The shape of Purge's window, the consumer that lets the Purge pieces reach `main` (roadmap,
-//! "Purge (fast track)"): `cargo run -p mdshared-ui --features a11y --example purge_shape`.
+//! "Purge (fast track)"): `cargo run --release -p mdshared-ui --features a11y --example
+//! purge_shape`.
 //!
 //! It holds what Purge's main window holds, drawn with the toolkit and exposed to UI Automation
 //! through [`mdshared_ui::a11y`]:
 //! - a 2,000-row multi-select list with a column header (`ProgramList`, rows `Row0`..`Row1999`),
-//!   only its visible rows drawn, every row in the accessibility tree;
-//! - a search field (`SearchBox`, Ctrl+F) that filters the list;
-//! - a grouped list whose groups open and close (`LeftoverPane`, headers `GroupHeader0`..);
+//!   only its visible rows drawn, every row in the accessibility tree, each keyed by its program
+//!   so that its id and AutomationId stay with the program whatever the search shows;
+//! - a search field (`SearchBox`, Ctrl+F) that filters the list. The selection is kept by
+//!   program: a program the search hides leaves the selection, the others stay selected (so
+//!   Uninstall never acts on a program the list does not show);
+//! - a grouped list whose groups open and close (`LeftoverPane`, headers `GroupHeader0`.., each
+//!   group's items in a list `LeftoverList0`.., items `Leftover0_0`..);
 //! - a modal dialog (`ConfirmDialog`, buttons `ConfirmYes` and `ConfirmNo`) that Uninstall opens;
+//!   while it is open the rest of the window is hidden from UIA;
 //! - a progress bar (`SelectedProgress`), a check box (`ShowComponents`) and a footer
-//!   (`FooterCount`) a test reads back.
+//!   (`FooterCount`, read back as its Name) a test reads back.
+//!
+//! A row takes UIA's SelectionItem `Select` as "this row only"; `Select` on a selected row keeps
+//! it. `AddToSelection` and `RemoveFromSelection` reach the window as the same click and are not
+//! supported ([`mdshared_ui::a11y`]).
 //!
 //! `tests/uia/purge_shape.ps1` drives it with UIA, the way Purge's VM rig drives its WinUI
 //! window. Each request the window receives from UIA is printed on stdout, and so is the time to
-//! the first frame (check C1; `--first-frame` exits after it). The example grows with each Purge piece as it lands.
+//! the first frame (`--first-frame` exits after it). The example grows with each Purge piece as
+//! it lands.
 
 #[cfg(not(windows))]
 fn main() {
@@ -32,8 +43,8 @@ mod shape {
     use std::sync::{Arc, Mutex};
 
     use mdshared_text::bitmap::Bitmap;
-    use mdshared_ui::a11y::accesskit::{ActivationHandler, Node, NodeId, Role, TreeUpdate};
-    use mdshared_ui::a11y::{self, List, Request, RowIndex, Tree};
+    use mdshared_ui::a11y::accesskit::{ActivationHandler, NodeId, TreeUpdate};
+    use mdshared_ui::a11y::{self, Item, List, Request, Row, RowIndex, Tree};
     use mdshared_ui::check::{Tick, draw_tick};
     use mdshared_ui::gfx::{Face, Gfx, Painter, Rect};
     use mdshared_ui::keys::{KeyName, Mods, key_name};
@@ -104,7 +115,7 @@ mod shape {
                 dialog: a11y::id("ConfirmDialog"),
                 yes: a11y::id("ConfirmYes"),
                 no: a11y::id("ConfirmNo"),
-                rows: RowIndex::new("ProgramList", COUNT),
+                rows: RowIndex::new("ProgramList", 0..COUNT),
             }
         }
 
@@ -116,13 +127,31 @@ mod shape {
             a11y::id(&format!("GroupHeader{g}"))
         }
 
-        fn item(g: usize, r: usize) -> NodeId {
-            a11y::id(&format!("Leftover{g}_{r}"))
-        }
-
         fn header_of(&self, node: NodeId) -> Option<usize> {
             (0..GROUPS.len()).find(|g| Ids::header(*g) == node)
         }
+
+        /// The window's children other than the dialog, hidden while it is open.
+        fn main(&self) -> [NodeId; 7] {
+            [
+                self.button,
+                self.check,
+                self.search,
+                self.progress,
+                self.list,
+                self.pane,
+                self.footer,
+            ]
+        }
+    }
+
+    /// The part of `r` inside `area`, if any: the bounds of a pane's entry, so that one scrolled
+    /// out of the pane cannot take the hits meant for what is drawn where it would be (see
+    /// `a11y` on bounds).
+    fn clip(r: Rect, area: Rect) -> Option<Rect> {
+        let (x0, y0) = (r.x.max(area.x), r.y.max(area.y));
+        let (x1, y1) = (r.right().min(area.right()), r.bottom().min(area.bottom()));
+        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
     }
 
     /// The window's model: everything drawn and everything in the accessibility tree comes
@@ -131,9 +160,10 @@ mod shape {
         size: (f32, f32),
         scale: f32,
         scroll: f32,
-        /// The programs the search shows, by index into all of them.
+        /// The programs the search shows, by index into all of them, in order. A program's
+        /// index is its row's key in the accessibility tree.
         shown: Vec<usize>,
-        /// Over `shown`'s positions.
+        /// Over `shown`'s positions; [`refilter`](Self::refilter) carries it over by program.
         sel: Selection,
         search: TextField,
         leftovers: Sections,
@@ -231,6 +261,10 @@ mod shape {
         fn fraction(&self) -> f32 {
             (self.sel.len() as f32 / COUNT as f32).clamp(0.0, 1.0)
         }
+        /// The dialog's text under its title; also its description in the tree.
+        fn dialog_body(&self) -> String {
+            format!("{} programs will be removed.", self.sel.len())
+        }
         fn footer(&self) -> String {
             format!(
                 "{} selected, {} shown, uninstall pressed {} times, uninstalled {}, components {}",
@@ -242,17 +276,36 @@ mod shape {
             )
         }
 
+        /// Shows the programs whose name holds the search text. The selection, the cursor and the
+        /// anchor stay on their programs where those are still shown; a program the search hides
+        /// leaves the selection (and does not come back when it is shown again).
         fn refilter(&mut self) {
             let q = self.search.text().to_lowercase();
+            let old = std::mem::take(&mut self.shown);
             self.shown = (0..COUNT)
                 .filter(|i| q.is_empty() || name(*i).to_lowercase().contains(&q))
                 .collect();
-            self.sel = Selection::default();
+            let shown = &self.shown;
+            self.sel
+                .remap(|at| old.get(at).and_then(|p| shown.binary_search(p).ok()));
             self.scroll = 0.0;
+            if let Some(c) = self.sel.cursor() {
+                self.reveal(c);
+            }
         }
 
         fn reveal(&mut self, i: usize) {
             self.scroll = self.rows().reveal(i);
+        }
+
+        /// Moves the keyboard to `f`, scrolling a group header into the pane when it is out.
+        fn set_focus(&mut self, f: Focus) {
+            self.focus = f;
+            if let Focus::Group(g) = f
+                && let Some(hi) = self.leftovers.index(Entry::Heading(g))
+            {
+                self.leftovers.scroll = self.leftovers.reveal(hi);
+            }
         }
 
         fn press_uninstall(&mut self) {
@@ -272,7 +325,7 @@ mod shape {
         fn toggle_group(&mut self, g: usize) {
             self.leftovers.toggle(g);
             self.layout();
-            self.focus = Focus::Group(g);
+            self.set_focus(Focus::Group(g));
         }
 
         fn focus_node(&self, ids: &Ids) -> NodeId {
@@ -280,9 +333,9 @@ mod shape {
                 Focus::Button => ids.button,
                 Focus::Check => ids.check,
                 Focus::Search => ids.search,
-                Focus::List => match self.sel.cursor() {
-                    Some(i) if i < self.shown.len() => a11y::item_id(ids.list, i),
-                    _ => ids.list,
+                Focus::List => match self.sel.cursor().and_then(|i| self.shown.get(i)) {
+                    Some(p) => a11y::item_id(ids.list, *p),
+                    None => ids.list,
                 },
                 Focus::Group(g) => Ids::header(g),
                 Focus::Yes => ids.yes,
@@ -337,11 +390,19 @@ mod shape {
             };
             let list = a11y::list(tree, &l, |i| {
                 let p = self.shown[i];
-                (name(p), format!("Row{p}"), self.sel.contains(i))
+                Row {
+                    key: p,
+                    label: name(p),
+                    author: format!("Row{p}"),
+                    selected: self.sel.contains(i),
+                }
             });
 
             // The leftovers: a pane of groups, each a header that opens and closes (UIA
-            // ExpandCollapse) and, while open, its items.
+            // ExpandCollapse) and, while open, a list of its items. The group has no name of its
+            // own: the header names it, and a reader would otherwise say "Files" twice. The list
+            // says what the items are ("Leftover files, list"), and carries the set's size each
+            // item's "2 of 6" needs.
             let area = self.pane_area();
             let mut groups = Vec::new();
             for (g, title) in GROUPS.iter().enumerate() {
@@ -351,31 +412,50 @@ mod shape {
                 let open = !self.leftovers.is_collapsed(g);
                 let header_rect = self.leftovers.rect(area, hi);
                 let header_author = format!("GroupHeader{g}");
-                tree.add(
-                    Ids::header(g),
-                    a11y::expander(title, &header_author, header_rect, open),
-                );
-                let mut children = vec![Ids::header(g)];
-                if open {
-                    for r in 0..ITEMS {
-                        let Some(ei) = self.leftovers.index(Entry::Row { group: g, row: r }) else {
-                            continue;
-                        };
-                        let mut n = Node::new(Role::ListItem);
-                        n.set_label(format!("{title} {}", r + 1));
-                        n.set_author_id(format!("Leftover{g}_{r}"));
-                        n.set_bounds(a11y::bounds(self.leftovers.rect(area, ei)));
-                        n.set_position_in_set(r);
-                        n.set_size_of_set(ITEMS);
-                        tree.add(Ids::item(g, r), n);
-                        children.push(Ids::item(g, r));
-                    }
+                let mut header = a11y::expander(title, &header_author, header_rect, open);
+                match clip(header_rect, area) {
+                    Some(r) => header.set_bounds(a11y::bounds(r)),
+                    None => header.clear_bounds(),
                 }
+                tree.add(Ids::header(g), header);
+                let mut children = vec![Ids::header(g)];
+                let mut whole = header_rect;
+                if open {
+                    let rows = (0..ITEMS).filter_map(|r| {
+                        let ei = self.leftovers.index(Entry::Row { group: g, row: r })?;
+                        let rect = self.leftovers.rect(area, ei);
+                        whole.h = rect.bottom() - whole.y;
+                        Some(Item {
+                            key: r,
+                            label: format!("{title} {}", r + 1),
+                            author: format!("Leftover{g}_{r}"),
+                            bounds: clip(rect, area),
+                        })
+                    });
+                    let rows: Vec<Item> = rows.collect();
+                    let items_rect = Rect::new(
+                        whole.x,
+                        header_rect.bottom(),
+                        whole.w,
+                        whole.bottom() - header_rect.bottom(),
+                    );
+                    children.push(a11y::plain_list(
+                        tree,
+                        &format!("Leftover {}", title.to_lowercase()),
+                        &format!("LeftoverList{g}"),
+                        clip(items_rect, area),
+                        rows,
+                    ));
+                }
+                // The group covers its header and items, cut to the pane, so that it cannot
+                // take hits meant for what is above or below the pane.
                 let group_author = format!("Group{g}");
-                tree.add(
-                    Ids::group(g),
-                    a11y::group(title, &group_author, header_rect, children),
-                );
+                let mut group = a11y::group("", &group_author, whole, children);
+                match clip(whole, area) {
+                    Some(r) => group.set_bounds(a11y::bounds(r)),
+                    None => group.clear_bounds(),
+                }
+                tree.add(Ids::group(g), group);
                 groups.push(Ids::group(g));
             }
             tree.add(
@@ -399,17 +479,23 @@ mod shape {
                 let (yes, no) = self.dialog_buttons();
                 tree.add(ids.yes, a11y::button("Uninstall", "ConfirmYes", yes, false));
                 tree.add(ids.no, a11y::button("Cancel", "ConfirmNo", no, false));
-                tree.add(
-                    ids.dialog,
-                    a11y::dialog(
-                        "Uninstall the selected programs?",
-                        "ConfirmDialog",
-                        self.dialog_rect(),
-                        true,
-                        vec![ids.yes, ids.no],
-                    ),
+                let mut d = a11y::dialog(
+                    "Uninstall the selected programs?",
+                    "ConfirmDialog",
+                    self.dialog_rect(),
+                    true,
+                    vec![ids.yes, ids.no],
                 );
+                d.set_description(self.dialog_body());
+                tree.add(ids.dialog, d);
                 children.push(ids.dialog);
+                // Modal: the rest stays in the tree, hidden, so that a reader and a UIA client
+                // see only the dialog, and nothing is sent again but these seven when it closes.
+                for n in ids.main() {
+                    if let Some(node) = tree.get_mut(n) {
+                        node.set_hidden();
+                    }
+                }
             }
             tree.add(ids.root, a11y::window("Purge shape", self.scale, children));
             tree.end(self.focus_node(ids))
@@ -430,7 +516,12 @@ mod shape {
                 return true;
             }
             let header = |n: NodeId| ids.header_of(n);
-            let row = |n: NodeId| ids.rows.row(n).filter(|i| *i < self.shown.len());
+            // A row's node names its program (the key); the row's position is where the search
+            // shows that program now, if it does.
+            let row = |n: NodeId| {
+                let p = ids.rows.key(n)?;
+                self.shown.binary_search(&p).ok()
+            };
             match req {
                 Request::Click(n) if n == ids.button => self.press_uninstall(),
                 Request::Click(n) if n == ids.check => {
@@ -456,10 +547,18 @@ mod shape {
                     }
                 }
                 Request::Focus(n) if header(n).is_some() => {
-                    self.focus = Focus::Group(header(n).unwrap_or(0));
+                    let g = header(n).unwrap_or(0);
+                    self.set_focus(Focus::Group(g));
                 }
+                // SelectionItem's Select, AddToSelection and RemoveFromSelection all come as
+                // this click. An unselected row: Select, that row only. A selected row: nothing,
+                // so that Select on it keeps it selected.
                 Request::Click(n) if row(n).is_some() => {
-                    self.sel.select_only(row(n).unwrap_or(0));
+                    let i = row(n).unwrap_or(0);
+                    if self.sel.contains(i) {
+                        return false;
+                    }
+                    self.sel.select_only(i);
                     self.focus = Focus::List;
                 }
                 Request::Focus(n) if row(n).is_some() => {
@@ -526,7 +625,8 @@ mod shape {
 
         fn key(&mut self, key: &KeyName, typed: Option<&str>) -> bool {
             if *key == KeyName::Tab {
-                self.focus = self.next_focus(self.mods.shift);
+                let f = self.next_focus(self.mods.shift);
+                self.set_focus(f);
                 return true;
             }
             if self.dialog {
@@ -782,7 +882,7 @@ mod shape {
                     pal.text,
                     inner,
                 );
-                let msg = format!("{} programs will be removed.", self.sel.len());
+                let msg = self.dialog_body();
                 p.text(
                     Face::Ui,
                     14.0,
@@ -827,19 +927,27 @@ mod shape {
         model: Model,
         tree: Tree,
         ids: Ids,
+        /// The focus of the last update sent.
+        focus: NodeId,
     }
 
     impl State {
         /// Builds the tree again, sends the adapter what changed and keeps the whole tree for a
         /// client that connects later.
         fn changed(&mut self) {
+            self.window.request_redraw();
             let update = self.model.build(&mut self.tree, &self.ids);
-            let full = self.tree.full(self.model.focus_node(&self.ids));
+            if update.nodes.is_empty() && update.tree.is_none() && update.focus == self.focus {
+                // Nothing in the tree changed: no update, and the kept tree is still right.
+                return;
+            }
+            self.focus = update.focus;
+            // The whole tree, kept for a client that connects later (or again).
+            let full = self.tree.full(update.focus);
             if let Ok(mut l) = self.latest.lock() {
                 *l = Some(full);
             }
             self.adapter.update_if_active(|| update);
-            self.window.request_redraw();
         }
 
         fn draw(&mut self) {
@@ -887,7 +995,15 @@ mod shape {
                 .with_min_inner_size(LogicalSize::new(820.0, 520.0))
                 .with_visible(false);
             let window = Rc::new(el.create_window(attrs).expect("a window"));
-            let latest = Arc::new(Mutex::new(None));
+            let scale = window.scale_factor() as f32;
+            let size = window.inner_size().to_logical::<f32>(f64::from(scale));
+            let ids = Ids::new();
+            let model = Model::new((size.width, size.height), scale);
+            // The tree is built before the adapter exists, so that the first request for it
+            // (which can come as soon as the window does) is answered with the whole tree.
+            let mut tree = Tree::new(ids.root);
+            let focus = model.build(&mut tree, &ids).focus;
+            let latest = Arc::new(Mutex::new(Some(tree.full(focus))));
             let adapter = accesskit_winit::Adapter::with_mixed_handlers(
                 el,
                 &window,
@@ -896,9 +1012,6 @@ mod shape {
             );
             let context = softbuffer::Context::new(window.clone()).expect("softbuffer");
             let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
-            let scale = window.scale_factor() as f32;
-            let size = window.inner_size().to_logical::<f32>(f64::from(scale));
-            let ids = Ids::new();
             let mut state = State {
                 latest,
                 window: window.clone(),
@@ -906,15 +1019,11 @@ mod shape {
                 adapter,
                 gfx: Gfx::new(),
                 pal: LIGHT,
-                model: Model::new((size.width, size.height), scale),
-                tree: Tree::new(ids.root),
+                model,
+                tree,
+                focus,
                 ids,
             };
-            state.model.build(&mut state.tree, &state.ids);
-            let full = state.tree.full(state.model.focus_node(&state.ids));
-            if let Ok(mut l) = state.latest.lock() {
-                *l = Some(full);
-            }
             state.draw();
             window.set_visible(true);
             // Check C1: from the start of main to the first frame presented.
@@ -931,8 +1040,11 @@ mod shape {
         fn user_event(&mut self, _el: &ActiveEventLoop, event: accesskit_winit::Event) {
             let Some(s) = self.state.as_mut() else { return };
             match event.window_event {
-                // Not sent with a direct activation handler; kept for completeness.
-                accesskit_winit::WindowEvent::InitialTreeRequested => s.changed(),
+                // Sent when the activation handler had no tree to give; the whole tree, then.
+                accesskit_winit::WindowEvent::InitialTreeRequested => {
+                    let (tree, focus) = (&s.tree, s.focus);
+                    s.adapter.update_if_active(|| tree.full(focus));
+                }
                 accesskit_winit::WindowEvent::ActionRequested(req) => {
                     if s.model.request(a11y::request(req), &s.ids) {
                         s.changed();
