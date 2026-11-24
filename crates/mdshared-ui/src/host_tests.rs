@@ -1,11 +1,17 @@
 //! The window host's pure parts: the damage and its device rectangle, the folding of the
-//! animator's deadline with the application's timer, the click count, the reduction of winit's
-//! positions, buttons and wheel to logical px, the copy of the bitmap into the window's buffer,
-//! and the config's defaults. The window itself is run by `examples/host.rs`.
+//! animator's deadline with the application's timer, the covered and minimized window, the
+//! click count, the reduction of winit's positions, buttons and wheel to logical px, the copy of
+//! the bitmap into the window's buffer, and the config's defaults. The window itself is run by
+//! `examples/host.rs`.
 
+use super::frame::*;
+use super::input::*;
 use super::*;
+use crate::anim::Animator;
 use crate::anim::{Clock, ManualClock, Motion};
+use std::time::Duration;
 use winit::dpi::PhysicalPosition;
+use winit::event::{MouseButton, MouseScrollDelta};
 
 /// A small LCG with a fixed seed: the same "random" input every run.
 struct Lcg(u64);
@@ -322,15 +328,24 @@ fn a_timer_asked_of_the_animator_comes_back_as_its_deadline() {
 
 // ---- clicks ----
 
+/// Windows' default double-click rectangle, 4 x 4 device px, at scale 1: 2 px each way.
+const SLOP: (f32, f32) = (2.0, 2.0);
+
 #[test]
 fn presses_close_in_time_and_place_count_up() {
     let t0 = Instant::now();
     let ms = Duration::from_millis;
     let mut c = Clicks::default();
     let iv = ms(500);
-    assert_eq!(c.press(t0, (10.0, 10.0), Button::Left, iv), 1);
-    assert_eq!(c.press(t0 + ms(200), (12.0, 9.0), Button::Left, iv), 2);
-    assert_eq!(c.press(t0 + ms(400), (13.0, 10.0), Button::Left, iv), 3);
+    assert_eq!(c.press(t0, (10.0, 10.0), Button::Left, iv, SLOP), 1);
+    assert_eq!(
+        c.press(t0 + ms(200), (12.0, 9.0), Button::Left, iv, SLOP),
+        2
+    );
+    assert_eq!(
+        c.press(t0 + ms(400), (13.0, 10.0), Button::Left, iv, SLOP),
+        3
+    );
 }
 
 #[test]
@@ -339,14 +354,145 @@ fn a_late_far_or_other_press_starts_counting_again() {
     let ms = Duration::from_millis;
     let iv = ms(500);
     let mut c = Clicks::default();
-    c.press(t0, (10.0, 10.0), Button::Left, iv);
-    assert_eq!(c.press(t0 + ms(501), (10.0, 10.0), Button::Left, iv), 1);
-    assert_eq!(c.press(t0 + ms(600), (20.0, 10.0), Button::Left, iv), 1);
-    assert_eq!(c.press(t0 + ms(700), (20.0, 10.0), Button::Right, iv), 1);
-    assert_eq!(c.press(t0 + ms(800), (20.0, 10.0), Button::Right, iv), 2);
+    c.press(t0, (10.0, 10.0), Button::Left, iv, SLOP);
+    assert_eq!(
+        c.press(t0 + ms(501), (10.0, 10.0), Button::Left, iv, SLOP),
+        1
+    );
+    assert_eq!(
+        c.press(t0 + ms(600), (20.0, 10.0), Button::Left, iv, SLOP),
+        1
+    );
+    assert_eq!(
+        c.press(t0 + ms(700), (20.0, 10.0), Button::Right, iv, SLOP),
+        1
+    );
+    assert_eq!(
+        c.press(t0 + ms(800), (20.0, 10.0), Button::Right, iv, SLOP),
+        2
+    );
     // A clock that went back is no time at all; a position that is not a number is no match.
-    assert_eq!(c.press(t0, (20.0, 10.0), Button::Right, iv), 3);
-    assert_eq!(c.press(t0, (f32::NAN, 10.0), Button::Right, iv), 1);
+    assert_eq!(c.press(t0, (20.0, 10.0), Button::Right, iv, SLOP), 3);
+    assert_eq!(c.press(t0, (f32::NAN, 10.0), Button::Right, iv, SLOP), 1);
+}
+
+#[test]
+fn the_click_count_stops_at_three() {
+    let t0 = Instant::now();
+    let iv = Duration::from_millis(500);
+    let mut c = Clicks::default();
+    let counts: Vec<u32> = (0..6)
+        .map(|i| {
+            c.press(
+                t0 + Duration::from_millis(100 * i),
+                (5.0, 5.0),
+                Button::Left,
+                iv,
+                SLOP,
+            )
+        })
+        .collect();
+    assert_eq!(counts, [1, 2, 3, 3, 3, 3]);
+    assert_eq!(MAX_CLICKS, 3);
+}
+
+#[test]
+fn the_slop_is_half_the_systems_rectangle_in_logical_px() {
+    assert_eq!(click_slop((4, 4), 1.0), (2.0, 2.0));
+    assert_eq!(click_slop((4, 4), 2.0), (1.0, 1.0));
+    assert_eq!(click_slop((6, 10), 1.0), (3.0, 5.0));
+    for s in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert_eq!(click_slop((4, 4), s), (2.0, 2.0), "scale {s}");
+    }
+}
+
+#[test]
+fn a_press_on_the_edge_of_the_rectangle_counts_and_one_past_it_does_not() {
+    let t0 = Instant::now();
+    let iv = Duration::from_millis(500);
+    let ms = Duration::from_millis;
+    let mut c = Clicks::default();
+    c.press(t0, (10.0, 10.0), Button::Left, iv, (2.0, 3.0));
+    assert_eq!(
+        c.press(t0 + ms(10), (12.0, 13.0), Button::Left, iv, (2.0, 3.0)),
+        2
+    );
+    let mut c = Clicks::default();
+    c.press(t0, (10.0, 10.0), Button::Left, iv, (2.0, 3.0));
+    assert_eq!(
+        c.press(t0 + ms(10), (12.5, 10.0), Button::Left, iv, (2.0, 3.0)),
+        1
+    );
+    let mut c = Clicks::default();
+    c.press(t0, (10.0, 10.0), Button::Left, iv, (2.0, 3.0));
+    assert_eq!(
+        c.press(t0 + ms(10), (10.0, 6.5), Button::Left, iv, (2.0, 3.0)),
+        1
+    );
+}
+
+// ---- a window that cannot be seen ----
+
+#[test]
+fn a_zero_size_or_the_systems_word_is_a_minimized_window() {
+    assert!(minimized((0, 0), None));
+    assert!(minimized((0, 600), Some(false)));
+    assert!(minimized((800, 0), None));
+    assert!(minimized((800, 600), Some(true)));
+    assert!(!minimized((800, 600), Some(false)));
+    assert!(!minimized((800, 600), None));
+    assert!(!minimized((1, 1), None));
+}
+
+#[test]
+fn a_covered_or_minimized_window_is_hidden_until_both_are_over() {
+    let mut v = Visibility::default();
+    assert!(!v.hidden());
+    // Minimized (Windows: no `Occluded` ever comes).
+    assert!(!v.set_minimized(true));
+    assert!(v.hidden());
+    // Restored: seen again, once.
+    assert!(v.set_minimized(false));
+    assert!(!v.hidden());
+    assert!(!v.set_minimized(false));
+    // Covered and minimized: undoing one leaves it hidden.
+    assert!(!v.set_occluded(true));
+    assert!(!v.set_minimized(true));
+    assert!(!v.set_occluded(false));
+    assert!(v.hidden());
+    assert!(v.set_minimized(false));
+    assert!(!v.hidden());
+    // A repeat of the same word changes nothing.
+    assert!(!v.set_occluded(false));
+}
+
+#[test]
+fn a_minimized_window_wakes_for_timers_only_and_comes_back_drawn_whole() {
+    let t0 = Instant::now();
+    let mut v = Visibility::default();
+    let mut d = Deadlines {
+        anim: Some(t0 + Duration::from_millis(16)),
+        timer: Some(t0 + Duration::from_secs(3)),
+    };
+    let mut damage = Damage::default();
+    // What the loop does on a `Resized(0, 0)`: the window is minimized.
+    if v.set_minimized(minimized((0, 0), Some(true))) {
+        damage.all();
+    }
+    assert!(v.hidden());
+    // The caret's next blink does not wake it; the timer does.
+    assert_eq!(d.next(v.hidden()), Some(t0 + Duration::from_secs(3)));
+    assert_eq!(
+        d.take_due(t0 + Duration::from_millis(20), v.hidden()),
+        Due::default()
+    );
+    assert_eq!(d.anim, None);
+    // Restored to its size: seen again, and drawn whole.
+    if v.set_minimized(minimized((800, 600), Some(false))) {
+        damage.all();
+    }
+    assert!(!v.hidden());
+    assert!(damage.full);
 }
 
 // ---- reduction ----
@@ -494,7 +640,7 @@ fn a_config_takes_nonsense_sizes_as_its_defaults() {
     assert_eq!(Config::new("T").app_id("purge").app_id, "purge");
 }
 
-#[cfg(all(feature = "a11y", windows))]
+#[cfg(feature = "a11y")]
 #[test]
 fn accessibility_bounds_are_device_px() {
     let r = access_rect(Rect::new(10.0, 20.0, 30.0, 40.0), 1.5);

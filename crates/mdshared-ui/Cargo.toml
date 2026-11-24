@@ -117,9 +117,10 @@ media-session = ["dep:windows"]
 # current user's registry; on Linux the desktop's notification server over the zbus already
 # there. Off: `Notifier::new` answers Unsupported, and the model types are still there.
 notify = ["dep:windows", "windows?/Data_Xml_Dom", "windows?/UI_Notifications"]
-# Accessibility: `a11y::*` builds an AccessKit tree from the widgets' models, and the window's
-# adapter serves it to UI Automation (roadmap W8). The tree builds on every system; the adapter
-# (accesskit_winit) is there on Windows only, so elsewhere nothing serves the tree yet.
+# Accessibility: `a11y::*` builds an AccessKit tree from the widgets' models (the window host takes
+# an application's tree through `host::App::accessibility`), and the window's adapter serves it to
+# UI Automation (roadmap W8). The tree builds on every system; the adapter (accesskit_winit) is
+# there on Windows only, so elsewhere nothing serves the tree yet.
 a11y = ["dep:accesskit", "dep:accesskit_winit"]
 # The window host: `host::run` owns the winit loop and the softbuffer present of one window and
 # hands the application the toolkit's own events (roadmap W1, at Purge's scope). Off: the module

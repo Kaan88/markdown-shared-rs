@@ -456,52 +456,91 @@ A review against parley 0.12.0 found faults, fixed in a second commit (`paragrap
 
 `host::run(Config, app)` owns the winit loop, the softbuffer surface, the bitmap, the `Gfx` and
 the window's one `Animator`; the application implements `host::App` (`start`, `event`, `draw`,
-`message`, and with `a11y` on Windows `accessibility`) and keeps its models. Nothing is called
-back into a widget. The application asks for things through the `Cx` each call is given.
+`message`, and with `a11y` `accessibility`) and keeps its models. Nothing is called back into a
+widget. The application asks for things through the `Cx` each call is given. The module is a
+directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs`,
+`host/input.rs` (winit's input reduced), `host/frame.rs` (damage, deadlines, the present) and
+`host/run.rs` (the loop).
 
-- **Events** are winit's reduced to logical px: pointer move and leave, press (with a click
-  count) and release, wheel (a notch is `WHEEL_LINE` = 48 px, Shift turns it sideways by
-  `viewport::wheel_delta`), key presses as `keys::KeyName` with the modifiers and the typed text,
-  input-method text and composition, modifiers, focus, scale, resize, theme, the close request,
-  `Wake` for a timer, and `Action` for an assistive technology. `Event` is `non_exhaustive`.
+- **Events** are winit's reduced to logical px: pointer move and leave, press and release,
+  wheel (a notch is `WHEEL_LINE` = 48 px; winit's sign, so a wheel turned away from the user is
+  +dy; Shift turns it sideways by `viewport::wheel_delta`), key presses as `keys::KeyName` with
+  the modifiers and the typed text, input-method text and composition, modifiers, focus, scale,
+  resize, theme, `Contrast`, the close request, `Wake` for a timer, and `Action` for an
+  assistive technology. `Event` is `non_exhaustive`. A press carries its click count: presses of
+  one button within `platform::double_click_time` and inside the system's double-click
+  rectangle (`platform::double_click_size`: `SM_CXDOUBLECLK` by `SM_CYDOUBLECLK` device px,
+  half each way; 4 x 4 off Windows), stopping at 3.
 - **Damage:** `Cx::request_redraw(rect)` rectangles are joined into one; the frame draws that
   rectangle (the painter is clipped to it) and presents only it with `present_with_damage`
-  (the whole buffer when its age is not 1). Resize, scale, the backdrop switching and the
-  window being seen again after `Occluded` repaint everything. A covered window is not drawn.
+  (the whole buffer when its age is not 1). Resize, scale, a change of the backdrop or its
+  palette (`Cx::set_backdrop`), and the window being seen again repaint everything.
+- **Hidden windows:** a window covered (`Occluded`) or minimized is not drawn, and the
+  animator's deadline does not wake it; timers still do. winit 0.30.13 never sends `Occluded` on
+  Windows, so a minimized window is known by a `Resized` of zero width or height, or
+  `is_minimized() == Some(true)`, and `occluded || minimized` is what every check reads.
 - **One wake-up:** the animator's `end_frame` deadline (a caret's `blink_caret`, anything in
   motion) and the application's `Cx::wake_at` timer fold into one `WaitUntil`; with neither the
   loop waits. At the animator's deadline the host redraws what the frame said was moving
   (`Cx::animating`), else the whole window; at the timer the application gets `Event::Wake`.
+  `Cx::wake_at` works from any call; an `Animator::wake_at` asked outside a draw waits for the
+  next frame, as `Cx::anim`'s doc says.
+- **Every animated value on every frame.** A partial frame still ends the animator's frame, and
+  `end_frame` forgets the names it was not asked for. The host keeps it so, because the
+  deadline of the next frame comes only from `end_frame` and the commonest partial frame (a
+  caret's blink, which draws only the field) needs it; `App::draw` and the module doc say that
+  every animated value is asked for on every frame whatever the damage (or named with
+  `Animator::keep`).
 - **Workers** send with `Proxy::send` (from `Cx::proxy`), which is `EventLoopProxy` underneath.
+  After `Cx::exit` what arrives is dropped.
 - **The window:** undecorated, a minimum size, the system shadow on Windows, the dark title-bar
   mode and corners from the config; the 8 px edge band of a restored window resizes it
   (`window::edge_at`, `drag_resize_window`) with the resize cursors; the title row is the
   application's (`Cx::drag_window`, `title_double_click`, `toggle_maximize`, `minimize`);
   snap layouts by `Cx::set_maximize_button`, re-sent after a change of scale.
-- **Backdrop:** `Cx::set_backdrop(Backdrop::Mica, &pal)` runs `frost::Frost` (so
-  `platform::set_backdrop`), refused when the system shows none, high contrast included
-  (`platform::backdrop_available`); `Cx::frost(p, rect)` marks chrome for it within the damage.
-  A TODO names `tokens::allowed_backdrop` (branch `wk/hc`), not on this base.
+- **Backdrop, Windows only:** `Cx::set_backdrop(Backdrop::Mica, &pal)` runs `frost::Frost` (so
+  `platform::set_backdrop`) with `tokens::allowed_backdrop(want, high_contrast)`, and Frost
+  still refuses it when the system shows none; `Cx::frost(p, rect)` marks chrome for it within
+  the damage. The host reads high contrast at start, on `ThemeChanged`, when the window gains
+  the keyboard, and when `platform::watch_contrast` wakes it (the host takes that one wake; an
+  application of the host does not call it), and sends `Event::Contrast` on a switch. Off
+  Windows there is no backdrop: stock softbuffer presents Xrgb8888, so the keyed-out chrome
+  showed black on KDE Wayland; the host reports none (`Cx::frosted` is false) until it presents
+  with alpha, and does not read the contrast there (the portal read can wait half a second).
 - **First frame:** created hidden, drawn and presented, shown, presented again. mdview's rules;
-  no DWM cloak, as mdview uses none.
-- **Accessibility** (`host,a11y`, Windows): `accesskit_winit::Adapter::with_mixed_handlers` before
-  the window is shown; the latest tree is kept for the activation handler, as `purge_shape` does;
-  the tree is asked again after every call that asked for a redraw or `accessibility_changed`.
-  The `a11y` feature's Cargo lines (AccessKit 0.25.2, accesskit_winit 0.34.2) and lock change were
-  copied from `wk/spike`; softbuffer 0.4.8, already in the lock, became an optional dependency.
+  no DWM cloak, as mdview uses none. It is drawn as focused (winit's `with_active`, true by
+  default, activates a window when shown), so the chrome does not flip at launch; if the window
+  has no keyboard once shown, it is drawn again unfocused and the application gets
+  `Focus(false)`.
+- **Accessibility** (`host,a11y`): the tree's types (`accesskit`) are in plain `[dependencies]`
+  and build everywhere, so `App::accessibility`, `Event::Action` and `access_rect` exist on every
+  system; the adapter (`accesskit_winit`) is Windows-only. On Windows
+  `Adapter::with_mixed_handlers` is made before the window is shown; the latest tree is kept for
+  the activation handler, as `purge_shape` does; the tree is asked again after every call that
+  asked for a redraw or `accessibility_changed`, and after a resize or a change of scale.
+  Elsewhere the tree is not asked for. The Cargo lines follow `wk/a11y`'s layout (its working
+  copy of 2026-11-25), so the two merge easily; softbuffer 0.4.8, already in the lock, became an
+  optional dependency.
 
 Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and
-corners, macOS specifics, key releases, regions with their own damage.
+corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases,
+regions with their own damage.
 
-Run: 28 unit tests of the pure parts (the damage join against a plain min and max over random
-rectangles, the outward device rounding against fine sampling, the folding of an animation's or
-a blinking caret's deadline with a timer, the click count, the reduction of positions, buttons
-and wheels, the copy into the buffer, nonsense input). The example `examples/host.rs` (a title
-row over Mica, a button with a tooltip after 600 ms, a blinking field, a worker ticking every
-second) was compiled and run headless on Windows for 5 seconds with `--seconds 5`: it printed the
-full first frame, then frames of only the footer (24,180 600x24) on each tick and only the field
-(24,128 320x32) on each caret change, and closed itself on the timer after 5.0 s. With
-`host,a11y`, a UI Automation script found the window (framework `mdshared-ui`), the button by
-AutomationId `Hello` and the field as an Edit, and its Invoke reached the app as a Click. **Not
-seen by a person**: the look, Mica and frost, the drag, resize and snap, the tooltip (no pointer
-rested on it), the white-flash rule. Linux and macOS were only type-checked.
+Run: 34 unit tests of the pure parts with `host,a11y` (33 with `host`): the damage join
+against a plain min and max over random rectangles, the outward device rounding against fine
+sampling, the folding of an animation's or a blinking caret's deadline with a timer, the covered
+and minimized window (a minimized window wakes for timers only and comes back drawn whole), the
+click count with its cap and the double-click rectangle, the reduction of positions, buttons and
+wheels, the copy into the buffer, nonsense input. The example `examples/host.rs` (a title row
+over Mica, a button with a tooltip after 600 ms, a blinking field, a worker ticking every second)
+was compiled and run headless on Windows with `--seconds N`, after the rebase onto `feat/anim`:
+a full first frame, then frames of only the footer (24,180 600x24) on each tick and only the
+field (24,128 320x32) on each caret change, and the close on the timer. In one run the window
+did not get the keyboard at launch: it printed `focus false` and drew once more, whole. In
+another a script minimized it for 2.5 s with `ShowWindow`: the ticks kept coming and no frame
+was drawn until the restore, which drew one whole frame. With `host,a11y`, a UI Automation
+script found the window (framework `mdshared-ui`), the button by AutomationId `Hello` and the
+field as an Edit, and its Invoke reached the app as a Click. **Not seen by a person**: the look,
+Mica and frost, the drag, resize and snap, the tooltip (no pointer rested on it), the
+first-frame rules (no white flash, no flip). Linux (`host` and `host,a11y`) and macOS were only
+type-checked; the KDE Wayland fix (no backdrop off Windows) was not run there.

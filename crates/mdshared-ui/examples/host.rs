@@ -3,7 +3,8 @@
 //! `--features host,a11y` on Windows its accessibility tree too.
 //!
 //! One window: a title row with the caption buttons (drag it, double-click it, rest on the
-//! maximize button for the snap layouts), frosted over Mica where the system shows it; a button
+//! maximize button for the snap layouts), frosted over Mica where the system shows it (Windows
+//! only; elsewhere the title row stays flat); a button
 //! with a tooltip after a delay; a text field whose caret blinks at the system's rate; and a
 //! worker thread that sends a message every second through the host's proxy. Each frame prints
 //! the rectangle it drew, and each thing the window does is printed, so a run with nobody
@@ -288,7 +289,7 @@ impl App for Demo {
                 println!("close requested");
                 cx.exit();
             }
-            #[cfg(all(feature = "a11y", windows))]
+            #[cfg(feature = "a11y")]
             Event::Action(req) => {
                 println!("a11y action {:?} on {:?}", req.action, req.target_node);
                 if req.action == accesskit::Action::Click && req.target_node == HELLO_NODE {
@@ -404,7 +405,7 @@ impl App for Demo {
         }
     }
 
-    #[cfg(all(feature = "a11y", windows))]
+    #[cfg(feature = "a11y")]
     fn accessibility(&mut self, cx: &mut Cx<'_, Msg>) -> accesskit::TreeUpdate {
         use accesskit::{Action, Node, Role, TreeId, TreeInfo, TreeUpdate};
         let s = cx.scale();
@@ -436,11 +437,11 @@ impl App for Demo {
     }
 }
 
-#[cfg(all(feature = "a11y", windows))]
+#[cfg(feature = "a11y")]
 const ROOT_NODE: accesskit::NodeId = accesskit::NodeId(1);
-#[cfg(all(feature = "a11y", windows))]
+#[cfg(feature = "a11y")]
 const HELLO_NODE: accesskit::NodeId = accesskit::NodeId(2);
-#[cfg(all(feature = "a11y", windows))]
+#[cfg(feature = "a11y")]
 const FIELD_NODE: accesskit::NodeId = accesskit::NodeId(3);
 
 fn main() {

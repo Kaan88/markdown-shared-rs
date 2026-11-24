@@ -646,6 +646,21 @@ mod imp {
         Duration::from_millis(if ms == 0 { 500 } else { ms as u64 })
     }
 
+    pub fn double_click_size() -> (u32, u32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK,
+        };
+        // SAFETY: no preconditions; 0 is the answer for a failure.
+        let (w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_CXDOUBLECLK),
+                GetSystemMetrics(SM_CYDOUBLECLK),
+            )
+        };
+        let clean = |v: i32| if v > 0 { v as u32 } else { 4 };
+        (clean(w), clean(h))
+    }
+
     pub fn caret_blink_time() -> Option<Duration> {
         // SAFETY: no preconditions.
         let ms = unsafe { GetCaretBlinkTime() };
@@ -1226,6 +1241,10 @@ mod imp {
         )?;
         Some(factor == 0.0)
     }
+    /// Neither Linux nor macOS says how far a double click may stray: Windows' default, 4 px.
+    pub fn double_click_size() -> (u32, u32) {
+        (4, 4)
+    }
     /// macOS: the interval set in Settings (`NSEvent.doubleClickInterval`). Elsewhere 500 ms.
     pub fn double_click_time() -> Duration {
         #[cfg(target_os = "macos")]
@@ -1597,6 +1616,12 @@ fn note_change<T: PartialEq>(seen: &mut Option<T>, now: T) -> bool {
 /// The system double-click interval, default 500 ms.
 pub fn double_click_time() -> Duration {
     imp::double_click_time()
+}
+/// The rectangle, width by height in device px, that the second press of a double click must
+/// fall in, centred on the first: `SM_CXDOUBLECLK` and `SM_CYDOUBLECLK` on Windows (4 x 4 by
+/// default; a failed call gives 4), and 4 x 4 on Linux and macOS, which do not say.
+pub fn double_click_size() -> (u32, u32) {
+    imp::double_click_size()
 }
 /// The caret blink half-period; None when blinking is disabled.
 pub fn caret_blink_time() -> Option<Duration> {
@@ -2070,6 +2095,17 @@ mod tests {
             super::imp::select_argument(Path::new("C:/docs/a b/read me.md")),
             "/select,\"C:\\docs\\a b\\read me.md\""
         );
+    }
+}
+
+#[cfg(test)]
+mod double_click_tests {
+    #[test]
+    fn the_double_click_rectangle_is_at_least_a_pixel_each_way() {
+        let (w, h) = super::double_click_size();
+        assert!(w >= 1 && h >= 1, "{w} x {h}");
+        #[cfg(not(windows))]
+        assert_eq!((w, h), (4, 4));
     }
 }
 
