@@ -7,6 +7,8 @@
 //! ([`focus`]), and animation ([`anim`]). No window loop; the application
 //! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
 
+#[cfg(feature = "a11y")]
+pub mod a11y;
 pub mod anim;
 pub mod blur;
 pub mod cf_html;
