@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::gfx::{Face, Gfx, Rect};
-use crate::keys::KeyName;
+use crate::keys::{KeyName, Mods};
 use crate::theme::{DARK, LIGHT};
 use mdshared_text::Bitmap;
 
@@ -148,8 +148,8 @@ fn a_hit_is_inside_the_rectangle_and_not_outside_it() {
 
 #[test]
 fn enter_and_space_activate_a_link_and_the_other_keys_do_not() {
-    assert!(key(KeyName::Enter));
-    assert!(key(KeyName::Space));
+    assert!(key(KeyName::Enter, Mods::default()));
+    assert!(key(KeyName::Space, Mods::default()));
     for other in [
         KeyName::Tab,
         KeyName::Escape,
@@ -166,12 +166,15 @@ fn enter_and_space_activate_a_link_and_the_other_keys_do_not() {
         KeyName::Char('e'),
         KeyName::F(1),
     ] {
-        assert!(!key(other.clone()), "{other:?} activated a link");
+        assert!(
+            !key(other.clone(), Mods::default()),
+            "{other:?} activated a link"
+        );
     }
     let link = Link::new("Open");
-    assert!(link.key(KeyName::Enter));
-    assert!(link.key(KeyName::Space));
-    assert!(!link.key(KeyName::Escape));
+    assert!(link.key(KeyName::Enter, Mods::default()));
+    assert!(link.key(KeyName::Space, Mods::default()));
+    assert!(!link.key(KeyName::Escape, Mods::default()));
 }
 
 #[test]
@@ -377,6 +380,18 @@ fn a_link_draws_nothing_outside_its_rectangle_except_the_ring() {
             );
         }
         assert!(nothing_outside(&bmp, pal, r), "an elided link overflowed");
+        // Narrower than the ellipsis itself: still nothing outside.
+        let mut bmp = blank(pal);
+        let r = Rect::new(AT, DOWN, 4.0, LINK_H);
+        {
+            let mut p = painter(&mut bmp, &mut gfx);
+            let look = Look {
+                hovered: true,
+                ..Look::default()
+            };
+            draw_link(&mut p, pal, r, "Open the file", look);
+        }
+        assert!(nothing_outside(&bmp, pal, r), "a 4 px link overflowed");
     }
 }
 
@@ -437,5 +452,26 @@ fn link_sheet() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen");
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
+    }
+}
+
+#[test]
+fn ctrl_or_alt_with_enter_or_space_does_not_activate() {
+    let ctrl = Mods {
+        ctrl: true,
+        ..Mods::default()
+    };
+    let alt = Mods {
+        alt: true,
+        ..Mods::default()
+    };
+    let shift = Mods {
+        shift: true,
+        ..Mods::default()
+    };
+    for k in [KeyName::Enter, KeyName::Space] {
+        assert!(!key(k.clone(), ctrl), "Ctrl+{k:?}");
+        assert!(!key(k.clone(), alt), "Alt+{k:?}");
+        assert!(key(k.clone(), shift), "Shift+{k:?}");
     }
 }

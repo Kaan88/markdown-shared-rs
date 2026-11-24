@@ -19,7 +19,7 @@
 use crate::cursor::Cursor;
 use crate::focus::draw_ring;
 use crate::gfx::{Face, Painter, Rect, mix};
-use crate::keys::KeyName;
+use crate::keys::{KeyName, Mods};
 use crate::theme::Palette;
 
 /// The height a link wants: the line of text with a little room above and below. A caller that
@@ -86,15 +86,16 @@ impl Link {
         cursor()
     }
 
-    /// What this link does with a key, by [`key`](crate::link::key): `true` for Enter and Space,
-    /// `false` for every other key.
-    pub fn key(&self, k: KeyName) -> bool {
-        key(k)
+    /// What this link does with a key, by [`key`](crate::link::key): `true` for Enter and Space
+    /// with neither Ctrl nor Alt held, `false` for everything else.
+    pub fn key(&self, k: KeyName, mods: Mods) -> bool {
+        key(k, mods)
     }
 }
 
 /// The width of `text` in the face and size a link draws it, in logical px. Empty text is zero
-/// wide; the width of text with a trailing space includes that space.
+/// wide. Trailing spaces are not counted (the painter measures the laid-out line, as parley's
+/// `Layout::width` does), so `"Open "` is as wide as `"Open"`.
 pub fn measure(p: &mut Painter, text: &str) -> f32 {
     p.measure(Face::Ui, LINK_TEXT, text)
 }
@@ -119,11 +120,12 @@ pub fn cursor() -> Cursor {
     Cursor::Hand
 }
 
-/// Whether the key activates a link: Enter and Space do, and every other key does not. The
-/// caller decides whether the keyboard is on the link at all; this only says what the two
-/// activation keys are.
-pub fn key(key: KeyName) -> bool {
-    matches!(key, KeyName::Enter | KeyName::Space)
+/// Whether the key activates a link: Enter and Space do, with or without Shift, when neither Ctrl
+/// nor Alt is held (as `toggle` and `dropdown` read them); every other key does not. The caller
+/// decides whether the keyboard is on the link at all, and leaves a disabled link out of the keys
+/// as it leaves it out of the hits; this only says what the activation keys are.
+pub fn key(key: KeyName, mods: Mods) -> bool {
+    !mods.ctrl && !mods.alt && matches!(key, KeyName::Enter | KeyName::Space)
 }
 
 /// How a link is drawn just now, from the caller's own state.
@@ -170,7 +172,9 @@ pub fn draw_link(p: &mut Painter, pal: &Palette, r: Rect, text: &str, look: Look
         draw_ring(p, pal, r, RADIUS);
     }
     // What fits is drawn as it is; what does not is shortened once, so that the underline can be
-    // drawn under exactly the characters on screen.
+    // drawn under exactly the characters on screen. The clip keeps an ellipsis that is itself
+    // wider than a very narrow `r` inside it.
+    let saved = p.clip(r);
     if p.measure(Face::Ui, LINK_TEXT, text) > r.w {
         let shown = p.elide(Face::Ui, LINK_TEXT, text, r.w);
         p.text(Face::Ui, LINK_TEXT, r.x, r.cy(), &shown, colour, r.w);
@@ -199,6 +203,7 @@ pub fn draw_link(p: &mut Painter, pal: &Palette, r: Rect, text: &str, look: Look
             );
         }
     }
+    p.restore(saved);
 }
 
 #[cfg(test)]
