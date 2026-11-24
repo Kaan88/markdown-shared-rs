@@ -504,6 +504,8 @@ impl<T: Clone> Menu<T> {
                         }
                 })
                 .sum::<f32>();
+        // The top of a menu that stands on its anchor's top, kept as it is (not rounded again).
+        let mut stands = None;
         let (x, y, shown) = match self.around {
             Some(around) => {
                 let placed = match around {
@@ -514,7 +516,23 @@ impl<T: Clone> Menu<T> {
                 };
                 self.went_left = placed.left;
                 self.went_up = placed.above;
-                (placed.rect.x, placed.rect.y, placed.rect.h)
+                let (mut x, mut y) = (placed.rect.x, placed.rect.y);
+                if let Around::Below(anchor) = around {
+                    // A menu hung from its anchor's right edge keeps that edge on the anchor's
+                    // after rounding: x and w rounded apart could leave it most of a px short,
+                    // and a joined menu (`joins`) apart from its control. So the right edge is
+                    // rounded and the left taken from it; likewise the bottom of a menu standing
+                    // on its anchor's top, whose top is then not rounded again (its height may be
+                    // a fraction in a look of fractional sizes).
+                    if placed.left && x == anchor.right() - placed.rect.w {
+                        x = anchor.right().round() - w.round();
+                    }
+                    if placed.above && y == anchor.y - h {
+                        y = anchor.y.round() - placed.rect.h;
+                        stands = Some(y);
+                    }
+                }
+                (x, y, placed.rect.h)
             }
             None => {
                 let top = area.y.max(4.0);
@@ -538,7 +556,7 @@ impl<T: Clone> Menu<T> {
                 (x, y, h.min(bottom - top))
             }
         };
-        self.rect = Rect::new(x.round(), y.round(), w.round(), shown);
+        self.rect = Rect::new(x.round(), stands.unwrap_or(y.round()), w.round(), shown);
         self.content = h;
         let max = (h - shown).max(0.0);
         if let Some(i) = self.reveal.take() {

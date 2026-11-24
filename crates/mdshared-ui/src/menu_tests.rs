@@ -669,3 +669,121 @@ fn menu_look_sheet() {
         bmp.write_png(&out.join(file)).expect("the sheet");
     }
 }
+
+/// A menu around `anchor` in `area`, its one row's label `n` letters long, placed at `scale`.
+fn around_at(anchor: Rect, area: Rect, n: usize, scale: f32) -> Menu<u8> {
+    let mut menu = Menu::new(vec![Item::new(0u8, "m".repeat(n))], 0.0, 0.0, false).around(anchor);
+    let mut bmp = Bitmap::new(8, 8);
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+    menu.place_in(&mut p, area);
+    menu
+}
+
+const SCALES: [f32; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+const FRACTIONS: [f32; 7] = [0.0, 0.17, 0.33, 0.5, 0.667, 0.75, 0.9];
+
+/// A button at a window's right edge opens its menu leftwards, and one at the left rightwards;
+/// either way the menu joins it at every scale, whatever the fractions of the button's place
+/// and size and of the menu's width.
+#[test]
+fn a_menu_around_a_control_joins_it_at_every_scale_leftwards_or_rightwards() {
+    for scale in SCALES {
+        for fx in FRACTIONS {
+            for fw in FRACTIONS {
+                for n in [14, 19, 23, 27, 31, 36, 40] {
+                    let area = Rect::new(0.0, 30.0, 600.0 + fx, 500.0);
+                    let size = (28.0 + fw, 24.0 + fx);
+                    let right = Rect::new(area.right() - 4.0 - size.0, 40.0 + fw, size.0, size.1);
+                    let menu = around_at(right, area, n, scale);
+                    assert!(menu.opened_left(), "scale {scale} {fx} {fw} {n}");
+                    assert_eq!(menu.rect().right(), right.right().round());
+                    assert!(
+                        joins(right, menu.rect()),
+                        "leftward, scale {scale}: {right:?} {:?}",
+                        menu.rect()
+                    );
+                    let left = Rect::new(10.0 + fx, 40.0 + fw, size.0, size.1);
+                    let menu = around_at(left, area, n, scale);
+                    assert!(!menu.opened_left());
+                    assert!(
+                        joins(left, menu.rect()),
+                        "rightward, scale {scale}: {left:?} {:?}",
+                        menu.rect()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A menu that stands on its control (no room below) keeps its bottom on the control's top,
+/// rounded, even in a look whose sizes are fractions.
+#[test]
+fn a_menu_flipped_above_its_control_stands_on_its_rounded_top() {
+    let look = Look {
+        row: 27.3,
+        pad: 4.6,
+        ..Look::ROUNDED
+    };
+    for scale in SCALES {
+        for f in FRACTIONS {
+            let area = Rect::new(0.0, 0.0, 600.0, 400.0);
+            let anchor = Rect::new(500.0 + f, 360.0 + f, 30.0, 24.0 + f);
+            let mut menu = Menu::new(many(3), 0.0, 0.0, false)
+                .around(anchor)
+                .with_look(look);
+            let mut bmp = Bitmap::new(8, 8);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            menu.place_in(&mut p, area);
+            assert!(menu.opened_above() && menu.opened_left());
+            assert_eq!(menu.rect().bottom(), anchor.y.round(), "scale {scale} {f}");
+            assert_eq!(
+                menu.rect().right(),
+                anchor.right().round(),
+                "scale {scale} {f}"
+            );
+        }
+    }
+}
+
+/// A menu hung from a point and one opened rightwards around a control are where they were:
+/// the point (or the control's corner) rounded, its width rounded.
+#[test]
+fn a_menu_from_a_point_or_opened_rightwards_is_placed_as_before() {
+    for scale in SCALES {
+        for f in FRACTIONS {
+            for n in [14, 23, 31, 40] {
+                let area = Rect::new(0.0, 30.0, 600.0, 500.0);
+                let anchor = Rect::new(40.0 + f, 40.0 + f, 28.0 + f, 24.0 + f);
+                let around = around_at(anchor, area, n, scale);
+                let mut point = Menu::new(
+                    vec![Item::new(0u8, "m".repeat(n))],
+                    40.0 + f,
+                    60.0 + f,
+                    false,
+                );
+                let mut bmp = Bitmap::new(8, 8);
+                let mut gfx = Gfx::new();
+                let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                point.place_in(&mut p, area);
+                let w = point.rect().w;
+                assert_eq!(w, w.round());
+                assert_eq!(
+                    point.rect(),
+                    Rect::new((40.0 + f).round(), (60.0 + f).round(), w, point.rect().h)
+                );
+                assert_eq!(
+                    around.rect(),
+                    Rect::new(
+                        anchor.x.round(),
+                        anchor.bottom().round(),
+                        w,
+                        around.rect().h
+                    )
+                );
+            }
+        }
+    }
+}
