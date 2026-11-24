@@ -2,10 +2,8 @@
 //! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
 //! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, drop-down lists and
-//! toggle switches ([`dropdown`], [`toggle`]), table columns and splitters, link buttons, the
-//! cursors the widgets ask for, the models
-//! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, expanders, table
-//! columns and splitters, link buttons, the cursors the widgets ask for, the models
+//! toggle switches ([`dropdown`], [`toggle`]), expanders, anchored flyouts, table columns and
+//! splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), and animation ([`anim`]). No window loop; the application
 //! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
