@@ -158,7 +158,7 @@ Purge's scope narrows two existing rows:
 | P5 | **Hyperlink button** | S | low | none | `cursor`, `text` | Underlined on hover; the hand cursor; Invoke in UIA | done |
 | P6 | **Anchored flyout card** | S | medium | none | `menu::Menu::around`, `overlay`, `focus` scopes | Any content (text, a check box, a button) in a card placed like `Menu::around`; Esc and a click outside close it; it is its own focus scope | done |
 | P7 | **Read-only selectable text** | M | medium | none | `text`, `textfield`'s selection | Selection by drag, double click and Shift in a paragraph that cannot be edited (wrapped, and monospace); Ctrl+C; Copy in a context menu; the UIA Text pattern is optional | open |
-| P8 | **Single instance through a named mutex,** in `mdshared-app` (optional, last) | S | medium | none | `mdshared_app::single` (loopback TCP, which Purge must not use) | A second launch brings the first window forward through a named mutex and `FindWindow`, with no TCP listener | open |
+| P8 | **Single instance through a named mutex,** in `mdshared-app` (optional, last) | S | medium | none | `mdshared_app::single` (loopback TCP, which Purge must not use) | A second launch brings the first window forward through a named mutex and `FindWindow`, with no TCP listener | claimed: Claude Opus 5.5, 2026-11-25 |
 
 Checks for the ready toolkit (Purge's gates):
 
