@@ -47,6 +47,7 @@ pub mod textfield;
 pub mod theme;
 pub mod thumbs;
 pub mod tree;
+pub mod waveform;
 pub mod window;
 
 #[cfg(test)]
