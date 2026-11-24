@@ -46,6 +46,7 @@ mod shape {
     use mdshared_ui::a11y::accesskit::{ActivationHandler, NodeId, TreeUpdate};
     use mdshared_ui::a11y::{self, Item, List, Request, Row, RowIndex, Tree};
     use mdshared_ui::check::{Tick, draw_tick};
+    use mdshared_ui::expander::{self, Look};
     use mdshared_ui::gfx::{Face, Gfx, Painter, Rect};
     use mdshared_ui::keys::{KeyName, Mods, key_name};
     use mdshared_ui::overlay;
@@ -404,13 +405,23 @@ mod shape {
             // says what the items are ("Leftover files, list"), and carries the set's size each
             // item's "2 of 6" needs.
             let area = self.pane_area();
+            let sticky = self.leftovers.sticky(area);
             let mut groups = Vec::new();
             for (g, title) in GROUPS.iter().enumerate() {
                 let Some(hi) = self.leftovers.index(Entry::Heading(g)) else {
                     continue;
                 };
                 let open = !self.leftovers.is_collapsed(g);
-                let header_rect = self.leftovers.rect(area, hi);
+                // A sticky header is where it is drawn, and its items are cut below it, so that
+                // the header, not an item under it, takes the hits there.
+                let (header_rect, items_area) = match sticky {
+                    Some((s, r)) if s == hi => {
+                        let below =
+                            Rect::new(area.x, r.bottom(), area.w, area.bottom() - r.bottom());
+                        (r, below)
+                    }
+                    _ => (self.leftovers.rect(area, hi), area),
+                };
                 let header_author = format!("GroupHeader{g}");
                 let mut header = a11y::expander(title, &header_author, header_rect, open);
                 match clip(header_rect, area) {
@@ -429,7 +440,7 @@ mod shape {
                             key: r,
                             label: format!("{title} {}", r + 1),
                             author: format!("Leftover{g}_{r}"),
-                            bounds: clip(rect, area),
+                            bounds: clip(rect, items_area),
                         })
                     });
                     let rows: Vec<Item> = rows.collect();
@@ -443,7 +454,7 @@ mod shape {
                         tree,
                         &format!("Leftover {}", title.to_lowercase()),
                         &format!("LeftoverList{g}"),
-                        clip(items_rect, area),
+                        clip(items_rect, items_area),
                         rows,
                     ));
                 }
@@ -704,6 +715,34 @@ mod shape {
             }
         }
 
+        /// A group's header: the expander's header (`expander::draw_header`, the same height) on
+        /// a band of the bar colour. The expander draws no background at rest, and a group header
+        /// needs one, to stand apart from the items and to cover them while it sticks.
+        fn draw_group_header(&self, p: &mut Painter, pal: &Palette, r: Rect, g: usize) {
+            p.fill(r, pal.bar);
+            let look = Look {
+                hovered: self.hovered_header() == Some(g),
+                pressed: false,
+                focused: self.focus == Focus::Group(g),
+                disabled: false,
+            };
+            let open = !self.leftovers.is_collapsed(g);
+            expander::draw_header(p, pal, r, GROUPS[g], open, look);
+        }
+
+        /// The group whose header is under the pointer, if any (none while the dialog is open).
+        fn hovered_header(&self) -> Option<usize> {
+            if self.dialog {
+                return None;
+            }
+            let (x, y) = self.pointer;
+            let e = self.leftovers.entry_at(self.pane_area(), x, y)?;
+            match self.leftovers.entry(e) {
+                Some(Entry::Heading(g)) => Some(g),
+                _ => None,
+            }
+        }
+
         fn draw(&mut self, p: &mut Painter, pal: &Palette) {
             let b = self.button_rect();
             let fill = if self.focus == Focus::Button {
@@ -825,27 +864,7 @@ mod shape {
             for e in self.leftovers.visible() {
                 let r = self.leftovers.rect(pane, e);
                 match self.leftovers.entry(e) {
-                    Some(Entry::Heading(g)) => {
-                        p.fill(r, pal.bar);
-                        if self.focus == Focus::Group(g) {
-                            p.fill(Rect::new(r.x, r.y, 3.0, r.h), pal.accent);
-                        }
-                        let chevron = if self.leftovers.is_collapsed(g) {
-                            mdshared_ui::glyph::RIGHT
-                        } else {
-                            mdshared_ui::glyph::DOWN
-                        };
-                        p.icon(chevron, 12.0, r.x + 20.0, r.cy(), pal.muted);
-                        p.text(
-                            Face::Semibold,
-                            13.0,
-                            r.x + 36.0,
-                            r.cy(),
-                            GROUPS[g],
-                            pal.text,
-                            r.w - 52.0,
-                        );
-                    }
+                    Some(Entry::Heading(g)) => self.draw_group_header(p, pal, r, g),
                     Some(Entry::Row { group, row }) => {
                         let label = format!("{} {}", GROUPS[group], row + 1);
                         p.text(
@@ -860,6 +879,13 @@ mod shape {
                     }
                     None => {}
                 }
+            }
+            // The heading of the group at the top sticks there while its rows scroll under it,
+            // drawn over them; `Sections::entry_at` already gives it the clicks there.
+            if let Some((hi, r)) = self.leftovers.sticky(pane)
+                && let Some(Entry::Heading(g)) = self.leftovers.entry(hi)
+            {
+                self.draw_group_header(p, pal, r, g);
             }
             p.restore(saved);
 
@@ -1085,7 +1111,12 @@ mod shape {
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     let l = position.to_logical::<f32>(f64::from(m.scale));
+                    let was = m.hovered_header();
                     m.pointer = (l.x, l.y);
+                    // Only the drawing changes (a header's hover fill), not the tree.
+                    if m.hovered_header() != was {
+                        s.window.request_redraw();
+                    }
                     false
                 }
                 WindowEvent::MouseInput {
