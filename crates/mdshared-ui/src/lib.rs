@@ -27,6 +27,7 @@ pub mod menu;
 pub mod menu_bar;
 pub mod meter;
 pub mod notice;
+pub mod notify;
 pub mod open_documents;
 pub mod overlay;
 pub mod palette;
