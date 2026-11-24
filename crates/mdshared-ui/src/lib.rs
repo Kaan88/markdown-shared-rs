@@ -34,6 +34,7 @@ pub mod select;
 pub mod settings;
 pub mod shadow;
 pub mod snap;
+pub mod splitter;
 pub mod stale;
 pub mod table;
 pub mod textfield;
