@@ -67,6 +67,98 @@ pub fn draw_scrollbar_animated(
     p.rbox_a(r, w / 2.0, pal.thumb, 0.55 + 0.30 * t);
 }
 
+/// [`scrollbar`] on its side: the track along the bottom of `area`, the thumb moving across,
+/// or `None` when everything fits or the area is too narrow for a bar. For a table wider than
+/// its view, a terminal's long lines.
+pub fn hscrollbar(area: Rect, content: f32, view: f32, offset: f32) -> Option<(Rect, Rect)> {
+    if content <= view + 0.5 || area.w < 24.0 {
+        return None;
+    }
+    let track = Rect::new(area.x + 2.0, area.bottom() - 12.0, area.w - 4.0, 12.0);
+    let len = (track.w * view / content).clamp(28.0_f32.min(track.w), track.w);
+    let t = (offset / (content - view)).clamp(0.0, 1.0);
+    let thumb = Rect::new(track.x + t * (track.w - len), track.y, len, track.h);
+    Some((track, thumb))
+}
+
+/// The scroll offset that puts the horizontal thumb's left edge at `thumb_x`.
+pub fn offset_for_hthumb(track: Rect, thumb_w: f32, thumb_x: f32, content: f32, view: f32) -> f32 {
+    let span = (track.w - thumb_w).max(1.0);
+    ((thumb_x - track.x) / span).clamp(0.0, 1.0) * (content - view).max(0.0)
+}
+
+/// Both bars of a view that scrolls both ways, the vertical first. Each is [`scrollbar`] or
+/// [`hscrollbar`], except that when both show each stops short of the corner the other runs
+/// into, so the two never cross. Sizes and offsets are `(across, down)`.
+#[allow(clippy::type_complexity)] // two optional (track, thumb) pairs: what each bar answers
+pub fn scrollbars(
+    area: Rect,
+    content: (f32, f32),
+    view: (f32, f32),
+    offset: (f32, f32),
+) -> (Option<(Rect, Rect)>, Option<(Rect, Rect)>) {
+    let down = scrollbar(area, content.1, view.1, offset.1);
+    let across = hscrollbar(area, content.0, view.0, offset.0);
+    if down.is_none() || across.is_none() {
+        return (down, across);
+    }
+    // The corner is the bar's thickness: each loses it from its far end.
+    let down = scrollbar(
+        Rect::new(area.x, area.y, area.w, area.h - 12.0),
+        content.1,
+        view.1,
+        offset.1,
+    );
+    let across = hscrollbar(
+        Rect::new(area.x, area.y, area.w - 12.0, area.h),
+        content.0,
+        view.0,
+        offset.0,
+    );
+    (down, across)
+}
+
+/// [`draw_scrollbar`] on its side, for [`hscrollbar`]'s track and thumb: thin at rest, taller
+/// while hovered or dragged, along the bottom of the track.
+pub fn draw_hscrollbar(p: &mut Painter, pal: &Palette, track: Rect, thumb: Rect, active: bool) {
+    let h = if active { 8.0 } else { 3.0 };
+    if active {
+        p.rbox_a(
+            Rect::new(track.x, track.bottom() - h - 3.0, track.w, h),
+            h / 2.0,
+            pal.thumb,
+            0.10,
+        );
+    }
+    let r = Rect::new(thumb.x, track.bottom() - h - 3.0, thumb.w, h);
+    p.rbox_a(r, h / 2.0, pal.thumb, if active { 0.85 } else { 0.55 });
+}
+
+/// [`draw_scrollbar_animated`] on its side.
+pub fn draw_hscrollbar_animated(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl AsId,
+    track: Rect,
+    thumb: Rect,
+    active: bool,
+) {
+    let t = anim.toggle(id, active, fluent::FADE);
+    if t <= 0.0 || t >= 1.0 {
+        return draw_hscrollbar(p, pal, track, thumb, t >= 1.0);
+    }
+    let h = 3.0 + 5.0 * t;
+    p.rbox_a(
+        Rect::new(track.x, track.bottom() - h - 3.0, track.w, h),
+        h / 2.0,
+        pal.thumb,
+        0.10 * t,
+    );
+    let r = Rect::new(thumb.x, track.bottom() - h - 3.0, thumb.w, h);
+    p.rbox_a(r, h / 2.0, pal.thumb, 0.55 + 0.30 * t);
+}
+
 /// A scroll offset that glides: the wheel and the keyboard move a target, and what is drawn
 /// follows it over a few frames.
 ///
@@ -516,5 +608,90 @@ mod tests {
         // A huge document keeps a grabbable thumb.
         let (_, tiny) = scrollbar(area, 1e7, 400.0, 0.0).unwrap();
         assert_eq!(tiny.h, 28.0);
+    }
+
+    #[test]
+    fn the_horizontal_bar_is_the_vertical_on_its_side() {
+        let area = Rect::new(0.0, 0.0, 404.0, 100.0);
+        assert!(hscrollbar(area, 300.0, 404.0, 0.0).is_none());
+        assert!(hscrollbar(Rect::new(0.0, 0.0, 20.0, 100.0), 800.0, 20.0, 0.0).is_none());
+        let (track, thumb) = hscrollbar(area, 800.0, 400.0, 0.0).unwrap();
+        assert_eq!((track.w, track.h, track.bottom()), (400.0, 12.0, 100.0));
+        assert_eq!((thumb.w, thumb.x), (200.0, track.x));
+        let (_, end) = hscrollbar(area, 800.0, 400.0, 400.0).unwrap();
+        assert_eq!(end.right(), track.right());
+        let back = offset_for_hthumb(track, end.w, end.x, 800.0, 400.0);
+        assert!((back - 400.0).abs() < 0.01);
+        // The same numbers turned a quarter give the same lengths.
+        let (vt, vb) = scrollbar(Rect::new(0.0, 0.0, 100.0, 404.0), 800.0, 400.0, 150.0).unwrap();
+        let (ht, hb) = hscrollbar(area, 800.0, 400.0, 150.0).unwrap();
+        assert_eq!((vt.h, vb.h, vb.y - vt.y), (ht.w, hb.w, hb.x - ht.x));
+    }
+
+    #[test]
+    fn two_bars_stop_short_of_the_corner() {
+        let area = Rect::new(10.0, 20.0, 400.0, 300.0);
+        // One way only: as the bar alone.
+        assert_eq!(
+            scrollbars(area, (300.0, 900.0), (400.0, 300.0), (0.0, 50.0)),
+            (scrollbar(area, 900.0, 300.0, 50.0), None)
+        );
+        assert_eq!(
+            scrollbars(area, (900.0, 200.0), (400.0, 300.0), (50.0, 0.0)),
+            (None, hscrollbar(area, 900.0, 400.0, 50.0))
+        );
+        assert_eq!(
+            scrollbars(area, (1.0, 1.0), (400.0, 300.0), (0.0, 0.0)),
+            (None, None)
+        );
+        // Both: neither track enters the 12 px square at the bottom right.
+        let (down, across) = scrollbars(area, (900.0, 900.0), (400.0, 300.0), (500.0, 600.0));
+        let ((dt, db), (at, ab)) = (down.unwrap(), across.unwrap());
+        assert_eq!(dt.bottom(), area.bottom() - 12.0 - 2.0);
+        assert_eq!(at.right(), area.right() - 12.0 - 2.0);
+        assert!(dt.bottom() <= at.y && at.right() <= dt.x);
+        // At the far end each thumb reaches its shortened track's end.
+        assert_eq!((db.bottom(), ab.right()), (dt.bottom(), at.right()));
+    }
+
+    #[test]
+    fn the_horizontal_bar_widens_when_active_and_animates_like_the_vertical() {
+        let area = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let (track, thumb) = hscrollbar(area, 800.0, 200.0, 100.0).unwrap();
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut gfx = Gfx::new();
+        let mut frame = |ms: u64, active: bool, animated: bool| {
+            let mut bmp = Bitmap::new(200, 100);
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, LIGHT.page);
+            if animated {
+                clock.advance_ms(ms);
+                anim.begin_frame(clock.now());
+                draw_hscrollbar_animated(&mut p, &LIGHT, &mut anim, "bar", track, thumb, active);
+                (bmp, anim.end_frame().is_some())
+            } else {
+                draw_hscrollbar(&mut p, &LIGHT, track, thumb, active);
+                (bmp, false)
+            }
+        };
+        // How many rows the bar covers in the thumb's middle column.
+        let height = |bmp: &Bitmap| {
+            let x = thumb.cx() as usize;
+            let page = [LIGHT.page[2], LIGHT.page[1], LIGHT.page[0]];
+            (0..100)
+                .filter(|y| bmp.pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3] != page)
+                .count()
+        };
+        let (thin, wide) = (frame(0, false, false).0, frame(0, true, false).0);
+        assert!(height(&thin) > 0 && height(&thin) < height(&wide));
+        let (rest, more) = frame(0, false, true);
+        assert!(!more && rest.pixels == thin.pixels);
+        let (first, more) = frame(0, true, true);
+        assert!(more && first.pixels == thin.pixels);
+        let (mid, more) = frame(40, true, true);
+        assert!(more && height(&mid) > height(&thin) && height(&mid) < height(&wide));
+        let (end, more) = frame(50, true, true);
+        assert!(!more && end.pixels == wide.pixels);
     }
 }

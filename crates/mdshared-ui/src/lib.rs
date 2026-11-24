@@ -53,6 +53,7 @@ pub mod theme;
 pub mod thumbs;
 pub mod tokens;
 pub mod tree;
+pub mod viewport;
 pub mod waveform;
 pub mod window;
 
