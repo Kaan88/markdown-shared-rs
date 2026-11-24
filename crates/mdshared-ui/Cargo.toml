@@ -14,6 +14,10 @@ zeno = "=0.3.3"
 # `recycle`. Without its default features: its date crate `jiff` is left out, and everything else
 # it needs is already in the lock at versions it accepts.
 trash = { version = "=5.4.0", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"], optional = true }
+# Accessibility (W8, the owner's decision 2026-11-24): AccessKit's tree, only with the `a11y`
+# feature. Pure Rust with no system library, so the tree builds on every system; only the adapter
+# that serves it (accesskit_winit, below) is Windows-only.
+accesskit = { version = "=0.25.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
@@ -34,10 +38,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Accessibility",
 ] }
-# Accessibility (W8, the owner's decision 2026-11-24): AccessKit's tree and its winit adapter, only
-# with the `a11y` feature. Windows only for now (UI Automation, Purge's scope); the adapter's
-# default features (AT-SPI over zbus and async-io, winit's X11 and Wayland) are left out.
-accesskit = { version = "=0.25.2", optional = true }
+# The winit adapter of the accessibility tree (W8, `a11y`): Windows only for now (UI Automation,
+# Purge's scope). Its default features (AT-SPI over zbus and async-io, winit's X11 and Wayland) are
+# left out. The tree itself (`accesskit`) is plain Rust and is in [dependencies].
 accesskit_winit = { version = "=0.34.2", optional = true, default-features = false, features = ["rwh_06"] }
 # The system's media controls (src/media_session/smtc.rs) and toasts (src/notify/toast.rs), only
 # with the media-session or the notify feature.
@@ -108,8 +111,8 @@ media-session = ["dep:windows"]
 # there. Off: `Notifier::new` answers Unsupported, and the model types are still there.
 notify = ["dep:windows", "windows?/Data_Xml_Dom", "windows?/UI_Notifications"]
 # Accessibility: `a11y::*` builds an AccessKit tree from the widgets' models, and the window's
-# adapter serves it to UI Automation (roadmap W8). Windows only so far; elsewhere the feature
-# builds and the adapter is absent.
+# adapter serves it to UI Automation (roadmap W8). The tree builds on every system; the adapter
+# (accesskit_winit) is there on Windows only, so elsewhere nothing serves the tree yet.
 a11y = ["dep:accesskit", "dep:accesskit_winit"]
 
 [[example]]

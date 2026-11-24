@@ -66,9 +66,11 @@ cargo clippy --release -p mdshared-ui --all-targets --features media-session -- 
 cargo test --release -p mdshared-ui --features media-session media_session
 cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
 cargo test --release -p mdshared-ui --features notify notify
+cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
+cargo test --release -p mdshared-ui --features a11y a11y
 ```
 
-Run all nine before you say a change is done. While working, the debug forms are faster
+Run all eleven before you say a change is done. While working, the debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
 warnings`). Two traps:
 
@@ -96,7 +98,7 @@ is linked or run that way; say so when you report it.
 - A new direct dependency is pinned exactly: `name = "=1.2.3"`. (Some older entries are ranges;
   do not loosen any and do not copy that.) `Cargo.lock` is committed.
 - A dependency that only one platform needs goes under that platform's `[target]` table, and
-  one that only some applications need goes behind a feature (`recycle`, `client-margin`, `media-session`, `notify`).
+  one that only some applications need goes behind a feature (`recycle`, `client-margin`, `media-session`, `notify`, `a11y`).
 - Hand-written is the house style where the job is bounded: the HTML-to-Markdown converter,
   the language scanners, the VT parser, SHA-256, the date arithmetic are all written here.
 
