@@ -99,7 +99,7 @@ fn load() -> Option<Api> {
     };
     let lib = NAMES
         .iter()
-        .find_map(|name| unsafe { Library::new(name) }.ok())?;
+        .find_map(|name| unsafe { Library::new(*name) }.ok())?;
     // SAFETY: each symbol is looked up by its documented name and given its documented C
     // signature (`curl_easy_setopt` is variadic).
     unsafe {
