@@ -355,3 +355,40 @@ the first tag), at most `cf_html::MAX_BYTES`; on Linux and macOS through `arboar
 (`text/html`, `public.html`), the whole document a browser offers. Read only when a caller asks;
 nothing changes for an existing caller. Used by mdedit's "Paste rich text as Markdown" (issue #8).
 Not verified: Linux and macOS reads (compiled by CI only).
+
+## A drop-down list and a toggle switch on their own (`mdshared_ui::dropdown`, `toggle`, 2026-11-25)
+
+Roadmap P4, for Purge. `toggle::Toggle` is a switch's value and the press under way on it:
+Space turns it over, and a click does when the button goes up on the switch it went down on.
+`dropdown::Dropdown<T>` holds options (a value and a label each), the chosen one, and, while it
+is open, the `menu::Menu<usize>` of its options. The menu is the model's own, not the caller's,
+because the keys of an open drop-down (Up, Down, Enter) act on the menu's highlight; the caller
+reaches it through `menu()` and draws it last with `draw_dropdown_menu`. It is placed with
+`Menu::around` round the field grown by `MENU_GAP` (4 px) above and below, so it hangs 4 px
+under the field, left edges level, and flips above or leftwards where there is no room.
+
+The keys follow a Windows combo box: closed, Space, Enter, Alt+Down, Alt+Up and F4 open it, Up
+and Left, Down and Right, Home and End change the choice without opening, and a letter chooses
+the next option that begins with it; open, Escape and Tab close with no change. A click opens
+it on the release, as the settings dialog does.
+
+Both draw the settings dialog's pixels. Its switch and its drop-down field were moved, unchanged,
+to `toggle::switch` and `dropdown::field` (crate-private), and the single-page and the
+categorised forms now draw with them. The proof is in two parts: `settings::unchanged` still
+compares the single-page form with its frozen copy, and four tests draw each form's toggle and
+drop-down rows (at rest, under the pointer, pressed, disabled; light and dark; scales 1 and 1.5),
+wipe the control to the ground beside it, draw the standalone widget there and compare every
+pixel. Those four passed before the move as well as after it. The focus ring is the one
+difference: the dialog paints its own with the row's colour inside it; these use
+`focus::draw_ring`, which needs no background.
+
+Added to `menu::Menu`: `min_width(w)` (a drop-down's list is at least as wide as its field;
+off unless asked) and `highlight(i)` (the keyboard highlight set by index and brought into view).
+
+Not here: an editable combo box, the labels beside the controls, the menu's closing fade, the
+wheel changing a closed drop-down, and the accessibility layer, which (W8) will read the role
+from the type, the value from `Dropdown::selected_label` / `Toggle::on`, whether it is expanded
+from `Dropdown::is_open`, and the name and rectangle from the caller.
+
+Not verified: both were only drawn into bitmaps by tests; neither has run in a window, and the
+specimen sheets (`toggle_sheet`, `dropdown_sheet`) have not been seen by a person.

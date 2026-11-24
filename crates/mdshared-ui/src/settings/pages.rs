@@ -1955,29 +1955,9 @@ impl Form {
                 }
                 let open = matches!(&self.menu, Some((k, _)) if *k == i);
                 let h = hov(Target::Dropdown(i)) || open;
-                let fill = if h {
-                    mix(pal.field, pal.text, 0.05)
-                } else {
-                    pal.field
-                };
-                let edge = if h {
-                    mix(pal.line, pal.text, 0.18)
-                } else {
-                    pal.line
-                };
-                p.frame(ctrl, 6.0, fill, edge);
                 let shown = options.get(*value).map_or("", String::as_str);
-                p.text(
-                    Face::Ui,
-                    CONTROL_SIZE,
-                    ctrl.x + 11.0,
-                    ctrl.cy(),
-                    shown,
-                    if off { pal.faint } else { pal.text },
-                    ctrl.w - 36.0,
-                );
-                let arrow = if off { pal.faint } else { pal.muted };
-                p.icon(glyph::DOWN, 10.0, ctrl.right() - 15.0, ctrl.cy(), arrow);
+                // The same field as the standalone drop-down's.
+                crate::dropdown::field(p, pal, ctrl, shown, h, off);
             }
             Row::Number {
                 value,

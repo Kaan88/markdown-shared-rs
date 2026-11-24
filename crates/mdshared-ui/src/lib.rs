@@ -1,8 +1,9 @@
 //! Shared UI pieces for the Markdown viewer and editor, and the toolkit of the applications
 //! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
-//! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, table columns and
-//! splitters, link buttons, the cursors the widgets ask for, the models
+//! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, drop-down lists and
+//! toggle switches ([`dropdown`], [`toggle`]), table columns and splitters, link buttons, the
+//! cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), and animation ([`anim`]). No window loop; the application
 //! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
@@ -17,6 +18,7 @@ pub mod corners;
 pub mod cover;
 pub mod cursor;
 pub mod desktop_entry;
+pub mod dropdown;
 pub mod focus;
 pub mod frost;
 pub mod gfx;
@@ -57,6 +59,7 @@ pub mod table;
 pub mod textfield;
 pub mod theme;
 pub mod thumbs;
+pub mod toggle;
 pub mod tokens;
 pub mod tray;
 pub mod tree;

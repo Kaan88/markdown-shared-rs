@@ -175,6 +175,8 @@ pub struct Menu<T> {
     went_up: bool,
     /// Which rows open a submenu and draw an arrow; empty in a menu without submenus.
     branches: Vec<bool>,
+    /// The least width the menu is placed at ([`min_width`](Self::min_width)); zero for none.
+    min_w: f32,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -207,6 +209,7 @@ impl<T: Clone> Menu<T> {
             went_left: false,
             went_up: false,
             branches: Vec::new(),
+            min_w: 0.0,
         }
     }
 
@@ -232,6 +235,15 @@ impl<T: Clone> Menu<T> {
     /// geometry is [`submenu::beside`](crate::submenu::beside).
     pub fn beside(mut self, item: Rect, leftward: bool) -> Self {
         self.around = Some(Around::Beside(item, leftward));
+        self
+    }
+
+    /// Makes the menu at least `w` logical px wide, as a drop-down's list is at least as wide as
+    /// its field. The widest row still widens it, the menu's own limit of 420 px and the area it
+    /// is placed in still narrow it, and a width that is not finite or not positive asks for
+    /// nothing. A menu not given one is as wide as before.
+    pub fn min_width(mut self, w: f32) -> Self {
+        self.min_w = if w.is_finite() { w.max(0.0) } else { 0.0 };
         self
     }
 
@@ -353,7 +365,7 @@ impl<T: Clone> Menu<T> {
             let (label, _) = self.shown(&item.label);
             w = w.max(lead + p.measure(Face::Ui, 13.5, &label) + hint + 16.0);
         }
-        let w = w.min(MAX_WIDTH).min(area.w - 8.0);
+        let w = w.max(self.min_w).min(MAX_WIDTH).min(area.w - 8.0);
         let h: f32 = 2.0 * PAD
             + self
                 .items
@@ -560,6 +572,18 @@ impl<T: Clone> Menu<T> {
                 return;
             }
         }
+    }
+
+    /// Moves the keyboard highlight to row `index` and brings it into view at the next
+    /// placement, as [`step`](Self::step) does for the next row. Returns false, and changes
+    /// nothing, for an index past the last item or a disabled item.
+    pub fn highlight(&mut self, index: usize) -> bool {
+        if !self.items.get(index).is_some_and(|i| i.enabled) {
+            return false;
+        }
+        self.hover = Some(index);
+        self.reveal = Some(index);
+        true
     }
 
     /// Scrolls the rows down the list by `dy` logical px (negative goes back up) and moves the
@@ -995,5 +1019,52 @@ mod tests {
         menu.place_in(&mut p, area);
         assert_eq!(menu.hover, Some(19));
         assert!(menu.scroll() > 0.0);
+    }
+
+    #[test]
+    fn a_least_width_widens_a_narrow_menu_and_nothing_else() {
+        let plain = placed_width(&mut menu_of(&["One", "Two"], false));
+        assert_eq!(plain, 180.0, "the menu's own least width");
+        for (asked, got) in [
+            (260.0, 260.0),
+            (100.0, plain),
+            (0.0, plain),
+            (-5.0, plain),
+            (f32::NAN, plain),
+            (f32::INFINITY, plain),
+            // The menu's own limit and the area still narrow it.
+            (9000.0, MAX_WIDTH),
+        ] {
+            let mut menu = menu_of(&["One", "Two"], false).min_width(asked);
+            assert_eq!(placed_width(&mut menu), got, "asked {asked}");
+        }
+        let mut menu = menu_of(&["One", "Two"], false).min_width(500.0);
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        menu.place(&mut p, 300.0, 300.0);
+        assert_eq!(menu.rect().w, 292.0);
+    }
+
+    #[test]
+    fn a_highlight_set_by_index_is_brought_into_view_and_refuses_what_cannot_be_chosen() {
+        let mut items = many(30);
+        items[3].enabled = false;
+        let mut menu = Menu::new(items, 10.0, 10.0, false);
+        assert!(!menu.highlight(3), "a disabled item");
+        assert!(!menu.highlight(30), "past the last");
+        assert_eq!(menu.hover, None);
+        assert!(menu.highlight(25));
+        assert_eq!(menu.hover, Some(25));
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        menu.place_in(&mut p, area);
+        let row = menu.row_rect(25);
+        assert!(row.y >= menu.rect().y && row.bottom() <= menu.rect().bottom());
+        assert!(menu.highlight(0));
+        menu.place_in(&mut p, area);
+        assert_eq!(menu.scroll(), 0.0);
     }
 }
