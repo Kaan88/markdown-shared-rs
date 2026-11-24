@@ -1,6 +1,7 @@
 use super::*;
 use crate::anim::{Clock, ManualClock};
 use crate::gfx::{Face, Gfx};
+use crate::menu::PAD;
 use crate::theme::{DARK, LIGHT};
 use mdshared_text::Bitmap;
 
@@ -970,5 +971,37 @@ fn submenu_sheet() {
         let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen");
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
+    }
+}
+
+#[test]
+fn a_cascade_with_a_look_gives_it_to_every_menu_and_places_submenus_by_it() {
+    let mut c = Cascade::at(tree(), 100.0, 100.0).with_look(crate::menu::Look::FLAT);
+    place(&mut c, AREA);
+    assert_eq!(c.menu(0).unwrap().look(), crate::menu::Look::FLAT);
+    let (x, y) = on(&c, 0, 1);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    let (root, sub) = (c.menu(0).unwrap(), c.menu(1).unwrap());
+    assert_eq!(sub.look(), crate::menu::Look::FLAT);
+    // Against its menu with no gap, its first row level with the row that opened it.
+    assert_eq!(sub.rect().x, root.rect().right());
+    assert_eq!(sub.row_rect(0).y, root.row_rect(1).y);
+    assert_eq!(root.row_rect(1).h, crate::menu::Look::FLAT.row);
+    // A cascade given no look is the rounded one, and `beside` is `beside_with` in it.
+    assert_eq!(opened().menu(0).unwrap().look(), crate::menu::Look::ROUNDED);
+    let item = Rect::new(100.0, 140.0, 180.0, 32.0);
+    for leftward in [false, true] {
+        assert_eq!(
+            beside(150.0, 200.0, item, AREA, leftward),
+            beside_with(
+                150.0,
+                200.0,
+                item,
+                AREA,
+                leftward,
+                &crate::menu::Look::ROUNDED
+            )
+        );
     }
 }

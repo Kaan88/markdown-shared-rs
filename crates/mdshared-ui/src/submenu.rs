@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use crate::anim::{Animator, AsId, fluent, pop};
 use crate::gfx::{Painter, Rect};
 use crate::keys::KeyName;
-use crate::menu::{Around, Item, MENU_DROP, Menu, PAD};
+use crate::menu::{Around, Item, Look, MENU_DROP, Menu};
 use crate::theme::Palette;
 
 /// How long the pointer rests on a row before its submenu opens, or on another row before the
@@ -158,12 +158,27 @@ pub fn around(w: f32, h: f32, anchor: Rect, area: Rect) -> Placement {
 /// as it takes to end inside the area, and never above the area's top; a submenu taller than
 /// the area is as tall as the area and scrolls. NaN and negative sizes are none.
 pub fn beside(w: f32, h: f32, item: Rect, area: Rect, leftward: bool) -> Placement {
+    beside_with(w, h, item, area, leftward, &Look::ROUNDED)
+}
+
+/// [`beside`] for a submenu drawn in `look` ([`Menu::with_look`]): `look.gap` from its menu
+/// in place of [`GAP`], and its first row level with the item by `look.pad` in place of the
+/// rounded look's padding. The look's sizes are made [`sane`](Look::sane) first.
+pub fn beside_with(
+    w: f32,
+    h: f32,
+    item: Rect,
+    area: Rect,
+    leftward: bool,
+    look: &Look,
+) -> Placement {
+    let look = look.sane();
     let room = room(area);
     let w = size(w).min(room.w);
     let shown = size(h).min(room.h);
     let (lo, hi) = (room.x, room.right());
-    let right = (item.right() + GAP, false);
-    let left = (item.x - GAP - w, true);
+    let right = (item.right() + look.gap, false);
+    let left = (item.x - look.gap - w, true);
     let order = if leftward {
         [left, right]
     } else {
@@ -177,7 +192,7 @@ pub fn beside(w: f32, h: f32, item: Rect, area: Rect, leftward: bool) -> Placeme
             let x = if more_left { left.0 } else { right.0 };
             (push_in(x, w, lo, hi), more_left)
         });
-    let y = push_in(item.y - PAD, shown, room.y, room.bottom());
+    let y = push_in(item.y - look.pad, shown, room.y, room.bottom());
     Placement {
         rect: Rect::new(x, y, w, shown),
         left: went_left,
@@ -305,6 +320,7 @@ pub struct Cascade<T> {
     delay: Duration,
     access: bool,
     access_visible: bool,
+    look: Look,
 }
 
 impl<T: Clone> Cascade<T> {
@@ -324,6 +340,7 @@ impl<T: Clone> Cascade<T> {
             delay: DELAY,
             access: false,
             access_visible: true,
+            look: Look::ROUNDED,
         };
         cascade.menus.push(cascade.root());
         cascade
@@ -359,6 +376,15 @@ impl<T: Clone> Cascade<T> {
         self
     }
 
+    /// Draws every menu of the cascade in `look` ([`Menu::with_look`]; default
+    /// [`Look::ROUNDED`]), its submenus `look.gap` from their menus. Called on a cascade that is
+    /// open, it closes its submenus.
+    pub fn with_look(mut self, look: Look) -> Self {
+        self.look = look.sane();
+        self.reset();
+        self
+    }
+
     fn reset(&mut self) {
         self.menus = vec![self.root()];
         self.path.clear();
@@ -375,7 +401,8 @@ impl<T: Clone> Cascade<T> {
         let rows = nodes.iter().enumerate().filter(|(_, n)| n.opens());
         let mut menu = Menu::new(items, 0.0, 0.0, false)
             .access_keys(self.access)
-            .submenu_rows(rows.map(|(i, _)| i));
+            .submenu_rows(rows.map(|(i, _)| i))
+            .with_look(self.look);
         menu.set_access_visible(self.access_visible);
         menu
     }
