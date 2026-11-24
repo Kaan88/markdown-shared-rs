@@ -33,6 +33,7 @@ pub mod segments;
 pub mod select;
 pub mod settings;
 pub mod shadow;
+pub mod slider;
 pub mod snap;
 pub mod splitter;
 pub mod stale;
