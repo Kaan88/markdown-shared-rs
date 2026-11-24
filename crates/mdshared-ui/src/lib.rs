@@ -1,11 +1,14 @@
 //! Shared UI pieces for the Markdown viewer and editor: a software painter, palettes, menu, text
 //! field, file tree, key parsing, OS glue, and the generic drawing of the shell (title row and
-//! tabs, panes, scrollbar, tooltips, toasts, dialog frames). No window loop; the application owns that.
+//! tabs, panes, scrollbar, tooltips, toasts, dialog frames), and classic desktop widgets (`classic`: a menu bar
+//! with drop-downs, sortable column headers, a one-line field, push buttons). No window loop; the
+//! application owns that.
 
 pub mod blur;
 pub mod cf_html;
 pub mod check;
 pub mod chrome;
+pub mod classic;
 pub mod corners;
 pub mod desktop_entry;
 pub mod frost;
