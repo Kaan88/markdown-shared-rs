@@ -331,6 +331,45 @@ Not verified:
 - the tray's menu and the toasts' buttons pressed by a person;
 - `focus` and `submenu` under a real keyboard and pointer in an application.
 
+## A menu's look (`menu::Look`, 2026-11-24, `wk/menulook`, roadmap L11)
+
+mdplay's toolbar is flat, and the rounded, shadowed drop-down clashed with it. The look of a menu
+was eight numbers written into `menu.rs` and `submenu.rs`; they are now the fields of
+`menu::Look`, which a menu takes by `Menu::with_look` (or `set_look`, for a menu an application's
+own code made) and a cascade by `Cascade::with_look`, for every menu it opens:
+
+| Field | `ROUNDED` (the default) | `FLAT` |
+|---|---|---|
+| `radius`, the menu's corners | 8 | 0 |
+| `shadow` | yes | no |
+| `row` | 32 | 26 |
+| `pad`, above the first row and below the last | 5 | 4 |
+| `inset`, from the menu's side to a row's and its highlight's | 5 | 1 (inside the line) |
+| `hover_radius` | 5 | 0 |
+| `separator` | 9 | 9 |
+| `gap`, from a menu to its submenu | 2 (`submenu::GAP`) | 0 |
+
+The struct is `non_exhaustive`, so an application starts from either and changes fields, and a
+field added later breaks none. `Look::sane` puts back the rounded look's own value for any size
+that is not finite, is negative or is out of reason, so a look read from settings cannot break a
+menu. `row_span` and `submenu::beside` keep their signatures and meaning (the rounded look);
+`row_span_with` and `beside_with` take a look. The colours stay the palette's.
+
+Compatibility: a menu given no look is drawn with `Look::ROUNDED`, whose values are the old
+constants; the existing menu and submenu tests, which pin the rows, the placement and the
+pixels, pass unchanged. A test draws a menu with no look and with `ROUNDED` and finds the same
+pixels. The menu tests moved to `menu_tests.rs` (the file would have passed a thousand lines).
+
+What was run, on Windows: the nine commands of AGENTS.md, and after the last change (set_look) fmt, the workspace's clippy and mdshared-ui's tests again; two mutants (the shadow drawn whatever
+the look, the submenu's gap ignored) each failed a new test. The sheet
+`menu_look_sheet` (target/specimen/menu-look.png, -150) shows the rounded, a soft and the flat look,
+light and dark. mdplay's mockup draws its menu bar, toolbar menus and right-click menu in three
+looks built on it.
+
+Not verified: seen by a person (the owner has not looked yet); Linux and macOS (CI not run);
+mdview and mdedit were not rebuilt against the branch (they name no look, so nothing of theirs is
+drawn differently).
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
