@@ -151,7 +151,9 @@ fn the_keys_move_the_selection_and_do_not_wrap() {
     assert_eq!(selector_key(None, 4, &KeyName::End), Some(3));
     // A selection past the end, from a damaged caller, is read as the last.
     assert_eq!(selector_key(Some(9), 4, &KeyName::Up), None);
-    assert_eq!(selector_key(Some(9), 4, &KeyName::Right), None);
+    assert_eq!(selector_key(Some(9), 4, &KeyName::Right), Some(3));
+    assert_eq!(selector_key(Some(5), 1, &KeyName::Left), Some(0));
+    assert_eq!(selector_key(Some(5), 1, &KeyName::Right), Some(0));
     assert_eq!(selector_key(Some(9), 4, &KeyName::Left), Some(2));
     assert_eq!(selector_key(Some(9), 4, &KeyName::Home), Some(0));
     assert_eq!(selector_key(Some(9), 4, &KeyName::End), Some(3));

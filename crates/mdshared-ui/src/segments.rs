@@ -97,10 +97,11 @@ pub fn selector_at(rects: &[Rect], x: f32, y: f32) -> Option<usize> {
 /// one, Home and End go to the first and the last. It does not wrap, as a Windows tab strip does
 /// not: Left on the first and Right on the last change nothing.
 ///
-/// With nothing selected (`selected` is `None`) any of the four picks an option: Left and Home the
-/// first, Right and End the last. A selection past the end, from a caller's damaged state, is read
-/// as the last: Right changes nothing and Left steps back from there. No options, or any other
-/// key, give `None`. It reads no clock, no painter and no state of its own.
+/// With nothing selected (`selected` is `None`) any of the four picks an option: Left, Right and
+/// Home the first, End the last. A selection past the end, from a caller's damaged state, is
+/// repaired by any of the four: Right and End give the last, Left the one before it (the last when
+/// there is only one), Home the first. No options, or any other key, give `None`. It reads no
+/// clock, no painter and no state of its own.
 pub fn selector_key(selected: Option<usize>, count: usize, key: &KeyName) -> Option<usize> {
     if count == 0 {
         return None;
@@ -109,11 +110,13 @@ pub fn selector_key(selected: Option<usize>, count: usize, key: &KeyName) -> Opt
     match key {
         KeyName::Left => match selected {
             Some(0) => None,
-            Some(k) => Some(k.min(last).saturating_sub(1)),
+            Some(k) if k > last => Some(last.saturating_sub(1)),
+            Some(k) => Some(k - 1),
             None => Some(0),
         },
         KeyName::Right => match selected {
             Some(k) if k < last => Some(k + 1),
+            Some(k) if k > last => Some(last),
             Some(_) => None,
             None => Some(0),
         },
