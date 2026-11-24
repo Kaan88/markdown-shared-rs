@@ -6,7 +6,15 @@ Everything here is opt-in: an application that calls none of it draws and behave
 **Not verified:** nothing here has run in a window. The module is covered by unit tests on a
 clock moved by hand (below); how the motions look and feel, and the wiring into a real winit
 loop shown under "The window loop", have not been seen by anyone. macOS and Linux were not run;
-the Linux build was checked by `cargo check` for the target only.
+the Linux build was checked by `cargo clippy --all-targets` for the target only (nothing linked
+or run), so the reading of the settings portal on a helper thread and its `SettingChanged`
+signal have never met a portal.
+
+Changed after a review on 2026-11-24 (the entries below say "review" where they come from it):
+values are kept as `f64`, an `Id` is its own name, a spring ends at a precision the value's type
+gives, a delay survives reduced motion, a kept value goes on moving, a page switch ends when the
+window changes under it, `Easing::CubicBezier` only exists checked, the Linux reading of the
+system's wish no longer blocks, and there are `cycle` and `blink` for what repeats.
 
 ## The model
 
@@ -23,6 +31,13 @@ Animation keeps that shape: there is no list of running animations and no timer 
   target starts from where the value is, so nothing jumps when the user changes their mind half
   way. A name that a frame does not ask for is forgotten at the end of that frame, so there is
   nothing to clean up.
+- What repeats (a spinner, a blinking caret) follows the same rule: asking for its phase is what
+  keeps it going, and the first frame that does not ask lets the window sleep.
+- A name is anything that hashes (`"sidebar"`, `("row", i, "fill")`), taken as `impl AsId`. An
+  `Id` is a name already hashed and is itself, not hashed again: `Id::new("a")` names the value
+  `"a"` names, and a part under it is `id.with("fill")`. (For that an `Id` is not `Hash`; a tuple
+  with an `Id` in it is not a name.) One name is one value: two different targets for one name
+  in one frame trip a `debug_assert`.
 
 Time is the frames' time, from a `Clock`: `SystemClock` in an application, `ManualClock` in a
 test or for a render that must come out the same every time. A frame never moves the animations
@@ -33,14 +48,16 @@ stall or a minute minimised, what was in flight goes on from where it was and do
 
 | Piece | What it is |
 |---|---|
-| `Animator` | The values in flight of one window. `begin_frame(now)`, then `value`, `value_from`, `toggle`, `presence`, `set`, `get`, `keep`, `forget` while drawing, then `end_frame() -> Option<Instant>` |
-| `Motion` | How a value moves: `Motion::SNAP`, `Motion::tween(duration, easing)`, `Motion::spring(spring)`, and `.delayed(duration)` |
-| `Easing` | Linear, the in / out / in-out curves (quad, cubic, quint, sine, expo), `OutBack`, and `CubicBezier(x1, y1, x2, y2)` with the CSS meaning; `Easing::EASE` and the other CSS keywords |
-| `Spring` | Stiffness and damping, or `Spring::response(seconds, damping_ratio)`; `SMOOTH` (the default, critically damped), `SNAPPY`, `BOUNCY`; a settle threshold. Stepped by its exact solution, so any frame time gives the same path |
-| `Animatable` | What can move: `f32`, `(f32, f32)`, `Rect`, `Rgb`, `[f32; 4]` |
+| `Animator` | The values in flight of one window. `begin_frame(now)`, then `value`, `value_from`, `toggle`, `presence`, `cycle`, `blink`, `set`, `get`, `keep`, `forget` while drawing, then `end_frame() -> Option<Instant>` |
+| `Id`, `AsId` | A name, and what can be one: anything that hashes, or an `Id` (which is itself) |
+| `Motion` | How a value moves: `Motion::SNAP`, `Motion::tween(duration, easing)`, `Motion::spring(spring)`, and `.delayed(duration)`. A delay is a wait and is always kept: on a snap, and under reduced motion (a tooltip's half second stays half a second; only the fade goes) |
+| `Easing` | Linear, the in / out / in-out curves (quad, cubic, quint, sine, expo), `OutBack`, and the CSS cubic bezier: `Easing::cubic_bezier(x1, y1, x2, y2) -> Option<Easing>` refuses what CSS refuses (a number that is not finite, an x outside 0..=1), `Easing::bezier(...)` is the `const` form for constants (it pulls a wrong curve right and never panics). `Easing::EASE` and the other CSS keywords |
+| `Spring` | Stiffness and damping, or `Spring::response(seconds, damping_ratio)`; `SMOOTH` (the default, critically damped), `SNAPPY`, `BOUNCY`; a settle threshold. Stepped by its exact solution, so any frame time gives the same path. With no damping it swings for ever and keeps asking for frames |
+| `Animatable` | What can move: `f32`, `f64`, `(f32, f32)`, `Rect`, `Rgb`, `[f32; 4]`. Kept as `f64` while it moves. `precision()` says how close counts as there, which is what ends a spring: a thousandth for a bare number, a quarter of a pixel for a point and a `Rect`, just under half a step for an `Rgb` |
+| `Periodic` | A cycle with its settings: a period, `.ping_pong()`, `.still_at(phase)` for reduced motion; `.phase(anim, id)`, and `.at(elapsed)` for the arithmetic alone |
 | `fluent` | The Windows 11 timings and curves, and motions made of them (below) |
-| `Snapshot` | A saved rectangle of the bitmap, and its `crossfade`, `slide_fade` and `push` with what was drawn there since |
-| `PageTransition` | A page or tab switch of a region, driven by a `Snapshot` of the old page |
+| `Snapshot` | A saved rectangle of the bitmap, and its `crossfade`, `slide_fade` and `push` with what was drawn there since. It is blended only into a bitmap of the size it was taken from |
+| `PageTransition` | A page or tab switch of a region, driven by a `Snapshot` of the old page. It ends at once if the bitmap's size, the scale or the region changes under it |
 | `Transient<T>` | A slot for a thing that comes and goes, which keeps it while its exit plays |
 | `pop` | Draws anything faded as a whole and moved into place: the entrance and exit of a popup |
 | `Policy`, `set_system_reduced` | Reduced motion (below) |
@@ -48,7 +65,28 @@ stall or a minute minimised, what was in flight goes on from where it was and do
 The painter gained what these need: `Painter::offset` / `restore_offset` (move everything drawn
 by whole device pixels, so text stays sharp), and `Painter::snapshot` / `fade` (give a group of
 drawing calls one opacity: save the pixels, draw, blend the saved ones back). There are no
-layers and no scaling; a popup moves and fades, as the Windows ones do.
+layers and no scaling; a popup moves and fades, as the Windows ones do. `Painter::offset` moves
+what is drawn in logical px; it does not move `fill_dev` and `blit`, which say where in the
+bitmap, so a drawing that uses them inside `pop` fades as a whole but that part does not move
+(add `Painter::origin` to its device coordinates).
+
+### Precision
+
+A value is kept as `f64` whatever its type. An `f32` has steps of four at fifty million, so a
+scroll offset far down a terminal's scrollback or a folder of a hundred thousand rows would
+glide in jumps and stop beside its target; asked for as an `f64` it moves by fractions of a
+pixel and ends exactly on target (tested at 5e7, for a tween, a spring and `SmoothScroll`). The
+values of a widget stay `f32`. Because both are animatable, a bare literal whose result nothing
+else types (`anim.value("x", 1.0, m).round()`) needs a suffix: `1.0_f32`.
+
+A spring has no fixed end; it ends when every number is within the precision of the value's
+type and too slow to leave again, or within the spring's own `with_threshold` if that is
+coarser. So a colour on a spring stops asking for frames when the colour read stops changing
+(about a third of a second for `Spring::SMOOTH`, where it was twice that), and a bare `f32` that
+is a position in pixels wants `Spring::SMOOTH.with_threshold(0.25)`, as `SmoothScroll` has.
+
+A critically damped spring has 1.36 % of its way left one `response` after it starts (exactly
+`(1 + 2π) e^(-2π)`), and a thousandth after about one and a half.
 
 ### Timings (`anim::fluent`)
 
@@ -86,6 +124,11 @@ struct App {
 
 // At start, and again when the system's settings may have changed (ThemeChanged, Focused(true)):
 app.anim.set_system_reduced(platform::motion_reduced());
+// Once, at start: on Linux the first answer comes from a helper thread a moment later, and the
+// setting may change at any time. `Woken::MotionChanged` is the application's own user event;
+// its handler runs the line above again and asks for a redraw. (Nothing is called elsewhere.)
+let proxy = event_loop.create_proxy();
+platform::watch_motion_reduced(move || _ = proxy.send_event(Woken::MotionChanged));
 // The application's own setting, if it has one: Policy::System, Always or Never.
 app.anim.set_policy(policy);
 
@@ -114,11 +157,14 @@ Notes:
   seconds) takes the earlier of the two deadlines, or hands its timer to the animator with
   `anim.wake_at(instant)` before `end_frame` and uses the one deadline it gets back.
 - `set_frame_interval` sets the pace while something moves (a sixtieth of a second unless set);
-  an application that knows its monitor's rate sets it from that.
+  an application that knows its monitor's rate sets it from that. It is never less than a
+  millisecond.
 - An application that repaints only the damaged part of its window either treats a frame the
   animator asked for as damage of what is animating, or calls `anim.keep(id)` for the names in
   the parts it skipped. A name not asked for and not kept starts fresh, at its target, which is
-  never wrong, only without motion.
+  never wrong, only without motion. A kept value goes on to its target and then stops asking for
+  frames, as if it had been asked for; a `get` after `keep` reads this frame's value. The part
+  itself still shows the frame that last drew it, so draw it once more when `anim.settled(id)`.
 - A render that must not depend on time (`--shot`, a golden image) uses `Policy::Never`, or a
   `ManualClock`.
 
@@ -196,7 +242,31 @@ scroll.scroll_by(-dy, content_h, view_h);
 scroll.jump_to(offset, content_h, view_h);
 // Drawing:
 let y = scroll.offset(&mut anim, "page-scroll", content_h, view_h).round();
+// A click during the glide: the row under the pointer as drawn, with no frame asked for.
+let row = ((click_y + scroll.current(&anim, "page-scroll")) / row_h) as usize;
 ```
+
+The numbers given may be `f32` or `f64`; the offset is kept as `f64`. Content too long for an
+`f32` (past sixteen million px) is read with `offset_f64`, `target_f64` and `current_f64`, and
+the first visible row's position is taken off before anything goes to `f32`.
+
+Something that repeats for as long as it is shown:
+
+```rust
+// A phase from 0 up to 1, a frame every interval while this line runs:
+let turn = anim.cycle("sync-icon", Duration::from_millis(900));
+// There and back, and half way when motion is reduced:
+const PULSE: Periodic = Periodic::new(Duration::from_millis(500)).ping_pong().still_at(0.5);
+let size = 4.0 + 4.0 * PULSE.phase(&mut anim, "recording-dot");
+// A caret: the window wakes only when it changes, twice a second here.
+if focused && anim.blink("caret", blink, blink) { p.fill(caret, pal.text); }
+// On every key: the caret is solid again and its time starts over.
+anim.forget("caret");
+```
+
+`blink` is given `platform::caret_blink_time()` for both times; when that is `None` (blinking
+switched off) the caret is simply drawn. With reduced motion a cycle stands at phase 0 (or its
+`still_at`), a blink is steadily on, and neither asks for a frame.
 
 ## Widgets with motion
 
@@ -210,6 +280,9 @@ and on every frame under reduced motion, each draws exactly the pixels of the pl
 | a bare offset | `scroll::SmoothScroll` | The offset glides to where the wheel sent it, on a spring |
 | `check::draw_tick` | `draw_tick_animated(p, pal, anim, id, …)` | The tick fades in and out |
 | `overlay::Bubble::draw` | `Bubble::draw_presence(p, pal, t)` | Toast, tooltip and link hint fade; a toast also rises 8 px |
+| `slider::draw` | `slider::draw_animated(p, pal, anim, id, …)` | The thumb glides to a value set by a key, the wheel or a click; its dot grows and shrinks |
+| none | `slider::draw_progress_indeterminate(p, pal, anim, id, r)` | A piece of the accent runs along the track: `anim.cycle` over `PROGRESS_RUN` (1.6 s). `draw_progress_indeterminate_at(p, pal, r, phase)` is the drawing at a phase, with no animator |
+| none | `slider::draw_spinner(p, pal, anim, id, cx, cy, r)` | An arc turns (`SPINNER_TURN`, 1.1 s) and breathes (`SPINNER_BREATH`, 1.6 s): two cycles. `draw_spinner_at(p, pal, cx, cy, r, phase)` is the drawing at a phase |
 | `overlay::draw_backdrop` | `draw_backdrop_presence(p, pal, w, h, t)` | The dimming follows the dialog's presence |
 | `overlay::draw_dialog_card` | `pop(p, dialog_bounds(card), t, (0.0, DIALOG_RISE), …)` | A dialog fades and rises as one thing |
 | `menu::Menu::draw_in` | `Menu::draw_in_presence(p, pal, area, t)` | The menu fades and drops 6 px into place |
@@ -218,7 +291,8 @@ Not done, and how each would be: the settings form (`settings::Form`) draws its 
 ticks and scrollbar and has no animator passed in, so it is unchanged; an application can still
 wrap the whole form in `pop` for its entrance. The bars of `notice` (update, crash, offer) take
 their height from the application's layout, which can animate that height with `anim.value`. The
-command palette, the tree's disclosure, the tab strip and the text field's caret have no motion.
+command palette, the tree's disclosure, the tab strip and the text field's caret have no motion
+(`Animator::blink` is there for the caret; `textfield` does not use it yet).
 
 ## Reduced motion
 
@@ -228,12 +302,24 @@ command palette, the tree's disclosure, the tab strip and the text field's caret
 |---|---|
 | Windows | `SPI_GETCLIENTAREAANIMATION`: Settings, Accessibility, Visual effects, "Animation effects" |
 | macOS | `NSWorkspace.accessibilityDisplayShouldReduceMotion`: Accessibility, Display, "Reduce motion" |
-| Linux | The settings portal: `org.freedesktop.appearance` `reduced-motion`, else `org.gnome.desktop.interface` `enable-animations`, else `org.kde.kdeglobals.KDE` `AnimationDurationFactor` at 0. Half a second to answer, cached for a second; false without a portal |
+| Linux | The settings portal: `org.freedesktop.appearance` `reduced-motion`, else `org.gnome.desktop.interface` `enable-animations`, else `org.kde.kdeglobals.KDE` `AnimationDurationFactor` at 0. Read on a helper thread, never on the caller's; false without a portal |
 
-The application passes it to `Animator::set_system_reduced`. When it is on (and the policy is
-`System`), every value is its target at once: slides, fades and smooth scrolling alike, and
-`end_frame` asks for no frame. Fades are not kept: the Windows setting this follows switches off
-every animation of the system's own controls. `Animator::set_policy` is the application's switch
+`motion_reduced()` never blocks. On Linux the portal is another process that may be slow, hung
+or absent, so the call gives the last answer the portal gave (false before the first), starts a
+new reading at most once a second, and the first reading stays to listen for the portal's
+`SettingChanged` signal. A reading that fails or never ends leaves the last answer standing: a
+setting that is on is not taken for off because the portal was slow.
+`platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux only;
+elsewhere the wake is dropped), so the application has the right value a moment after it
+starts and when the user changes the setting.
+
+The application passes the answer to `Animator::set_system_reduced`. When it is on (and the
+policy is `System`), nothing moves: a value goes to its target at once, slides, fades and smooth
+scrolling alike; a cycle stands still and a blink is steadily on; and `end_frame` asks for no
+frame for any of them. Fades are not kept: the Windows setting this follows switches off every
+animation of the system's own controls. Delays are kept, since a delay is a wait and not a
+movement: a value with a delayed motion keeps its old value for the delay and then takes the new
+one, with one wake-up at the end of the wait. `Animator::set_policy` is the application's switch
 over it: `Policy::Always` animates whatever the system says, `Policy::Never` never does.
 
 `platform::reduces_motion()`, which existed, is unchanged (macOS only, false elsewhere), since
@@ -251,3 +337,17 @@ of a delay while waiting); forgetting of names not asked for; the stall guard; r
 the policy; the blends of a snapshot against values computed by hand; page switches; `Transient`
 and `pop`; the painter's offset (pixel-identical drawing, moved, at scales 1, 1.25 and 1.5); and
 for each widget that the animated drawing at rest is the plain drawing pixel for pixel.
+
+Added with the review: a kept tween and a kept spring arrive and the frames stop; a snap, reduced
+motion and a tooltip keep their delay; a tween, a spring and a `SmoothScroll` at 5e7 move in
+steps smaller than an `f32` has there and end exactly on target; an `Id` reads the value its
+name reads; an `Rgb` spring stops at most two frames after the colour read stops changing; the
+checked bezier refuses six kinds of wrong curve and the constant form never gives a value that
+is not a number; a page switch under a resize, a new scale or a moved region ends with the frame
+equal to the new page drawn plainly, for all three effects; the example above as a doc-test;
+`cycle`, `Periodic` (against a second way of computing it, on 2000 times from a fixed-seed LCG)
+and `blink` (150 frames for a minute of blinking, each deadline at the next change); the spinner
+and the busy bar at a phase pixel for pixel as a copy of the old code drew them; and the logic of
+the Linux reading (`LastGood`: no answer keeps the last one, the wake is called on a change
+only, one reading at a time) on every system. The two-targets `debug_assert` is tested in debug
+builds only.
