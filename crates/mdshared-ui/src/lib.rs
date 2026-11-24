@@ -49,6 +49,7 @@ pub mod snap;
 pub mod spectrum;
 pub mod splitter;
 pub mod stale;
+pub mod submenu;
 pub mod table;
 pub mod textfield;
 pub mod theme;

@@ -1,4 +1,9 @@
 //! Popup menus drawn inside the window: the main menu, Recent and the right-click menus.
+//!
+//! A menu hangs from a point ([`Menu::new`], [`Menu::above`]) or is anchored to a rectangle
+//! and kept on screen at any corner ([`Menu::around`]). Submenus, their hover delay and their
+//! keys are [`submenu::Cascade`](crate::submenu::Cascade), which is made of these menus placed
+//! [`beside`](Menu::beside) one another.
 
 use crate::gfx::{Face, Painter, Rect};
 use crate::scroll;
@@ -120,12 +125,26 @@ pub fn same_letter(key: char, typed: char) -> bool {
 
 const ROW: f32 = 32.0;
 const SEP: f32 = 9.0;
-const PAD: f32 = 5.0;
+/// The padding above the first row and below the last, and at each side of the rows.
+pub(crate) const PAD: f32 = 5.0;
 const MAX_WIDTH: f32 = 420.0;
 
 /// How far from its place a menu starts when it is drawn by
 /// [`Menu::draw_in_presence`], in logical px.
 pub const MENU_DROP: f32 = 6.0;
+
+/// The room the arrow of a row that opens a submenu takes at the row's right, in place of a
+/// hint.
+const ARROW: f32 = 28.0;
+
+/// How a menu placed by [`Menu::around`] or [`Menu::beside`] stands to its rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Around {
+    /// Below the rectangle, flipped above or to the left when it does not fit.
+    Below(Rect),
+    /// Beside the rectangle (an item as wide as its menu), on the left first when `true`.
+    Beside(Rect, bool),
+}
 
 pub struct Menu<T> {
     pub items: Vec<Item<T>>,
@@ -148,6 +167,14 @@ pub struct Menu<T> {
     access: bool,
     /// Whether the marked letters are drawn underlined.
     access_visible: bool,
+    /// Placed by a rectangle ([`around`](Self::around), [`beside`](Self::beside)) rather than
+    /// from `anchor`.
+    around: Option<Around>,
+    /// The last placement by a rectangle put the menu to the left of it, or above it.
+    went_left: bool,
+    went_up: bool,
+    /// Which rows open a submenu and draw an arrow; empty in a menu without submenus.
+    branches: Vec<bool>,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -176,7 +203,78 @@ impl<T: Clone> Menu<T> {
             reveal: None,
             access: false,
             access_visible: !crate::keys::MAC,
+            around: None,
+            went_left: false,
+            went_up: false,
+            branches: Vec::new(),
         }
+    }
+
+    /// Anchors the menu to `anchor` and keeps it on screen at any corner: a context menu on a
+    /// selected word or a cell, a drop-down under a button, or one at a right-click, which is a
+    /// rectangle of no size at the pointer. The menu opens below the anchor with its left edge
+    /// at the anchor's left; where it would cross the bottom of the area it opens above the
+    /// anchor instead, and where it would cross the right it opens to the left, its right edge at
+    /// the anchor's right. When it fits on neither side it goes to the side with more room and
+    /// is pushed inside the area, over the anchor; one taller than the area scrolls. This takes
+    /// the place of the point given to [`new`](Self::new), of its `align_right` and of
+    /// [`above`](Self::above). The geometry is [`submenu::around`](crate::submenu::around).
+    pub fn around(mut self, anchor: Rect) -> Self {
+        self.around = Some(Around::Below(anchor));
+        self
+    }
+
+    /// Places the menu beside `item` as a submenu: `item` is the row that opens it, as wide as
+    /// its menu ([`Menu::rect`]'s `x` and `w`, the row's `y` and `h`). The menu goes to the
+    /// right of it with its first row level with the item, or to the left first when `leftward`
+    /// (the menu it comes from opened to the left, so its submenus carry on that way); it flips
+    /// to the other side when it would leave the area, and slides up to stay inside it. The
+    /// geometry is [`submenu::beside`](crate::submenu::beside).
+    pub fn beside(mut self, item: Rect, leftward: bool) -> Self {
+        self.around = Some(Around::Beside(item, leftward));
+        self
+    }
+
+    pub(crate) fn set_around(&mut self, around: Around) {
+        self.around = Some(around);
+    }
+
+    /// Whether the last placement put the menu to the left of the rectangle it was placed by:
+    /// flipped by [`around`](Self::around), or on the left by [`beside`](Self::beside). False
+    /// for a menu placed from a point.
+    pub fn opened_left(&self) -> bool {
+        self.went_left
+    }
+
+    /// Whether the menu stands above its anchor: flipped above by the last placement of
+    /// [`around`](Self::around), or, for a menu hung from a point, made [`above`](Self::above).
+    pub fn opened_above(&self) -> bool {
+        if self.around.is_some() {
+            self.went_up
+        } else {
+            self.above
+        }
+    }
+
+    /// Marks the rows at `rows` (indices into `items`) as rows that open a submenu: each draws a
+    /// right-pointing arrow at its right in place of its hint, and the menu keeps room for it.
+    /// An index past the last item is ignored. [`submenu::Cascade`](crate::submenu::Cascade)
+    /// marks its menus this way; a menu marked by nobody draws as it always did.
+    pub fn submenu_rows(mut self, rows: impl IntoIterator<Item = usize>) -> Self {
+        for row in rows {
+            if row < self.items.len() {
+                if self.branches.len() <= row {
+                    self.branches.resize(row + 1, false);
+                }
+                self.branches[row] = true;
+            }
+        }
+        self
+    }
+
+    /// Whether row `index` opens a submenu ([`submenu_rows`](Self::submenu_rows)).
+    pub fn opens_submenu(&self, index: usize) -> bool {
+        self.branches.get(index).copied().unwrap_or(false)
     }
 
     /// Reads the labels of this menu for access keys: `Open &files…` marks `f`, `&&` is a
@@ -244,8 +342,10 @@ impl<T: Clone> Menu<T> {
         let lead =
             if marks || icons { 40.0 } else { 14.0 } + if marks && icons { MARK } else { 0.0 };
         let mut w: f32 = 180.0;
-        for item in &self.items {
-            let hint = if item.hint.is_empty() {
+        for (i, item) in self.items.iter().enumerate() {
+            let hint = if self.opens_submenu(i) {
+                ARROW
+            } else if item.hint.is_empty() {
                 0.0
             } else {
                 p.measure(Face::Ui, 12.0, &item.hint) + 28.0
@@ -260,25 +360,40 @@ impl<T: Clone> Menu<T> {
                 .iter()
                 .map(|i| ROW + if i.separator_before { SEP } else { 0.0 })
                 .sum::<f32>();
-        let top = area.y.max(4.0);
-        let bottom = area.bottom() - 4.0;
-        let mut x = if self.align_right {
-            self.anchor.0 - w
-        } else {
-            self.anchor.0
+        let (x, y, shown) = match self.around {
+            Some(around) => {
+                let placed = match around {
+                    Around::Below(anchor) => crate::submenu::around(w, h, anchor, area),
+                    Around::Beside(item, leftward) => {
+                        crate::submenu::beside(w, h, item, area, leftward)
+                    }
+                };
+                self.went_left = placed.left;
+                self.went_up = placed.above;
+                (placed.rect.x, placed.rect.y, placed.rect.h)
+            }
+            None => {
+                let top = area.y.max(4.0);
+                let bottom = area.bottom() - 4.0;
+                let mut x = if self.align_right {
+                    self.anchor.0 - w
+                } else {
+                    self.anchor.0
+                };
+                let mut y = if self.above {
+                    (self.anchor.1 - h).max(top)
+                } else {
+                    // Where it was opened, even when that is in the title row (a tab's own
+                    // menu); only being pushed up to fit stops at the area's top.
+                    self.anchor.1
+                };
+                x = x.min(area.right() - w - 4.0).max(area.x + 4.0);
+                if y + h > bottom {
+                    y = (bottom - h).max(top);
+                }
+                (x, y, h.min(bottom - top))
+            }
         };
-        let mut y = if self.above {
-            (self.anchor.1 - h).max(top)
-        } else {
-            // Where it was opened, even when that is in the title row (a tab's own menu); only
-            // being pushed up to fit stops at the area's top.
-            self.anchor.1
-        };
-        x = x.min(area.right() - w - 4.0).max(area.x + 4.0);
-        if y + h > bottom {
-            y = (bottom - h).max(top);
-        }
-        let shown = h.min(bottom - top);
         self.rect = Rect::new(x.round(), y.round(), w.round(), shown);
         self.content = h;
         let max = (h - shown).max(0.0);
@@ -351,7 +466,11 @@ impl<T: Clone> Menu<T> {
                 }
                 x = col + 18.0;
             }
-            let hint_w = if item.hint.is_empty() {
+            let hint_w = if self.opens_submenu(i) {
+                let c = if item.enabled { pal.muted } else { pal.faint };
+                p.icon(crate::glyph::RIGHT, 12.0, r.right() - 12.0, r.cy(), c);
+                ARROW - 2.0
+            } else if item.hint.is_empty() {
                 0.0
             } else {
                 p.text_right(
@@ -391,7 +510,11 @@ impl<T: Clone> Menu<T> {
     /// of it and only draws it.
     pub fn draw_in_presence(&mut self, p: &mut Painter, pal: &Palette, area: Rect, t: f32) {
         self.place_in(p, area);
-        let drop = if self.above { MENU_DROP } else { -MENU_DROP };
+        let drop = if self.opened_above() {
+            MENU_DROP
+        } else {
+            -MENU_DROP
+        };
         // The frame and the shadow round it.
         let bounds = self.rect.inset(-18.0);
         crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
