@@ -211,6 +211,56 @@ pub fn legible(colour: Rgb, ground: Rgb, ratio: f32) -> Rgb {
     mix(colour, toward, hi)
 }
 
+/// `colour` moved towards black or white, whichever is the further from the first of `read`,
+/// by the least that brings every colour of `read` to `ratio` against it; when no move brings
+/// them all there, the one that gives the worst-read of them the most contrast. The answer is
+/// `colour` when it already reads, and `colour` when `read` is empty.
+///
+/// A made fill is read by more than one colour (text, a hint, a marked letter), where
+/// [`legible`] follows only one of them.
+fn legible_fill(colour: Rgb, read: &[Rgb], ratio: f32) -> Rgb {
+    if read.is_empty() {
+        return colour;
+    }
+    let weakest = |c: Rgb| {
+        read.iter()
+            .map(|&r| contrast(r, c))
+            .fold(f32::INFINITY, f32::min)
+    };
+    if weakest(colour) >= ratio {
+        return colour;
+    }
+    let toward = if contrast([0, 0, 0], read[0]) >= contrast([255, 255, 255], read[0]) {
+        [0, 0, 0]
+    } else {
+        [255, 255, 255]
+    };
+    // The contrast of a reading colour grows towards one end and falls towards the other, so
+    // walk the way in steps, then halve the step that reached for the least move.
+    const STEPS: usize = 32;
+    let mut best = (weakest(colour), 0.0f32);
+    for step in 1..=STEPS {
+        let mut t = step as f32 / STEPS as f32;
+        let w = weakest(mix(colour, toward, t));
+        if w >= ratio {
+            let mut lo = (step - 1) as f32 / STEPS as f32;
+            for _ in 0..16 {
+                let mid = (lo + t) / 2.0;
+                if weakest(mix(colour, toward, mid)) >= ratio {
+                    t = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return mix(colour, toward, t);
+        }
+        if w > best.0 {
+            best = (w, t);
+        }
+    }
+    mix(colour, toward, best.1)
+}
+
 /// `base` with `accent` in place of its own, made legible against the page
 /// ([`ACCENT_CONTRAST`]), and the colours that follow from it made anew: the text on an
 /// accent fill (black or white, whichever reads better), the selected row's tint and the text
@@ -330,10 +380,11 @@ impl Tokens {
     ///   [`SYSTEM_LINE_CONTRAST`], else the window text; `popup_line` is the window text;
     /// * `hover`, `press`, `on` (the selected row) and `selection` (selected text) are made:
     ///   the window moved towards the window text (hover, press) or the highlight (on,
-    ///   selection), then kept at [`SYSTEM_FILL_CONTRAST`] against the window text that is
-    ///   drawn on them ([`legible`]). The toolkit draws a selected row's text and selected
-    ///   text in `text`, not in a text of their own, so the highlight itself, which only the
-    ///   highlight text reads on, cannot be their fill;
+    ///   selection), then kept at [`SYSTEM_FILL_CONTRAST`] against every colour drawn on them
+    ///   ([`legible`], [`legible_fill`]): `text` on all four, and `faint` and `accent` too on
+    ///   `hover` and `on`, where a hint and a matched letter are drawn. The toolkit draws a
+    ///   selected row's text and selected text in `text`, not in a text of their own, so the
+    ///   highlight itself, which only the highlight text reads on, cannot be their fill;
     /// * the find marks, `danger`, `warn` and `warn_bg`, which no system colour names, are
     ///   those of [`HIGH_CONTRAST_DARK`] or [`HIGH_CONTRAST_LIGHT`].
     ///
@@ -354,6 +405,12 @@ impl Tokens {
         };
         let fill =
             |towards: Rgb, t: f32| legible(mix(c.window, towards, t), text, SYSTEM_FILL_CONTRAST);
+        // `hover` and `on` carry more than `text`: a hovered row's hint, and a selected row's
+        // hint and matched letters, in `faint` and `accent`.
+        let read = [text, c.gray_text, c.highlight];
+        let fill_read = |towards: Rgb, t: f32| {
+            legible_fill(mix(c.window, towards, t), &read, SYSTEM_FILL_CONTRAST)
+        };
         let chrome = if contrast(text, c.button_face) >= SYSTEM_FILL_CONTRAST {
             c.button_face
         } else {
@@ -374,9 +431,9 @@ impl Tokens {
                 text,
                 muted: text,
                 faint: c.gray_text,
-                hover: fill(text, 0.15),
+                hover: fill_read(text, 0.15),
                 press: fill(text, 0.25),
-                on: fill(c.highlight, 0.35),
+                on: fill_read(c.highlight, 0.35),
                 selection: fill(c.highlight, 0.6),
                 line,
                 accent: c.highlight,

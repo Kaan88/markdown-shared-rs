@@ -275,6 +275,30 @@ fn every_contrast_theme_keeps_its_contrast_and_the_made_fills_read() {
             );
             assert_ne!(colour, p.page, "{name}: {fill} is seen on the page");
         }
+        // The toolkit draws more than `text` on a made fill: a selected row's hint and the
+        // letters a filter matched, in `faint` and `accent` (palette.rs), and a hovered row's
+        // hint in `faint`. They read at the same target as `text`.
+        for (ground, fill, colour_name, colour) in [
+            (p.on, "on", "faint", p.faint),
+            (p.on, "on", "accent", p.accent),
+            (p.hover, "hover", "faint", p.faint),
+            (p.hover, "hover", "accent", p.accent),
+        ] {
+            assert!(
+                contrast(colour, ground) >= SYSTEM_FILL_CONTRAST - 0.01,
+                "{name}: {colour_name} on {fill}: {}",
+                contrast(colour, ground)
+            );
+        }
+        // `danger` and `warn` are icons and lines as well as text, so 3:1 against the window
+        // is enough for them.
+        for (colour_name, colour) in [("danger", p.danger), ("warn", p.warn)] {
+            assert!(
+                contrast(colour, p.page) >= SYSTEM_LINE_CONTRAST - 0.01,
+                "{name}: {colour_name} on the window: {}",
+                contrast(colour, p.page)
+            );
+        }
         assert!(
             contrast(p.line, p.page) >= SYSTEM_LINE_CONTRAST,
             "{name}: line"
@@ -286,6 +310,25 @@ fn every_contrast_theme_keeps_its_contrast_and_the_made_fills_read() {
             contrast(p.press, p.page) > contrast(p.hover, p.page),
             "{name}"
         );
+    }
+    // The toolkit's own high-contrast palettes make no fill; theirs are given, and must read
+    // for the same colours.
+    for (name, p) in [
+        ("high contrast light", HIGH_CONTRAST_LIGHT),
+        ("high contrast dark", HIGH_CONTRAST_DARK),
+    ] {
+        for (ground, fill, colour_name, colour) in [
+            (p.on, "on", "faint", p.faint),
+            (p.on, "on", "accent", p.accent),
+            (p.hover, "hover", "faint", p.faint),
+            (p.hover, "hover", "accent", p.accent),
+        ] {
+            assert!(
+                contrast(colour, ground) >= SYSTEM_FILL_CONTRAST,
+                "{name}: {colour_name} on {fill}: {}",
+                contrast(colour, ground)
+            );
+        }
     }
 }
 
@@ -324,6 +367,36 @@ fn nonsense_colours_give_a_palette_and_no_panic() {
         assert_eq!(p.page, c.window);
         assert_eq!(p.text, c.window_text);
     }
+}
+
+#[test]
+fn a_fill_that_no_colour_reads_on_is_the_best_the_way_gives() {
+    // White, black and a mid grey laid on one fill: no ground reads at 4.5 for all three
+    // (white and black alone leave only a narrow band of luminance, and the grey sits outside
+    // it), so the answer is the place where the worst of them reads best.
+    let read = [[255, 255, 255], [0, 0, 0], [128, 128, 128]];
+    let start = [128, 128, 128];
+    let worst = |c: Rgb| {
+        read.iter()
+            .map(|&r| contrast(r, c))
+            .fold(f32::INFINITY, f32::min)
+    };
+    let fill = legible_fill(start, &read, SYSTEM_FILL_CONTRAST);
+    assert!(worst(fill) < SYSTEM_FILL_CONTRAST);
+    // Nothing towards either end of the way reads better than the answer does.
+    for toward in [[0, 0, 0], [255, 255, 255]] {
+        for step in 0..=64 {
+            let t = step as f32 / 64.0;
+            let w = worst(mix(fill, toward, t));
+            assert!(
+                w <= worst(fill) + 0.001,
+                "{toward:?} at {t}: {w} beats {}",
+                worst(fill)
+            );
+        }
+    }
+    // No colours to read for leaves the fill as it is.
+    assert_eq!(legible_fill(start, &[], SYSTEM_FILL_CONTRAST), start);
 }
 
 #[test]
