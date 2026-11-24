@@ -2,6 +2,7 @@
 
 pub mod bitmap;
 mod fonts;
+pub mod image;
 pub mod text;
 
 pub use bitmap::{Bitmap, decode_png_rgba};

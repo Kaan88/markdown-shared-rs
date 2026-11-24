@@ -8,3 +8,6 @@ publish.workspace = true
 parley = "=0.12.0"
 swash = "=0.2.10"
 png = "0.18"
+# JPEG for cover art, thumbnails and photos (`image`); pure Rust. The owner chose it on
+# 2026-11-24 (docs/ROADMAP.md, "Decided by the owner").
+zune-jpeg = "=0.5.15"
