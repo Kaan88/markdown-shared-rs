@@ -2,6 +2,7 @@
 //! field, file tree, key parsing, OS glue, and the generic drawing of the shell (title row and
 //! tabs, panes, scrollbar, tooltips, toasts, dialog frames). No window loop; the application owns that.
 
+pub mod anim;
 pub mod blur;
 pub mod cf_html;
 pub mod check;

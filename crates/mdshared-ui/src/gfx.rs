@@ -217,6 +217,8 @@ pub struct Painter<'a> {
     pub scale: f32,
     /// Device px: x0, y0, x1, y1.
     clip: (i32, i32, i32, i32),
+    /// Device px added to everything drawn in logical px: see [`offset`](Painter::offset).
+    origin: (i32, i32),
 }
 
 impl<'a> Painter<'a> {
@@ -227,6 +229,7 @@ impl<'a> Painter<'a> {
             gfx,
             scale,
             clip,
+            origin: (0, 0),
         }
     }
 
@@ -235,8 +238,59 @@ impl<'a> Painter<'a> {
         1.0 / self.scale
     }
 
-    fn dev(&self, v: f32) -> i32 {
-        (v * self.scale).round() as i32
+    fn dev_x(&self, v: f32) -> i32 {
+        (v * self.scale).round() as i32 + self.origin.0
+    }
+
+    fn dev_y(&self, v: f32) -> i32 {
+        (v * self.scale).round() as i32 + self.origin.1
+    }
+
+    /// Moves everything drawn from now on by `dx, dy` logical px, on top of any offset already
+    /// set, and returns the offset before, to be given back to
+    /// [`restore_offset`](Self::restore_offset). The move is rounded to whole device pixels, so
+    /// what is drawn moved is pixel for pixel what is drawn in place: text and box edges stay
+    /// as sharp. For something that slides: a toast rising into place, a page coming in.
+    ///
+    /// It moves what is given in logical px, a [`clip`](Self::clip) set afterwards included.
+    /// It does not move a clip already set, nor the calls that take device px
+    /// ([`fill_dev`](Self::fill_dev), [`blit`](Self::blit)): those say where in the bitmap, and
+    /// a caller that wants them moved adds [`origin`](Self::origin) itself.
+    /// [`dev_rect`](Self::dev_rect) gives the moved rectangle.
+    pub fn offset(&mut self, dx: f32, dy: f32) -> (i32, i32) {
+        let old = self.origin;
+        self.origin = (
+            old.0 + (dx * self.scale).round() as i32,
+            old.1 + (dy * self.scale).round() as i32,
+        );
+        old
+    }
+
+    pub fn restore_offset(&mut self, origin: (i32, i32)) {
+        self.origin = origin;
+    }
+
+    /// The offset in force, in device px: zero unless [`offset`](Self::offset) set one.
+    pub fn origin(&self) -> (i32, i32) {
+        self.origin
+    }
+
+    /// Saves the pixels of `r` (cut to the clip) as they are now: before drawing something
+    /// there that is to be faded ([`fade`](Self::fade)), or to keep the old content of a region
+    /// that is about to change ([`crate::anim::PageTransition`]).
+    pub fn snapshot(&self, r: Rect) -> crate::anim::Snapshot {
+        let (x0, y0, x1, y1) = self.dev_rect(r);
+        let c = self.clip;
+        crate::anim::Snapshot::take(self.bmp, x0.max(c.0), y0.max(c.1), x1.min(c.2), y1.min(c.3))
+    }
+
+    /// Fades everything drawn since `under` was taken, in its rectangle, to `opacity` as one
+    /// thing: at 1 it stays as drawn, at 0 it is gone, and at a half a popup's shadow, frame
+    /// and text are half there together, with none of them showing through another. This is
+    /// how a group of drawing calls gets an opacity in a painter that has no layers; the cost
+    /// is a copy and a blend of the rectangle. See [`crate::anim::pop`] for the usual wrapper.
+    pub fn fade(&mut self, under: &crate::anim::Snapshot, opacity: f32) {
+        under.crossfade(self.bmp, opacity);
     }
 
     /// Restricts drawing to `r` (intersected with the bitmap) and returns the previous clip, to be
@@ -244,10 +298,10 @@ impl<'a> Painter<'a> {
     pub fn clip(&mut self, r: Rect) -> (i32, i32, i32, i32) {
         let old = self.clip;
         self.clip = (
-            self.dev(r.x).max(old.0),
-            self.dev(r.y).max(old.1),
-            self.dev(r.right()).min(old.2),
-            self.dev(r.bottom()).min(old.3),
+            self.dev_x(r.x).max(old.0),
+            self.dev_y(r.y).max(old.1),
+            self.dev_x(r.right()).min(old.2),
+            self.dev_y(r.bottom()).min(old.3),
         );
         old
     }
@@ -295,10 +349,10 @@ impl<'a> Painter<'a> {
     /// A rounded rectangle with antialiased corners, blended at `alpha`.
     pub fn rbox_a(&mut self, r: Rect, radius: f32, c: Rgb, alpha: f32) {
         let (x0, y0, x1, y1) = (
-            self.dev(r.x),
-            self.dev(r.y),
-            self.dev(r.right()),
-            self.dev(r.bottom()),
+            self.dev_x(r.x),
+            self.dev_y(r.y),
+            self.dev_x(r.right()),
+            self.dev_y(r.bottom()),
         );
         self.rbox_dev(x0, y0, x1, y1, radius * self.scale, c, alpha);
     }
@@ -350,10 +404,10 @@ impl<'a> Painter<'a> {
     /// A filled box with a one-device-pixel outline.
     pub fn frame(&mut self, r: Rect, radius: f32, fill: Rgb, stroke: Rgb) {
         let (x0, y0, x1, y1) = (
-            self.dev(r.x),
-            self.dev(r.y),
-            self.dev(r.right()),
-            self.dev(r.bottom()),
+            self.dev_x(r.x),
+            self.dev_y(r.y),
+            self.dev_x(r.right()),
+            self.dev_y(r.bottom()),
         );
         let rad = radius * self.scale;
         self.rbox_dev(x0, y0, x1, y1, rad, stroke, 1.0);
@@ -371,10 +425,10 @@ impl<'a> Painter<'a> {
     /// `r` in device px, as the painter rounds it: x0, y0, x1, y1.
     pub fn dev_rect(&self, r: Rect) -> (i32, i32, i32, i32) {
         (
-            self.dev(r.x),
-            self.dev(r.y),
-            self.dev(r.right()),
-            self.dev(r.bottom()),
+            self.dev_x(r.x),
+            self.dev_y(r.y),
+            self.dev_x(r.right()),
+            self.dev_y(r.bottom()),
         )
     }
 
@@ -402,7 +456,11 @@ impl<'a> Painter<'a> {
             return;
         }
         let s = self.scale;
-        let pts: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x * s, y * s)).collect();
+        let (ox, oy) = (self.origin.0 as f32, self.origin.1 as f32);
+        let pts: Vec<(f32, f32)> = points
+            .iter()
+            .map(|&(x, y)| (x * s + ox, y * s + oy))
+            .collect();
         let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         for &(x, y) in &pts {
             (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
@@ -494,6 +552,7 @@ impl<'a> Painter<'a> {
             layout.width().ceil() as i32 + 2,
             layout.height().ceil() as i32 + 2,
         );
+        let (x, y) = (x + self.origin.0 as f32, y + self.origin.1 as f32);
         let (xi, yi) = (x.floor() as i32, y.floor() as i32);
         let c = self.clip;
         if xi >= c.2 || yi >= c.3 || xi + w <= c.0 || yi + h <= c.1 {
@@ -627,8 +686,8 @@ impl<'a> Painter<'a> {
         if mask.width == 0 {
             return;
         }
-        let x0 = (cx * self.scale - side / 2.0).round() as i32 + mask.left;
-        let y0 = (cy * self.scale - side / 2.0).round() as i32 + mask.top;
+        let x0 = (cx * self.scale - side / 2.0).round() as i32 + mask.left + self.origin.0;
+        let y0 = (cy * self.scale - side / 2.0).round() as i32 + mask.top + self.origin.1;
         let (xa, xb) = (
             x0.max(self.clip.0),
             (x0 + mask.width as i32).min(self.clip.2),
@@ -816,6 +875,136 @@ mod tests {
             p.strikethrough_range(Face::Ui, 14.0, 12.0, 24.0, text, 4..4, red);
         });
         assert!(rows_of(&none, red).is_empty());
+    }
+
+    /// Every kind of drawing the painter has, around the point 20, 16.
+    fn scene(p: &mut Painter<'_>) {
+        p.shadow(Rect::new(20.0, 16.0, 60.0, 30.0), 6.0, false);
+        p.frame(
+            Rect::new(20.0, 16.0, 60.0, 30.0),
+            6.0,
+            [240, 240, 240],
+            [90, 90, 90],
+        );
+        p.rbox_a(Rect::new(24.5, 20.0, 12.0, 8.0), 3.0, [200, 30, 30], 0.6);
+        p.text(Face::Ui, 13.0, 26.0, 31.0, "Offset", [10, 10, 10], 50.0);
+        p.underline_range(Face::Ui, 13.0, 26.0, 31.0, "Offset", 0..3, [0, 0, 200]);
+        p.icon(glyph::CHECK, 12.0, 70.0, 26.0, [0, 120, 0]);
+        p.polygon(&[(60.0, 36.0), (72.0, 36.0), (66.0, 44.0)], [120, 0, 120]);
+        p.paragraph(
+            Face::Ui,
+            10.0,
+            22.0,
+            34.0,
+            30.0,
+            "two lines of it",
+            [60, 60, 60],
+        );
+        let old = p.clip(Rect::new(20.0, 16.0, 8.0, 30.0));
+        p.fill(Rect::new(0.0, 40.0, 200.0, 3.0), [0, 0, 0]);
+        p.restore(old);
+    }
+
+    #[test]
+    fn an_offset_moves_everything_by_whole_device_pixels_and_changes_nothing_else() {
+        for (scale, by, moved) in [
+            (1.0, (7.0, 5.0), (7, 5)),
+            (1.0, (-3.4, 0.0), (-3, 0)),
+            (1.5, (4.0, 2.0), (6, 3)),
+            (1.25, (0.0, 9.0), (0, 11)),
+        ] {
+            let (w, h) = (180u32, 110u32);
+            let draw = |by: Option<(f32, f32)>| {
+                let mut bmp = Bitmap::new(w, h);
+                let mut gfx = Gfx::new();
+                {
+                    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                    p.fill(Rect::new(0.0, 0.0, 200.0, 200.0), [255, 255, 255]);
+                    assert_eq!(p.origin(), (0, 0));
+                    if let Some((dx, dy)) = by {
+                        let before = p.offset(dx, dy);
+                        assert_eq!(before, (0, 0));
+                        assert_eq!(p.origin(), moved);
+                        // What `dev_rect` gives is where the drawing lands.
+                        let at = p.dev_rect(Rect::new(20.0, 16.0, 60.0, 30.0));
+                        assert_eq!(at.0, (20.0 * scale).round() as i32 + moved.0);
+                        assert_eq!(at.1, (16.0 * scale).round() as i32 + moved.1);
+                        scene(&mut p);
+                        p.restore_offset(before);
+                        assert_eq!(p.origin(), (0, 0));
+                    } else {
+                        scene(&mut p);
+                    }
+                }
+                bmp
+            };
+            let (still, shifted) = (draw(None), draw(Some(by)));
+            assert_ne!(still.pixels, shifted.pixels, "{by:?} moved nothing");
+            let px = |bmp: &Bitmap, x: i32, y: i32| {
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    return [255, 255, 255, 255];
+                }
+                let o = (y as usize * w as usize + x as usize) * 4;
+                [
+                    bmp.pixels[o],
+                    bmp.pixels[o + 1],
+                    bmp.pixels[o + 2],
+                    bmp.pixels[o + 3],
+                ]
+            };
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    assert_eq!(
+                        px(&shifted, x, y),
+                        px(&still, x - moved.0, y - moved.1),
+                        "scale {scale}, by {by:?}, at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offsets_add_up_and_leave_device_pixel_calls_and_an_earlier_clip_alone() {
+        let bmp = marked(|p| {
+            let old = p.clip(Rect::new(0.0, 0.0, 50.0, 48.0));
+            let first = p.offset(10.0, 0.0);
+            let second = p.offset(5.0, 2.0);
+            assert_eq!((first, second, p.origin()), ((0, 0), (10, 0), (15, 2)));
+            // Logical: moved, and cut by the clip that was set before the offset.
+            p.fill(Rect::new(30.0, 10.0, 20.0, 4.0), [255, 0, 0]);
+            // Device: where it says.
+            p.fill_dev(2, 30, 6, 34, [0, 0, 255], 1.0);
+            p.restore_offset(second);
+            p.restore_offset(first);
+            p.restore(old);
+        });
+        assert_eq!(
+            rows_of(&bmp, [255, 0, 0]),
+            vec![(12, 45, 49), (13, 45, 49), (14, 45, 49), (15, 45, 49)]
+        );
+        assert_eq!(rows_of(&bmp, [0, 0, 255]).first(), Some(&(30, 2, 5)));
+    }
+
+    #[test]
+    fn a_fade_gives_what_was_drawn_since_the_snapshot_one_opacity() {
+        let bmp = marked(|p| {
+            let r = Rect::new(10.0, 10.0, 40.0, 20.0);
+            let under = p.snapshot(r);
+            assert_eq!(under.rect(), (10, 10, 50, 30));
+            // Two boxes that overlap: faded one by one the overlap would be darker.
+            p.fill(Rect::new(10.0, 10.0, 30.0, 20.0), [0, 0, 0]);
+            p.fill(Rect::new(20.0, 10.0, 30.0, 20.0), [0, 0, 0]);
+            p.fade(&under, 0.5);
+            // Cut to the clip.
+            let old = p.clip(Rect::new(0.0, 0.0, 20.0, 15.0));
+            assert_eq!(p.snapshot(r).rect(), (10, 10, 20, 15));
+            p.restore(old);
+        });
+        let grey = rows_of(&bmp, [128, 128, 128]);
+        assert_eq!(grey.len(), 20);
+        assert!(grey.iter().all(|&(_, x0, x1)| (x0, x1) == (10, 49)));
+        assert!(rows_of(&bmp, [0, 0, 0]).is_empty());
     }
 
     #[test]

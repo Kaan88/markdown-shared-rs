@@ -435,6 +435,27 @@ mod imp {
         ) == Some(0)
     }
 
+    /// "Animation effects" in Settings, Accessibility, Visual effects (before Windows 11:
+    /// "Show animations in Windows"), which is `SPI_GETCLIENTAREAANIMATION`: whether a window
+    /// animates what is inside it. Off means less motion is asked for. A call that fails says
+    /// nothing was asked.
+    pub fn motion_reduced() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+        };
+        let mut animates: i32 = 1;
+        // SAFETY: this action writes one BOOL through the pointer, which is to a live i32.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                (&mut animates as *mut i32).cast(),
+                0,
+            )
+        };
+        ok != 0 && animates == 0
+    }
+
     pub fn double_click_time() -> Duration {
         // SAFETY: no preconditions.
         let ms = unsafe { GetDoubleClickTime() };
@@ -775,15 +796,30 @@ mod imp {
 
     #[cfg(not(target_os = "macos"))]
     fn read_color_scheme() -> Option<u32> {
-        use zbus::zvariant::{OwnedValue, Value};
         let bus = zbus::blocking::Connection::session().ok()?;
+        read_setting(&bus, "org.freedesktop.appearance", "color-scheme", |v| {
+            u32::try_from(v).ok()
+        })
+    }
+
+    /// One value of the settings portal, read by `read` once the variants it is wrapped in are
+    /// taken off. `None` when the portal does not answer, does not know the key, or `read`
+    /// refuses the value's type.
+    #[cfg(not(target_os = "macos"))]
+    fn read_setting<T>(
+        bus: &zbus::blocking::Connection,
+        namespace: &str,
+        key: &str,
+        read: impl Fn(&zbus::zvariant::Value) -> Option<T>,
+    ) -> Option<T> {
+        use zbus::zvariant::{OwnedValue, Value};
         let call = |method: &str| {
             bus.call_method(
                 Some("org.freedesktop.portal.Desktop"),
                 "/org/freedesktop/portal/desktop",
                 Some("org.freedesktop.portal.Settings"),
                 method,
-                &("org.freedesktop.appearance", "color-scheme"),
+                &(namespace, key),
             )
         };
         // `ReadOne` (portal version 2) answers with the value; the older `Read` wraps it once more.
@@ -793,7 +829,82 @@ mod imp {
         while let Value::Value(inner) = value {
             value = inner;
         }
-        u32::try_from(value).ok()
+        read(value)
+    }
+
+    /// macOS: Accessibility, Display, Reduce motion.
+    #[cfg(target_os = "macos")]
+    pub fn motion_reduced() -> bool {
+        objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+    /// The desktop's wish for less motion from the settings portal, cached for a second.
+    #[cfg(not(target_os = "macos"))]
+    pub fn motion_reduced() -> bool {
+        use std::sync::Mutex;
+        use std::time::Instant;
+        static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, reduced)) = *cache
+            && at.elapsed() < Duration::from_secs(1)
+        {
+            return reduced;
+        }
+        let reduced = portal_reduces_motion(Duration::from_millis(500));
+        *cache = Some((Instant::now(), reduced));
+        reduced
+    }
+
+    /// Asks the settings portal whether less motion is wanted, on a helper thread, giving up
+    /// after `timeout` as [`portal_prefers_dark`] does. False on any failure.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn portal_reduces_motion(timeout: Duration) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("mdshared-portal".into())
+            .spawn(move || _ = tx.send(read_reduced_motion()));
+        spawned.is_ok() && rx.recv_timeout(timeout).ok().flatten() == Some(true)
+    }
+
+    /// The first of these the portal answers:
+    ///
+    /// 1. `org.freedesktop.appearance` `reduced-motion`, the portal's own key (1 asks for less
+    ///    motion, 0 has no wish), where the portal is new enough to have it;
+    /// 2. `org.gnome.desktop.interface` `enable-animations` (GNOME's Settings, Accessibility,
+    ///    Seeing, "Animation effects"; false asks for less), which the GNOME and GTK portals
+    ///    pass on;
+    /// 3. `org.kde.kdeglobals.KDE` `AnimationDurationFactor` (Plasma's System Settings,
+    ///    "Animation speed"; 0 is its "instant" end), which the KDE portal passes on.
+    #[cfg(not(target_os = "macos"))]
+    fn read_reduced_motion() -> Option<bool> {
+        use zbus::zvariant::Value;
+        let bus = zbus::blocking::Connection::session().ok()?;
+        let wish = read_setting(&bus, "org.freedesktop.appearance", "reduced-motion", |v| {
+            u32::try_from(v).ok()
+        });
+        if let Some(wish) = wish {
+            return Some(wish == 1);
+        }
+        let animations = read_setting(
+            &bus,
+            "org.gnome.desktop.interface",
+            "enable-animations",
+            |v| bool::try_from(v).ok(),
+        );
+        if let Some(on) = animations {
+            return Some(!on);
+        }
+        // KDE stores its settings as text; a portal may also hand the number over as one.
+        let factor = read_setting(
+            &bus,
+            "org.kde.kdeglobals.KDE",
+            "AnimationDurationFactor",
+            |v| match v {
+                Value::Str(s) => s.as_str().trim().parse::<f64>().ok(),
+                Value::F64(f) => Some(*f),
+                _ => None,
+            },
+        )?;
+        Some(factor == 0.0)
     }
     /// macOS: the interval set in Settings (`NSEvent.doubleClickInterval`). Elsewhere 500 ms.
     pub fn double_click_time() -> Duration {
@@ -886,8 +997,27 @@ pub fn open_file(path: &Path, extensions: &[&str]) -> bool {
 pub fn reveal_in_file_manager(path: &Path) -> bool {
     imp::reveal_in_file_manager(path)
 }
+/// Whether the system asks for less motion, on every system this crate runs on: what an
+/// [`Animator`](crate::anim::Animator) is told through
+/// [`set_system_reduced`](crate::anim::Animator::set_system_reduced). The application reads it
+/// at start and again when the system says its settings changed (winit's `ThemeChanged` is a
+/// good moment, and so is the window gaining the focus); it is cheap enough for that, not for
+/// every frame.
+///
+/// - Windows: Settings, Accessibility, Visual effects, "Animation effects" switched off
+///   (`SPI_GETCLIENTAREAANIMATION`).
+/// - macOS: System Settings, Accessibility, Display, "Reduce motion".
+/// - Linux: the settings portal, asked for its own `reduced-motion` key, then GNOME's
+///   `enable-animations`, then Plasma's animation speed at "instant"; cached for a second and
+///   given half a second to answer. Without a portal the answer is false.
+pub fn motion_reduced() -> bool {
+    imp::motion_reduced()
+}
+
 /// Whether the system asks for less motion (macOS: Accessibility, Display, Reduce motion), so
-/// animations stay still. False elsewhere, where the applications ask the system themselves.
+/// animations stay still. False elsewhere, where the applications ask the system themselves;
+/// [`motion_reduced`] asks on every system, and is what new code calls. This one is kept as it
+/// was for the applications that already use it.
 pub fn reduces_motion() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -980,6 +1110,37 @@ pub fn backdrop_available() -> bool {
 /// transparent shows the desktop itself.
 pub fn set_backdrop(hwnd: isize, backdrop: Backdrop) -> bool {
     imp::set_backdrop(hwnd, backdrop)
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    /// The system is asked, answers, and answers the same when asked again at once. What it
+    /// answers depends on the machine the test runs on, so only that is held.
+    #[test]
+    fn the_wish_for_less_motion_is_read_without_failing() {
+        let reduced = motion_reduced();
+        println!("the system asks for less motion: {reduced}");
+        assert_eq!(motion_reduced(), reduced);
+        // The older call is what it was: macOS's answer, and false elsewhere.
+        if !cfg!(target_os = "macos") {
+            assert!(!reduces_motion());
+        }
+    }
+
+    /// The portal read never hangs: false on any failure, within its time limit.
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn the_portal_answer_about_motion_comes_within_the_time_limit() {
+        let start = std::time::Instant::now();
+        let reduced = imp::portal_reduces_motion(Duration::from_millis(500));
+        println!(
+            "portal asks for less motion: {reduced}, in {:?}",
+            start.elapsed()
+        );
+        assert!(start.elapsed() < Duration::from_millis(900));
+    }
 }
 
 #[cfg(test)]
