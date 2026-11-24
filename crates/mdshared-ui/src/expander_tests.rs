@@ -1,7 +1,7 @@
 use super::*;
 use crate::anim::{Clock, ManualClock};
-use crate::gfx::Gfx;
-use crate::keys::KeyName;
+use crate::gfx::{Gfx, Rgb};
+use crate::keys::{KeyName, Mods};
 use crate::theme::{DARK, LIGHT};
 use mdshared_text::Bitmap;
 use std::time::Duration;
@@ -12,12 +12,12 @@ fn area() -> Rect {
     Rect::new(10.0, 20.0, 200.0, 140.0)
 }
 
-fn header_bitmap(pal: &Palette, expanded: bool, look: Look) -> Bitmap {
+fn header_on(pal: &Palette, ground: Rgb, expanded: bool, look: Look) -> Bitmap {
     let mut bmp = Bitmap::new(200, 40);
     let mut gfx = Gfx::new();
     {
         let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
-        p.fill(Rect::new(0.0, 0.0, 200.0, 40.0), pal.page);
+        p.fill(Rect::new(0.0, 0.0, 200.0, 40.0), ground);
         draw_header(
             &mut p,
             pal,
@@ -28,6 +28,15 @@ fn header_bitmap(pal: &Palette, expanded: bool, look: Look) -> Bitmap {
         );
     }
     bmp
+}
+
+fn header_bitmap(pal: &Palette, expanded: bool, look: Look) -> Bitmap {
+    header_on(pal, pal.page, expanded, look)
+}
+
+fn rgb_at(bmp: &Bitmap, x: usize, y: usize) -> Rgb {
+    let o = (y * 200 + x) * 4;
+    [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]]
 }
 
 #[test]
@@ -64,9 +73,9 @@ fn the_header_takes_its_own_rectangle_and_no_more() {
 #[test]
 fn space_and_enter_toggle_and_other_keys_do_not() {
     let mut e = Expander::new(false);
-    assert!(e.key(&KeyName::Space));
+    assert!(e.key(KeyName::Space, Mods::default()));
     assert!(e.expanded);
-    assert!(e.key(&KeyName::Enter));
+    assert!(e.key(KeyName::Enter, Mods::default()));
     assert!(!e.expanded);
     for key in [
         KeyName::Char('x'),
@@ -85,9 +94,37 @@ fn space_and_enter_toggle_and_other_keys_do_not() {
         KeyName::PageDown,
     ] {
         let before = e.expanded;
-        assert!(!e.key(&key), "{key:?} was taken by the expander");
+        assert!(
+            !e.key(key.clone(), Mods::default()),
+            "{key:?} was taken by the expander"
+        );
         assert_eq!(e.expanded, before, "{key:?} changed the expander");
     }
+}
+
+#[test]
+fn ctrl_and_alt_leave_the_expander_to_the_applications_shortcuts() {
+    let ctrl = Mods {
+        ctrl: true,
+        ..Mods::default()
+    };
+    let alt = Mods {
+        alt: true,
+        ..Mods::default()
+    };
+    let mut e = Expander::new(false);
+    assert!(!e.key(KeyName::Enter, ctrl), "Ctrl+Enter was taken");
+    assert!(!e.key(KeyName::Space, ctrl), "Ctrl+Space was taken");
+    assert!(!e.key(KeyName::Enter, alt), "Alt+Enter was taken");
+    assert!(!e.key(KeyName::Space, alt), "Alt+Space was taken");
+    assert!(!e.expanded, "a shortcut changed the expander");
+    // Shift is not a shortcut modifier here: Shift+Enter still toggles.
+    let shift = Mods {
+        shift: true,
+        ..Mods::default()
+    };
+    assert!(e.key(KeyName::Enter, shift));
+    assert!(e.expanded);
 }
 
 #[test]
@@ -108,6 +145,11 @@ fn a_header_is_the_top_of_the_area_and_a_nonsense_area_gives_nothing() {
     let a = area();
     assert_eq!(header_rect(a), Rect::new(a.x, a.y, a.w, HEADER_H));
     assert_eq!(
+        header_rect(Rect::new(5.0, 6.0, 100.0, 20.0)),
+        Rect::new(5.0, 6.0, 100.0, 20.0),
+        "a short area keeps a short header"
+    );
+    assert_eq!(
         header_rect(Rect::new(f32::NAN, f32::INFINITY, f32::NAN, 90.0)),
         Rect::new(0.0, 0.0, 0.0, HEADER_H)
     );
@@ -115,6 +157,11 @@ fn a_header_is_the_top_of_the_area_and_a_nonsense_area_gives_nothing() {
         header_rect(Rect::new(0.0, 0.0, -5.0, 90.0)).w,
         0.0,
         "a negative width is not a rectangle"
+    );
+    assert_eq!(
+        header_rect(Rect::new(0.0, 0.0, 100.0, f32::INFINITY)).h,
+        HEADER_H,
+        "an endless area gets the ordinary header"
     );
 }
 
@@ -279,6 +326,51 @@ fn every_look_of_the_header_draws_differently() {
 }
 
 #[test]
+fn at_rest_and_disabled_the_header_leaves_the_background_showing() {
+    for pal in [&LIGHT, &DARK] {
+        let plain = header_on(pal, pal.pane, false, Look::default());
+        assert_eq!(
+            rgb_at(&plain, 8, 2),
+            pal.pane,
+            "the resting header painted a box over the pane"
+        );
+        let disabled = Look {
+            disabled: true,
+            ..Look::default()
+        };
+        let quiet = header_on(pal, pal.pane, false, disabled);
+        assert_eq!(
+            rgb_at(&quiet, 8, 2),
+            pal.pane,
+            "the disabled header painted a box over the pane"
+        );
+        for (name, look) in [
+            (
+                "hovered",
+                Look {
+                    hovered: true,
+                    ..Look::default()
+                },
+            ),
+            (
+                "pressed",
+                Look {
+                    pressed: true,
+                    ..Look::default()
+                },
+            ),
+        ] {
+            let filled = header_on(pal, pal.pane, false, look);
+            assert_ne!(
+                rgb_at(&filled, 8, 2),
+                pal.pane,
+                "the {name} header did not fill"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_returned_body_rect_is_under_the_header_and_as_tall_as_the_animation() {
     let clock = ManualClock::new();
     let mut anim = Animator::new();
@@ -302,25 +394,21 @@ fn the_returned_body_rect_is_under_the_header_and_as_tall_as_the_animation() {
             Look::default(),
             BODY,
         );
-        let at = body_height(&mut anim, "expander", expanded, BODY);
-        (body, at, anim.end_frame().is_some())
+        (body, anim.end_frame().is_some())
     };
-    let (body, at, more) = frame(0, false);
+    let (body, more) = frame(0, false);
     assert_eq!(
         (body.x, body.y, body.w, body.h),
         (a.x, a.y + HEADER_H, a.w, 0.0)
     );
-    assert_eq!(body.h, at);
     assert!(!more);
     frame(0, true);
-    let (body, at, more) = frame(100, true);
+    let (body, more) = frame(100, true);
     assert_eq!((body.x, body.y, body.w), (a.x, a.y + HEADER_H, a.w));
     assert!(body.h > 0.0 && body.h < BODY, "half way: {}", body.h);
-    assert_eq!(body.h, at, "the body rect is not the animated height");
     assert!(more);
-    let (body, at, _) = frame(300, true);
+    let (body, _) = frame(300, true);
     assert_eq!(body.h, BODY);
-    assert_eq!(body.h, at);
 }
 
 #[test]
@@ -344,11 +432,29 @@ fn the_body_rect_stops_at_the_bottom_of_the_area() {
         BODY,
     );
     assert_eq!(body.h, 30.0, "the body ran past its area");
+    // An area shorter than the header has a short header and no room for a body.
+    let tiny = Rect::new(0.0, 0.0, 200.0, 20.0);
+    let body = draw_expander_animated(
+        &mut p,
+        &LIGHT,
+        &mut anim,
+        "tiny",
+        tiny,
+        "Details",
+        true,
+        Look::default(),
+        BODY,
+    );
+    assert_eq!(
+        (body.y, body.h),
+        (20.0, 0.0),
+        "the body ignored the short header"
+    );
     anim.end_frame();
 }
 
-/// The sheet a person looks at: closed, open and mid-animation, with the header's looks, light
-/// and dark, at two scales. `cargo test -p mdshared-ui expander_sheet -- --ignored`, then open
+/// The sheet a person looks at: an open expander and the header's looks while closed, light and
+/// dark, at two scales. `cargo test -p mdshared-ui expander_sheet -- --ignored`, then open
 /// target/specimen/expander.png and expander-150.png.
 #[test]
 #[ignore]
