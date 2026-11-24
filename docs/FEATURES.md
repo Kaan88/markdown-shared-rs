@@ -370,6 +370,129 @@ Not verified: seen by a person (the owner has not looked yet); Linux and macOS (
 mdview and mdedit were not rebuilt against the branch (they name no look, so nothing of theirs is
 drawn differently).
 
+## The look as a user setting (`appearance`, joined menus, 2026-11-24, `wk/menulook`, roadmap L12)
+
+mdplay makes its whole look a setting (its D-024): a colour scheme, where the accent comes from,
+the corners, the shadows, the menus' rows, menus joined to their control, the speed of motion.
+The parts any application can use are here, so mdview, mdedit, Hub and mdmix can offer the same
+choices with a few lines. Three pieces, each opt-in:
+
+- **`appearance`**, the look as plain data. `Appearance` has the fields `scheme`
+  (`Scheme::{Dark, Light, Warm, Cool}`), `accent` (`AccentFrom::{Theme, System, Cover,
+  Custom(rgb)}`), `radius`, `shadow` (1 is the toolkit's strength, 0 none), `menu_row`,
+  `joined`, `motion` (`Speed::{Off, Snappy, Fluent, Soft}`, factors 0, 0.66, 1, 1.5) and
+  `submenu_delay_ms`. `Appearance::DEFAULT` is the toolkit's own look (DARK, its accent,
+  `Look::ROUNDED`, Fluent, `submenu::DELAY`), so opting in changes nothing until the user does.
+  `WARM` and `COOL` are two new light palettes taken from mdplay's prototype.
+- **`Painter::shadow_with`** and **`menu::Look::shadow_strength`**: the popup shadow at a
+  strength; `shadow` is `shadow_with` at 1, pixel for pixel.
+- **`menu::joins`, `join_under`, `join_over`**: a menu drawn joined to the control that opens it,
+  the control a tab of the menu (the popup's colour, its line round the tab's top and sides, the
+  seam opened, the menu's corner squared under a tab at its edge, and a concave curve of up to
+  `menu::FILLET` px where the tab's side meets the menu's top inside its width).
+
+### Adopting it
+
+```rust
+use mdshared_ui::anim::{Motion, fluent};
+use mdshared_ui::appearance::{self, Appearance};
+use mdshared_ui::{menu, platform, submenu};
+
+const NAME: &str = "myapp-look"; // one word: whose text it is
+const VERSION: u32 = 1;
+
+// At start: the text is one value of the settings file (unescape it if it was escaped).
+let mut look = Appearance::DEFAULT;
+let mut own_keys = Vec::new();
+if let Some((_version, pairs)) = appearance::parse(&text, NAME) {
+    own_keys = look.read_all(pairs); // the pairs that are not the look's: the app's own
+}
+
+// The palette: the scheme's (or the app's own for a scheme it draws itself), with the accent.
+let system = platform::system_accent(); // ask again on ThemeChanged or when focus returns
+let cover = cover_colors.map(|c| c.accent); // cover::colors, once per picture
+let pal = look.palette(&look.scheme.palette(), system, cover);
+
+// Menus and cascades take the look; the cascade also takes the delay.
+let mlook = look.menu_look();
+let mut m = menu::Menu::new(items, 0.0, 0.0, false).around(control).with_look(mlook);
+let cascade = submenu::Cascade::new(nodes, control)
+    .with_look(mlook)
+    .with_delay(look.submenu_delay());
+
+// A joined menu, each frame it is open.
+m.place_in(&mut p, area);
+let joined = look.joined && menu::joins(control, m.rect());
+if joined {
+    menu::join_under(&mut p, &pal, &mlook, control);
+}
+m.draw_in(&mut p, &pal, area);
+if joined {
+    menu::join_over(&mut p, &pal, &mlook, control, m.rect());
+}
+// ...then the control's label over it, in pal.text.
+
+// Motion: the animator's policy, and the Fluent durations at the user's speed.
+anim.set_policy(look.motion.policy());
+let enter = Motion::tween(look.motion.scale(fluent::FAST), fluent::DECELERATE);
+
+// On a change: apply it as above, then save the look and the app's own keys in one text.
+let mut pairs = look.write();
+pairs.extend(own_keys.iter().cloned());
+let text = appearance::to_text(NAME, VERSION, &pairs);
+```
+
+The text is a header line `name version` and a `key value` line per pair; values are escaped as
+the settings file escapes them (`%`, line breaks), so any text fits. `appearance::KEYS` lists
+the look's keys and values. `parse` never panics: it refuses a text over 64 KiB or with another
+header, skips lines it could not have written, reads at most 256 pairs, and takes CRLF, a
+byte-order mark and blank lines; `read` leaves a field when its value does not read and holds a
+number to its range.
+
+What stays the application's own:
+
+- **Its palettes.** `Scheme::palette` is the toolkit's; an application with a dark of its own
+  (mdplay) passes that as `base` for `Scheme::Dark`. `palette` only puts the accent in.
+- **Its keys.** Anything else it wants in the same text (columns, a layout) goes into the pairs;
+  `read_all` hands them back.
+- **When to ask again.** The system's accent (`platform::system_accent`) when the system says
+  its colours changed or the window regains the focus; the cover's accent once per picture.
+- **The preferences page.** `Scheme::ALL`, `AccentFrom::SOURCES`, `Speed::ALL` and their
+  `label`s fill a `settings::Form`; the ranges are `MAX_RADIUS`, `MAX_SHADOW`,
+  `MIN_MENU_ROW`/`MAX_MENU_ROW`, `MAX_SUBMENU_DELAY_MS`.
+- **Where its menus open.** `Menu::around(control)` opens flush under the control, which a joined
+  menu needs; an application that wants a gap when menus are apart anchors to a rectangle a few
+  px taller.
+
+Not there: dark warm or cool schemes; fonts and text sizes (`tokens::Sizes`); high contrast
+(`tokens::Tokens::from_system`, which an application in high contrast uses instead); acrylic
+menus and the prototype's "unfold" entrance; a joined submenu or a menu joined above its
+control (a flipped menu does not join, and `join_over` answers false); the tab fading with its
+menu (the caller draws both inside one `anim::pop`).
+
+`menu_look` maps the numbers onto `Look::ROUNDED`: this radius, row and shadow strength (no
+shadow at 0), the highlight's corners two px less than the menu's and at most 5 (the prototype's
+rule, and `DEFAULT` gives `ROUNDED` itself), the flat look's full-row highlight at radius 0; the
+padding and gaps stay the rounded look's. The join differs from mdplay's mockup in two places: the
+squared corner paints only the pixels the rounded fill did not cover, so a lit first row is kept,
+and the curve takes the tab's own side line into it instead of standing beside it.
+
+Compatibility: nothing existing changes. `Painter::shadow` draws what it drew (a test against a
+copy of the old loop, light and dark, at scale 1 and 1.5); `Look::ROUNDED` and `FLAT` gain
+`shadow_strength: 1.0` (the struct is `non_exhaustive`); everything else is new.
+
+What was run, on Windows, on 86afe1b with these docs: the nine commands of AGENTS.md, all
+passing (the workspace's tests 1248 passed, 0 failed, 22 ignored; the feature runs recycle 11,
+media_session 7, notify 11, none failed);
+mutants that drew the menu's shadow at strength 1 whatever the look, filled the squared corner
+whole, left out the curve, dropped the width test of `joins`, let a cover source fall back to
+black, dropped the text's size limit and left `read` unclamped each failed a test. The sheet
+`appearance_sheet` (target/specimen/appearance.png, -150) draws the four schemes with a menu
+joined to its title, in the toolkit's look and in mdplay's prototype's; the agent looked at it.
+
+Not verified: seen by the owner; Linux and macOS (CI not run); used by an application (mdplay's
+port is its own work); mdview and mdedit not rebuilt against the branch (they name none of it).
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
