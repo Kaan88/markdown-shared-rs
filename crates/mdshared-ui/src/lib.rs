@@ -4,10 +4,12 @@
 //! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, table columns and
 //! splitters, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
-//! ([`focus`]), and animation ([`anim`]). No window loop; the application
-//! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
+//! ([`focus`]), animation ([`anim`]), and the look as a user setting ([`appearance`]). No
+//! window loop; the application owns that. `docs/CATALOGUE.md` lists every module with its
+//! entry points.
 
 pub mod anim;
+pub mod appearance;
 pub mod blur;
 pub mod cf_html;
 pub mod check;
