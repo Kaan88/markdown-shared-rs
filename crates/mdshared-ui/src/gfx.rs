@@ -739,6 +739,25 @@ impl<'a> Painter<'a> {
         layout.height() / self.scale
     }
 
+    /// The height [`paragraph`](Self::paragraph) would use for `text` in a column `w` wide,
+    /// without drawing it: what a caller needs to size a wrapped block before it is laid out.
+    /// Empty text has no height; `w` is treated as at least one device px, so a narrow or
+    /// nonsensical width still gives one word per line instead of a panic.
+    pub fn paragraph_height(&mut self, face: Face, size: f32, w: f32, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        let wrap = if w.is_finite() {
+            (w * self.scale).max(1.0)
+        } else {
+            1.0
+        };
+        self.gfx
+            .layout(face, size * self.scale, [0, 0, 0], wrap, text)
+            .height()
+            / self.scale
+    }
+
     /// The x offset of each character boundary of `text` (one entry per `char`, plus the end), in
     /// logical px, for carets and selections in a text field.
     pub fn caret_stops(&mut self, face: Face, size: f32, text: &str) -> Vec<f32> {
@@ -1039,5 +1058,27 @@ mod tests {
             mono.pixels, ui.pixels,
             "the monospace family drew nothing new"
         );
+    }
+
+    /// The measured height is the height the drawing then uses, at both scales and widths.
+    #[test]
+    fn a_paragraphs_measured_height_is_the_height_it_draws() {
+        for scale in [1.0, 1.5] {
+            let mut bmp = Bitmap::new(200, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            for w in [40.0, 90.0, 200.0] {
+                let text = "a few words that need more than one line in most columns";
+                let measured = p.paragraph_height(Face::Ui, 12.5, w, text);
+                let drawn = p.paragraph(Face::Ui, 12.5, 4.0, 4.0, w, text, [0, 0, 0]);
+                assert!(
+                    (measured - drawn).abs() < 1e-3,
+                    "at scale {scale}, {w} wide: measured {measured}, drew {drawn}"
+                );
+            }
+            assert_eq!(p.paragraph_height(Face::Ui, 12.5, 100.0, ""), 0.0);
+            // A width that is not a number still lays the words out one per line.
+            assert!(p.paragraph_height(Face::Ui, 12.5, f32::NAN, "two words") > 0.0);
+        }
     }
 }
