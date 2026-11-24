@@ -485,3 +485,13 @@ fn every_error_says_what_went_wrong() {
             .contains("WebP")
     );
 }
+
+#[test]
+fn a_picture_encoded_as_png_decodes_to_the_same_pixels() {
+    let mut lcg = Lcg(3);
+    let rgba: Vec<u8> = (0..7 * 5 * 4).map(|_| lcg.next() as u8).collect();
+    let im = Image::new(7, 5, rgba).unwrap();
+    let bytes = encode_png(&im);
+    assert_eq!(sniff(&bytes), Format::Png);
+    assert_eq!(decode(&bytes, Limits::DEFAULT).unwrap(), im);
+}

@@ -144,7 +144,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A picture in 8-bit RGBA, top-down, `width * 4` bytes a row, straight (not premultiplied)
-/// alpha: what `Painter::image` takes.
+/// alpha: what `Bitmap::image` takes.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Image {
@@ -330,6 +330,23 @@ pub fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         .ok(),
         _ => None,
     }
+}
+
+/// The picture as a PNG file's bytes, RGBA at eight bits a channel, with the png crate's
+/// default compression: what a cache of thumbnails keeps on disk, and what [`decode`] reads
+/// back to the same pixels.
+pub fn encode_png(image: &Image) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, image.width, image.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    // Writing into a Vec only fails on a size the header cannot hold, which an `Image` never
+    // has; an empty result would then be refused by `decode` as damaged.
+    let written = encoder
+        .write_header()
+        .and_then(|mut w| w.write_image_data(&image.rgba));
+    drop(written);
+    out
 }
 
 /// Runs a decoder with any panic in it turned into [`Error::Damaged`].
