@@ -308,7 +308,10 @@ fn the_caret_is_drawn_in_the_on_phase_and_absent_in_the_off_phase() {
         let mut anim = Animator::new();
         let mut field = TextField::new();
         field.set_text(text);
-        // The caret's column: at the left edge when empty, after the text otherwise.
+        // The caret's column: at the left edge when empty, after the text otherwise. The
+        // painter rounds a rectangle's edge to the nearest device pixel, so the column is the
+        // rounded one: truncating found the caret only where the text's width ends in less than
+        // half a pixel, as it does with Segoe UI and not with DejaVu Sans.
         let x = if text.is_empty() {
             AREA.x
         } else {
@@ -321,7 +324,12 @@ fn the_caret_is_drawn_in_the_on_phase_and_absent_in_the_off_phase() {
                     .copied()
                     .unwrap_or(0.0)
         };
-        let (cx, cy) = (x as u32, AREA.cy() as u32);
+        let (cx, cy) = (x.round() as u32, AREA.cy() as u32);
+        // What that column shows with no caret: the page, or with an empty field the edge of
+        // the placeholder's first letter in a font whose letter starts that far left (Tahoma's
+        // "S" does).
+        let under = pixel(&plain(&field, false, false), cx, cy);
+        assert_ne!(under, COLORS.caret, "{text:?}");
 
         let on = blinking(&mut field, &mut anim, clock.now(), Some(HALF), true);
         assert_eq!(pixel(&on, cx, cy), COLORS.caret, "{text:?}: on");
@@ -329,7 +337,7 @@ fn the_caret_is_drawn_in_the_on_phase_and_absent_in_the_off_phase() {
 
         clock.advance_ms(500);
         let off = blinking(&mut field, &mut anim, clock.now(), Some(HALF), true);
-        assert_eq!(pixel(&off, cx, cy), BACK, "{text:?}: off");
+        assert_eq!(pixel(&off, cx, cy), under, "{text:?}: off");
         assert_eq!(off.pixels, plain(&field, true, false).pixels, "{text:?}");
 
         clock.advance_ms(500);
@@ -344,7 +352,7 @@ fn the_caret_is_drawn_in_the_on_phase_and_absent_in_the_off_phase() {
         // Not focused: the plain unfocused drawing, which has no caret.
         let away = blinking(&mut field, &mut anim, clock.now(), Some(HALF), false);
         assert_eq!(away.pixels, plain(&field, false, true).pixels, "{text:?}");
-        assert_eq!(pixel(&away, cx, cy), BACK, "{text:?}: unfocused");
+        assert_eq!(pixel(&away, cx, cy), under, "{text:?}: unfocused");
     }
 }
 

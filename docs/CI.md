@@ -32,4 +32,16 @@ file had two identities. `canonical_or_absolute` now canonicalizes the nearest e
 a missing file, so the identity is the same with or without the file (and the CI job needs no
 `TEMP` override).
 
+Finding from the first Linux and macOS test runs: no font is shipped, so the tests measure text
+in the system's own interface font. That is Segoe UI on Windows, SF on macOS, and on the Linux
+runner DejaVu Sans, which is wider than Segoe UI (the Linux list is Inter, Noto Sans,
+Cantarell, DejaVu Sans, and the runner has only the last). Tests that held only with Segoe UI's
+widths failed there. They now measure: the pane's switch names, the settings form's
+beside-or-under rule and its fit, and the text field's caret column (the painter rounds an edge
+to the nearest pixel, and the test truncated it). Where a number is the design's own, measured
+with Segoe UI, it is still asserted on Windows only. With DejaVu Sans the sample settings pages
+are cut in two places: the value "365 days of use" in its stepper (103 of 92 px), and at the
+minimum size the label "Looked at for less than". Those control widths are the design's and
+were not changed, so on Linux that test checks only that the pages fit in height.
+
 Known limits: no ARM Windows or ARM Linux; the tests run headless, so nothing here opens a window.
