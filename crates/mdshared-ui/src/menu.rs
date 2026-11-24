@@ -3,13 +3,18 @@
 //! A menu hangs from a point ([`Menu::new`], [`Menu::above`]) or is anchored to a rectangle
 //! and kept on screen at any corner ([`Menu::around`]). Submenus, their hover delay and their
 //! keys are [`submenu::Cascade`](crate::submenu::Cascade), which is made of these menus placed
-//! [`beside`](Menu::beside) one another.
+//! [`beside`](Menu::beside) one another. A menu can be drawn joined to the control that opens
+//! it, the control a tab of the menu: [`join_under`], [`join_over`] and [`joins`].
 
 use crate::gfx::{Face, Painter, Rect};
 use crate::scroll;
 use crate::theme::Palette;
 use std::borrow::Cow;
 use std::ops::Range;
+
+#[path = "menu_join.rs"]
+mod join;
+pub use join::{FILLET, join_over, join_under, joins};
 
 #[derive(Clone, Debug)]
 pub struct Item<T> {
