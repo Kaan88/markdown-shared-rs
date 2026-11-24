@@ -179,7 +179,7 @@ Checks for the ready toolkit (Purge's gates):
 | X5 | **`pool`: cancel by key, and results in a chosen order.** | S | low | `mdshared_app::pool` | open |
 | X6 | **`commands`: chord sequences (`Ctrl+K Ctrl+S`) and keymaps per context.** | M | medium | `commands`, `keys` | open |
 | X7 | **Compare `mdshared-term` with a real terminal.** Run a known test suite (vttest, esctest) through `Screen` and note the differences; nothing was compared with xterm | M | low | `mdshared-term` | open |
-| X8 | **The text field's caret on `Animator::blink`.** `textfield` has no blink of its own; give it an animator and `platform::caret_blink_time()` | S | medium | `anim::cycle`, `textfield` | claimed: Claude Opus 5.5 (opencode), 2026-11-25 |
+| X8 | **The text field's caret on `Animator::blink`.** `textfield` has no blink of its own; give it an animator and `platform::caret_blink_time()` | S | medium | `anim::cycle`, `textfield` | done |
 | X9 | **`system_is_dark` off the UI thread on Linux.** It blocks up to 500 ms and caches false on a timeout, as `motion_reduced` did; `platform::LastGood` and the listener are there to reuse. Owner decides: mdview and mdedit call it, and the first answer would come later | S | medium | `platform` | open |
 | X10 | **A page switch that survives a resize.** Redraw the old page at the new size and `begin_with` it | S | low | W1, `anim::PageTransition` | open |
 
