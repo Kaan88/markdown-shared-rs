@@ -44,6 +44,7 @@ pub mod stale;
 pub mod table;
 pub mod textfield;
 pub mod theme;
+pub mod thumbs;
 pub mod tree;
 pub mod window;
 
