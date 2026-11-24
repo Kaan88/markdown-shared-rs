@@ -294,6 +294,43 @@ linted for it from Windows, nothing was run) and macOS (not built here; CI build
 both); `mdshared-term` against a real terminal or a program running in a pseudo-terminal (there
 is none here); `pool` under real load.
 
+## The roadmap's foundations and music-player pieces (2026-11-24, `feat/anim`)
+
+The roadmap's music-player phase and most of its foundations, one commit each. Each module has a
+provisional row in [CATALOGUE.md](CATALOGUE.md), and the ROADMAP rows name their commits. All of it
+is additive: mdview's and mdedit's code and executables do not change. mdplay, pinned at
+`09c67cd`, still builds and passes its tests against this branch.
+
+These pieces need the system:
+
+| Piece | Notes on the design |
+|---|---|
+| `media_session` (feature `media-session`) | The player gives a `NowPlaying` and reads `Command`s after a wake: SMTC on Windows, MPRIS on Linux |
+| `notify` (feature `notify`) | Windows toasts under an AppUserModelID. `Notifier::new` writes `HKCU\Software\Classes\AppUserModelId\<id>` (its name and icon), because an unpackaged executable has no other way to name its toasts. On Linux it uses the desktop's notification server over zbus. A tag replaces the previous notification; at most three buttons |
+| `tray` | Windows: `Shell_NotifyIconW` on a hidden window and thread of its own, with no winit; the icon comes back after Explorer restarts (`TaskbarCreated`); the menu is the system's own. Linux: a StatusNotifierItem with a `com.canonical.dbusmenu` menu |
+| `window_state` | The saved place is one settings value. `restore` uses the window's own monitor, else the nearest one, scaled and kept on the work area |
+
+The rest is pure models and drawing, with no OS involved: `focus`, `submenu`, `viewport` with
+`scroll::hscrollbar`, `cursor`, `tokens`, `spectrum`, `meter`, `waveform`, `seek`, `knob`,
+`cover`, `sections` and `thumbs`.
+
+What was run, on Windows:
+- the workspace's tests;
+- clippy with warnings as errors, for the workspace and for each of the `recycle`, `media-session`
+  and `notify` features;
+- the Linux type-check with a stub `pkg-config`.
+
+What was run once on Windows 11, with no one clicking:
+- the `tray` example: the shell took the icon;
+- the `notify` example: its toasts were read back from the system's list.
+
+Not verified:
+- the Linux backends on a real bus (type-checked only);
+- macOS, where these pieces answer `Unsupported`;
+- Wine;
+- the tray's menu and the toasts' buttons pressed by a person;
+- `focus` and `submenu` under a real keyboard and pointer in an application.
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
