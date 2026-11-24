@@ -151,7 +151,7 @@ Purge's scope narrows two existing rows:
 | Id | What | Size | Risk | Deps | Builds on | Done when | Status |
 |---|---|---|---|---|---|---|---|
 | W5b | **The system's high-contrast colours.** Extends W5 | S | medium | none | `tokens`, `platform::system_high_contrast` | Under Windows HC the tokens use the active scheme's `GetSysColor` colours (window, text, highlight, hotlight, gray text, button face and text); Mica, Acrylic and frost are off; switching HC while running repaints | open |
-| P1 | **Selector bar with N options** (tabs) | S | low | none | `segments` | `segments` with any count; arrow keys; each option one UIA tab or radio item | open |
+| P1 | **Selector bar with N options** (tabs) | S | low | none | `segments` | `segments` with any count; arrow keys; each option one UIA tab or radio item | claimed: DeepSeek Flash (opencode), 2026-11-25 |
 | P2 | **InfoBar.** Extends `notice` | S | low | none | `notice`, `overlay` | Info, success, warning and error colours and glyphs; a title, a message and up to two action buttons; a close button; several stacked; in a page, not only at the top | open |
 | P3 | **Expander** | S | low | none | `anim::Transient`, `tree`'s disclosure | A header with a chevron; an animated body that respects reduced motion; the UIA ExpandCollapse state | open |
 | P4 | **Dropdown (combo box) and toggle switch, standalone** | S | low | none | `settings::Form`'s choice and toggle, `menu::Menu::around`, `anim` switch | Usable outside `settings::Form`; the dropdown opens a `menu` under itself; keyboard operable | open |
