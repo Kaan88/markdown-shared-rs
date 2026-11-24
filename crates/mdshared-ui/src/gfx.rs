@@ -741,17 +741,15 @@ impl<'a> Painter<'a> {
 
     /// The height [`paragraph`](Self::paragraph) would use for `text` in a column `w` wide,
     /// without drawing it: what a caller needs to size a wrapped block before it is laid out.
-    /// Empty text has no height; `w` is treated as at least one device px, so a narrow or
-    /// nonsensical width still gives one word per line instead of a panic.
+    /// Empty text has no height. The column is taken as `paragraph` takes it: at least one
+    /// device px, so a narrow, negative or NaN width gives one word per line instead of a panic,
+    /// and an infinite width never wraps, so the text is one line.
     pub fn paragraph_height(&mut self, face: Face, size: f32, w: f32, text: &str) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
-        let wrap = if w.is_finite() {
-            (w * self.scale).max(1.0)
-        } else {
-            1.0
-        };
+        // The same expression as in `paragraph`, so the two always agree (NaN.max(1.0) is 1.0).
+        let wrap = (w * self.scale).max(1.0);
         self.gfx
             .layout(face, size * self.scale, [0, 0, 0], wrap, text)
             .height()
@@ -1079,6 +1077,33 @@ mod tests {
             assert_eq!(p.paragraph_height(Face::Ui, 12.5, 100.0, ""), 0.0);
             // A width that is not a number still lays the words out one per line.
             assert!(p.paragraph_height(Face::Ui, 12.5, f32::NAN, "two words") > 0.0);
+        }
+    }
+
+    /// Widths that are not ordinary numbers are measured as `paragraph` draws them: an infinite
+    /// column is one line, and NaN, a negative or an infinitely negative one is one word a line.
+    #[test]
+    fn a_paragraphs_measured_height_agrees_with_the_drawing_at_odd_widths() {
+        for scale in [1.0, 1.5] {
+            let mut bmp = Bitmap::new(200, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            let text = "a few words that need more than one line in most columns";
+            for w in [f32::INFINITY, f32::NAN, -40.0, f32::NEG_INFINITY, 0.0] {
+                let measured = p.paragraph_height(Face::Ui, 12.5, w, text);
+                let drawn = p.paragraph(Face::Ui, 12.5, 4.0, 4.0, w, text, [0, 0, 0]);
+                assert!(
+                    (measured - drawn).abs() < 1e-3,
+                    "at scale {scale}, {w} wide: measured {measured}, drew {drawn}"
+                );
+            }
+            let one_line = p.paragraph_height(Face::Ui, 12.5, f32::INFINITY, text);
+            let one_word = p.paragraph_height(Face::Ui, 12.5, 10_000.0, "a");
+            assert!(
+                (one_line - one_word).abs() < 1e-3,
+                "an infinite column wrapped: {one_line} against one line's {one_word}"
+            );
+            assert!(p.paragraph_height(Face::Ui, 12.5, f32::NAN, text) > 2.0 * one_line);
         }
     }
 }

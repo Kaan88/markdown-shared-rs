@@ -6,21 +6,32 @@
 //! The model ([`InfoBar`]) holds only what the bar says; it reads no clock and calls nothing.
 //! The caller owns the events: it passes the pointer's position to [`InfoBar::hit`], and the
 //! hit under the pointer to [`draw_infobar`] as its hover state, then acts on the hit itself.
-//! The height depends on the width because the message wraps, so it is asked for with
-//! [`InfoBar::height`] and the same painter that draws.
+//! A caller that also tracks a held press or the keyboard passes all three to
+//! [`draw_infobar_with`] in a [`Look`]. To move the keyboard through a bar's buttons, and to
+//! know where each one is, it asks [`InfoBar::parts`] for their rectangles, which come from the
+//! same layout that drawing and hits use. The height depends on the width because the message
+//! wraps, so it is asked for with [`InfoBar::height`] and the same painter that draws.
 //!
-//! Deliberately not here: the pointer or keyboard state (the caller keeps it), dismissing a bar
-//! or storing a list of bars (the caller owns both), motion (there is none, so an idle window
-//! stays idle), and the accessibility tree. In the later accessibility layer (W8) a bar is a
-//! group or a status whose name is its title and message, and each action and the close button
-//! is a button; the model here carries everything that tree needs.
+//! Deliberately not here: the pointer or keyboard state (the caller keeps it, and decides the
+//! order focus moves in), dismissing a bar or storing a list of bars (the caller owns both),
+//! motion (there is none, so an idle window stays idle), and the accessibility tree. In the
+//! later accessibility layer (W8) a bar is a group or a status whose name is its title and
+//! message, and each action and the close button is a button; the model here carries
+//! everything that tree needs.
+//!
+//! Also not here: telling a high-contrast palette by anything but identity. A [`Palette`] has
+//! no field that says it is high contrast, so only [`crate::tokens::HIGH_CONTRAST_LIGHT`] and
+//! [`crate::tokens::HIGH_CONTRAST_DARK`] themselves get the high-contrast colours. A palette
+//! made from one of them, such as `Tokens::high_contrast(true).with_accent(c)`, is not equal to
+//! it and is taken as light or dark from its `dark` flag. [`crate::tokens::Tokens::from_system`]
+//! never makes such a palette: a high-contrast look keeps its own accent.
 //!
 //! The action buttons are drawn by [`crate::notice::bar_button`], the one the bars across the
-//! top of the page use. The per-severity colours are defined once, in [`severity_colors`], for
-//! light, dark and the two high-contrast palettes; a palette that is not one of
-//! [`crate::tokens::HIGH_CONTRAST_LIGHT`] or [`crate::tokens::HIGH_CONTRAST_DARK`] is taken as
-//! light or dark from its `dark` flag.
+//! top of the page use, and the focus ring by [`crate::focus::draw_ring`], as for the other
+//! widgets. The per-severity colours are defined once, in [`severity_colors`], for light, dark
+//! and the two high-contrast palettes.
 
+use crate::focus::draw_ring;
 use crate::gfx::{Face, Painter, Rect, Rgb, mix, rgb};
 use crate::glyph;
 use crate::notice::{bar_button, bar_button_w};
@@ -51,6 +62,13 @@ const TITLE_GAP: f32 = 2.0;
 const MESSAGE_TEXT: f32 = 12.5;
 /// The corners of the card.
 const RADIUS: f32 = 6.0;
+/// The corners of an action button (as [`bar_button`] draws it) and of the close button's
+/// square.
+const BUTTON_RADIUS: f32 = 5.0;
+/// How far the close button's square leans from the card's fill towards the text colour, under
+/// the pointer and under the pointer while pressed (the lifts [`bar_button`] uses).
+const CLOSE_HOVER: f32 = 0.10;
+const CLOSE_PRESS: f32 = 0.16;
 
 /// How serious a bar's news is. Each severity has a glyph and a colour of its own; the glyph
 /// carries the meaning where colour does not (a high-contrast scheme).
@@ -108,7 +126,33 @@ pub enum Hit {
     Close,
 }
 
-/// An InfoBar's data: its severity, a title, a message, up to [`MAX_ACTIONS`] actions and
+/// Where a bar's controls are in the rectangle it was asked about, from [`InfoBar::parts`].
+/// These are the rectangles [`InfoBar::hit`] answers for and [`draw_infobar`] draws in.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct Parts {
+    /// Each action's id and button, in the order they are drawn, left to right.
+    pub actions: Vec<(u32, Rect)>,
+    /// The close button's square, or `None` when the bar cannot be closed.
+    pub close: Option<Rect>,
+}
+
+/// How [`draw_infobar_with`] draws a bar's controls just now, from the caller's own state. Each
+/// field names the control it applies to, or `None` for none. A hit that is not on the bar (an
+/// action id it does not have, or [`Hit::Close`] on a bar that cannot be closed) marks nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Look {
+    /// The control under the pointer: it is lightened, as [`draw_infobar`] draws it.
+    pub hover: Option<Hit>,
+    /// The control a held press started on. It is drawn pressed while the pointer is still over
+    /// it (`hover` names the same control), and as only hovered or at rest otherwise, as
+    /// [`bar_button`] draws a press.
+    pub pressed: Option<Hit>,
+    /// The control the keyboard is on: the accent ring of [`crate::focus::draw_ring`] is drawn
+    /// just outside it.
+    pub focused: Option<Hit>,
+}
+
+/// An InfoBar's data:its severity, a title, a message, up to [`MAX_ACTIONS`] actions and
 /// whether it can be closed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct InfoBar {
@@ -203,6 +247,19 @@ impl InfoBar {
             .map(|&(id, _)| Hit::Action(id))
     }
 
+    /// The rectangle of each action button and of the close button when the bar is drawn in
+    /// `rect`, so that a caller can move the keyboard through them or place something by them.
+    /// It is the layout [`InfoBar::hit`] and [`draw_infobar`] use, so a point of `rect` in one
+    /// of these rectangles hits that control. Where the close button and an action would
+    /// overlap in a very small rectangle, the close button is the one hit. Nothing is kept.
+    pub fn parts(&self, p: &mut Painter, rect: Rect) -> Parts {
+        let l = self.layout(p, rect);
+        Parts {
+            actions: l.actions,
+            close: l.close,
+        }
+    }
+
     fn layout(&self, p: &mut Painter, rect: Rect) -> Layout {
         let close = self.closable.then(|| {
             Rect::new(
@@ -224,7 +281,13 @@ impl InfoBar {
         let message_top = rect.y + PAD + title_h + if title_h > 0.0 { TITLE_GAP } else { 0.0 };
         let message_h = p.paragraph_height(Face::Ui, MESSAGE_TEXT, text_w, &self.message);
         let message = Rect::new(text_x, message_top, text_w, message_h);
-        let actions_top = message_top + message_h + if self.actions.is_empty() { 0.0 } else { GAP };
+        let mut actions_top =
+            message_top + message_h + if self.actions.is_empty() { 0.0 } else { GAP };
+        if close.is_some() {
+            // The actions are right-aligned under the close button; under a short title and
+            // message they would reach up into it.
+            actions_top = actions_top.max(rect.y + PAD + CLOSE_SIZE + GAP);
+        }
         let widths: Vec<f32> = self
             .actions
             .iter()
@@ -237,13 +300,12 @@ impl InfoBar {
             actions.push((action.id, Rect::new(x, actions_top, *w, ACTION_H)));
             x += w + GAP;
         }
-        let actions_h = if self.actions.is_empty() {
-            0.0
-        } else {
-            GAP + ACTION_H
-        };
         // From the top edge: the padding, the title's line and the message, then the actions.
-        let content = (message_top - rect.y) + message_h + actions_h;
+        let content = if self.actions.is_empty() {
+            (message_top - rect.y) + message_h
+        } else {
+            (actions_top - rect.y) + ACTION_H
+        };
         // A close button is the tallest thing a short bar may otherwise be too short for.
         let lowest = content.max(PAD + if self.closable { CLOSE_SIZE } else { 0.0 });
         Layout {
@@ -295,7 +357,9 @@ pub struct SeverityColors {
 /// application's own accent reaches them. Success has no palette entry, and the four fills and
 /// the frame are this module's own: they are light or dark by the palette's flag, and the high
 /// contrast palettes (recognised by identity with [`HIGH_CONTRAST_LIGHT`] and
-/// [`HIGH_CONTRAST_DARK`]) keep the page as the fill and the ink as the frame.
+/// [`HIGH_CONTRAST_DARK`]) keep the page as the fill and the ink as the frame. A palette built
+/// from one of those two, for example with another accent, is not recognised: see the module's
+/// "Also not here".
 pub fn severity_colors(severity: Severity, pal: &Palette) -> SeverityColors {
     use Severity::*;
     let high_contrast = *pal == HIGH_CONTRAST_LIGHT || *pal == HIGH_CONTRAST_DARK;
@@ -343,7 +407,31 @@ pub fn severity_colors(severity: Severity, pal: &Palette) -> SeverityColors {
 /// cross sits at the top right and takes the close hover. Everything is clipped to `rect`, so a
 /// bar squeezed shorter than its content loses the bottom rather than drawing over what is
 /// below it.
+///
+/// It is [`draw_infobar_with`] with only the hover set: no press and no focus ring.
 pub fn draw_infobar(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, hover: Option<Hit>) {
+    draw_infobar_with(
+        p,
+        pal,
+        rect,
+        bar,
+        Look {
+            hover,
+            ..Look::default()
+        },
+    );
+}
+
+/// Draws `bar` in `rect` as [`draw_infobar`] does, with the hover, the press and the keyboard
+/// focus of `look`, and changes nothing.
+///
+/// A pressed action is drawn as [`bar_button`] draws a press, and the pressed close button's
+/// square leans further towards the text colour than its hover does; either shows only while
+/// the pointer is still over that control. The focused control gets the accent ring of
+/// [`crate::focus::draw_ring`] just outside its rectangle (the button, or the close button's
+/// square), hovered or not. The ring lies in the card's padding, so the clip to `rect` cuts it
+/// only when the bar is squeezed shorter than its content.
+pub fn draw_infobar_with(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, look: Look) {
     let colors = severity_colors(bar.severity, pal);
     let l = bar.layout(p, rect);
     let clip = p.clip(rect);
@@ -378,6 +466,10 @@ pub fn draw_infobar(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, h
         );
     }
     for (k, (action, (_, button))) in bar.actions.iter().zip(&l.actions).enumerate() {
+        let id = Some(Hit::Action(action.id));
+        if look.focused == id {
+            draw_ring(p, pal, *button, BUTTON_RADIUS);
+        }
         bar_button(
             p,
             pal,
@@ -385,13 +477,21 @@ pub fn draw_infobar(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, h
             button.cy(),
             &action.label,
             k == 0,
-            hover == Some(Hit::Action(action.id)),
-            false,
+            look.hover == id,
+            look.pressed == id,
         );
     }
     if let Some(close) = l.close {
-        if hover == Some(Hit::Close) {
-            p.rbox(close, 5.0, mix(colors.fill, pal.text, 0.10));
+        if look.focused == Some(Hit::Close) {
+            draw_ring(p, pal, close, BUTTON_RADIUS);
+        }
+        if look.hover == Some(Hit::Close) {
+            let lift = if look.pressed == Some(Hit::Close) {
+                CLOSE_PRESS
+            } else {
+                CLOSE_HOVER
+            };
+            p.rbox(close, BUTTON_RADIUS, mix(colors.fill, pal.text, lift));
         }
         p.icon(glyph::CLOSE, 10.0, close.cx(), close.cy(), pal.muted);
     }

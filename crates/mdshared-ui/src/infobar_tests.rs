@@ -216,28 +216,455 @@ fn every_severity_draws_its_glyph_in_its_own_colour() {
     }
 }
 
+/// The device pixels of `r` (logical, at `scale`) as BGRA bytes, row after row.
+fn pixels_in(bmp: &Bitmap, r: Rect, scale: f32) -> Vec<u8> {
+    let (x0, x1) = ((r.x * scale) as usize, (r.right() * scale) as usize);
+    let (y0, y1) = ((r.y * scale) as usize, (r.bottom() * scale) as usize);
+    let mut out = Vec::new();
+    for y in y0..y1.min(bmp.height as usize) {
+        let o = y * bmp.width as usize * 4;
+        out.extend_from_slice(&bmp.pixels[o + x0 * 4..o + x1.min(bmp.width as usize) * 4]);
+    }
+    out
+}
+
+/// Every device pixel where `a` and `b` differ.
+fn differences(a: &Bitmap, b: &Bitmap) -> Vec<(usize, usize)> {
+    let w = a.width as usize;
+    a.pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.pixels.as_chunks::<4>().0)
+        .enumerate()
+        .filter(|(_, (p, q))| p != q)
+        .map(|(i, _)| (i % w, i / w))
+        .collect()
+}
+
 #[test]
 fn the_close_cross_is_drawn_only_when_the_bar_is_closable() {
+    // The cross is checked against the same card with no text at all, so no antialiased letter
+    // can stand in for it or hide it.
     for pal in [&LIGHT, &DARK] {
-        let close = Rect::new(420.0 - PAD - CLOSE_SIZE, PAD, CLOSE_SIZE, CLOSE_SIZE);
-        let draw = |on: bool| {
+        let (mut bmp, mut gfx) = scratch();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let rect = Rect::new(0.0, 0.0, 420.0, sample().height(&mut p, 420.0));
+        let close = sample().parts(&mut p, rect).close.expect("closable");
+        let draw = |bar: InfoBar| {
             shot(pal, 420, 120, move |p| {
-                let bar = sample().closable(on);
-                let rect = Rect::new(0.0, 0.0, 420.0, bar.height(p, 420.0));
-                draw_infobar(p, pal, rect, &bar, None);
+                draw_infobar(p, pal, rect, &bar, None)
             })
         };
-        let open = draw(true);
-        let shut = draw(false);
+        let with_text = draw(sample());
+        let bare_open = draw(InfoBar::new(Severity::Info, "", ""));
+        let bare_shut = draw(InfoBar::new(Severity::Info, "", "").closable(false));
+        let fill = severity_colors(Severity::Info, pal).fill;
+        let area = close.w as usize * close.h as usize;
+        assert_eq!(
+            count_in(&bare_shut, close, fill, 0),
+            area,
+            "a bar that cannot be closed drew something where the cross goes"
+        );
         assert!(
-            count_in(&open, close, pal.muted, 24) > 0,
+            count_in(&bare_open, close, fill, 0) < area,
             "the close cross is missing from the closable bar"
         );
-        assert_eq!(
-            count_in(&shut, close, pal.muted, 24),
-            0,
-            "a bar that cannot be closed drew a close cross"
+        assert!(
+            pixels_in(&with_text, close, 1.0) == pixels_in(&bare_open, close, 1.0),
+            "the bar's text reaches into the close button"
         );
+    }
+}
+
+#[test]
+fn the_parts_are_the_rectangles_hit_answers_for() {
+    let (mut bmp, mut gfx) = scratch();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+    let bars = [
+        sample().action(7, "Install").action(9, "Details"),
+        sample().action(3, "Undo").closable(false),
+        InfoBar::new(Severity::Error, "", "").action(1, "OK"),
+        InfoBar::new(Severity::Warning, "Short", "")
+            .action(4, "Retry")
+            .action(5, "Cancel"),
+    ];
+    for bar in &bars {
+        // Its own height, and squeezed so small that the controls crowd each other.
+        for (w, squeeze) in [(460.0, false), (300.0, false), (60.0, true)] {
+            let h = if squeeze { 30.0 } else { bar.height(&mut p, w) };
+            let rect = Rect::new(20.0, 10.0, w, h);
+            let parts = bar.parts(&mut p, rect);
+            assert_eq!(parts.actions.len(), bar.actions().len());
+            assert_eq!(parts.close.is_some(), bar.is_closable());
+            for (&(id, _), action) in parts.actions.iter().zip(bar.actions()) {
+                assert_eq!(id, action.id, "the parts are not in the drawing order");
+            }
+            if !squeeze {
+                for &(id, r) in &parts.actions {
+                    assert_eq!(bar.hit(&mut p, rect, r.cx(), r.cy()), Some(Hit::Action(id)));
+                }
+                if let Some(c) = parts.close {
+                    assert_eq!(bar.hit(&mut p, rect, c.cx(), c.cy()), Some(Hit::Close));
+                }
+            }
+            // A second, plain way to answer every point: the close square first, then the
+            // first action that holds it, and only inside the bar.
+            let mut y = rect.y - 4.0;
+            while y < rect.bottom() + 4.0 {
+                let mut x = rect.x - 4.0;
+                while x < rect.right() + 4.0 {
+                    let expected = if !rect.contains(x, y) {
+                        None
+                    } else if parts.close.is_some_and(|c| c.contains(x, y)) {
+                        Some(Hit::Close)
+                    } else {
+                        parts
+                            .actions
+                            .iter()
+                            .find(|(_, r)| r.contains(x, y))
+                            .map(|&(id, _)| Hit::Action(id))
+                    };
+                    assert_eq!(bar.hit(&mut p, rect, x, y), expected, "at ({x}, {y})");
+                    x += 1.5;
+                }
+                y += 1.5;
+            }
+        }
+    }
+}
+
+#[test]
+fn an_action_under_a_short_text_stays_below_the_close_button() {
+    let (mut bmp, mut gfx) = scratch();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+    for (title, message) in [("", ""), ("T", ""), ("", "Hi."), ("Title", "Short.")] {
+        let bar = InfoBar::new(Severity::Info, title, message).action(1, "OK");
+        let rect = Rect::new(0.0, 0.0, 300.0, bar.height(&mut p, 300.0));
+        let parts = bar.parts(&mut p, rect);
+        let close = parts.close.expect("closable");
+        let (_, ok) = parts.actions[0];
+        assert!(
+            ok.y >= rect.y + PAD + CLOSE_SIZE + GAP,
+            "{title:?}/{message:?}: the action's top {} is beside the close button",
+            ok.y
+        );
+        assert!(ok.y >= close.bottom(), "{ok:?} overlaps {close:?}");
+        assert!(
+            ok.bottom() + PAD <= rect.bottom() + 1e-3,
+            "the card is too short for {ok:?}"
+        );
+    }
+    // The point the two once shared is the close button's alone.
+    let bar = InfoBar::new(Severity::Info, "", "").action(1, "OK");
+    let rect = Rect::new(0.0, 0.0, 300.0, bar.height(&mut p, 300.0));
+    assert_eq!(bar.hit(&mut p, rect, 276.0, 28.0), Some(Hit::Close));
+    let (_, ok) = bar.parts(&mut p, rect).actions[0];
+    assert!(!ok.contains(276.0, 28.0));
+}
+
+/// `draw_infobar` as it was before `draw_infobar_with` existed, kept to prove it still draws
+/// the same pixels.
+fn old_draw_infobar(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, hover: Option<Hit>) {
+    let colors = severity_colors(bar.severity, pal);
+    let l = bar.layout(p, rect);
+    let clip = p.clip(rect);
+    p.frame(rect, RADIUS, colors.fill, colors.line);
+    p.icon(
+        bar.severity.glyph(),
+        ICON,
+        l.icon.cx(),
+        l.icon.cy(),
+        colors.ink,
+    );
+    if !bar.title.is_empty() {
+        p.text(
+            Face::Semibold,
+            TITLE_TEXT,
+            l.title.x,
+            l.title.cy(),
+            &bar.title,
+            pal.text,
+            l.title.w,
+        );
+    }
+    if !bar.message.is_empty() {
+        p.paragraph(
+            Face::Ui,
+            MESSAGE_TEXT,
+            l.message.x,
+            l.message.y,
+            l.message.w,
+            &bar.message,
+            pal.text,
+        );
+    }
+    for (k, (action, (_, button))) in bar.actions.iter().zip(&l.actions).enumerate() {
+        bar_button(
+            p,
+            pal,
+            button.x,
+            button.cy(),
+            &action.label,
+            k == 0,
+            hover == Some(Hit::Action(action.id)),
+            false,
+        );
+    }
+    if let Some(close) = l.close {
+        if hover == Some(Hit::Close) {
+            p.rbox(close, 5.0, mix(colors.fill, pal.text, 0.10));
+        }
+        p.icon(glyph::CLOSE, 10.0, close.cx(), close.cy(), pal.muted);
+    }
+    p.restore(clip);
+}
+
+#[test]
+fn draw_infobar_draws_what_it_drew_before_the_look_was_added() {
+    let bars = [
+        sample().action(7, "Install").action(9, "Details"),
+        sample().action(7, "Install").closable(false),
+        InfoBar::new(Severity::Error, "", ""),
+    ];
+    let hovers = [
+        None,
+        Some(Hit::Action(7)),
+        Some(Hit::Action(9)),
+        Some(Hit::Action(99)),
+        Some(Hit::Close),
+    ];
+    for pal in [&LIGHT, &DARK, &HIGH_CONTRAST_LIGHT, &HIGH_CONTRAST_DARK] {
+        for bar in &bars {
+            for hover in hovers {
+                let draw = |f: &dyn Fn(&mut Painter, Rect)| {
+                    shot(pal, 460, 140, |p| {
+                        let rect = Rect::new(4.0, 4.0, 440.0, bar.height(p, 440.0));
+                        f(p, rect)
+                    })
+                };
+                let old = draw(&|p, r| old_draw_infobar(p, pal, r, bar, hover));
+                let now = draw(&|p, r| draw_infobar(p, pal, r, bar, hover));
+                let with = draw(&|p, r| {
+                    draw_infobar_with(
+                        p,
+                        pal,
+                        r,
+                        bar,
+                        Look {
+                            hover,
+                            ..Look::default()
+                        },
+                    )
+                });
+                assert!(
+                    old.pixels == now.pixels,
+                    "draw_infobar changed, hover {hover:?}"
+                );
+                assert!(
+                    old.pixels == with.pixels,
+                    "the hover-only look differs, {hover:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_press_shows_only_on_the_control_under_the_pointer() {
+    for pal in [&LIGHT, &DARK] {
+        let bar = sample().action(7, "Install").action(9, "Details");
+        let (mut bmp, mut gfx) = scratch();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let rect = Rect::new(0.0, 0.0, 460.0, bar.height(&mut p, 460.0));
+        let parts = bar.parts(&mut p, rect);
+        let draw = |look: Look| {
+            shot(pal, 460, 140, |p| {
+                draw_infobar_with(p, pal, rect, &bar, look)
+            })
+        };
+        let rest = draw(Look::default());
+        let mut controls: Vec<(Hit, Rect)> = parts
+            .actions
+            .iter()
+            .map(|&(id, r)| (Hit::Action(id), r))
+            .collect();
+        controls.push((Hit::Close, parts.close.unwrap()));
+        for (hit, r) in controls {
+            let hovered = draw(Look {
+                hover: Some(hit),
+                ..Look::default()
+            });
+            let pressed = draw(Look {
+                hover: Some(hit),
+                pressed: Some(hit),
+                ..Look::default()
+            });
+            let left = draw(Look {
+                pressed: Some(hit),
+                ..Look::default()
+            });
+            let changed = differences(&hovered, &pressed);
+            assert!(
+                !changed.is_empty(),
+                "{hit:?} has no press look on {}",
+                pal.dark
+            );
+            for &(x, y) in &changed {
+                assert!(
+                    r.contains(x as f32 + 0.5, y as f32 + 0.5),
+                    "pressing {hit:?} changed ({x}, {y}), outside {r:?}"
+                );
+            }
+            assert!(
+                left.pixels == rest.pixels,
+                "a press the pointer has left still shows on {hit:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_focused_control_gets_the_accent_ring_just_outside_it() {
+    for pal in [&LIGHT, &DARK] {
+        let bar = sample().action(7, "Install").action(9, "Details");
+        let (mut bmp, mut gfx) = scratch();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let rect = Rect::new(0.0, 0.0, 460.0, bar.height(&mut p, 460.0));
+        let parts = bar.parts(&mut p, rect);
+        let draw = |look: Look| {
+            shot(pal, 460, 140, |p| {
+                draw_infobar_with(p, pal, rect, &bar, look)
+            })
+        };
+        let rest = draw(Look::default());
+        let mut controls: Vec<(Hit, Rect)> = parts
+            .actions
+            .iter()
+            .map(|&(id, r)| (Hit::Action(id), r))
+            .collect();
+        controls.push((Hit::Close, parts.close.unwrap()));
+        for (hit, r) in controls {
+            for hover in [None, Some(hit)] {
+                let plain = draw(Look {
+                    hover,
+                    ..Look::default()
+                });
+                let focused = draw(Look {
+                    hover,
+                    focused: Some(hit),
+                    ..Look::default()
+                });
+                let changed = differences(&plain, &focused);
+                assert!(!changed.is_empty(), "{hit:?} took no focus ring");
+                for &(x, y) in &changed {
+                    let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    assert!(
+                        r.inset(-4.0).contains(cx, cy) && !r.inset(1.0).contains(cx, cy),
+                        "the ring of {hit:?} drew at ({x}, {y}), not just outside {r:?}"
+                    );
+                }
+                assert!(
+                    count_in(&focused, r.inset(-4.0), pal.accent, 8)
+                        > count_in(&plain, r.inset(-4.0), pal.accent, 8),
+                    "the ring of {hit:?} is not in the accent"
+                );
+            }
+        }
+        // Focus on something the bar does not have marks nothing.
+        let missing = Some(Hit::Action(99));
+        let look = Look {
+            focused: missing,
+            pressed: missing,
+            hover: missing,
+        };
+        assert!(
+            draw(look).pixels == rest.pixels,
+            "an action the bar lacks was marked"
+        );
+        let shut = sample().closable(false);
+        let plain = shot(pal, 460, 140, |p| draw_infobar(p, pal, rect, &shut, None));
+        let focused = shot(pal, 460, 140, |p| {
+            draw_infobar_with(
+                p,
+                pal,
+                rect,
+                &shut,
+                Look {
+                    focused: Some(Hit::Close),
+                    ..Look::default()
+                },
+            )
+        });
+        assert!(
+            plain.pixels == focused.pixels,
+            "a bar with no close button drew its ring"
+        );
+    }
+}
+
+#[test]
+fn a_wrapped_message_stays_above_the_actions_and_inside_the_card_at_scale_one_and_a_half() {
+    const SCALE: f32 = 1.5;
+    let title = "This file has changed";
+    let message = "Someone else saved it while you were editing, so the copy on disk is not \
+                   the one in front of you. Reload it or keep yours.";
+    let full = InfoBar::new(Severity::Warning, title, message)
+        .action(1, "Reload")
+        .action(2, "Keep mine");
+    for pal in [&LIGHT, &DARK] {
+        for w in [240.0, 330.0] {
+            let mut bmp = Bitmap::new(8, 8);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, SCALE);
+            let rect = Rect::new(10.0, 10.0, w, full.height(&mut p, w));
+            let parts = full.parts(&mut p, rect);
+            let one_line = p.paragraph_height(Face::Ui, MESSAGE_TEXT, f32::INFINITY, message);
+            let lines = full.layout(&mut p, rect).message.h;
+            assert!(lines > 2.0 * one_line, "{w} wide, the message did not wrap");
+            let actions_top = parts
+                .actions
+                .iter()
+                .map(|(_, r)| r.y)
+                .fold(f32::MAX, f32::min);
+            for (_, r) in &parts.actions {
+                assert!(
+                    r.bottom() + PAD <= rect.bottom() + 1e-3,
+                    "{r:?} leaves the card"
+                );
+            }
+            // The message's own ink: the same card and title with and without it, both with no
+            // actions and closable, so its column and place are the full bar's.
+            let draw = |bar: InfoBar| {
+                let size = |v: f32| ((v + 20.0) * SCALE) as u32;
+                let mut bmp = Bitmap::new(size(w), size(rect.h));
+                let mut gfx = Gfx::new();
+                {
+                    let mut p = Painter::new(&mut bmp, &mut gfx, SCALE);
+                    p.fill(Rect::new(0.0, 0.0, w + 20.0, rect.h + 20.0), pal.page);
+                    draw_infobar(&mut p, pal, rect, &bar, None);
+                }
+                bmp
+            };
+            let with = draw(InfoBar::new(Severity::Warning, title, message));
+            let without = draw(InfoBar::new(Severity::Warning, title, ""));
+            let ink = differences(&with, &without);
+            assert!(!ink.is_empty(), "the message drew nothing");
+            let inside = rect.inset(PAD);
+            for &(x, y) in &ink {
+                let (lx, ly) = (x as f32 / SCALE, y as f32 / SCALE);
+                let (rx, by) = ((x + 1) as f32 / SCALE, (y + 1) as f32 / SCALE);
+                assert!(
+                    by <= actions_top,
+                    "{w} wide on {}: ink at device ({x}, {y}) reaches the actions at {actions_top}",
+                    pal.dark
+                );
+                assert!(
+                    lx >= inside.x && rx <= inside.right() && ly >= inside.y,
+                    "{w} wide: ink at device ({x}, {y}) is outside the card's padding"
+                );
+            }
+        }
     }
 }
 
