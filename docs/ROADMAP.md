@@ -150,7 +150,7 @@ Purge's scope narrows two existing rows:
 
 | Id | What | Size | Risk | Deps | Builds on | Done when | Status |
 |---|---|---|---|---|---|---|---|
-| W5b | **The system's high-contrast colours.** Extends W5 | S | medium | none | `tokens`, `platform::system_high_contrast` | Under Windows HC the tokens use the active scheme's `GetSysColor` colours (window, text, highlight, hotlight, gray text, button face and text); Mica, Acrylic and frost are off; switching HC while running repaints | claimed: Claude Opus 5.5 (opencode), 2026-11-25 |
+| W5b | **The system's high-contrast colours.** Extends W5 | S | medium | none | `tokens`, `platform::system_high_contrast` | Under Windows HC the tokens use the active scheme's `GetSysColor` colours (window, text, highlight, hotlight, gray text, button face and text); Mica, Acrylic and frost are off; switching HC while running repaints | done |
 | P1 | **Selector bar with N options** (tabs) | S | low | none | `segments` | `segments` with any count; arrow keys; each option one UIA tab or radio item | done: `segments` selector bar (bar_width, draw_selector, selector_rects, selector_at, selector_key), this commit |
 | P2 | **InfoBar.** Extends `notice` | S | low | none | `notice`, `overlay` | Info, success, warning and error colours and glyphs; a title, a message and up to two action buttons; a close button; several stacked; in a page, not only at the top | open |
 | P3 | **Expander** | S | low | none | `anim::Transient`, `tree`'s disclosure | A header with a chevron; an animated body that respects reduced motion; the UIA ExpandCollapse state | open |

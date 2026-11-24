@@ -135,15 +135,267 @@ fn the_system_look_is_one_of_the_known_ones() {
     assert!(contrast(t.palette.accent, t.palette.page) >= ACCENT_CONTRAST - 0.01);
     assert_eq!(t.sizes, Sizes::DEFAULT);
     let plain = Tokens::from_system(false);
+    // Under a Windows contrast theme the look is made from that theme's colours.
+    let scheme = crate::platform::system_contrast_colors().map(|c| Tokens::from_system_colors(&c));
+    eprintln!("contrast theme: {scheme:?}");
     assert!(
-        [LIGHT, DARK, HIGH_CONTRAST_LIGHT, HIGH_CONTRAST_DARK].contains(&plain.palette),
-        "an unaccented look is a known palette"
+        [LIGHT, DARK, HIGH_CONTRAST_LIGHT, HIGH_CONTRAST_DARK].contains(&plain.palette)
+            || scheme == Some(plain),
+        "an unaccented look is a known palette or the system's contrast theme"
     );
 }
 
+/// A contrast theme from its eight colours, in the order of [`SystemColors`]'s fields.
+const fn scheme(c: [u32; 8]) -> SystemColors {
+    SystemColors {
+        window: rgb(c[0]),
+        window_text: rgb(c[1]),
+        highlight: rgb(c[2]),
+        highlight_text: rgb(c[3]),
+        hot_light: rgb(c[4]),
+        gray_text: rgb(c[5]),
+        button_face: rgb(c[6]),
+        button_text: rgb(c[7]),
+    }
+}
+
+/// Windows 11's Aquatic, from `hcblack.theme` (Resources, Ease of Access Themes).
+const AQUATIC: SystemColors = scheme([
+    0x202020, 0xffffff, 0x8ee3f0, 0x263b50, 0x75e9fc, 0xa6a6a6, 0x202020, 0xffffff,
+]);
+/// Windows 11's Desert, a light one, from `hcwhite.theme`.
+const DESERT: SystemColors = scheme([
+    0xfffaef, 0x3d3d3d, 0x903909, 0xfff5e3, 0x1c5e75, 0x676767, 0xfffaef, 0x202020,
+]);
+/// Windows 11's Dusk, from `hc1.theme`: its button text is not its window text.
+const DUSK: SystemColors = scheme([
+    0x2d3236, 0xffffff, 0xa1bfde, 0x212d3b, 0x70ebde, 0xa6a6a6, 0x2d3236, 0xb6f6f0,
+]);
+/// Windows 11's Night sky, from `hc2.theme`.
+const NIGHT_SKY: SystemColors = scheme([
+    0x000000, 0xffffff, 0xd6b4fd, 0x2b2b2b, 0x8080ff, 0xa6a6a6, 0x000000, 0xffee32,
+]);
+/// Windows 10's High Contrast Black.
+const HIGH_CONTRAST_BLACK: SystemColors = scheme([
+    0x000000, 0xffffff, 0x1aebff, 0x000000, 0xffff00, 0x3ff23f, 0x000000, 0xffffff,
+]);
+
+const SCHEMES: [(&str, SystemColors); 5] = [
+    ("Aquatic", AQUATIC),
+    ("Desert", DESERT),
+    ("Dusk", DUSK),
+    ("Night sky", NIGHT_SKY),
+    ("High Contrast Black", HIGH_CONTRAST_BLACK),
+];
+
+#[test]
+fn a_contrast_theme_gives_its_own_colours_to_the_palette() {
+    let p = Tokens::from_system_colors(&AQUATIC).palette;
+    let c = AQUATIC;
+    assert!(p.dark);
+    for (name, field) in [
+        ("page", p.page),
+        ("title", p.title),
+        ("bar", p.bar),
+        ("pane", p.pane),
+        ("field", p.field),
+        ("popup", p.popup),
+    ] {
+        assert_eq!(field, c.window, "{name}");
+    }
+    for (name, field) in [
+        ("text", p.text),
+        ("muted", p.muted),
+        ("folder", p.folder),
+        ("popup_line", p.popup_line),
+    ] {
+        assert_eq!(field, c.window_text, "{name}");
+    }
+    assert_eq!(p.faint, c.gray_text);
+    assert_eq!(p.line, c.gray_text);
+    assert_eq!(p.thumb, c.gray_text);
+    assert_eq!(p.accent, c.highlight);
+    assert_eq!(p.on_accent, c.highlight_text);
+    // What no system colour names is the toolkit's dark high-contrast palette's.
+    assert_eq!(p.danger, HIGH_CONTRAST_DARK.danger);
+    assert_eq!(p.warn, HIGH_CONTRAST_DARK.warn);
+    assert_eq!(p.warn_bg, HIGH_CONTRAST_DARK.warn_bg);
+    assert_eq!(p.find_mark, HIGH_CONTRAST_DARK.find_mark);
+    assert_eq!(p.find_current, HIGH_CONTRAST_DARK.find_current);
+    assert_eq!(Tokens::from_system_colors(&AQUATIC).sizes, Sizes::DEFAULT);
+
+    // Windows 10's High Contrast Black, field by field where the theme names it.
+    let b = Tokens::from_system_colors(&HIGH_CONTRAST_BLACK).palette;
+    assert_eq!(b.page, [0, 0, 0]);
+    assert_eq!(b.bar, [0, 0, 0]);
+    assert_eq!(b.text, [255, 255, 255]);
+    assert_eq!(b.faint, [0x3f, 0xf2, 0x3f]);
+    assert_eq!(b.line, [0x3f, 0xf2, 0x3f]);
+    assert_eq!(b.accent, [0x1a, 0xeb, 0xff]);
+    assert_eq!(b.on_accent, [0, 0, 0]);
+
+    // Desert is light, whatever the desktop's choice, and takes the light palette's marks.
+    let d = Tokens::from_system_colors(&DESERT).palette;
+    assert!(!d.dark);
+    assert_eq!(d.page, DESERT.window);
+    assert_eq!(d.text, DESERT.window_text);
+    assert_eq!(d.accent, DESERT.highlight);
+    assert_eq!(d.danger, HIGH_CONTRAST_LIGHT.danger);
+}
+
+#[test]
+fn every_contrast_theme_keeps_its_contrast_and_the_made_fills_read() {
+    for (name, c) in SCHEMES {
+        let p = Tokens::from_system_colors(&c).palette;
+        // The theme's own pairs are kept exactly, so their contrast is the theme's.
+        assert_eq!(
+            contrast(p.text, p.page),
+            contrast(c.window_text, c.window),
+            "{name}"
+        );
+        assert!(contrast(p.text, p.page) >= 7.0, "{name}: text on page");
+        assert_eq!(
+            contrast(p.on_accent, p.accent),
+            contrast(c.highlight_text, c.highlight)
+        );
+        assert!(
+            contrast(p.text, p.bar) >= SYSTEM_FILL_CONTRAST,
+            "{name}: text on bar"
+        );
+        for (fill, colour) in [
+            ("hover", p.hover),
+            ("press", p.press),
+            ("on", p.on),
+            ("selection", p.selection),
+        ] {
+            assert!(
+                contrast(p.text, colour) >= SYSTEM_FILL_CONTRAST - 0.01,
+                "{name}: text on {fill}: {}",
+                contrast(p.text, colour)
+            );
+            assert_ne!(colour, p.page, "{name}: {fill} is seen on the page");
+        }
+        assert!(
+            contrast(p.line, p.page) >= SYSTEM_LINE_CONTRAST,
+            "{name}: line"
+        );
+        assert!(contrast(p.faint, p.page) >= 4.5, "{name}: faint");
+        assert!(contrast(p.accent, p.page) >= 4.5, "{name}: accent");
+        // A press shows more than a hover.
+        assert!(
+            contrast(p.press, p.page) > contrast(p.hover, p.page),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_button_face_or_grey_text_that_does_not_read_is_not_used_for_the_chrome_or_lines() {
+    let poor = SystemColors {
+        // White text on a light grey button face: 1.6:1.
+        button_face: rgb(0xcccccc),
+        // A grey line on black at 1.3:1.
+        gray_text: rgb(0x202020),
+        ..NIGHT_SKY
+    };
+    let p = Tokens::from_system_colors(&poor).palette;
+    assert_eq!(p.title, poor.window);
+    assert_eq!(p.bar, poor.window);
+    assert_eq!(p.line, poor.window_text);
+    assert_eq!(p.thumb, poor.window_text);
+    // The disabled text stays the theme's.
+    assert_eq!(p.faint, poor.gray_text);
+    // A button face the text reads on is the chrome's.
+    let face = SystemColors {
+        button_face: rgb(0x1c1c40),
+        ..NIGHT_SKY
+    };
+    assert_eq!(Tokens::from_system_colors(&face).palette.bar, rgb(0x1c1c40));
+    assert_eq!(
+        Tokens::from_system_colors(&face).palette.page,
+        NIGHT_SKY.window
+    );
+}
+
+#[test]
+fn nonsense_colours_give_a_palette_and_no_panic() {
+    for c in [scheme([0; 8]), scheme([0xffffff; 8]), scheme([0x808080; 8])] {
+        let p = Tokens::from_system_colors(&c).palette;
+        assert_eq!(p.page, c.window);
+        assert_eq!(p.text, c.window_text);
+    }
+}
+
+#[test]
+fn without_the_systems_colours_high_contrast_is_the_toolkits_own() {
+    assert_eq!(
+        Tokens::high_contrast_with(None, true),
+        Tokens::high_contrast(true)
+    );
+    assert_eq!(
+        Tokens::high_contrast_with(None, false),
+        Tokens::high_contrast(false)
+    );
+    // With them, dark or light is the theme's, not the caller's.
+    assert_eq!(
+        Tokens::high_contrast_with(Some(&DESERT), true),
+        Tokens::from_system_colors(&DESERT)
+    );
+    assert_eq!(
+        Tokens::high_contrast_with(Some(&AQUATIC), false),
+        Tokens::from_system_colors(&AQUATIC)
+    );
+}
+
+#[test]
+fn under_high_contrast_no_backdrop_is_asked_for() {
+    for want in Backdrop::ALL {
+        assert_eq!(allowed_backdrop(want, true), Backdrop::Off);
+        assert_eq!(allowed_backdrop(want, false), want);
+    }
+}
+
+/// The backdrop rule given to a [`crate::frost::Frost`]: a switch to high contrast while the
+/// window has the keyboard takes the backdrop away at the next frame, and back again after.
+#[test]
+fn a_switch_to_high_contrast_turns_the_frost_off_at_once() {
+    use crate::frost::{Frost, System};
+    struct Sys(Vec<Backdrop>);
+    impl System for Sys {
+        fn available(&mut self) -> bool {
+            true
+        }
+        fn set(&mut self, b: Backdrop) -> bool {
+            self.0.push(b);
+            true
+        }
+    }
+    let mut sys = Sys(Vec::new());
+    let mut frost = Frost::default();
+    let pal = DARK;
+    frost.sync(
+        allowed_backdrop(Backdrop::Mica, false),
+        true,
+        &pal,
+        &mut sys,
+    );
+    assert!(frost.key().is_some());
+    let hc = Tokens::from_system_colors(&AQUATIC).palette;
+    assert!(frost.sync(allowed_backdrop(Backdrop::Mica, true), true, &hc, &mut sys));
+    assert!(frost.key().is_none());
+    frost.sync(
+        allowed_backdrop(Backdrop::Mica, false),
+        true,
+        &pal,
+        &mut sys,
+    );
+    assert!(frost.key().is_some());
+    assert_eq!(sys.0, [Backdrop::Mica, Backdrop::Off, Backdrop::Mica]);
+}
+
 /// A sheet for a person to judge: `cargo test -p mdshared-ui tokens_sheet -- --ignored` writes
-/// `target/specimen/tokens.png`: for the toolkit's palettes, the high-contrast ones and four
-/// accents in light and dark, a link, a button in the accent, a selected row and selected text.
+/// `target/specimen/tokens.png`: for the toolkit's palettes, the high-contrast ones, the five
+/// system contrast themes of the tests, and four accents in light and dark, a link, a button in the accent, a selected row and selected text.
 #[test]
 #[ignore]
 fn tokens_sheet() {
@@ -156,6 +408,9 @@ fn tokens_sheet() {
             ("high contrast light".to_string(), HIGH_CONTRAST_LIGHT),
             ("high contrast dark".to_string(), HIGH_CONTRAST_DARK),
         ];
+        for (name, c) in SCHEMES {
+            v.push((name.to_lowercase(), Tokens::from_system_colors(&c).palette));
+        }
         for (name, a) in [
             ("gold", [255, 185, 0]),
             ("green", [16, 124, 16]),

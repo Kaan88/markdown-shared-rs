@@ -14,15 +14,26 @@
 //! palettes ([`HIGH_CONTRAST_LIGHT`], [`HIGH_CONTRAST_DARK`]) put text, quiet text and the accent
 //! at 7:1 or better and the lines where they can be seen.
 //!
-//! Deliberately not here: the system's own high-contrast colours (Windows's chosen scheme:
-//! the palettes here are the toolkit's); widgets reading sizes from the tokens (they keep
-//! their constants, which [`Sizes::DEFAULT`] names, so no application's look moves);
-//! fonts; and watching the system (the application asks again on winit's `ThemeChanged` or
-//! when the window gains the focus, as for [`crate::platform::system_is_dark`]).
+//! Under a Windows contrast theme (Aquatic, Desert, Dusk, Night sky, or one the person made)
+//! the palette is made from that theme's own colours instead ([`SystemColors`],
+//! [`Tokens::from_system_colors`]), as WinUI does, so the application looks like the rest of
+//! the desktop. Where the system gives no colours (Linux's portal says only whether contrast
+//! is asked for) the toolkit's palettes stand in. A backdrop (Mica, Acrylic, the frosted
+//! chrome) is not shown under high contrast: [`allowed_backdrop`] is the rule.
+//!
+//! Deliberately not here: widgets reading sizes from the tokens (they keep their constants,
+//! which [`Sizes::DEFAULT`] names, so no application's look moves); fonts; a link colour and a
+//! button text colour in the palette (it has neither field; [`SystemColors::hot_light`] and
+//! [`SystemColors::button_text`] are there for an application that draws its own); and
+//! watching the system. The application asks again on winit's `ThemeChanged` or when the
+//! window gains the focus, as for [`crate::platform::system_is_dark`]; a switch of the
+//! contrast theme reaches no winit event, so on Windows [`crate::platform::watch_contrast`]
+//! wakes the application for it.
 
-use crate::cover::contrast;
+use crate::cover::{contrast, luminance};
 use crate::gfx::{Rgb, mix, rgb};
 use crate::theme::{DARK, LIGHT, Palette};
+use mdshared_app::backdrop::Backdrop;
 
 /// The sizes the widgets are drawn at, in logical px, by name.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -229,6 +240,50 @@ pub fn accented(base: &Palette, accent: Rgb) -> Palette {
     }
 }
 
+/// The colours of the system's contrast theme, one for each of the system colours a
+/// contrast theme sets (Windows's `GetSysColor`, named after its `COLOR_` indices). Each pair
+/// is chosen by the theme to be read together: window text on the window, highlight text on
+/// the highlight, button text on the button face. [`crate::platform::system_contrast_colors`]
+/// reads them; [`Tokens::from_system_colors`] makes a palette of them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SystemColors {
+    /// `COLOR_WINDOW`: behind content.
+    pub window: Rgb,
+    /// `COLOR_WINDOWTEXT`: text on the window.
+    pub window_text: Rgb,
+    /// `COLOR_HIGHLIGHT`: a selected item's fill.
+    pub highlight: Rgb,
+    /// `COLOR_HIGHLIGHTTEXT`: text on the highlight.
+    pub highlight_text: Rgb,
+    /// `COLOR_HOTLIGHT`: hyperlinks.
+    pub hot_light: Rgb,
+    /// `COLOR_GRAYTEXT`: text that cannot be used (disabled).
+    pub gray_text: Rgb,
+    /// `COLOR_BTNFACE`: a button's fill.
+    pub button_face: Rgb,
+    /// `COLOR_BTNTEXT`: text on a button.
+    pub button_text: Rgb,
+}
+
+/// The contrast a fill the toolkit makes up (hover, press, the selected row) keeps against
+/// the text drawn on it under a system contrast theme: WCAG's AA for body text.
+pub const SYSTEM_FILL_CONTRAST: f32 = 4.5;
+
+/// The contrast a line needs against the window to be drawn in the theme's grey text rather
+/// than its window text: WCAG's 3:1 for the parts of a control.
+pub const SYSTEM_LINE_CONTRAST: f32 = 3.0;
+
+/// The backdrop to ask for when the setting is `want`: none under high contrast, where the
+/// system shows flat colours and the theme's colours must not be mixed with a blurred desktop;
+/// `want` otherwise. Give its answer to [`crate::frost::Frost::sync`] (or
+/// [`crate::platform::set_backdrop`]) in place of the setting, with `high_contrast` from
+/// [`crate::platform::system_high_contrast`] read when the tokens are made. Then a switch to
+/// high contrast while the window has the keyboard turns the backdrop off at the next frame,
+/// and on Linux, where the blur does not ask about contrast, it is off too.
+pub fn allowed_backdrop(want: Backdrop, high_contrast: bool) -> Backdrop {
+    if high_contrast { Backdrop::Off } else { want }
+}
+
 /// The look an application draws with: a palette and the sizes.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Tokens {
@@ -258,6 +313,95 @@ impl Tokens {
         }
     }
 
+    /// The look of the system's contrast theme `colors`, mapped onto the palette as WinUI maps
+    /// them, with [`Sizes::DEFAULT`]:
+    ///
+    /// * `page`, `pane`, `field` and `popup` are the window;
+    /// * `title` and `bar`, the rows that hold the window's buttons, are the button face,
+    ///   unless the window text does not read on it at [`SYSTEM_FILL_CONTRAST`]; then the
+    ///   window (every label of the toolkit is drawn in `text`, and the button text has no
+    ///   field of its own);
+    /// * `text`, `muted` and `folder` are the window text. `muted` is text that can still be
+    ///   used (a shortcut beside a menu item, a hint), and WinUI draws such secondary text in
+    ///   the window text under high contrast;
+    /// * `faint`, the toolkit's text for what cannot be used, is the grey text;
+    /// * `accent` is the highlight and `on_accent` the highlight text, the theme's own pair;
+    /// * `line` and `thumb` are the grey text where it reads on the window at
+    ///   [`SYSTEM_LINE_CONTRAST`], else the window text; `popup_line` is the window text;
+    /// * `hover`, `press`, `on` (the selected row) and `selection` (selected text) are made:
+    ///   the window moved towards the window text (hover, press) or the highlight (on,
+    ///   selection), then kept at [`SYSTEM_FILL_CONTRAST`] against the window text that is
+    ///   drawn on them ([`legible`]). The toolkit draws a selected row's text and selected
+    ///   text in `text`, not in a text of their own, so the highlight itself, which only the
+    ///   highlight text reads on, cannot be their fill;
+    /// * the find marks, `danger`, `warn` and `warn_bg`, which no system colour names, are
+    ///   those of [`HIGH_CONTRAST_DARK`] or [`HIGH_CONTRAST_LIGHT`].
+    ///
+    /// `dark` is whether the window is darker than its text, whatever the application's own
+    /// choice of dark or light: Desert is a light theme even under a dark desktop.
+    ///
+    /// The hyperlink colour and the button text have no field ([`SystemColors::hot_light`],
+    /// [`SystemColors::button_text`]). The theme's own colours are used as they are: a theme
+    /// the person made with colours that do not read is theirs to choose.
+    pub fn from_system_colors(colors: &SystemColors) -> Tokens {
+        let c = colors;
+        let text = c.window_text;
+        let dark = luminance(c.window) < luminance(text);
+        let base = if dark {
+            HIGH_CONTRAST_DARK
+        } else {
+            HIGH_CONTRAST_LIGHT
+        };
+        let fill =
+            |towards: Rgb, t: f32| legible(mix(c.window, towards, t), text, SYSTEM_FILL_CONTRAST);
+        let chrome = if contrast(text, c.button_face) >= SYSTEM_FILL_CONTRAST {
+            c.button_face
+        } else {
+            c.window
+        };
+        let line = if contrast(c.gray_text, c.window) >= SYSTEM_LINE_CONTRAST {
+            c.gray_text
+        } else {
+            text
+        };
+        Tokens {
+            palette: Palette {
+                dark,
+                page: c.window,
+                title: chrome,
+                bar: chrome,
+                pane: c.window,
+                text,
+                muted: text,
+                faint: c.gray_text,
+                hover: fill(text, 0.15),
+                press: fill(text, 0.25),
+                on: fill(c.highlight, 0.35),
+                selection: fill(c.highlight, 0.6),
+                line,
+                accent: c.highlight,
+                on_accent: c.highlight_text,
+                field: c.window,
+                popup: c.window,
+                popup_line: text,
+                folder: text,
+                thumb: line,
+                ..base
+            },
+            sizes: Sizes::DEFAULT,
+        }
+    }
+
+    /// The high-contrast look: the system's contrast theme when `colors` gives one
+    /// ([`Tokens::from_system_colors`]), else the toolkit's own ([`Tokens::high_contrast`],
+    /// dark or light by `dark`), as on Linux, whose portal gives no colours.
+    pub fn high_contrast_with(colors: Option<&SystemColors>, dark: bool) -> Tokens {
+        match colors {
+            Some(colors) => Tokens::from_system_colors(colors),
+            None => Tokens::high_contrast(dark),
+        }
+    }
+
     /// The same with `accent` as the accent ([`accented`]).
     pub fn with_accent(self, accent: Rgb) -> Tokens {
         Tokens {
@@ -276,13 +420,17 @@ impl Tokens {
 
     /// The look the system asks for: dark or light ([`crate::platform::system_is_dark`]), high
     /// contrast when it is on, and the desktop's accent when `follow_accent` and the system
-    /// gives one (a high-contrast look keeps its own accent). Each call asks the system; on
+    /// gives one (a high-contrast look keeps its own accent). High contrast is the system's
+    /// contrast theme where the system gives its colours
+    /// ([`crate::platform::system_contrast_colors`], Windows) and the toolkit's high-contrast
+    /// palettes elsewhere ([`Tokens::high_contrast_with`]). Each call asks the system; on
     /// Linux that is the settings portal, up to half a second for each question when it does
     /// not answer.
     pub fn from_system(follow_accent: bool) -> Tokens {
         let dark = crate::platform::system_is_dark();
         if crate::platform::system_high_contrast() {
-            return Tokens::high_contrast(dark);
+            let colors = crate::platform::system_contrast_colors();
+            return Tokens::high_contrast_with(colors.as_ref(), dark);
         }
         let tokens = Tokens::new(dark);
         match crate::platform::system_accent() {

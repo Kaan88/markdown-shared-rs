@@ -156,6 +156,8 @@ pub fn pick_save_async(
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::tokens::SystemColors;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::System::DataExchange::{
@@ -489,6 +491,153 @@ mod imp {
             )
         };
         ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+
+    /// The eight system colours of [`SystemColors`], read with `GetSysColor` whether or not a
+    /// contrast theme is on (without one they are the classic theme's, which nothing uses).
+    pub(super) fn sys_colors() -> SystemColors {
+        use windows_sys::Win32::Graphics::Gdi::{
+            COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+            COLOR_HOTLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+        };
+        let get = |index| {
+            // SAFETY: no pointers; an index the system does not know gives 0, which is black.
+            let v = unsafe { GetSysColor(index) };
+            // A COLORREF is 0x00BBGGRR.
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+        };
+        SystemColors {
+            window: get(COLOR_WINDOW),
+            window_text: get(COLOR_WINDOWTEXT),
+            highlight: get(COLOR_HIGHLIGHT),
+            highlight_text: get(COLOR_HIGHLIGHTTEXT),
+            hot_light: get(COLOR_HOTLIGHT),
+            gray_text: get(COLOR_GRAYTEXT),
+            button_face: get(COLOR_BTNFACE),
+            button_text: get(COLOR_BTNTEXT),
+        }
+    }
+
+    pub fn system_contrast_colors() -> Option<SystemColors> {
+        system_high_contrast().then(sys_colors)
+    }
+
+    /// Whom to wake when the contrast changes; replaced by each [`watch_contrast`].
+    static CONTRAST_WAKE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+    /// The contrast as last seen by the watching window: on, and the colours.
+    pub(super) static CONTRAST_SEEN: Mutex<Option<(bool, SystemColors)>> = Mutex::new(None);
+    /// The watching window, 0 when it could not be made.
+    static CONTRAST_WINDOW: OnceLock<isize> = OnceLock::new();
+
+    pub fn watch_contrast(wake: impl Fn() + Send + Sync + 'static) {
+        *CONTRAST_WAKE.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(wake));
+        contrast_window();
+    }
+
+    /// The hidden window that hears of contrast changes, made with its thread on the first
+    /// call; None when it could not be made.
+    pub(super) fn contrast_window() -> Option<isize> {
+        let hwnd = *CONTRAST_WINDOW.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("mdshared-contrast".into())
+                .spawn(move || contrast_thread(tx));
+            if spawned.is_err() {
+                return 0;
+            }
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+        });
+        (hwnd != 0).then_some(hwnd)
+    }
+
+    /// Reads the contrast now and wakes the application if it is not what was seen last.
+    fn contrast_maybe_changed() {
+        let now = (system_high_contrast(), sys_colors());
+        let changed = super::note_change(
+            &mut CONTRAST_SEEN.lock().unwrap_or_else(PoisonError::into_inner),
+            now,
+        );
+        // The wake is taken out of the lock first, so a wake that calls `watch_contrast` does
+        // not wait on itself.
+        let wake = CONTRAST_WAKE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let (true, Some(wake)) = (changed, wake) {
+            wake();
+        }
+    }
+
+    unsafe extern "system" fn contrast_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: windows_sys::Win32::Foundation::WPARAM,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+        };
+        // A switch of the contrast theme sends both: the setting (`SPI_SETHIGHCONTRAST`, and
+        // "WindowsThemeElement") and, once the colours are in place, the colours. Any other
+        // setting's change finds nothing changed and wakes no one.
+        if msg == WM_SETTINGCHANGE || msg == WM_SYSCOLORCHANGE {
+            contrast_maybe_changed();
+        }
+        // SAFETY: the arguments are the ones this window procedure was called with.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// The watching window's thread: notes the contrast as it is, makes the window, answers
+    /// `tx` with it (0 when it could not be made), and runs the window's loop for the rest of
+    /// the process. A hidden top-level window, not a message-only one: only top-level windows
+    /// hear the broadcasts `WM_SETTINGCHANGE` and `WM_SYSCOLORCHANGE`.
+    fn contrast_thread(tx: std::sync::mpsc::Sender<isize>) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage,
+            WNDCLASSW, WS_OVERLAPPED,
+        };
+        *CONTRAST_SEEN.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((system_high_contrast(), sys_colors()));
+        let class = wide("mdshared-contrast");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(contrast_proc),
+            lpszClassName: class.as_ptr(),
+            // SAFETY: an all-zero WNDCLASSW is valid for the fields not set.
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: `wc` and the class name outlive the call. The class is registered once, by
+        // this thread, which is started once.
+        unsafe { RegisterClassW(&wc) };
+        let title = wide("");
+        // SAFETY: the class is registered; the window is never shown and has no state.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        _ = tx.send(hwnd as isize);
+        if hwnd.is_null() {
+            return;
+        }
+        // SAFETY: an ordinary message loop on the window's own thread.
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
     }
 
     pub fn double_click_time() -> Duration {
@@ -1104,6 +1253,13 @@ mod imp {
         Some(Duration::from_millis(530))
     }
     pub fn style_window(_hwnd: isize, _dark: bool) {}
+    /// No system here gives the colours of a contrast theme.
+    pub fn system_contrast_colors() -> Option<crate::tokens::SystemColors> {
+        None
+    }
+    /// Nothing is watched here: the application reads again on winit's `ThemeChanged` or
+    /// when its window gains the focus.
+    pub fn watch_contrast(_wake: impl Fn() + Send + Sync + 'static) {}
     pub fn backdrop_available() -> bool {
         false
     }
@@ -1398,6 +1554,46 @@ pub fn system_accent() -> Option<crate::gfx::Rgb> {
 pub fn system_high_contrast() -> bool {
     imp::system_high_contrast()
 }
+/// The colours of the system's contrast theme while one is on ([`system_high_contrast`]):
+/// on Windows the eight `GetSysColor` colours of [`crate::tokens::SystemColors`]. None while
+/// no contrast theme is on, and always on Linux and macOS, which give no such colours (the
+/// toolkit's own high-contrast palettes stand in there). Nine quick calls to the system, no
+/// waiting. For [`crate::tokens::Tokens::from_system`].
+pub fn system_contrast_colors() -> Option<crate::tokens::SystemColors> {
+    imp::system_contrast_colors()
+}
+
+/// Has `wake` called when a contrast theme is switched on or off, or another is chosen,
+/// while the application runs, so that it makes its tokens again
+/// ([`crate::tokens::Tokens::from_system`]), passes the backdrop through
+/// [`crate::tokens::allowed_backdrop`] again, and repaints. Windows tells no winit event of
+/// this. Here a thread of its own keeps a hidden window that hears the system's
+/// `WM_SETTINGCHANGE` and `WM_SYSCOLORCHANGE` broadcasts; at each it reads whether high
+/// contrast is on and the eight colours, and calls `wake` when they differ from what it read
+/// last. One switch can call it twice (the setting first, the colours a moment later); reading
+/// again each time gives the right look. Other settings' changes do not call it.
+///
+/// `wake` runs on that thread, so it must only wake the application's loop (send a user event
+/// through winit's `EventLoopProxy`). A second call replaces the wake of the first. The thread
+/// and its window are made on the first call, which waits for them (a few milliseconds), and
+/// stay until the process ends. If the window cannot be made, nothing is called.
+///
+/// On Linux and macOS the wake is dropped and never called: the application reads again on
+/// winit's `ThemeChanged` or when its window gains the focus.
+pub fn watch_contrast(wake: impl Fn() + Send + Sync + 'static) {
+    imp::watch_contrast(wake)
+}
+
+/// Keeps `now` as the last seen and says whether it differs from what was seen before
+/// (nothing seen counts as a difference). The watching window's rule, apart so it is tested on
+/// every system.
+#[cfg(any(test, windows))]
+fn note_change<T: PartialEq>(seen: &mut Option<T>, now: T) -> bool {
+    let changed = seen.as_ref() != Some(&now);
+    *seen = Some(now);
+    changed
+}
+
 /// The system double-click interval, default 500 ms.
 pub fn double_click_time() -> Duration {
     imp::double_click_time()
@@ -1728,6 +1924,75 @@ mod backdrop_tests {
     fn there_is_no_backdrop_off_windows() {
         assert!(!backdrop_available());
         assert!(!set_backdrop(0, Backdrop::Mica));
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_is_noted_once_and_the_same_again_is_no_change() {
+        let mut seen = None;
+        assert!(note_change(&mut seen, (false, 1)));
+        assert!(!note_change(&mut seen, (false, 1)));
+        assert!(note_change(&mut seen, (true, 1)));
+        assert!(note_change(&mut seen, (true, 2)));
+        assert!(!note_change(&mut seen, (true, 2)));
+        assert_eq!(seen, Some((true, 2)));
+    }
+
+    /// The system's own colours are printed, never compared: they are this machine's.
+    #[test]
+    fn the_contrast_colours_are_read_without_failing() {
+        let on = system_high_contrast();
+        let colors = system_contrast_colors();
+        println!("high contrast {on}: {colors:?}");
+        #[cfg(windows)]
+        {
+            println!("GetSysColor now: {:?}", imp::sys_colors());
+            assert_eq!(colors.is_some(), on);
+        }
+        #[cfg(not(windows))]
+        assert_eq!(colors, None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_a_contrast_wake_is_dropped() {
+        watch_contrast(|| panic!("never called"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_window_wakes_only_when_the_contrast_differs_from_the_last_seen() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch_contrast(move || {
+            _ = tx.send(());
+        });
+        let hwnd = imp::contrast_window().expect("the hidden window is made");
+        let send = |msg| {
+            // SAFETY: the window is ours and alive; both messages take no pointers here. The
+            // call returns once the window's thread has handled the message.
+            unsafe { SendMessageW(hwnd as _, msg, 0, 0) };
+        };
+        // Nothing changed: the messages alone wake no one.
+        send(WM_SYSCOLORCHANGE);
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
+        // What was seen last differs from the system now, as just after a switch.
+        let now = (system_high_contrast(), imp::sys_colors());
+        let mut other = now.1;
+        other.window = [other.window[0] ^ 1, other.window[1], other.window[2]];
+        *imp::CONTRAST_SEEN.lock().unwrap() = Some((!now.0, other));
+        send(WM_SYSCOLORCHANGE);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        // Seen now: the next message wakes no one.
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
     }
 }
 
