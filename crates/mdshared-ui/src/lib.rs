@@ -2,7 +2,7 @@
 //! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
 //! scrollbar, tooltips, toasts, dialog frames), sliders, knobs and faders, table columns and
-//! splitters, the models
+//! splitters, the cursors the widgets ask for, the models
 //! of lists, grids and selections, and animation ([`anim`]). No window loop; the application
 //! owns that. `docs/CATALOGUE.md` lists every module with its entry points.
 
@@ -14,6 +14,7 @@ pub mod chrome;
 pub mod commands;
 pub mod corners;
 pub mod cover;
+pub mod cursor;
 pub mod desktop_entry;
 pub mod frost;
 pub mod gfx;
