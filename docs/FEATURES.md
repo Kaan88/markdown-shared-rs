@@ -403,3 +403,51 @@ from `Dropdown::is_open`, and the name and rectangle from the caller.
 
 Not verified: both were only drawn into bitmaps by tests; neither has run in a window, and the
 specimen sheets (`toggle_sheet`, `dropdown_sheet`) have not been seen by a person.
+
+## Read-only selectable text (`mdshared_ui::seltext`, P7)
+A paragraph that cannot be edited but can be selected, for Purge's log output and the paths in
+its details pane. `SelectableText` holds the text, an anchor and a caret as byte offsets on char
+boundaries, and the drag in progress; `draw` paints the selection behind a `Painter::paragraph`.
+No editing, no caret, no clipboard and no clock: Ctrl+C answers `Action::Copy(text)` and the
+caller puts it on the clipboard, and the context menu's items carry the same `Action`s.
+The lines come from the new `Painter::paragraph_lines`, which reads the parley layout
+`paragraph` already builds and returns each line's byte range, its y and height, and the x of
+every char boundary from the same run advances. Hit testing and the highlight therefore use the
+drawn glyph positions rather than a second shaping of the text. The model keeps the lines last
+given to `press` or `drag` for the keys; the caller must give it fresh ones with `set_lines` after
+a resize or a font change.
+Two clicks select a word with the classes `textfield` uses; three select the whole logical line
+between its newlines, not one wrapped piece, which is what a log line needs. Shift with the
+arrows, Home, End and Up/Down extends the selection, and Up and Down keep the x they started
+from. Alt is refused.
+Run on Windows: `cargo test --release -p mdshared-ui` (seltext's 13 tests and its ignored sheet,
+the new gfx test and the rest of the crate), `cargo fmt --all --check` and the workspace's clippy
+with warnings as errors. The pixel test draws a selection in both palettes at scale 1 and 1.5 and checks the
+highlight under the selected space and the page under an unselected character.
+Not verified: a real pointer and keyboard in a window; a person looking at
+`target/specimen/seltext.png`; right-to-left paragraphs (their stops follow parley's runs but no
+test exercises them); Linux and macOS (not run here). The UI Automation Text pattern is not done.
+
+A review against parley 0.12.0 found faults, fixed in a second commit (`paragraph_lines` and
+`seltext` were not pinned by any application yet, so both changed):
+- `paragraph_lines` takes the colour the paragraph is drawn in, so it reads the cached layout
+  `paragraph` draws instead of shaping the text again in black. It is linear in the text: a
+  table from byte offset to stop replaces counting chars from the line start for every cluster
+  (a 100,000-char line went from 307 ms to 2 ms in release).
+- `Line` gained `edges`, one flag per stop: the chars inside a parley cluster ("e" and its
+  accent, a joined emoji, a flag) carry the cluster start's x and `false`. A click lands only on
+  an edge, and Left and Right step one cluster.
+- The caret remembers whether it is at the end of a wrapped line or the start of the next (the
+  same byte offset). A click past the end of a line, End, and Up or Down landing at a line end
+  keep it on that line; `caret_line` reports which line it is on.
+- Two clicks take the char under the pointer rather than the char after the nearest boundary,
+  and a line break is a word class of its own. A lone `\r`, U+2028 and U+2029 end a line for
+  three clicks, Home and End, as `\n` does.
+- Lines that do not fit the text are dropped where they come in, so lines of another text no
+  longer panic in `press`, `drag` or the keys.
+- Left and Right drop a selection at its left or right end; Shift+Up on the first line and
+  Shift+Down on the last go to the ends of the text; Ctrl+Home and Ctrl+End were added; a
+  Shift+click after two or three clicks extends from the far edge of the word or line.
+- `draw` gives a selected empty line a highlight as wide as a space, and places the highlight
+  from the rounded corner of the area as the glyphs are, so they agree at a fractional x.
+  Select all is disabled on empty text.

@@ -185,6 +185,12 @@ impl Gfx {
         layout
     }
 
+    /// How many laid-out labels the cache holds, for tests that check two calls share one.
+    #[cfg(test)]
+    pub(crate) fn cached_layouts(&self) -> usize {
+        self.cache.len()
+    }
+
     /// The mask of an icon `side` device px across. The chrome draws the same few icons every
     /// frame, so each is stroked once per size.
     fn icon(&mut self, glyph: &str, side: f32) -> Rc<IconMask> {
@@ -211,6 +217,27 @@ impl Gfx {
         self.icons.insert(k, mask.clone());
         mask
     }
+}
+
+/// One wrapped line of [`Painter::paragraph`], as [`Painter::paragraph_lines`] reports it.
+///
+/// `range` is the line's byte range in the whole paragraph, `y` is the top of its line box from
+/// the top of the paragraph, and `height` is the box's height, all in logical px. `stops` holds
+/// the x of every character boundary in the line from its left edge, the start of the line first
+/// and one entry after every char: `stops.len()` is `range`'s char count plus one.
+///
+/// `edges` has one entry per stop and says whether that stop is the edge of a cluster, a place
+/// a caret may stand. A cluster is what parley shapes as one unit: a letter with its combining
+/// accents, an emoji joined with zero-width joiners, a flag. The chars inside a cluster have
+/// `edges[i] == false` and the x of the cluster's start, so they have no position of their own.
+/// The first and the last stop of a line are always edges.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Line {
+    pub range: std::ops::Range<usize>,
+    pub y: f32,
+    pub height: f32,
+    pub stops: Vec<f32>,
+    pub edges: Vec<bool>,
 }
 
 /// Draws into one bitmap with a clip rectangle. Coordinates are logical px.
@@ -756,6 +783,144 @@ impl<'a> Painter<'a> {
             / self.scale
     }
 
+    /// The wrapped lines of [`paragraph`](Self::paragraph), without drawing them, for a caller
+    /// that must know where its text went: hit testing and a selection highlight.
+    ///
+    /// Give it the face, size, width, text and colour `paragraph` is given. Layouts are cached by
+    /// all five, colour included, so with the same five this reads the very layout `paragraph`
+    /// draws, from the cache, and the lines break exactly where the drawn text does; with another
+    /// colour it shapes the text a second time. `width` is the column width in logical px, as
+    /// `paragraph` takes it (zero or less is treated as one device px, as there). The first line
+    /// starts at y = 0; `y` is the top of the line's box and `height` its height, both logical px.
+    ///
+    /// `range` is the line's byte range in `text`, and `stops` holds the x of every character
+    /// boundary in that line from its left edge, in the order the text runs: one entry for the
+    /// start of the line, one after each char, so `stops.len()` is the line's char count plus
+    /// one. `stops` and `range` agree with the drawn glyph positions because they are read from
+    /// the same parley layout's runs, not measured again. The chars inside a cluster (an accent
+    /// after its letter, the parts of a joined emoji or a flag) get the x of the cluster's start
+    /// and `false` in `edges`. Empty text gives no lines; a line that wraps after a space
+    /// includes the space's width in its last stop.
+    ///
+    /// The work is linear in the length of the text.
+    pub fn paragraph_lines(
+        &mut self,
+        face: Face,
+        size: f32,
+        width: f32,
+        text: &str,
+        c: Rgb,
+    ) -> Vec<Line> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let layout = self.gfx.layout(
+            face,
+            size * self.scale,
+            c,
+            (width * self.scale).max(1.0),
+            text,
+        );
+        let mut lines = Vec::with_capacity(layout.len());
+        for line in layout.lines() {
+            let range = line.text_range();
+            let metrics = line.metrics();
+            let Some(piece) = text.get(range.clone()) else {
+                continue;
+            };
+            // The stop index of every char boundary of the line, by byte offset from its start,
+            // so a cluster finds its stops without counting chars from the start of the line.
+            let mut index = vec![usize::MAX; piece.len() + 1];
+            let mut count = 0;
+            for (b, _) in piece.char_indices() {
+                index[b] = count;
+                count += 1;
+            }
+            index[piece.len()] = count;
+            let count = count + 1;
+            // Device px, one entry per char boundary of the line, NaN until a run gives it.
+            let mut xs = vec![f32::NAN; count];
+            let mut edges = vec![true; count];
+            // A run may appear as several glyph runs when its styles differ; its clusters are
+            // all there once, on the first of them.
+            let mut seen = None;
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if seen == Some(run.run().index()) {
+                    continue;
+                }
+                seen = Some(run.run().index());
+                let rtl = run.run().is_rtl();
+                let mut x = run.offset();
+                for cluster in run.run().visual_clusters() {
+                    let at = cluster.text_range();
+                    let advance = cluster.advance();
+                    let (a, b) = (
+                        at.start.clamp(range.start, range.end) - range.start,
+                        at.end.clamp(range.start, range.end) - range.start,
+                    );
+                    x += advance;
+                    let (Some(&first), Some(&last)) = (index.get(a), index.get(b)) else {
+                        continue;
+                    };
+                    if first == usize::MAX || last == usize::MAX || last < first {
+                        continue;
+                    }
+                    let left = x - advance;
+                    // Where the text of this cluster starts and ends, in reading order: for
+                    // right-to-left text the first char is at the cluster's right edge.
+                    let (from, to) = if rtl {
+                        (left + advance, left)
+                    } else {
+                        (left, left + advance)
+                    };
+                    // The chars inside the cluster sit at its start and are no edge.
+                    for (i, slot) in xs[first..last].iter_mut().enumerate() {
+                        if slot.is_nan() {
+                            *slot = from;
+                        }
+                        if i > 0 {
+                            edges[first + i] = false;
+                        }
+                    }
+                    if xs[last].is_nan() {
+                        xs[last] = if first == last { from } else { to };
+                    }
+                }
+            }
+            let left = (metrics.offset + metrics.inline_min_coord) / self.scale;
+            let first_known = xs.iter().position(|x| !x.is_nan());
+            match first_known {
+                Some(i) => {
+                    let v = xs[i];
+                    for slot in &mut xs[..i] {
+                        *slot = v;
+                    }
+                }
+                None => {
+                    xs.fill(left * self.scale);
+                }
+            }
+            for i in 1..xs.len() {
+                if xs[i].is_nan() {
+                    xs[i] = xs[i - 1];
+                }
+            }
+            edges[0] = true;
+            edges[count - 1] = true;
+            lines.push(Line {
+                range,
+                y: metrics.block_min_coord / self.scale,
+                height: (metrics.block_max_coord - metrics.block_min_coord) / self.scale,
+                stops: xs.into_iter().map(|x| x / self.scale).collect(),
+                edges,
+            });
+        }
+        lines
+    }
+
     /// The x offset of each character boundary of `text` (one entry per `char`, plus the end), in
     /// logical px, for carets and selections in a text field.
     pub fn caret_stops(&mut self, face: Face, size: f32, text: &str) -> Vec<f32> {
@@ -1025,6 +1190,50 @@ mod tests {
         assert_eq!(grey.len(), 20);
         assert!(grey.iter().all(|&(_, x0, x1)| (x0, x1) == (10, 49)));
         assert!(rows_of(&bmp, [0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn paragraph_lines_joins_back_into_the_text_and_covers_the_height_paragraph_draws() {
+        let mut bmp = Bitmap::new(8, 8);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let text = "The quick brown fox jumps over the lazy dog, and again, and again.";
+        let lines = p.paragraph_lines(Face::Ui, 13.0, 120.0, text, [0, 0, 0]);
+        assert!(
+            lines.len() >= 3,
+            "120 px wraps this text into {}",
+            lines.len()
+        );
+        let mut at = 0;
+        for l in &lines {
+            assert_eq!(l.range.start, at, "the lines are contiguous");
+            assert_eq!(
+                l.stops.len(),
+                text[l.range.clone()].chars().count() + 1,
+                "one stop per char boundary: {:?}",
+                l.range
+            );
+            assert!(
+                l.stops.windows(2).all(|w| w[0] <= w[1]),
+                "stops run left to right: {:?}",
+                l.stops
+            );
+            at = l.range.end;
+        }
+        assert_eq!(at, text.len(), "every byte is on a line");
+        assert_eq!(lines[0].y, 0.0, "the first line starts at the top");
+        let bottom = lines.last().unwrap().y + lines.last().unwrap().height;
+        let height = p.paragraph(Face::Ui, 13.0, 0.0, 0.0, 120.0, text, [0, 0, 0]);
+        let count = (height / lines[0].height).round() as usize;
+        assert_eq!(count, lines.len(), "{height} px of {lines:?} lines");
+        assert!(
+            (height - bottom).abs() < lines[0].height,
+            "paragraph draws {height} px where the lines end at {bottom}"
+        );
+        assert!(
+            p.paragraph_lines(Face::Ui, 13.0, 120.0, "", [0, 0, 0])
+                .is_empty()
+        );
     }
 
     #[test]

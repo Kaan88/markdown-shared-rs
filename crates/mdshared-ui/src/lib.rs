@@ -53,6 +53,7 @@ pub mod sections;
 pub mod seek;
 pub mod segments;
 pub mod select;
+pub mod seltext;
 pub mod settings;
 pub mod shadow;
 pub mod slider;

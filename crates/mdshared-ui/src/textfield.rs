@@ -62,13 +62,13 @@ pub struct FieldColors {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Space,
     Word,
     Other,
 }
 
-fn class(c: char) -> Class {
+pub(crate) fn class(c: char) -> Class {
     if c.is_whitespace() {
         Class::Space
     } else if c.is_alphanumeric() || c == '_' {
