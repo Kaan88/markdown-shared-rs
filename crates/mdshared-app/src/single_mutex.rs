@@ -43,7 +43,8 @@
 //! or hung), when its record cannot be read (an elevated first instance seen from a plain launch,
 //! or a squatter's record: see "Deliberately not here"), and when it went away while this waited.
 //! [`send`] gives false for a window that does not take the message, which is every winit
-//! window until its procedure is replaced to call [`received`] (roadmap P8b), and for one that
+//! window until its procedure is replaced to call [`received`] (`mdshared_ui::handover::listen`
+//! does that), and for one that
 //! did not answer within [`SEND_TIMEOUT`]. In each case the application decides, and should do
 //! one of two things: call [`acquire`] again, which gives [`Instance::First`] when the instance
 //! has gone (this launch is then the first after all), and otherwise either tell the user in a

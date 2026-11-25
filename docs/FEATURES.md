@@ -1400,7 +1400,24 @@ was lost. Noted for later:
   `Cache::hex_stops` have no direct test. The release and feature runs of AGENTS.md were not
   run.
 
-## A veil strength for the backdrop (`Cx::set_backdrop_veil`, `Frost::set_veil`, 2026-11-25, `feat/backdrop-veil`, roadmap X11)
+## A second launch's hand-over reaching a winit window (`mdshared_ui::handover`, 2026-11-25, `feat/handover`, roadmap P8b)
+
+`single_mutex::send` hands the first instance's window a `WM_COPYDATA`, which is sent, not
+posted, so winit's `with_msg_hook` never sees it and a winit window refused it. `handover::listen
+(&window, app_id, wake)` replaces the window procedure once (with `SetWindowLongPtrW`, chained
+by `CallWindowProcW` as `snap` does, so either may come first): a `WM_COPYDATA` that
+`single_mutex::received` takes for `app_id` is queued, answered with 1 (so `send` gives true) and
+calls `wake`; everything else goes on to winit. `handover::take(&window)` gives the queued
+arguments, oldest first. The entry goes with the window (`WM_NCDESTROY`). Called from another
+thread, and off Windows, `listen` gives false and `take` nothing. Wanted by Barbican; Purge does
+not need it.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `handover.rs`,
+with a window of the test's own: before `listen` a hand-over is refused; after it two are
+queued in order, answered and wake once each, not passed on; a second `listen` keeps the first
+id; another application's hand-over passes on and is refused; the window's destruction removes
+its entry); `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y
+-- -D warnings`; `cargo fmt --all --check`; on Windows only. Not seen in an application.
 
 Asked for by Purge, whose Mica and Acrylic strength is a setting and which re-keyed the frost
 itself because the veil was fixed (Mica 0, Acrylic 150, `frost::veil`). `Frost::set_veil(Some(v))`
