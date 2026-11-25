@@ -13,7 +13,9 @@
 //! its hover fills fading, in the window's animator (see `settings/motion.rs`); `draw` is
 //! unchanged. A number row can be shown as a slider instead of a stepper
 //! ([`Form::show_as_slider`], see `settings/slider_row.rs`); a host with one passes the pointer
-//! to [`Form::pointer`], which reports a drag's changes.
+//! to [`Form::pointer`], which reports a drag's changes. A text row holding a hex colour can be
+//! shown as a swatch with a picker in a popover ([`Form::show_as_colour`], see
+//! `settings/colour_row.rs`).
 //!
 //! All coordinates are logical px. No callbacks, no threads: every event returns an [`Outcome`].
 
@@ -29,10 +31,14 @@ use crate::scroll;
 use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette as Colors;
 
+mod colour_row;
 mod motion;
 pub mod pages;
 mod slider_row;
 
+#[cfg(test)]
+#[path = "settings/colour_tests.rs"]
+mod colour_tests;
 #[cfg(test)]
 mod frozen;
 #[cfg(test)]
@@ -408,6 +414,8 @@ pub struct Form {
     high_contrast: bool,
     /// The ids of the number rows drawn as sliders ([`Form::show_as_slider`]).
     sliders: Vec<u32>,
+    /// The text rows drawn as colours, and their picker ([`Form::show_as_colour`]).
+    colours: colour_row::Colours,
 
     // The last layout.
     laid: bool,
@@ -446,6 +454,7 @@ impl Form {
             style: Style::CLASSIC,
             high_contrast: false,
             sliders: Vec::new(),
+            colours: colour_row::Colours::default(),
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -528,6 +537,7 @@ impl Form {
             // The thumb in hand may now be another row's, or no row's.
             self.drag = Drag::None;
         }
+        self.close_colour();
         self.stops = vec![Vec::new(); self.rows.len()];
         self.stops_text = vec![String::new(); self.rows.len()];
         self.menu = None;
@@ -574,6 +584,7 @@ impl Form {
             }
             _ => return false,
         }
+        self.colour_value_set(i);
         true
     }
 
@@ -877,7 +888,7 @@ impl Form {
     }
 
     fn text_area(&self, i: usize) -> Rect {
-        let c = self.control_rect(i);
+        let c = self.colour_field(i).unwrap_or_else(|| self.control_rect(i));
         Rect::new(c.x + 10.0, c.y, c.w - 20.0, c.h)
     }
 
@@ -1111,6 +1122,9 @@ impl Form {
     /// number or a slider (Ctrl takes bigger steps), Home and End go to the ends, Page Up and
     /// Page Down take big steps of a number or a slider; a text box takes the usual editing keys.
     pub fn key(&mut self, key: &KeyName, mods: Mods, typed: Option<&str>) -> Outcome {
+        if let Some(o) = self.colour_key(key, mods, typed) {
+            return o;
+        }
         if let Some((i, menu)) = &mut self.menu {
             let i = *i;
             return match key {
@@ -1232,6 +1246,9 @@ impl Form {
     /// slider row's thumb in hand follows the pointer, but its change is reported only by
     /// [`release`](Self::release); [`pointer`](Self::pointer) reports it as it happens.
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
+        if let Some(moved) = self.colour_move(x, y) {
+            return moved;
+        }
         if let Some((_, menu)) = &mut self.menu {
             return menu.pointer(x, y);
         }
@@ -1260,6 +1277,7 @@ impl Form {
                 let hover = self.target_at(x, y);
                 let on_bar = self.bar().is_some_and(|(t, _)| t.contains(x, y));
                 let changed = hover != self.hover || on_bar != self.bar_hover;
+                let changed = self.colour_hover(x, y) || changed;
                 self.hover = hover;
                 self.bar_hover = on_bar;
                 changed
@@ -1287,6 +1305,9 @@ impl Form {
         self.pressed = None;
         self.menu_pressed = None;
         self.focus_visible = false;
+        if let Some(o) = self.colour_press(x, y, mods, clicks) {
+            return o;
+        }
         if let Some((_, menu)) = &mut self.menu {
             if menu.contains(x, y) {
                 menu.pointer(x, y);
@@ -1362,6 +1383,9 @@ impl Form {
     /// A slider row's thumb is let go, with an [`Outcome::Changed`] when its value moved since
     /// the last one reported.
     pub fn release(&mut self, x: f32, y: f32) -> Outcome {
+        if let Some(o) = self.colour_release(x, y) {
+            return o;
+        }
         if let Drag::Slider(i, _, reported) = self.drag {
             return self.slider_release(i, reported);
         }
@@ -1408,6 +1432,9 @@ impl Form {
     /// The wheel over `(x, y)`: `dy` logical px, positive towards the end. Scrolls the body (an
     /// open dropdown's menu when the pointer is over it). Returns true when something moved.
     pub fn wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        if self.colour_open().is_some() {
+            return false;
+        }
         if let Some((_, menu)) = &mut self.menu {
             return menu.contains(x, y) && menu.scroll_by(dy);
         }
@@ -1574,6 +1601,7 @@ impl Form {
                 None => menu.draw_in(p, pal, window),
             }
         }
+        self.draw_colour_picker(p, pal, caret_on);
     }
 
     fn draw_row(
@@ -1791,6 +1819,7 @@ impl Form {
                 p.text_center(Face::Ui, 13.0, v, &number_text(*value, unit), pal.text);
             }
             Row::Text { placeholder, .. } => {
+                let ctrl = self.draw_swatch(p, pal, i).unwrap_or(ctrl);
                 let hov = self.hover == Some(Target::Text(i));
                 let edge = if hov && !focused {
                     mix(pal.line, pal.text, 0.18)

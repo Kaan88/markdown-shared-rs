@@ -241,6 +241,9 @@ impl Form {
     /// other change of the view, `None` for none). A host with sliders calls this instead of
     /// `pointer_move`; either is right for a form without them.
     pub fn pointer(&mut self, x: f32, y: f32) -> Outcome {
+        if let Some(o) = self.colour_pointer(x, y) {
+            return o;
+        }
         if let Drag::Slider(i, ..) = self.drag {
             if !self.slide(x, y) {
                 return Outcome::None;
