@@ -40,8 +40,9 @@
 //! [`Painter::paragraph`] does, and a word wider than the rectangle (`C:\Program Files\Mozilla
 //! Firefox\uninstall\helper.exe`, a registry key) runs past its right edge, where the clip cuts
 //! it off and no click can reach it. [`SelectableText::with_wrap`] with [`Wrap::Anywhere`] breaks
-//! such a word between two clusters instead, so every char stays inside the rectangle: what a
-//! pane of paths in the monospace face wants. The breaks are only where the lines end: the text
+//! such a word between two clusters instead, so the text stays inside the rectangle (but for a
+//! trailing space, which hangs past the edge, and a single cluster wider than the rectangle):
+//! what a pane of paths in the monospace face wants. The breaks are only where the lines end: the text
 //! is not changed, so a copy across a break gives the text as it was, with no line break added.
 //!
 //! # Where the caret is

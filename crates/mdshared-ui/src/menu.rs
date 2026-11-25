@@ -174,14 +174,14 @@ pub struct Menu<T> {
     access_visible: bool,
     /// Placed by a rectangle ([`around`](Self::around), [`beside`](Self::beside)) rather than
     /// from `anchor`.
-    around: Option<Around>,
+    pub(crate) around: Option<Around>,
     /// The last placement by a rectangle put the menu to the left of it, or above it.
     went_left: bool,
     went_up: bool,
     /// Which rows open a submenu and draw an arrow; empty in a menu without submenus.
     branches: Vec<bool>,
     /// The least width the menu is placed at ([`min_width`](Self::min_width)); zero for none.
-    min_w: f32,
+    pub(crate) min_w: f32,
     /// The highlighted row is drawn in the palette's accent with `on_accent`
     /// ([`set_high_contrast`](Self::set_high_contrast)).
     high_contrast: bool,

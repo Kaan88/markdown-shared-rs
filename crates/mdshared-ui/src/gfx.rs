@@ -88,6 +88,7 @@ pub enum Face {
 /// registry key with no space for a long stretch stays inside its column. Neither changes the
 /// text: the lines only say where it is broken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Wrap {
     /// Break between words only; a word wider than the column overflows it.
     #[default]

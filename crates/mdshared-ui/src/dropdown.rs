@@ -266,9 +266,15 @@ impl<T> Dropdown<T> {
             return;
         }
         if let Some(menu) = self.menu.as_mut() {
-            menu.set_around(Around::Clear(menu_anchor(field)));
+            let around = Around::Clear(menu_anchor(field));
+            // Called each frame with the same field, nothing changes: a list the wheel scrolled
+            // stays where it was.
+            if menu.around == Some(around) && menu.min_w == field.w.max(0.0) {
+                return;
+            }
+            menu.set_around(around);
             menu.set_min_width(field.w);
-            // Cut shorter, the list keeps the highlighted row in view.
+            // Moved, and perhaps cut shorter, the list keeps the highlighted row in view.
             if let Some(row) = menu.hover {
                 menu.highlight(row);
             }

@@ -468,7 +468,7 @@ few hundred: every press and drag is given the lines of the whole paragraph (`pa
 linear in the text, about 2 ms for 100,000 chars in release), `draw` builds them on every frame
 that shows a selection, and nothing scrolls or is virtualised. It is not a log view; output that
 grows without end belongs in a list of rows. `SelectableText` holds the text, an anchor and a caret as byte offsets on char
-boundaries, and the drag in progress; `draw` paints the selection behind a `Painter::paragraph`.
+boundaries, and the drag in progress; `draw` paints the selection behind the paragraph it draws.
 No editing, no caret, no clipboard and no clock: Ctrl+C answers `Action::Copy(text)` and the
 caller puts it on the clipboard, and the context menu's items carry the same `Action`s.
 The lines come from the new `Painter::paragraph_lines`, which reads the parley layout
@@ -478,7 +478,7 @@ drawn glyph positions rather than a second shaping of the text. The model keeps 
 given to `press` or `drag` for the keys; the caller must give it fresh ones with `set_lines` after
 a resize or a font change.
 Two clicks select a word with the classes `textfield` uses; three select the whole logical line
-between its newlines, not one wrapped piece, which is what a log line needs. Shift with the
+between its newlines, not one wrapped piece (a whole path or registry value). Shift with the
 arrows, Home, End and Up/Down extends the selection, and Up and Down keep the x they started
 from. Alt is refused.
 Run on Windows: `cargo test --release -p mdshared-ui` (seltext's tests, 28 then and 31 after the

@@ -257,8 +257,8 @@ impl<A: App> Host<A> {
         window::edge_at(at.0, at.1, self.st.size.0, self.st.size.1)
     }
 
-    /// Asks the application for its nodes and gives the adapter what changed: only while an
-    /// assistive technology listens, unless `always` (once, before the window is shown, so the
+    /// Asks the application for its nodes and gives the adapter what changed: only once an
+    /// assistive technology has asked (Windows' adapter stays active from then on), unless `always` (once, before the window is shown, so the
     /// first request is served a real tree). Not asked, the tree is marked stale.
     #[cfg(all(feature = "a11y", windows))]
     fn refresh_tree(&mut self, always: bool) {
@@ -486,6 +486,8 @@ impl<A: App> Host<A> {
                 self.read_window();
                 if self.st.vis.hidden() {
                     // Minimized: nothing to lay out, and the size kept is the last real one.
+                    // A tree kept for a frame that will not come now is built at once.
+                    self.after();
                     return None;
                 }
                 self.st.damage.all();
@@ -513,6 +515,8 @@ impl<A: App> Host<A> {
                 if self.st.vis.set_occluded(occluded) {
                     self.st.damage.all();
                 }
+                // Hidden now, a tree kept for a frame is built at once.
+                self.after();
                 return None;
             }
             WindowEvent::Focused(focused) => {
@@ -718,8 +722,8 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
                 // first request, or sends `Wake::Refresh` when the tree was never built. Kept
                 // for an adapter that sends it.
                 accesskit_winit::WindowEvent::InitialTreeRequested => self.refresh_tree(false),
-                // Nothing is kept for an assistive technology that leaves: with nobody
-                // listening the tree is no longer built.
+                // Not sent on Windows (accesskit_winit drops the deactivation handler there):
+                // once asked, the tree is built for the life of the window.
                 accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
             },
         }

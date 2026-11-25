@@ -73,7 +73,7 @@
 //! **Accessibility** (features `host` and `a11y`). The application adds its nodes to the
 //! host's [`a11y::Tree`](crate::a11y::Tree) in [`App::accessibility`]; the host begins and ends
 //! that tree, so AccessKit gets only what changed, and keeps it whole for the system's first
-//! request (served at once, on the thread that asks). On Windows the AccessKit adapter is made
+//! request (served at once, inside the window procedure). On Windows the AccessKit adapter is made
 //! with `with_mixed_handlers` before the window is shown. The host asks for the nodes once
 //! after the first frame, before the window is shown, and then only once an assistive
 //! technology has asked (on Windows the adapter stays active from then on, for the life of

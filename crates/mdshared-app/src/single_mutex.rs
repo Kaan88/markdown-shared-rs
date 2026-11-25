@@ -20,11 +20,15 @@
 //!     Instance::First(guard) => { /* make the window */ guard.publish_window(hwnd); /* run, keeping guard */ }
 //!     Instance::Running(first) => {
 //!         match first.wait_window(Duration::from_secs(2)) {
-//!             Some(window) if single_mutex::send("purge", window, &args) => {
+//!             Some(window) => {
+//!                 if !single_mutex::send("purge", window, &args) {
+//!                     // Not handed over (every winit window until P8b): see "When nothing is
+//!                     // handed over". Send once, never again.
+//!                 }
+//!                 // Forward either way: the user sees the instance that is running.
 //!                 single_mutex::bring_forward(window);
 //!             }
-//!             // Not handed over: see "When nothing is handed over". Send once, never again.
-//!             _ => { /* tell the user, or run anyway */ }
+//!             None => { /* tell the user, or run anyway */ }
 //!         }
 //!         return; // the caller's choice
 //!     }

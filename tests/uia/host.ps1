@@ -27,7 +27,7 @@ while (-not $btn -and $sw.ElapsedMilliseconds -lt 3000) {
     $btn = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $idc)
     if (-not $btn) { Start-Sleep -Milliseconds 50 }
 }
-if (-not $btn) { Write-Output 'FAIL no Hello button' } else {
+if (-not $btn) { Write-Output 'FAIL no Hello button'; exit 1 } else {
 Write-Output ("button '{0}' bounds {1}" -f $btn.Current.Name, $btn.Current.BoundingRectangle)
 $fc = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'Field')
 $field = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $fc)
@@ -41,5 +41,8 @@ Write-Output ("window bounds {0}" -f $wb)
 $p.WaitForExit(12000) | Out-Null
 $log = Get-Content $out
 $hit = $log | Select-String 'a11y action Click'
-if ($hit) { Write-Output "PASS invoke reached the app: $hit" } else { Write-Output 'FAIL invoke not seen'; $log | Select-Object -Last 10 }
+$failed = -not $field
+if ($hit) { Write-Output "PASS invoke reached the app: $hit" } else { Write-Output 'FAIL invoke not seen'; $log | Select-Object -Last 10; $failed = $true }
 Get-Content (Join-Path $env:TEMP 'host_probe_err.txt') | Select-Object -First 12
+if ($failed) { exit 1 }
+exit 0
