@@ -268,7 +268,7 @@ impl SelectableText {
     /// to the ends of the line between line breaks, and Up and Down do nothing. Alt is refused
     /// whole, so Alt+C is not a copy and changes nothing. Every other key is `None` and changes
     /// nothing.
-    pub fn key(&mut self, key: KeyName, mods: Mods) -> Option<Action> {
+    pub fn key(&mut self, key: &KeyName, mods: Mods) -> Option<Action> {
         if mods.alt {
             return None;
         }

@@ -73,9 +73,9 @@
 //! (the menu's geometry is the one used); a backdrop or a modal flyout (that is a dialog,
 //! [`overlay::draw_backdrop`](crate::overlay::draw_backdrop)); a card taller than its area
 //! scrolling (it is cut to the area, and the content is the caller's to fit); right-to-left;
-//! several flyouts open at once beyond what nested focus scopes give. For the accessibility
-//! layer (roadmap W8): a flyout will be a pane, a group like a dialog that is not modal, with its
-//! own focus scope; nothing is reported to a screen reader yet.
+//! several flyouts open at once beyond what nested focus scopes give; and an `a11y` builder: a
+//! caller reports an open flyout as `a11y::dialog` with `modal` false (a group like a dialog
+//! that is not modal), with its content as children.
 
 use crate::anim::pop;
 use crate::focus::Focus;

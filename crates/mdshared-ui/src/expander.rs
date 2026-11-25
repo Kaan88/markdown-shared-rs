@@ -17,8 +17,9 @@
 //! Deliberately not here: the body's content (the caller draws it); the header's icons besides
 //! the chevron; a chevron that turns through the animation (the plain drawing swaps the right
 //! and down chevrons, which is what the tree's disclosure does); and the accessibility layer.
-//! For the later W8 layer this is a group whose header is a button that expands or collapses;
-//! [`Expander::expanded`] is what maps to UIA's ExpandCollapse state.
+//! For a screen reader the caller builds the header with `a11y::expander` (feature `a11y`), a
+//! button that expands or collapses; [`Expander::expanded`] is what maps to UIA's
+//! ExpandCollapse state.
 
 use crate::anim::{Animator, AsId, Id, fluent};
 use crate::focus::draw_ring;
@@ -84,7 +85,7 @@ impl Expander {
     /// body and answers true. Every other key changes nothing and answers false, so the caller
     /// can pass keys on to the application's shortcuts. This does not know whether the expander
     /// is disabled: the caller leaves a disabled one out of its keys.
-    pub fn key(&mut self, key: KeyName, mods: Mods) -> bool {
+    pub fn key(&mut self, key: &KeyName, mods: Mods) -> bool {
         if mods.ctrl || mods.alt || !matches!(key, KeyName::Space | KeyName::Enter) {
             return false;
         }

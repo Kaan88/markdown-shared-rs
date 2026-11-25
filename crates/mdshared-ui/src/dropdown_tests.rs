@@ -1073,6 +1073,12 @@ fn the_clear_placement_is_arounds_but_never_over_the_anchor() {
             assert_eq!(clear, plain);
             continue;
         }
+        let below_room = (room.bottom() - anchor.bottom()).max(0.0);
+        let above_room = (anchor.y - room.y).max(0.0);
+        if below_room.max(above_room).min(room.h) < h.min(48.0) {
+            assert_eq!(clear, plain, "a sliver falls back to covering the anchor");
+            continue;
+        }
         cut += 1;
         let r = clear.rect;
         assert!(
@@ -1092,4 +1098,33 @@ fn the_clear_placement_is_arounds_but_never_over_the_anchor() {
         }
     }
     assert!(cut > 100, "the run reached the case it is about ({cut})");
+}
+
+#[test]
+fn an_open_menu_follows_the_field_when_the_page_scrolls() {
+    let field = Rect::new(40.0, 60.0, 160.0, DROPDOWN_H);
+    let mut d = widths();
+    d.open_menu(field);
+    place(&mut d, AREA);
+    let before = d.menu().unwrap().rect();
+    assert_eq!(before.y, field.bottom() + MENU_GAP);
+
+    let scrolled = Rect::new(field.x, field.y + 90.0, field.w, field.h);
+    d.set_field(scrolled);
+    place(&mut d, AREA);
+    let after = d.menu().unwrap().rect();
+    assert_eq!(
+        after.y,
+        scrolled.bottom() + MENU_GAP,
+        "the menu stayed where it opened"
+    );
+    assert_eq!((after.x, after.w), (before.x, before.w));
+
+    // A closed drop-down and an unusable field change nothing.
+    d.set_field(Rect::new(f32::NAN, 0.0, 10.0, 10.0));
+    place(&mut d, AREA);
+    assert_eq!(d.menu().unwrap().rect(), after);
+    d.close();
+    d.set_field(field);
+    assert!(d.menu().is_none());
 }

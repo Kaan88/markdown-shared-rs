@@ -397,9 +397,9 @@ is open, Up and Down stop at the first and the last option, as WinUI's ComboBox 
 menu still goes round.
 
 Not here: an editable combo box, the labels beside the controls, the menu's closing fade, the
-wheel changing a closed drop-down, and the accessibility layer, which (W8) will read the role
-from the type, the value from `Dropdown::selected_label` / `Toggle::on`, whether it is expanded
-from `Dropdown::is_open`, and the name and rectangle from the caller.
+wheel changing a closed drop-down. For a screen reader the caller builds `a11y::combo_box` and
+`a11y::switch` (feature `a11y`, added later by W8) from `Dropdown::selected_label` /
+`Toggle::on` and `Dropdown::is_open`, with the name and rectangle it has.
 
 Not verified: both were only drawn into bitmaps by tests; neither has run in a window, and the
 specimen sheets (`toggle_sheet`, `dropdown_sheet`) have not been seen by a person.

@@ -148,8 +148,8 @@ fn a_hit_is_inside_the_rectangle_and_not_outside_it() {
 
 #[test]
 fn enter_and_space_activate_a_link_and_the_other_keys_do_not() {
-    assert!(key(KeyName::Enter, Mods::default()));
-    assert!(key(KeyName::Space, Mods::default()));
+    assert!(key(&KeyName::Enter, Mods::default()));
+    assert!(key(&KeyName::Space, Mods::default()));
     for other in [
         KeyName::Tab,
         KeyName::Escape,
@@ -167,14 +167,14 @@ fn enter_and_space_activate_a_link_and_the_other_keys_do_not() {
         KeyName::F(1),
     ] {
         assert!(
-            !key(other.clone(), Mods::default()),
+            !key(&other.clone(), Mods::default()),
             "{other:?} activated a link"
         );
     }
     let link = Link::new("Open");
-    assert!(link.key(KeyName::Enter, Mods::default()));
-    assert!(link.key(KeyName::Space, Mods::default()));
-    assert!(!link.key(KeyName::Escape, Mods::default()));
+    assert!(link.key(&KeyName::Enter, Mods::default()));
+    assert!(link.key(&KeyName::Space, Mods::default()));
+    assert!(!link.key(&KeyName::Escape, Mods::default()));
 }
 
 #[test]
@@ -287,6 +287,7 @@ fn a_disabled_link_is_quiet_whatever_else_is_set() {
                 pressed: true,
                 focused: true,
                 disabled: true,
+                ink: None,
             },
         );
         assert_eq!(plain.pixels, loud.pixels, "a disabled link took a mark");
@@ -334,6 +335,7 @@ fn a_link_with_no_text_or_no_room_draws_nothing() {
                     pressed: true,
                     focused: true,
                     disabled: false,
+                    ink: None,
                 },
             );
         }
@@ -470,8 +472,29 @@ fn ctrl_or_alt_with_enter_or_space_does_not_activate() {
         ..Mods::default()
     };
     for k in [KeyName::Enter, KeyName::Space] {
-        assert!(!key(k.clone(), ctrl), "Ctrl+{k:?}");
-        assert!(!key(k.clone(), alt), "Alt+{k:?}");
-        assert!(key(k.clone(), shift), "Shift+{k:?}");
+        assert!(!key(&k.clone(), ctrl), "Ctrl+{k:?}");
+        assert!(!key(&k.clone(), alt), "Alt+{k:?}");
+        assert!(key(&k.clone(), shift), "Shift+{k:?}");
+    }
+}
+
+#[test]
+fn the_ink_replaces_the_accent() {
+    let ink = [0x1c, 0x5e, 0x75];
+    for pal in [&LIGHT, &DARK] {
+        let (over, r) = drawn(
+            pal,
+            "Open the file",
+            Look {
+                hovered: true,
+                ink: Some(ink),
+                ..Look::default()
+            },
+        );
+        assert!(
+            longest_run(&over, ink) >= (r.w * 0.8) as usize,
+            "the underline is not in the ink"
+        );
+        assert!(longest_run(&over, pal.accent) < (r.w * 0.5) as usize);
     }
 }

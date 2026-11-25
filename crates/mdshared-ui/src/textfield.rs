@@ -613,6 +613,10 @@ impl TextField {
     /// in, its caret moved or its selection changed (any of the calls that edit or move), and
     /// after a frame in which the field was not focused: so the caret is solid while the user
     /// types and the moment focus arrives.
+    ///
+    /// `focused` means the field has the keyboard in a window that has it too: a caller passes
+    /// false while its window is in the background (the host's `Event::Focus(false)`), or an
+    /// inactive window keeps waking twice a second to blink a caret nobody types into.
     pub fn blink_caret(
         &mut self,
         anim: &mut Animator,

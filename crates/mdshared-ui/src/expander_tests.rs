@@ -73,9 +73,9 @@ fn the_header_takes_its_own_rectangle_and_no_more() {
 #[test]
 fn space_and_enter_toggle_and_other_keys_do_not() {
     let mut e = Expander::new(false);
-    assert!(e.key(KeyName::Space, Mods::default()));
+    assert!(e.key(&KeyName::Space, Mods::default()));
     assert!(e.expanded);
-    assert!(e.key(KeyName::Enter, Mods::default()));
+    assert!(e.key(&KeyName::Enter, Mods::default()));
     assert!(!e.expanded);
     for key in [
         KeyName::Char('x'),
@@ -95,7 +95,7 @@ fn space_and_enter_toggle_and_other_keys_do_not() {
     ] {
         let before = e.expanded;
         assert!(
-            !e.key(key.clone(), Mods::default()),
+            !e.key(&key.clone(), Mods::default()),
             "{key:?} was taken by the expander"
         );
         assert_eq!(e.expanded, before, "{key:?} changed the expander");
@@ -113,17 +113,17 @@ fn ctrl_and_alt_leave_the_expander_to_the_applications_shortcuts() {
         ..Mods::default()
     };
     let mut e = Expander::new(false);
-    assert!(!e.key(KeyName::Enter, ctrl), "Ctrl+Enter was taken");
-    assert!(!e.key(KeyName::Space, ctrl), "Ctrl+Space was taken");
-    assert!(!e.key(KeyName::Enter, alt), "Alt+Enter was taken");
-    assert!(!e.key(KeyName::Space, alt), "Alt+Space was taken");
+    assert!(!e.key(&KeyName::Enter, ctrl), "Ctrl+Enter was taken");
+    assert!(!e.key(&KeyName::Space, ctrl), "Ctrl+Space was taken");
+    assert!(!e.key(&KeyName::Enter, alt), "Alt+Enter was taken");
+    assert!(!e.key(&KeyName::Space, alt), "Alt+Space was taken");
     assert!(!e.expanded, "a shortcut changed the expander");
     // Shift is not a shortcut modifier here: Shift+Enter still toggles.
     let shift = Mods {
         shift: true,
         ..Mods::default()
     };
-    assert!(e.key(KeyName::Enter, shift));
+    assert!(e.key(&KeyName::Enter, shift));
     assert!(e.expanded);
 }
 

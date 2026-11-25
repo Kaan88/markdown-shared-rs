@@ -12,13 +12,13 @@
 //! Deliberately not here: opening the address, which is the application's own business; motion
 //! (the underline and the colours are there on the frame they are drawn, and no frame is asked
 //! for); the pointer's tracking and the focus model, which the caller runs and passes in as
-//! [`Look`] flags; a hover delay; and the accessible name and role. The later accessibility
-//! layer (roadmap W8) will report the role hyperlink or button with Invoke, the link's text as
-//! its name, and [`link_rect`]'s rectangle as its bounds.
+//! [`Look`] flags; a hover delay; and the accessible name and role, which
+//! `a11y::link` gives (the role hyperlink with Invoke, the link's text as its name, and
+//! [`link_rect`]'s rectangle as its bounds).
 
 use crate::cursor::Cursor;
 use crate::focus::draw_ring;
-use crate::gfx::{Face, Painter, Rect, mix};
+use crate::gfx::{Face, Painter, Rect, Rgb, mix};
 use crate::keys::{KeyName, Mods};
 use crate::theme::Palette;
 
@@ -88,7 +88,7 @@ impl Link {
 
     /// What this link does with a key, by [`key`](crate::link::key): `true` for Enter and Space
     /// with neither Ctrl nor Alt held, `false` for everything else.
-    pub fn key(&self, k: KeyName, mods: Mods) -> bool {
+    pub fn key(&self, k: &KeyName, mods: Mods) -> bool {
         key(k, mods)
     }
 }
@@ -124,7 +124,7 @@ pub fn cursor() -> Cursor {
 /// nor Alt is held (as `toggle` and `dropdown` read them); every other key does not. The caller
 /// decides whether the keyboard is on the link at all, and leaves a disabled link out of the keys
 /// as it leaves it out of the hits; this only says what the activation keys are.
-pub fn key(key: KeyName, mods: Mods) -> bool {
+pub fn key(key: &KeyName, mods: Mods) -> bool {
     !mods.ctrl && !mods.alt && matches!(key, KeyName::Enter | KeyName::Space)
 }
 
@@ -139,6 +139,10 @@ pub struct Look {
     pub focused: bool,
     /// It cannot be used: drawn in the faint colour, with no underline, ring or press look.
     pub disabled: bool,
+    /// The text colour in place of the palette's accent. Under Windows high contrast give the
+    /// theme's hyperlink colour, [`crate::tokens::SystemColors::hot_light`]: the accent of the
+    /// system's theme is its Highlight, a selection colour, not its link colour.
+    pub ink: Option<Rgb>,
 }
 
 /// Draws the link `text` in `r` with the colours and marks `look` asks for, and changes nothing.
@@ -161,12 +165,13 @@ pub fn draw_link(p: &mut Painter, pal: &Palette, r: Rect, text: &str, look: Look
     if r.w <= 0.0 || r.h <= 0.0 {
         return;
     }
+    let ink = look.ink.unwrap_or(pal.accent);
     let colour = if look.disabled {
         pal.faint
     } else if look.pressed {
-        mix(pal.accent, pal.text, PRESS)
+        mix(ink, pal.text, PRESS)
     } else {
-        pal.accent
+        ink
     };
     if look.focused && !look.disabled {
         draw_ring(p, pal, r, RADIUS);

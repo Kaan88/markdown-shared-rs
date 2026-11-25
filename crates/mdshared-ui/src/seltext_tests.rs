@@ -147,9 +147,9 @@ fn a_double_click_selects_a_word_and_a_triple_click_its_line() {
     assert_eq!(m.selected_text(), "four five");
     // End stops before the newline, so Shift+End does not take the next line with it.
     m.press(&lines, 0.0, middle(&lines[0]), Mods::default(), 1);
-    assert_eq!(m.key(KeyName::End, shift()), None);
+    assert_eq!(m.key(&KeyName::End, shift()), None);
     assert_eq!(m.selected_text(), "one two three");
-    assert_eq!(m.key(KeyName::Home, shift()), None);
+    assert_eq!(m.key(&KeyName::Home, shift()), None);
     assert!(!m.has_selection());
 }
 
@@ -172,20 +172,20 @@ fn shift_down_extends_to_the_next_wrapped_line_at_the_same_x() {
     let mut m = model(text);
     m.press(&lines, 0.0, middle(&lines[0]), Mods::default(), 1);
     assert_eq!(m.caret().0, 0);
-    assert_eq!(m.key(KeyName::Down, shift()), None);
+    assert_eq!(m.key(&KeyName::Down, shift()), None);
     assert_eq!(m.caret().0, lines[1].range.start);
     assert_eq!(m.selection(), 0..lines[1].range.start);
     assert_eq!(m.selected_text(), &text[..lines[1].range.start]);
     // Down again, now without Shift, moves and drops the selection.
-    assert_eq!(m.key(KeyName::Down, Mods::default()), None);
+    assert_eq!(m.key(&KeyName::Down, Mods::default()), None);
     assert_eq!(m.caret().0, lines[2].range.start);
     assert!(!m.has_selection());
     // Up keeps the x as well; at the first line it stays put.
-    assert_eq!(m.key(KeyName::Up, Mods::default()), None);
+    assert_eq!(m.key(&KeyName::Up, Mods::default()), None);
     assert_eq!(m.caret().0, lines[1].range.start);
-    assert_eq!(m.key(KeyName::Up, Mods::default()), None);
+    assert_eq!(m.key(&KeyName::Up, Mods::default()), None);
     assert_eq!(m.caret().0, 0);
-    assert_eq!(m.key(KeyName::Up, shift()), None);
+    assert_eq!(m.key(&KeyName::Up, shift()), None);
     assert_eq!(m.caret().0, 0);
     assert!(!m.has_selection());
 }
@@ -197,7 +197,7 @@ fn ctrl_c_copies_the_selection_and_ctrl_a_selects_everything() {
     let hello = text.find("hello").unwrap();
     let line = &lines[0];
     let mut m = model(text);
-    assert_eq!(m.key(KeyName::Char('c'), ctrl()), None, "nothing selected");
+    assert_eq!(m.key(&KeyName::Char('c'), ctrl()), None, "nothing selected");
     m.press(
         &lines,
         x_in_char(line, text, hello),
@@ -207,13 +207,13 @@ fn ctrl_c_copies_the_selection_and_ctrl_a_selects_everything() {
     );
     assert_eq!(m.selected_text(), "hello");
     assert_eq!(
-        m.key(KeyName::Char('c'), ctrl()),
+        m.key(&KeyName::Char('c'), ctrl()),
         Some(Action::Copy("hello".into()))
     );
-    assert_eq!(m.key(KeyName::Char('a'), ctrl()), None);
+    assert_eq!(m.key(&KeyName::Char('a'), ctrl()), None);
     assert_eq!(m.selection(), 0..text.len());
     assert_eq!(
-        m.key(KeyName::Char('c'), ctrl()),
+        m.key(&KeyName::Char('c'), ctrl()),
         Some(Action::Copy(text.into()))
     );
     m.clear_selection();
@@ -237,11 +237,11 @@ fn alt_c_is_refused_and_so_are_alt_arrows() {
         ctrl: true,
         ..Mods::default()
     };
-    assert_eq!(m.key(KeyName::Char('c'), alt), None);
-    assert_eq!(m.key(KeyName::Char('c'), alt_ctrl), None);
+    assert_eq!(m.key(&KeyName::Char('c'), alt), None);
+    assert_eq!(m.key(&KeyName::Char('c'), alt_ctrl), None);
     assert_eq!(m.caret(), before);
     assert_eq!(m.selected_text(), text);
-    assert_eq!(m.key(KeyName::Down, alt), None);
+    assert_eq!(m.key(&KeyName::Down, alt), None);
     assert_eq!(m.caret(), before);
     // Other keys are the caller's and leave the text alone.
     for key in [
@@ -253,14 +253,14 @@ fn alt_c_is_refused_and_so_are_alt_arrows() {
         KeyName::F(5),
         KeyName::Char('z'),
     ] {
-        assert_eq!(m.key(key, Mods::default()), None);
+        assert_eq!(m.key(&key, Mods::default()), None);
         assert_eq!(m.caret(), before);
     }
     // Home and End do move, and this paragraph has its lines.
     m.set_lines(&lines);
-    assert_eq!(m.key(KeyName::Home, Mods::default()), None);
+    assert_eq!(m.key(&KeyName::Home, Mods::default()), None);
     assert_eq!(m.caret().0, 0);
-    assert_eq!(m.key(KeyName::End, Mods::default()), None);
+    assert_eq!(m.key(&KeyName::End, Mods::default()), None);
     assert_eq!(m.caret().0, text.len());
 }
 
@@ -328,10 +328,10 @@ fn a_press_drag_and_the_keys_stay_on_char_boundaries_of_non_ascii_text() {
         }
         m.select_all();
         for _ in 0..60 {
-            m.key(KeyName::Left, shift());
+            m.key(&KeyName::Left, shift());
             assert!(text.is_char_boundary(m.caret().0));
             assert!(text.is_char_boundary(m.anchor));
-            m.key(KeyName::Right, shift());
+            m.key(&KeyName::Right, shift());
             assert!(text.is_char_boundary(m.caret().0));
         }
     }
@@ -343,7 +343,7 @@ fn nothing_goes_wrong_with_empty_text_or_nonsense_coordinates() {
     m.press(&[], f32::NAN, f32::NAN, Mods::default(), 1);
     m.press(&[], f32::INFINITY, f32::NEG_INFINITY, Mods::default(), 2);
     m.drag(&[], 4.0, 4.0);
-    m.key(KeyName::Down, shift());
+    m.key(&KeyName::Down, shift());
     assert_eq!(m.caret(), (0, 0));
     assert!(!m.has_selection());
     assert_eq!(m.selected_text(), "");
@@ -475,35 +475,35 @@ fn the_end_of_a_wrapped_line_stays_on_that_line_for_end_home_and_down() {
         assert!(lines.len() >= 3, "scale {scale}: {} lines", lines.len());
         let mut m = model(text);
         m.press(&lines, 0.0, middle(&lines[0]), none, 1);
-        m.key(KeyName::End, none);
+        m.key(&KeyName::End, none);
         assert_eq!(m.caret().0, lines[0].range.end, "scale {scale}");
         assert_eq!(
             m.caret_line(),
             Some(0),
             "scale {scale}: End stays on line 0"
         );
-        m.key(KeyName::End, none);
+        m.key(&KeyName::End, none);
         assert_eq!(m.caret().0, lines[0].range.end, "scale {scale}: End again");
         assert_eq!(m.caret_line(), Some(0), "scale {scale}: End again");
-        m.key(KeyName::Home, none);
+        m.key(&KeyName::Home, none);
         assert_eq!(m.caret().0, 0, "scale {scale}: Home after End");
 
         // A click past the end of line 0, then Down, is on line 1, at its end.
         m.press(&lines, 1000.0, middle(&lines[0]), none, 1);
         assert_eq!(m.caret_line(), Some(0), "scale {scale}");
-        m.key(KeyName::Down, none);
+        m.key(&KeyName::Down, none);
         assert_eq!(m.caret_line(), Some(1), "scale {scale}: Down from line 0");
         assert_eq!(m.caret().0, lines[1].range.end, "scale {scale}");
-        m.key(KeyName::Home, none);
+        m.key(&KeyName::Home, none);
         assert_eq!(m.caret().0, lines[1].range.start, "scale {scale}");
-        m.key(KeyName::Up, none);
+        m.key(&KeyName::Up, none);
         assert_eq!(m.caret_line(), Some(0), "scale {scale}: Up from line 1");
 
         // Shift+End from the start selects line 0 and Shift+Down keeps the line end's x.
         m.press(&lines, 0.0, middle(&lines[0]), none, 1);
-        m.key(KeyName::End, shift());
+        m.key(&KeyName::End, shift());
         assert_eq!(m.selection(), 0..lines[0].range.end, "scale {scale}");
-        m.key(KeyName::Down, shift());
+        m.key(&KeyName::Down, shift());
         assert_eq!(m.caret_line(), Some(1), "scale {scale}");
 
         // Right puts the caret at the start of the next line, as Windows does.
@@ -511,7 +511,7 @@ fn the_end_of_a_wrapped_line_stays_on_that_line_for_end_home_and_down() {
         let x = x_in_char(&lines[0], text, end0 - 1);
         m.press(&lines, x, middle(&lines[0]), none, 1);
         while m.caret().0 < end0 {
-            m.key(KeyName::Right, none);
+            m.key(&KeyName::Right, none);
         }
         assert_eq!(m.caret().0, end0);
         assert_eq!(m.caret_line(), Some(1), "scale {scale}: Right goes down");
@@ -618,14 +618,14 @@ fn a_press_and_the_arrows_land_only_on_the_edges_of_clusters() {
         m.press(&lines, -10.0, middle(line), none, 1);
         let mut seen = vec![m.caret().0];
         for _ in 0..edges.len() {
-            m.key(KeyName::Right, none);
+            m.key(&KeyName::Right, none);
             seen.push(m.caret().0);
         }
         seen.dedup();
         assert_eq!(seen, edges, "scale {scale}: Right");
         let mut back = vec![m.caret().0];
         for _ in 0..edges.len() {
-            m.key(KeyName::Left, shift());
+            m.key(&KeyName::Left, shift());
             back.push(m.caret().0);
         }
         back.dedup();
@@ -668,8 +668,8 @@ fn lines_of_another_text_are_ignored_and_nothing_panics() {
         KeyName::Up,
         KeyName::Down,
     ] {
-        m.key(key.clone(), none);
-        m.key(key, shift());
+        m.key(&key.clone(), none);
+        m.key(&key, shift());
         assert!(m.caret().0 <= 2);
     }
     let _ = m.selected_text();
@@ -686,7 +686,7 @@ fn lines_of_another_text_are_ignored_and_nothing_panics() {
         let mut m = model(text);
         m.press(&bad, 1000.0, 5.0, none, 1);
         m.press(&bad, 1000.0, 5.0, none, 2);
-        m.key(KeyName::End, none);
+        m.key(&KeyName::End, none);
         assert_eq!(m.caret_line(), None);
         assert!(text.is_char_boundary(m.caret().0));
     }
@@ -697,7 +697,7 @@ fn lines_of_another_text_are_ignored_and_nothing_panics() {
     mixed.push(other[0].clone());
     let mut m = model("some words here");
     m.set_lines(&mixed);
-    m.key(KeyName::End, none);
+    m.key(&KeyName::End, none);
     assert_eq!(m.caret().0, lines[0].range.end);
 }
 
@@ -722,8 +722,8 @@ fn paragraph_lines_is_linear_on_a_long_line_of_one_token() {
         let mut m = model(&text);
         let started = std::time::Instant::now();
         m.press(&lines, 5000.0, middle(&lines[0]), Mods::default(), 2);
-        m.key(KeyName::End, shift());
-        m.key(KeyName::Left, shift());
+        m.key(&KeyName::End, shift());
+        m.key(&KeyName::Left, shift());
         let model_took = started.elapsed();
         assert_eq!(m.selection().start, 0);
         println!("{len} chars: paragraph_lines {took:?}, model {model_took:?}");
@@ -798,7 +798,7 @@ fn a_lone_carriage_return_and_the_unicode_separators_end_a_line() {
         m.press(&lines, 1.0, middle(line), none, 3);
         assert_eq!(m.selected_text(), want, "triple click on line {i}");
         m.press(&lines, 0.0, middle(line), none, 1);
-        m.key(KeyName::End, shift());
+        m.key(&KeyName::End, shift());
         assert_eq!(m.selected_text(), want, "Shift+End on line {i}");
         m.press(&lines, 1000.0, middle(line), none, 1);
         let end = line.range.start + want.len();
@@ -806,14 +806,14 @@ fn a_lone_carriage_return_and_the_unicode_separators_end_a_line() {
     }
     // Without lines, End and Home use the same line breaks.
     let mut m = model(text);
-    m.key(KeyName::End, none);
+    m.key(&KeyName::End, none);
     assert_eq!(m.caret().0, 3);
     for _ in 0..2 {
-        m.key(KeyName::Right, none);
+        m.key(&KeyName::Right, none);
     }
-    m.key(KeyName::End, shift());
+    m.key(&KeyName::End, shift());
     assert_eq!(m.caret().0, text.find('\u{2028}').unwrap());
-    m.key(KeyName::Home, none);
+    m.key(&KeyName::Home, none);
     assert_eq!(m.caret().0, 4);
 }
 
@@ -827,13 +827,13 @@ fn left_and_right_drop_a_selection_at_its_ends_and_ctrl_home_and_end_go_to_the_t
     let mut m = model(text);
     m.press(&lines, x, middle(line), none, 2);
     assert_eq!(m.selection(), 6..11);
-    m.key(KeyName::Left, none);
+    m.key(&KeyName::Left, none);
     assert_eq!(m.caret(), (6, 6));
     m.press(&lines, x, middle(line), none, 2);
-    m.key(KeyName::Right, none);
+    m.key(&KeyName::Right, none);
     assert_eq!(m.caret(), (11, 11));
     m.press(&lines, x, middle(line), none, 2);
-    m.key(KeyName::Left, shift());
+    m.key(&KeyName::Left, shift());
     assert_eq!(m.selection(), 6..10, "Shift+Left moves the caret");
 
     let ctrl_shift = Mods {
@@ -841,13 +841,13 @@ fn left_and_right_drop_a_selection_at_its_ends_and_ctrl_home_and_end_go_to_the_t
         shift: true,
         ..Mods::default()
     };
-    m.key(KeyName::End, ctrl());
+    m.key(&KeyName::End, ctrl());
     assert_eq!(m.caret(), (11, 11));
-    m.key(KeyName::Home, ctrl_shift);
+    m.key(&KeyName::Home, ctrl_shift);
     assert_eq!(m.selection(), 0..11);
-    m.key(KeyName::Home, ctrl());
+    m.key(&KeyName::Home, ctrl());
     assert_eq!(m.caret(), (0, 0));
-    m.key(KeyName::End, ctrl_shift);
+    m.key(&KeyName::End, ctrl_shift);
     assert_eq!(m.selection(), 0..11);
 }
 
@@ -866,17 +866,17 @@ fn shift_up_on_the_first_line_and_shift_down_on_the_last_go_to_the_text_ends() {
     );
     let at = m.caret().0;
     assert!(at > 0);
-    m.key(KeyName::Up, none);
+    m.key(&KeyName::Up, none);
     assert_eq!(m.caret(), (at, at), "Up without Shift stays");
-    m.key(KeyName::Up, shift());
+    m.key(&KeyName::Up, shift());
     assert_eq!(m.selection(), 0..at);
     let last = lines.last().unwrap();
     let x = x_in_char(last, text, last.range.start + 1);
     m.press(&lines, x, middle(last), none, 1);
     let at = m.caret().0;
-    m.key(KeyName::Down, none);
+    m.key(&KeyName::Down, none);
     assert_eq!(m.caret(), (at, at), "Down without Shift stays");
-    m.key(KeyName::Down, shift());
+    m.key(&KeyName::Down, shift());
     assert_eq!(m.selection(), at..text.len());
 }
 
@@ -986,7 +986,7 @@ fn the_highlight_sits_where_the_glyphs_do_at_a_fractional_x() {
     let mut m = model(text);
     m.press(&lines, line.stops[i], middle(line), Mods::default(), 1);
     assert_eq!(m.caret().0, i, "ASCII: the stop index is the byte offset");
-    m.key(KeyName::End, shift());
+    m.key(&KeyName::End, shift());
     draw(&mut p, &LIGHT, area, Face::Ui, 13.0, &m, true);
     let row = ((area.y * scale).round() + line.y * scale).round() as usize + 1;
     let at = |x: usize| {

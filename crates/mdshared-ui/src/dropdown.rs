@@ -5,8 +5,9 @@
 //! window that is not a settings dialog.
 //!
 //! The model, [`Dropdown`], holds the options, the chosen one, the press under way and, while it
-//! is open, the menu. The caller owns the field's rectangle (passed in to every call, so nothing
-//! goes stale after a resize), the keyboard focus, the label beside the field and what a change
+//! is open, the menu. The caller owns the field's rectangle (passed in to every call that may
+//! open the menu; an open menu is placed by the field it opened from, so after a scroll or a
+//! resize the caller gives the new one to [`Dropdown::set_field`]), the keyboard focus, the label beside the field and what a change
 //! means. Events go in and an [`Outcome`] comes back: [`Dropdown::key`], [`Dropdown::press`],
 //! [`Dropdown::release`], [`Dropdown::pointer`], [`Dropdown::wheel`]. While the menu is open the
 //! caller sends it every key and every press, whatever is under the pointer, since an open menu
@@ -26,8 +27,9 @@
 //! field grown by [`MENU_GAP`] above and below: under the field with its left edges level and a
 //! gap of [`MENU_GAP`] px, above it where there is no room below, and leftwards where there is no
 //! room to the right. One rule is added: it never covers the field. Where it fits neither below
-//! nor above, it goes to the side with more room and is cut to that room, and scrolls. It is at
-//! least as wide as the field, opens with the chosen option ticked and highlighted (brought into
+//! nor above, it goes to the side with more room and is cut to that room, and scrolls, unless
+//! not even one row would show on either side: then it covers the field as a plain menu does.
+//! It is at least as wide as the field up to the menu's widest (420 px), opens with the chosen option ticked and highlighted (brought into
 //! view when it scrolls), and scrolls when it is taller than the window.
 //!
 //! The field's pixels are the settings dialog's: both draw it with the same function, and a test
@@ -47,8 +49,8 @@
 //! - a focus model: the caller passes [`Look::focused`] (see [`focus`](crate::focus));
 //! - the mouse wheel turning the choice of a closed field, which Windows does and which moves
 //!   settings by accident while a page scrolls;
-//! - what a screen reader is told. The accessibility layer (roadmap W8, not built yet) reads the
-//!   role from the type (a combo box), the value from [`Dropdown::selected`] and
+//! - what a screen reader is told. The caller builds the node with `a11y::combo_box` (feature
+//!   `a11y`): the role is a combo box, the value from [`Dropdown::selected`] and
 //!   [`Dropdown::selected_label`], whether it is expanded from [`Dropdown::is_open`], the list's
 //!   rectangle from [`Dropdown::menu`], and the name and the field's rectangle from the caller,
 //!   which has the label and passes the rectangle to every call.
@@ -77,6 +79,16 @@ use crate::theme::Palette;
 
 /// The height of the field, in logical px, as the settings dialog draws it.
 pub const DROPDOWN_H: f32 = 28.0;
+/// The rectangle a menu is placed round: `field` grown by [`MENU_GAP`] above and below.
+fn menu_anchor(field: Rect) -> Rect {
+    Rect::new(
+        field.x,
+        field.y - MENU_GAP,
+        field.w,
+        field.h + 2.0 * MENU_GAP,
+    )
+}
+
 /// The gap between the field and the menu it opens, in logical px.
 pub const MENU_GAP: f32 = 4.0;
 /// The corner radius of the field.
@@ -235,19 +247,27 @@ impl<T> Dropdown<T> {
             .enumerate()
             .map(|(k, (_, label))| Item::new(k, label.clone()).checked(k == self.selected))
             .collect();
-        let anchor = Rect::new(
-            field.x,
-            field.y - MENU_GAP,
-            field.w,
-            field.h + 2.0 * MENU_GAP,
-        );
         let mut menu = Menu::new(items, field.x, field.bottom(), false).min_width(field.w);
-        menu.set_around(Around::Clear(anchor));
+        menu.set_around(Around::Clear(menu_anchor(field)));
         menu.highlight(self.selected);
         self.pressed = false;
         self.menu_pressed = None;
         self.menu = Some(menu);
         self.menu.as_mut()
+    }
+
+    /// Moves an open menu to `field`, where the field is now: the page scrolled or the window
+    /// was resized under it. The next [`draw_dropdown_menu`] places the menu by the new field,
+    /// with its highlight and scroll kept. A closed menu, or a `field` that is not finite or has
+    /// no area, is left as it is. A caller that would rather close the menu on a scroll calls
+    /// [`close`](Self::close) instead.
+    pub fn set_field(&mut self, field: Rect) {
+        if !usable(field) {
+            return;
+        }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.set_around(Around::Clear(menu_anchor(field)));
+        }
     }
 
     /// Closes the menu with no change. Returns true if it was open.

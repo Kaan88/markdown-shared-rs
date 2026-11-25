@@ -519,3 +519,26 @@ fn tokens_sheet() {
     std::fs::create_dir_all(&out).unwrap();
     bmp.write_png(&out.join("tokens.png")).unwrap();
 }
+
+#[test]
+fn a_selected_row_stands_out_and_reads_under_every_contrast_theme() {
+    for (name, colors) in SCHEMES {
+        let pal = Tokens::from_system_colors(&colors).palette;
+        let (fill, text) = selected(&pal, true);
+        assert_eq!(
+            (fill, text),
+            (colors.highlight, colors.highlight_text),
+            "{name}"
+        );
+        assert!(contrast(text, fill) >= 4.5, "{name}: text on the selection");
+        assert!(
+            contrast(fill, pal.page) > contrast(pal.on, pal.page),
+            "{name}: the selection stands further from the window than `on`"
+        );
+    }
+    assert_eq!(selected(&LIGHT, false), (LIGHT.on, LIGHT.text));
+    assert_eq!(
+        selected(&HIGH_CONTRAST_DARK, false),
+        (HIGH_CONTRAST_DARK.accent, HIGH_CONTRAST_DARK.on_accent)
+    );
+}

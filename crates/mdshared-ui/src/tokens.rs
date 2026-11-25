@@ -334,6 +334,24 @@ pub fn allowed_backdrop(want: Backdrop, high_contrast: bool) -> Backdrop {
     if high_contrast { Backdrop::Off } else { want }
 }
 
+/// A selected row's or item's fill and the colour of its text, as `(fill, text)`.
+///
+/// Normally `on` with `text`. Under high contrast (`high_contrast` from
+/// [`crate::platform::system_high_contrast`] or the host's `Cx::high_contrast`) it is the
+/// palette's `accent` with `on_accent`, which for the system's theme
+/// ([`Tokens::from_system_colors`]) are its Highlight and HighlightText, the pair Windows draws a
+/// selected item in. The palette's `on` cannot do that there: it has to keep the window text
+/// readable, so it stays close to the window (about 1.2:1 in Desert, 1.9:1 in Night sky) and a
+/// selected row hardly shows. A row drawn with this pair draws its secondary text (a hint, a
+/// size) in the same `text` colour, since `faint` and `accent` do not read on Highlight.
+pub fn selected(pal: &Palette, high_contrast: bool) -> (Rgb, Rgb) {
+    if high_contrast || *pal == HIGH_CONTRAST_LIGHT || *pal == HIGH_CONTRAST_DARK {
+        (pal.accent, pal.on_accent)
+    } else {
+        (pal.on, pal.text)
+    }
+}
+
 /// The look an application draws with: a palette and the sizes.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Tokens {

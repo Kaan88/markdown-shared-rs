@@ -25,8 +25,8 @@
 //! - Left and Right, and Enter: Space is the key of a switch, as on Windows;
 //! - a focus model: the caller passes [`Look::focused`] (see [`focus`](crate::focus));
 //! - dragging the knob across, which a Windows switch allows and a click covers;
-//! - what a screen reader is told. The accessibility layer (roadmap W8, not built yet) reads
-//!   the role from the type (a toggle button), the state from [`Toggle::on`], and the name and
+//! - what a screen reader is told. The caller builds the node with `a11y::switch` (feature
+//!   `a11y`): a toggle button, the state from [`Toggle::on`], and the name and
 //!   the rectangle from the caller, which has the label and passes the rectangle to every call.
 //!
 //! ```text
