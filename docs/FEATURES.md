@@ -1278,3 +1278,124 @@ back); the test that a release ends the drag now checks the value. Noted for lat
   no fixed-seed run over press, move, key and release. The `///` of `key`, `press`, `release`
   and `pointer` do not mention the drag. The release and feature runs of AGENTS.md were not
   run.
+
+## A colour row with an in-form picker (`colour_picker`, `settings::Form::show_as_colour`, 2026-11-25, `feat/colour-row`, roadmap L10)
+
+Asked for by mdplay: its Look dialog keeps a custom accent and each look file's
+`colour.<name>` as text rows holding six hex digits. mdplay's Look dialog is the single-page
+`settings::Form` (it is the form that takes `settings::Style`, which the dialog uses; the paged
+form has no style), so the colour row is that form's. The paged form (`settings::pages::Form`)
+was not given one: it is a separate 2100-line form with its own rows, hits and drawing, and
+nothing asked for it; it draws such a row as its text field.
+
+- **`colour_picker`** (new module, model apart from drawing): `Hsv` and the conversions
+  `hsv_to_rgb` / `rgb_to_hsv` (to and from `gfx::Rgb`), `parse_hex` (six digits, either case,
+  `#` or not), `HexForm::of(text)` / `format(rgb)` (a colour goes back in the form its text
+  had), and `Picker`: the colour as HSV, the colour it opened with, the part with the keyboard
+  (`Part::{Square, Hue, Hex}`) and the part held. `press`, `drag`, `release` on the
+  saturation-brightness square and a hue strip; keys: on the square Left/Right saturation,
+  Up/Down brightness, 1% (Shift 10%); on the strip Left/Down and Right/Up the hue, 1 degree
+  (Shift 10), round the circle; the hex field takes the editing keys and a complete hex moves
+  the markers; Tab and Shift+Tab go round the three; Enter is `Outcome::Accept`, Escape
+  `Outcome::Cancel` (`cancel()` puts the opening colour and markers back); a press on the old
+  swatch goes back to it. The colour is kept as HSV and the hex made from it, so a drag through
+  grey or black keeps the hue (and through black the saturation); a hex typed or set keeps them
+  too when it is grey or black, and the same colour leaves the markers where they are.
+  `draw_picker` draws on the flyout's card (`flyout::draw_card`: the toolkit's shadow and
+  popup colours), the square and the strip from a `Cache` (bitmaps per size in device pixels
+  and, for the square, per hue, copied with `Painter::blit`), a white ring with a dark edge on
+  the square and a white handle on the strip, readable on any colour, the old and the new
+  colour side by side, and the hex in `Face::Mono`. Software painter only.
+- **A strip, not a ring**, for the hue: it is the square's width under it, so the card stays
+  small and rectangular; one axis is one number, so press, drag and arrows mean the same on it;
+  it costs a row of pixels to compute where a ring needs each pixel's angle and two
+  antialiased edges.
+- **`Form::show_as_colour(id) -> bool`**, the opt-in, after `show_as_slider`: no `Row` variant
+  and no `Value` variant or field; the value stays `Value::Text`. The marks are ids kept
+  through `set_rows`; the answer says whether a (non-secret) text row of that id is there now.
+  The row's control keeps its rectangle; a 28 px swatch takes its left end and the text field
+  the rest, typing in it as before (the swatch follows; a text that is not a colour shows an
+  empty swatch with a slash). A click on the swatch (on the release, as the form's buttons
+  act), or Enter, F4 or Alt+Down on the row, opens the picker in a popover placed as a flyout
+  under the control (above it when there is no room, always inside the window), drawn after
+  everything else. While open it takes the keys and the pointer: each colour picked is put
+  into the row's text at once, in its form, and reported as `Outcome::Changed` with the text
+  (a press and a key at once; a drag by `Form::pointer` at once, by `pointer_move` at the
+  release, as for a slider). Enter keeps it and closes; Escape or a press anywhere outside
+  the card (the swatch too, which then does not reopen it) puts back exactly the text it
+  opened with and reports it when it differs from what was last reported. The wheel does
+  nothing while it is open. `set_rows` closes it with no report. `set_value` on the open row
+  moves the markers and counts as reported. Also: `Form::colour(id) -> Option<Rgb>` (any text
+  row), `colour_open`, `swatch_rect(i)`, `picker_rect`, `picker_layout`.
+- settings.rs gained only hooks: the module line, one private field, `close_colour()` in
+  `set_rows`, `colour_value_set` in `set_value`, the colour row's field in `text_area`, the
+  swatch at the top of the text row's drawing, the picker after the dropdown menu, and one
+  early return each at the top of `key`, `press`, `release`, `pointer_move` and `wheel`, plus
+  one line for the swatch's hover; `Form::pointer` (slider_row.rs) one early return. Each is a
+  no-op for a form never told (`ids` empty, no picker open).
+
+Timings (release build, Windows, `colour_picker_draw_time`, the median of 50 whole frames of
+an 1100 x 700 form with nine colour rows and eight toggles, the picker open over it; the
+fastest and slowest in brackets): at scale 1.0, light 2.00 ms (1.94 to 3.15), dark 2.64 ms;
+dragging the hue (a new square every frame) light 2.26 ms, dark 2.81 ms; at 1.5, light 4.54 ms
+(4.38 to 6.90), dark 5.46 ms; dragging the hue light 5.11 ms, dark 5.79 ms. All under the 8 ms
+asked for; the square is a cached bitmap, so at rest the picker costs two copies.
+
+Run, on Windows only: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+--features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
+--features mdshared-ui/host,mdshared-ui/a11y` (all passed; the two clipboard tests of
+`platform::explorer_tests` failed on one run and passed on the next, because another program
+held the clipboard). New tests: 18 in `colour_picker_tests.rs` (every hex of a sample of
+636 056 (every third value of each channel), 153 600 more with one channel at each value, and
+all 256 greys come back as themselves; hex to HSV to hex is the same text in all four forms
+over 20 000 colours; `hsv_to_rgb` within 1 of the textbook sector formula over 100 000
+colours; press and drag on the square and the strip with the edges held; a drag through grey
+and black keeps the hue and comes back; the arrows with and without Shift, round the circle;
+Tab, Enter, Escape; typing a hex moves the markers only when complete, keeps the field's text,
+writes the row's form; cancel and the old swatch; nonsense numbers, points and layouts; the
+square's corners and the strip's hues in pixels at 1 and 1.5, light and dark; the cache draws
+what a fresh one draws; the marker and the ring in pixels) and 13 in `settings/colour_tests.rs`
+(a form never told, with hex text rows, draws and answers pixel for pixel as the frozen form
+`settings::frozen` through hover, a click where the swatch would be, Enter, typing, Alt+Down
+and the wheel, light and dark at 1 and 1.5; the marks follow ids and only mark non-secret text
+rows; the swatch shows the colour and follows typing; a click opens the picker under its row,
+inside the window, over the form; picking on the square and the strip reports the text in the
+row's form (`FFFFFF`, `#0055ff`), at once by `pointer`, at the release by `pointer_move`;
+arrows, Tab staying inside, Enter, F4, Alt+Down, Escape closing the picker and then the dialog;
+Escape, a press outside and a press on the swatch cancel to the exact old text, also one that
+was not a colour; typing in the picker's field moves the markers and the row, and `set_value`
+moves the picker; `set_rows` closes it and the wheel waits; it opens above a row near the
+bottom and stays inside a window smaller than it; odd windows and points; `draw_animated` draws
+it as `draw` does at rest). `settings::unchanged`, `settings::frozen`, the style and motion
+tests pass unchanged.
+
+The sheet `colour_sheet` (ignored) writes `specimen/colour_{light,dark,hc_light,hc_dark}_{100,150}[_keys].png`
+under `CARGO_TARGET_DIR` (else the workspace's `target`): the Look form with the picker open
+from a click, and from the keyboard with the hue strip ringed. An agent looked at the dark and
+the light ones and the high-contrast dark one: the swatch and the field sit in the row, the
+popover hangs under the accent row over the rows below with the flyout's shadow, the square
+runs white to the hue to black, the ring marker and the strip's handle read on the colours, the
+old and new swatches and the hex in mono; in high contrast the card's edge and the ring are
+clear. That is not the owner's approval: **not seen by a person**, not in mdplay, not on Linux
+or macOS, not under Wine.
+
+Claude Fable's review (2026-11-25): one blocking finding, fixed. A swatch took a press before
+an open dropdown did, so a menu item lying over a swatch opened the picker instead of being
+picked, and a press on a swatch did not close the menu; the open dropdown now takes the press
+first (tested). Also fixed: a press in the picker clears a hex-field selection whose release
+was lost. Noted for later:
+- Escape after the app's `set_value` on the open row puts back the text from before the
+  picker opened, and reports it.
+- The old swatch in the popover gives back the colour, not the text: a row that held no colour
+  is left at the fallback grey, and `#AaBbCc` comes back in small letters.
+- A digits-only hex picked to digits only forgets its capitals for the next opening.
+- The row's own field still draws as focused (underline and caret) under an open picker, and
+  IME composition still goes to it. A person should look.
+- A double click on the swatch opens the picker and cancels it at once.
+- No public call closes the picker except `set_rows` (the dropdown has the same gap).
+- `draw_picker` trusts a hand-built `Layout` (its fields are public); a huge one overflows or
+  allocates.
+- Tests: black keeping its saturation is not proved (saturation is already 0 there); no test
+  has a told form with Tab order or `Form::pointer`; `Picker::form`, `Layout::hue_marker` and
+  `Cache::hex_stops` have no direct test. The release and feature runs of AGENTS.md were not
+  run.
