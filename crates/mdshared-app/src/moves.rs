@@ -33,6 +33,10 @@ use std::path::{Path, PathBuf};
 #[path = "moves_links.rs"]
 mod links;
 
+/// "Copy them in" (D-209): files copied into a group's folder, with the pictures they show.
+#[path = "moves_copy.rs"]
+pub mod copy_in;
+
 /// The longest a note's whole path may be after it moves (the plan's 240).
 pub const PATH_MAX_CHARS: usize = 240;
 

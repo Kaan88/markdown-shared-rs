@@ -154,6 +154,13 @@ pub enum Kind {
     /// library file. Its notes are all `created: false`, so undo takes out their lines and never
     /// touches a file; it has no source.
     Links,
+    /// Files copied into the library's folder and linked there ("Copy them in", D-209): the
+    /// lines lead to the copies. Its notes are the copies this run made (`created: true`, any
+    /// extension, removed by undo only while they are the bytes written and nothing else lists
+    /// them) and the files linked as they were (`created: false`); its pictures are the pictures
+    /// a Markdown file took along, each with the original it was copied from. It has no source:
+    /// nothing of the owner's was changed.
+    Copies,
 }
 
 impl Kind {
@@ -165,6 +172,7 @@ impl Kind {
 
             Kind::Markdown => "markdown",
             Kind::Links => "links",
+            Kind::Copies => "copies",
         }
     }
 
@@ -176,6 +184,7 @@ impl Kind {
 
             "markdown" => Some(Kind::Markdown),
             "links" => Some(Kind::Links),
+            "copies" => Some(Kind::Copies),
             _ => None,
         }
     }
@@ -311,6 +320,12 @@ pub struct PictureRec {
     /// This run created the file: see [`NoteRec::created`].
     pub created: bool,
     pub sha256: String,
+    /// The file this one is a copy of, for a picture "Copy them in" took along with a Markdown
+    /// file ([`Kind::Copies`]): undo removes the copy only while this is where it was with the
+    /// digest it had, so the copy is never the only one. `None` for every other run's picture,
+    /// and the record then does not write it.
+    pub original: Option<PathBuf>,
+    pub original_sha256: String,
 }
 
 /// What a run's links did to one library file: the text it held before them, and the digest of
@@ -826,8 +841,16 @@ impl Record {
             .pictures
             .iter()
             .map(|p| {
+                let original = match &p.original {
+                    Some(o) => format!(
+                        ", \"original\": \"{}\", \"original_sha256\": \"{}\"",
+                        esc(&stored(o, library)),
+                        esc(&p.original_sha256)
+                    ),
+                    None => String::new(),
+                };
                 format!(
-                    "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"}}",
+                    "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"{original}}}",
                     esc(&stored(&p.path, library)),
                     p.created,
                     esc(&p.sha256)
@@ -1025,6 +1048,15 @@ impl Record {
                             created: p.get("created").and_then(Json::bool).unwrap_or(false),
                             sha256: p
                                 .get("sha256")
+                                .and_then(Json::str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            original: p
+                                .get("original")
+                                .and_then(Json::str)
+                                .map(|o| resolved(o, library)),
+                            original_sha256: p
+                                .get("original_sha256")
                                 .and_then(Json::str)
                                 .unwrap_or_default()
                                 .to_string(),
@@ -1269,6 +1301,19 @@ pub fn links_record(
     links: &[Link],
     before: &str,
 ) -> io::Result<(PathBuf, Record)> {
+    let record = links_record_of(library, instruction, group, links, before);
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// The record [`links_record`] writes, not yet written.
+fn links_record_of(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+) -> Record {
     let base = group.file.parent().unwrap_or(Path::new("")).to_path_buf();
     let old = Some(library::parse(before, &base));
     let mut sections_added: Vec<Vec<String>> = Vec::new();
@@ -1320,6 +1365,35 @@ pub fn links_record(
         added: Vec::new(),
     };
     record.keep_added(&group.file, Some(before.to_string()), links, library);
+    record
+}
+
+/// The record of a "Copy them in" run ([`Kind::Copies`]), made as [`links_record`] makes its
+/// own, after the copies are written and the links are in: `written` is what
+/// [`crate::moves::copy_in::write`] made. A line that leads to a copy this run made marks that
+/// copy as the run's own, with its digest; every other line is a file linked as it was.
+pub fn copies_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+) -> io::Result<(PathBuf, Record)> {
+    let mut record = links_record_of(library, instruction, group, links, before);
+    record.kind = Kind::Copies;
+    for note in &mut record.notes {
+        if let Some((_, created, sha)) = written
+            .files
+            .iter()
+            .find(|(p, _, _)| same_path(p, &note.path))
+        {
+            note.created = *created;
+            note.sha256 = if *created { sha.clone() } else { String::new() };
+        }
+    }
+    record.pictures = written.pictures.clone();
+    record.folders = written.folders.clone();
     let path = record.create(library)?;
     Ok((path, record))
 }
@@ -1843,6 +1917,8 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                     path: path.clone(),
                     created: true,
                     sha256: crate::update::sha256_hex(&bytes),
+                    original: None,
+                    original_sha256: String::new(),
                 });
                 report.pictures_written.push(path.clone());
                 record.note_done(&record_path, &format!("picture {path:?}"));
@@ -1854,6 +1930,8 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                     path: path.clone(),
                     created: false,
                     sha256: crate::update::sha256_hex(&bytes),
+                    original: None,
+                    original_sha256: String::new(),
                 });
                 report.pictures_written.push(path);
             }
@@ -2941,6 +3019,28 @@ impl Reach {
                 return Err(outside(folder));
             }
         }
+        // A run of copies links the owner's files where they are as well as its copies: those
+        // are never touched, so only the copies it made must be inside the library's reach. A
+        // copy may have any extension (the owner's file had it); a picture it took along must
+        // name the original it is a copy of.
+        if record.kind == Kind::Copies {
+            for note in record.notes.iter().filter(|n| n.created) {
+                if !reach.allows(&note.path) {
+                    return Err(outside(&note.path));
+                }
+            }
+            for picture in &record.pictures {
+                if !reach.allows(&picture.path) {
+                    return Err(outside(&picture.path));
+                }
+                if !has_extension(&picture.path, &PICTURE_EXTENSIONS)
+                    || (picture.created && picture.original.is_none())
+                {
+                    return Err(foreign(&picture.path));
+                }
+            }
+            return Ok(reach);
+        }
         for note in &record.notes {
             if !reach.allows(&note.path) {
                 return Err(outside(&note.path));
@@ -3157,7 +3257,7 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     // not be the only copy: the original is where it was, with the length and the digest it had.
     // A source in the Recycle Bin must be back for the same reason.
     // A run of links has no source: nothing was cut from a file, so nothing can be its only copy.
-    let state = if record.kind == Kind::Links {
+    let state = if matches!(record.kind, Kind::Links | Kind::Copies) {
         SourceState::Same
     } else {
         source_state(&record.source)
@@ -3243,6 +3343,10 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(picture.path.clone());
         } else if picture.path.symlink_metadata().is_err() {
             plan.gone.push(picture.path.clone());
+        } else if !original_there(picture) {
+            // A copy whose original is gone or changed may be the only one left: it stays.
+            plan.kept.push(picture.path.clone());
+            plan.pictures_kept.push(picture.path.clone());
         } else if digest_of(&picture.path).is_some_and(|d| d.eq_ignore_ascii_case(&picture.sha256))
         {
             plan.pictures.push(picture.path.clone());
@@ -3497,7 +3601,7 @@ pub fn undo_with(
         }
         let matches = created_note(note).is_some_and(|n| {
             reach.allows(note)
-                && has_extension(note, &["md"])
+                && (record.kind == Kind::Copies || has_extension(note, &["md"]))
                 && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
         });
         if !matches {
@@ -3520,6 +3624,7 @@ pub fn undo_with(
             .is_some_and(|p| {
                 reach.allows(picture)
                     && has_extension(picture, &PICTURE_EXTENSIONS)
+                    && original_there(p)
                     && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
             });
         if !matches {
@@ -3655,12 +3760,21 @@ fn rewrite_chains(record: &Record) -> Vec<(&Original, &Original)> {
     chains
 }
 
+/// Whether the file a picture was copied from is where it was, with the digest it had: always
+/// for a picture that names no original.
+fn original_there(picture: &PictureRec) -> bool {
+    match &picture.original {
+        None => true,
+        Some(o) => digest_of(o).is_some_and(|d| d.eq_ignore_ascii_case(&picture.original_sha256)),
+    }
+}
+
 /// Whether a library file holds nothing but its group's heading and its `home:` line.
 /// A run of links makes a group from the library's template (heading, `home:` and the lines
 /// that say what the file is), and records that text as the file's text before its links. Its
 /// group goes when the file holds that text exactly again: nothing the owner wrote is in it.
 fn holds_what_it_was_made_with(record: &Record, file: &Path) -> bool {
-    if record.kind != Kind::Links || !record.group.created {
+    if !matches!(record.kind, Kind::Links | Kind::Copies) || !record.group.created {
         return false;
     }
     let Some(added) = record.added.iter().find(|a| same_path(&a.file, file)) else {
@@ -3822,6 +3936,9 @@ fn link_parts(line: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "../../runs_copies_tests.rs"]
+    mod copies;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -4897,6 +5014,8 @@ mod tests {
             path: mine.clone(),
             created: true,
             sha256: digest("words I wrote\n"),
+            original: None,
+            original_sha256: String::new(),
         });
         let mut folder = good.clone();
         folder.folders = vec![outside_folder.clone()];
