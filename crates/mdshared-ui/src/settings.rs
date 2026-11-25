@@ -16,8 +16,8 @@ use crate::glyph;
 use crate::keys::{KeyName, Mods};
 use crate::menu::{Item, Menu};
 use crate::overlay::{
-    DIALOG_FOOTER, DIALOG_PAD, dialog_button_w, dialog_card, draw_backdrop, draw_dialog_button,
-    draw_dialog_card_with,
+    DIALOG_FOOTER, DIALOG_PAD, dialog_button_w, dialog_card, draw_backdrop, draw_backdrop_presence,
+    draw_dialog_button, draw_dialog_card_with,
 };
 use crate::scroll;
 use crate::textfield::{FieldColors, TextField};
@@ -329,6 +329,10 @@ pub struct Style {
     /// Group headings in small capitals (11 px, semibold, upper case) in the muted colour,
     /// instead of 13 px semibold in the text colour.
     pub caps_headings: bool,
+    /// How much of the classic backdrop dims the window behind the card: 1 the classic
+    /// ([`draw_backdrop`]), 0 none, so what the form changes stays in view. Held to 0..=1; not
+    /// a number is 1.
+    pub backdrop: f32,
 }
 
 impl Style {
@@ -339,6 +343,7 @@ impl Style {
         soft_shadow: None,
         neutral_segments: false,
         caps_headings: false,
+        backdrop: 1.0,
     };
 
     /// The card's corners as drawn: the radius, or the classic one when it is out of reason.
@@ -1393,7 +1398,12 @@ impl Form {
     /// phase of a focused text box.
     pub fn draw(&mut self, p: &mut Painter, pal: &Colors, window: Rect, caret_on: bool) {
         self.layout(p, window);
-        draw_backdrop(p, pal, window.w, window.h);
+        let dim = self.style.backdrop;
+        if dim.is_nan() || dim >= 1.0 {
+            draw_backdrop(p, pal, window.w, window.h);
+        } else if dim > 0.0 {
+            draw_backdrop_presence(p, pal, window.w, window.h, dim);
+        }
         let r = self.card;
         draw_dialog_card_with(p, pal, r, self.style.card_radius(), self.style.soft_shadow);
         p.text(

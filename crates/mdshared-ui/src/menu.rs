@@ -190,7 +190,22 @@ pub struct Look {
     /// The gap between a menu and a submenu beside it ([`crate::submenu::GAP`] in the rounded
     /// look).
     pub gap: f32,
+    /// The size of a label, in logical px ([`TEXT`], 13.5, in both looks here). The menu is
+    /// measured at the same size, so its width follows.
+    pub text: f32,
+    /// Whether the check mark and the icon share one column ([`ONE_LEAD`] px wide, the label
+    /// after it; a checked item shows its mark there, else its icon), as a web page's menus
+    /// lay them out, in place of a column each. A menu with neither has a [`NO_LEAD`] px
+    /// margin before its labels. Off in both looks here.
+    pub one_lead: bool,
 }
+
+/// The size of a menu label in [`Look::ROUNDED`] and [`Look::FLAT`].
+pub const TEXT: f32 = 13.5;
+/// The shared column of [`Look::one_lead`], from the row's left side to the label.
+pub const ONE_LEAD: f32 = 30.0;
+/// The margin before a label in a [`Look::one_lead`] menu with no marks and no icons.
+pub const NO_LEAD: f32 = 14.0;
 
 impl Look {
     /// The look every menu has had: 8 px corners with a shadow, 32 px rows, 5 px of padding at
@@ -206,6 +221,8 @@ impl Look {
         hover_radius: 5.0,
         separator: SEP,
         gap: crate::submenu::GAP,
+        text: TEXT,
+        one_lead: false,
     };
 
     /// Square and flat: no corners and no shadow, 26 px rows with 4 px above and below, a
@@ -222,6 +239,8 @@ impl Look {
         hover_radius: 0.0,
         separator: SEP,
         gap: 0.0,
+        text: TEXT,
+        one_lead: false,
     };
 
     /// This look with every size that is out of reason taken from [`Look::ROUNDED`], and the
@@ -250,6 +269,8 @@ impl Look {
             hover_radius: ok(self.hover_radius, 0.0, 64.0, d.hover_radius),
             separator: ok(self.separator, 0.0, 64.0, d.separator),
             gap: ok(self.gap, 0.0, 64.0, d.gap),
+            text: ok(self.text, 6.0, 48.0, d.text),
+            one_lead: self.one_lead,
         }
     }
 }
@@ -493,8 +514,12 @@ impl<T: Clone> Menu<T> {
     /// taller than the area is as tall as fits and scrolls ([`scroll_by`](Self::scroll_by)).
     pub fn place_in(&mut self, p: &mut Painter, area: Rect) {
         let (marks, icons) = self.columns();
-        let lead =
-            if marks || icons { 40.0 } else { 14.0 } + if marks && icons { MARK } else { 0.0 };
+        let look = self.look;
+        let lead = if look.one_lead {
+            look.inset + if marks || icons { ONE_LEAD } else { NO_LEAD }
+        } else {
+            (if marks || icons { 40.0 } else { 14.0 }) + if marks && icons { MARK } else { 0.0 }
+        };
         let mut w: f32 = 180.0;
         for (i, item) in self.items.iter().enumerate() {
             let hint = if self.opens_submenu(i) {
@@ -505,10 +530,9 @@ impl<T: Clone> Menu<T> {
                 p.measure(Face::Ui, 12.0, &item.hint) + 28.0
             };
             let (label, _) = self.shown(&item.label);
-            w = w.max(lead + p.measure(Face::Ui, 13.5, &label) + hint + 16.0);
+            w = w.max(lead + p.measure(Face::Ui, look.text, &label) + hint + 16.0);
         }
         let w = w.min(MAX_WIDTH).min(area.w - 8.0);
-        let look = self.look;
         let h: f32 = 2.0 * look.pad
             + self
                 .items
@@ -641,7 +665,18 @@ impl<T: Clone> Menu<T> {
             }
             let color = if item.enabled { pal.text } else { pal.faint };
             let mut x = r.x + 9.0;
-            if marks || icons {
+            if look.one_lead {
+                // One column for both, the label after it: the mark when the item is checked,
+                // else its icon.
+                let col = r.x + ONE_LEAD / 2.0;
+                if item.checked {
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
+                } else if !item.icon.is_empty() {
+                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    p.icon(item.icon, 14.0, col, r.cy(), c);
+                }
+                x = r.x + if marks || icons { ONE_LEAD } else { NO_LEAD };
+            } else if marks || icons {
                 // The check mark has a column of its own before the icons, so an item shows both
                 // what it is and whether it is on. A menu without icons has the mark where the
                 // icons would be.
@@ -676,11 +711,11 @@ impl<T: Clone> Menu<T> {
             };
             let (label, key) = self.shown(&item.label);
             let room = r.right() - x - hint_w - 8.0;
-            p.text(Face::Ui, 13.5, x, r.cy(), &label, color, room);
+            p.text(Face::Ui, look.text, x, r.cy(), &label, color, room);
             if let Some(key) = key.filter(|_| self.access_visible) {
                 // Only when the label was drawn whole: an elided one may have cut the letter.
-                if p.measure(Face::Ui, 13.5, &label) <= room {
-                    p.underline_range(Face::Ui, 13.5, x, r.cy(), &label, key, color);
+                if p.measure(Face::Ui, look.text, &label) <= room {
+                    p.underline_range(Face::Ui, look.text, x, r.cy(), &label, key, color);
                 }
             }
         }

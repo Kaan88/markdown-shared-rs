@@ -564,6 +564,31 @@ in the classic style is held to the frozen copy of the form before styles, pixel
 Not verified: seen by the owner; Linux and macOS (CI not run); Wine; mdview and mdedit not
 rebuilt against the branch (they name none of it).
 
+## A menu's text size and one lead column, a lighter backdrop (`menu::Look`, `settings::Style`, 2026-11-25, `wk/menulook`, roadmap L12)
+
+Measured against mdplay's HTML prototype, a web page's menus put the check mark and the icon in
+one 30 px column with the label after it, at 13 px, where the toolkit's have a column for each at
+13.5 px; and the prototype's settings panel does not dim the window as much as a modal dialog.
+Each piece is opt-in.
+
+- **`menu::Look::text`**: the labels' size in logical px; the menu is measured at it, so its width
+  follows. `TEXT` (13.5) in `ROUNDED` and `FLAT`; out of 6..=48, or not a number, `sane` gives the
+  default's.
+- **`menu::Look::one_lead`**: the check mark and the icon share one `ONE_LEAD` (30 px) column from
+  the row's left side, a checked item showing its mark there and any other its icon (muted); the
+  label starts after it. A menu with neither marks nor icons starts its labels `NO_LEAD` (14 px)
+  in. Off in both looks.
+- **`settings::Style::backdrop`**: how much of the classic backdrop dims the window behind the
+  card, 1 the classic `draw_backdrop`, 0 none, between them `draw_backdrop_presence` at that
+  part. 1 in `CLASSIC`; not a number is 1.
+
+Compatibility: nothing existing changes. `ROUNDED` and `FLAT` keep 13.5 and separate columns, and
+`CLASSIC` the full backdrop; every existing test passes unchanged. The new tests fail with each
+piece reverted (the lead's position, the text drawn and measured at the look's size, the
+backdrop's part).
+
+Not verified: seen by the owner; Linux and macOS (CI not run); Wine.
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the

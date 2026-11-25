@@ -253,3 +253,39 @@ fn a_style_changed_while_the_form_is_open_shows_in_the_next_frame() {
     assert!(bmp.pixels != classic.pixels);
     assert!(f.set_style(Style::CLASSIC));
 }
+
+#[test]
+fn the_backdrop_dims_the_window_by_the_styles_part_of_the_classic() {
+    // Far from the card, on a grey window: the classic dims it, a style with less dims it less,
+    // none leaves it, and a strength out of reason is the classic.
+    for pal in [&DARK, &LIGHT] {
+        let at = |style: Style| pixel(&drawn(pal, Some(style), 200, 1.0).0, 8.0, 8.0, 1.0)[0];
+        let classic = at(Style::CLASSIC);
+        let part = at(Style {
+            backdrop: 0.35,
+            ..Style::CLASSIC
+        });
+        let none = at(Style {
+            backdrop: 0.0,
+            ..Style::CLASSIC
+        });
+        assert!(classic < 170, "the classic dims: {classic}");
+        assert_eq!(none, 200, "no backdrop leaves the window");
+        assert!(classic < part && part < none, "{classic} < {part} < {none}");
+        for odd in [f32::NAN, 7.0] {
+            let got = at(Style {
+                backdrop: odd,
+                ..Style::CLASSIC
+            });
+            assert_eq!(got, classic, "{odd}");
+        }
+        assert_eq!(
+            at(Style {
+                backdrop: -2.0,
+                ..Style::CLASSIC
+            }),
+            200,
+            "below none is none"
+        );
+    }
+}

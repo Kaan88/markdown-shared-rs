@@ -879,3 +879,133 @@ fn a_soft_shadowed_menu_that_fades_fades_its_whole_shadow() {
         a(&full)
     );
 }
+
+/// Where the label of the first row starts: its leftmost ink, from the row's left side, in a
+/// menu of `items` drawn in `look` on the light palette.
+fn label_start(items: Vec<Item<u8>>, look: Look) -> f32 {
+    use crate::theme::LIGHT;
+    let mut menu = Menu::new(items, 40.0, 30.0, false).with_look(look);
+    let mut bmp = Bitmap::new(420, 240);
+    let mut gfx = Gfx::new();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(Rect::new(0.0, 0.0, 420.0, 240.0), LIGHT.page);
+        menu.draw(&mut p, &LIGHT, 420.0, 240.0);
+    }
+    let r = menu.rows[0];
+    let mut x = r.x as usize;
+    while x < r.right() as usize {
+        let ink =
+            (r.y as usize..r.bottom() as usize).any(|y| pixel(&bmp, x as f32, y as f32)[1] < 160);
+        if ink {
+            return x as f32 - r.x;
+        }
+        x += 1;
+    }
+    panic!("no label drawn");
+}
+
+#[test]
+fn one_lead_puts_the_mark_and_the_icon_in_one_column_before_the_label() {
+    // The first row is unchecked and has no icon, so its leftmost ink is its label's.
+    let marks = || {
+        vec![
+            Item::new(0u8, "Hello").checked(false),
+            Item::new(1, "World").checked(true),
+        ]
+    };
+    let both = || {
+        vec![
+            Item::new(0u8, "Hello").checked(false),
+            Item::new(1, "World")
+                .checked(true)
+                .icon(crate::glyph::CHECK),
+        ]
+    };
+    let plain = || vec![Item::new(0u8, "Hello"), Item::new(1, "World")];
+    let one = Look {
+        one_lead: true,
+        ..Look::ROUNDED
+    };
+    // The same glyph starts each, so the differences are the columns': a lead of 36 (marks or
+    // icons), 56 (both) or 9 (neither) before, ONE_LEAD or NO_LEAD with one column.
+    let classic = (
+        label_start(marks(), Look::ROUNDED),
+        label_start(both(), Look::ROUNDED),
+        label_start(plain(), Look::ROUNDED),
+    );
+    let shared = (
+        label_start(marks(), one),
+        label_start(both(), one),
+        label_start(plain(), one),
+    );
+    assert_eq!(
+        classic.0 - shared.0,
+        36.0 - ONE_LEAD,
+        "marks: {classic:?} {shared:?}"
+    );
+    assert_eq!(
+        classic.1 - shared.1,
+        56.0 - ONE_LEAD,
+        "both: {classic:?} {shared:?}"
+    );
+    assert_eq!(
+        classic.2 - shared.2,
+        9.0 - NO_LEAD,
+        "neither: {classic:?} {shared:?}"
+    );
+    const { assert!(!Look::ROUNDED.one_lead && !Look::FLAT.one_lead) };
+}
+
+#[test]
+fn a_looks_text_size_sizes_the_labels_and_the_menu() {
+    let long = "A label long enough to set the width of its menu";
+    let width = |text: f32| {
+        let mut m = menu_of(&[long], false).with_look(Look {
+            text,
+            ..Look::ROUNDED
+        });
+        placed_width(&mut m)
+    };
+    assert!(width(13.0) < width(13.5), "{} {}", width(13.0), width(13.5));
+    assert_eq!(Look::ROUNDED.text, 13.5);
+    assert_eq!(Look::FLAT.text, 13.5);
+    for odd in [f32::NAN, 0.0, 1000.0] {
+        let l = Look {
+            text: odd,
+            ..Look::ROUNDED
+        };
+        assert_eq!(l.sane().text, 13.5, "{odd}");
+    }
+    // The label is drawn at that size: a smaller one has less ink.
+    let ink = |text: f32| {
+        let look = Look {
+            text,
+            ..Look::ROUNDED
+        };
+        let (b, m) = {
+            use crate::theme::LIGHT;
+            let mut menu =
+                Menu::new(vec![Item::new(0u8, "Hello world")], 40.0, 30.0, false).with_look(look);
+            let mut bmp = Bitmap::new(320, 160);
+            let mut gfx = Gfx::new();
+            {
+                let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+                p.fill(Rect::new(0.0, 0.0, 320.0, 160.0), LIGHT.page);
+                menu.draw(&mut p, &LIGHT, 320.0, 160.0);
+            }
+            (bmp, menu)
+        };
+        let r = m.rows[0];
+        let mut dark = 0;
+        for y in r.y as usize..r.bottom() as usize {
+            for x in r.x as usize..r.right() as usize {
+                if pixel(&b, x as f32, y as f32)[1] < 160 {
+                    dark += 1;
+                }
+            }
+        }
+        dark
+    };
+    assert!(ink(10.0) < ink(13.5), "{} {}", ink(10.0), ink(13.5));
+}
