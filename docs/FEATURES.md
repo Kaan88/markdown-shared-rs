@@ -1516,11 +1516,18 @@ Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-f
 `a_rebase_keeps_the_progress_and_an_empty_or_idle_one_does_not` checks `fits` idle, on the old
 size and on another, that the animator's progress is the same before and after `rebase`, and the
 empty, idle, reduced-motion and new-scale cases;
+`an_idle_rebase_does_not_forget_a_finished_switch` runs a switch to its end and checks that an
+idle `rebase` answers false and leaves the animator's finished track in place (seen failing with
+the earlier body, which called `cancel` when idle);
 `a_resize_mid_switch_draws_the_old_page_at_the_new_size_and_does_not_stretch_it` grows the
 window from 60 by 30 to 80 by 40 half way, rebases, and compares every pixel with a switch that
-began at 80 by 40 at the same moment, plus three sampled pixels: the old page's fixed-width green
-block against the new right edge, and the background outside the region; both fail with `fits`
-and `rebase` neutered); `cargo clippy --workspace --all-targets --features
+began at 80 by 40 at the same moment, plus three sampled pixels: (57,10), the half-red mix of
+the old page with the new one, (65,10), where the old page's fixed-width green block sits
+against the new right edge (a stretched 40 px page would have it fifteen wide and reach x = 57),
+and (75,35), the background outside the region. That pixel test covers `PageEffect::Crossfade`
+only: the other effects keep their progress through a rebase by the same path, but no pixel test
+of theirs goes through one. The first and third fail with `fits` and `rebase` neutered);
+`cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows. Not
 seen in a real window: no application or example drives `PageTransition`, so the resize path is
 exercised by the tests only.

@@ -220,11 +220,21 @@ impl PageTransition {
     /// new page and call [`apply`](Self::apply), all in that same frame. The effect and the
     /// timing stay as they were.
     ///
-    /// It does nothing and answers false when no switch runs, and ends the switch when the
-    /// snapshot is empty or the animator does not animate. A snapshot of another rectangle than
-    /// the one `apply` is given still ends the switch, as any other mismatch does.
+    /// The progress survives only if `apply` runs every frame, this one included: a frame that
+    /// does not ask for it lets the animator forget the progress, and the next `apply` then finds
+    /// the switch finished and leaves the new page alone.
+    ///
+    /// It does nothing and answers false when no switch runs (the animator is not touched), and
+    /// ends the switch when the snapshot is empty or the animator does not animate. A snapshot
+    /// of another rectangle than the one `apply` is given still ends the switch, as any other
+    /// mismatch does. A switch that began over another running switch has a saved page that is a
+    /// blend of two pages, which cannot be drawn again: call [`cancel`](Self::cancel) for that
+    /// one instead.
     pub fn rebase(&mut self, anim: &mut Animator, old: Snapshot, scale: f32) -> bool {
-        if self.old.is_none() || old.is_empty() || !anim.animates() {
+        if self.old.is_none() {
+            return false;
+        }
+        if old.is_empty() || !anim.animates() {
             self.cancel(anim);
             return false;
         }
@@ -253,7 +263,10 @@ impl PageTransition {
     /// the bitmap has another size than at the start (the window was resized), the painter
     /// another scale (the window moved to another screen), or `r` is another device rectangle
     /// (the layout changed). A switch that should survive such a change is given the old page
-    /// again at the new size first ([`fits`](Self::fits) and [`rebase`](Self::rebase)).
+    /// again first ([`rebase`](Self::rebase)). [`fits`](Self::fits) detects the size change
+    /// only: another scale, or a moved region in a bitmap of the same size, is not caught by
+    /// it, and an application that wants those to survive notices them itself and calls
+    /// `rebase` with the old page drawn at the new place.
     /// Returns whether the switch is still running.
     ///
     /// The blend is of the whole region and does not heed the painter's clip.
@@ -739,6 +752,25 @@ mod tests {
         );
         assert!(!r.tr.running());
         r.anim.end_frame();
+    }
+
+    #[test]
+    fn an_idle_rebase_does_not_forget_a_finished_switch() {
+        let mut r = Rig::new();
+        r.begin(PageEffect::Crossfade);
+        r.frame(0, NEW);
+        r.frame(50, NEW);
+        assert!(!r.frame(50, NEW), "at the end of its time");
+        assert!(!r.tr.running());
+        // The finished switch leaves its track at rest in the animator, and an idle rebase
+        // leaves that track alone rather than forgetting it.
+        let done: Option<f32> = r.anim.get("page");
+        assert_eq!(done, Some(1.0), "the finished track is the animator's");
+        let old = Snapshot::take(&r.bmp, 10, 5, 50, 25);
+        assert!(!r.tr.rebase(&mut r.anim, old, 1.0));
+        assert!(!r.tr.running());
+        assert_eq!(r.anim.get::<f32>("page"), done, "and it is still there");
+        assert!(!r.anim.is_empty());
     }
 
     #[test]
