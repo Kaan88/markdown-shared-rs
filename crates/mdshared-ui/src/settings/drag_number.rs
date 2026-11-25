@@ -273,14 +273,14 @@ impl Form {
 
     /// The cursor the form asks for at `(x, y)`: [`Cursor::ResizeEw`] over the value of a
     /// draggable number row and all through its drag, wherever the pointer is; `None` (no
-    /// opinion: the host's own choice, usually the arrow) everywhere else, while a dropdown is
-    /// open, before the first layout, and always in a form with no draggable row. See the
-    /// [module](self) for how a host passes it on.
+    /// opinion: the host's own choice, usually the arrow) everywhere else, while a dropdown or a
+    /// colour picker is open (its card may cover the rows), before the first layout, and always
+    /// in a form with no draggable row. See the [module](self) for how a host passes it on.
     pub fn cursor_at(&self, x: f32, y: f32) -> Option<Cursor> {
         if matches!(self.drag, Drag::Number(_)) {
             return Some(Cursor::ResizeEw);
         }
-        if self.menu.is_some() || self.draggable.is_empty() {
+        if self.menu.is_some() || self.colour_open_row().is_some() || self.draggable.is_empty() {
             return None;
         }
         self.on_draggable_value(x, y).map(|_| Cursor::ResizeEw)

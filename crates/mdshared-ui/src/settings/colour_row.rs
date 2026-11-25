@@ -13,7 +13,8 @@
 //!
 //! The popover: placed as a [`flyout`](crate::flyout) is, under the row's control (above it
 //! when there is no room below, inside the window always), drawn over everything else in the
-//! form with the flyout's card and shadow. While it is open it takes the keys and the pointer:
+//! form with the flyout's card and shadow. While it is open it takes the keys and the pointer
+//! (the row's own field shows no caret, and [`Form::cursor_at`] asks for no shape):
 //! the square, the hue strip and the hex field are the picker's (see [`colour_picker`] for
 //! which key does what). Every colour picked is put into the row's text at once, in the form
 //! the text had when the picker opened (`#` or not, capitals or not), and reported as
@@ -109,6 +110,11 @@ impl Form {
     pub fn colour_open(&self) -> Option<u32> {
         let o = self.colours.open.as_ref()?;
         self.rows.get(o.row).and_then(Row::id)
+    }
+
+    /// The index of the row whose picker is open, if one is.
+    pub(super) fn colour_open_row(&self) -> Option<usize> {
+        self.colours.open.as_ref().map(|o| o.row)
     }
 
     /// The open picker's card as last placed, or an empty rectangle.

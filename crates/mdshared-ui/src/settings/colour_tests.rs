@@ -675,3 +675,67 @@ fn an_open_dropdown_takes_a_press_on_a_swatch() {
     click(&mut f, s.cx(), s.cy());
     assert_eq!(f.colour_open(), Some(ACCENT));
 }
+
+/// The pixels of `r` in `f` drawn with the caret's blink phase `caret_on`.
+fn area_with_caret(f: &mut Form, r: Rect, caret_on: bool) -> Vec<u8> {
+    let mut bmp = Bitmap::new(W as u32, H as u32);
+    bmp.clear([128; 3]);
+    let mut gfx = Gfx::new();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        f.draw(&mut p, &LIGHT, Rect::new(0.0, 0.0, W, H), caret_on);
+    }
+    let mut out = Vec::new();
+    for y in r.y as usize..r.bottom() as usize {
+        for x in r.x as usize..r.right() as usize {
+            let o = (y * bmp.width as usize + x) * 4;
+            out.extend_from_slice(&bmp.pixels[o..o + 3]);
+        }
+    }
+    out
+}
+
+/// While a row's picker is open the keys go to the picker, so the row's own field shows no
+/// caret; with the picker closed the focused field blinks again.
+#[test]
+fn the_rows_field_shows_no_caret_while_its_picker_is_open() {
+    let (mut f, _) = opened(ACCENT);
+    let r = f.control_rect(index(&f, ACCENT));
+    assert_eq!(
+        area_with_caret(&mut f, r, true),
+        area_with_caret(&mut f, r, false),
+        "no caret in the row while the picker holds the keys"
+    );
+    f.key(&KeyName::Escape, NONE, None);
+    assert_eq!(f.colour_open(), None);
+    assert_ne!(
+        area_with_caret(&mut f, r, true),
+        area_with_caret(&mut f, r, false),
+        "the focused field blinks again once the picker is closed"
+    );
+}
+
+/// The left-right arrow over a draggable number is not asked for while a picker is open (its
+/// card may cover the row), as while a dropdown is; it comes back when the picker closes.
+#[test]
+fn no_drag_cursor_while_a_picker_is_open() {
+    use crate::cursor::Cursor;
+    let mut v = rows();
+    v.insert(1, Row::number(98, "Corners", 8, 0, 24));
+    let mut f = Form::new("Look", v).single_page();
+    assert!(f.show_as_colour(ACCENT));
+    assert!(f.make_draggable(98));
+    shot(&mut f, &LIGHT);
+    let c = f.control_rect(index(&f, 98));
+    let at = (c.x as i32..c.right() as i32)
+        .map(|x| (x as f32, c.cy()))
+        .find(|&(x, y)| f.cursor_at(x, y) == Some(Cursor::ResizeEw))
+        .expect("a point over the draggable value");
+    let s = f.swatch_rect(index(&f, ACCENT));
+    click(&mut f, s.cx(), s.cy());
+    assert_eq!(f.colour_open(), Some(ACCENT));
+    assert_eq!(f.cursor_at(at.0, at.1), None);
+    f.key(&KeyName::Escape, NONE, None);
+    assert_eq!(f.colour_open(), None);
+    assert_eq!(f.cursor_at(at.0, at.1), Some(Cursor::ResizeEw));
+}
