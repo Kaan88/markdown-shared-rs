@@ -39,6 +39,10 @@ const CARD_W: f32 = 780.0;
 const CARD_H: f32 = 420.0;
 const MARGIN: f32 = 6.0;
 const RADIUS: f32 = 10.0;
+
+/// The card's corner radius, in logical px: what a caller that redraws only the card (a
+/// clipped repaint) rounds its clip by.
+pub const CARD_RADIUS: f32 = RADIUS;
 /// The strip over both columns: the title at the left, the × at the right, a hairline under.
 const HEADER_H: f32 = 40.0;
 /// The one inset: the title, the list's text, the page's text and the controls' right edge.
@@ -1059,6 +1063,19 @@ impl Form {
     /// The card as last laid out.
     pub fn rect(&self) -> Rect {
         self.geo.card
+    }
+
+    /// The open dropdown's menu as last placed, `None` when none is open: the frame itself, for
+    /// hits. A repaint uses [`menu_bounds`](Self::menu_bounds).
+    pub fn menu_rect(&self) -> Option<Rect> {
+        self.menu.as_ref().map(|(_, m)| m.rect())
+    }
+
+    /// Everything the open dropdown's menu touches when drawn, shadow, entrance and a device
+    /// pixel included ([`Menu::presence_bounds`]); `None` when none is open. Mark it as damage
+    /// while it is open, and once more on the frame after it closed.
+    pub fn menu_bounds(&self) -> Option<Rect> {
+        self.menu.as_ref().map(|(_, m)| m.presence_bounds())
     }
 
     /// The × button.

@@ -86,6 +86,12 @@ impl<K> Tooltip<K> {
         self.tip.as_ref().filter(|t| !t.shown).map(|t| t.due)
     }
 
+    /// The tip that waits to show (its control and text), `None` when nothing waits; one that
+    /// shows is [`shown`](Self::shown).
+    pub fn waiting(&self) -> Option<&Over<K>> {
+        self.tip.as_ref().filter(|t| !t.shown).map(|t| &t.over)
+    }
+
     /// The tip that shows now: its text and the control's rectangle.
     pub fn shown(&self) -> Option<&Over<K>> {
         self.tip.as_ref().filter(|t| t.shown).map(|t| &t.over)
@@ -210,6 +216,8 @@ mod tests {
         let mut tip = Tooltip::new();
         assert!(!tip.hover_at(t0, over(1), (5.0, 5.0)));
         assert_eq!(tip.deadline(), Some(t0 + D));
+        assert_eq!(tip.waiting().map(|o| o.key), Some(1), "it waits");
+        assert!(tip.shown().is_none());
         // Still at the same place: the wait goes on from entering.
         tip.hover_at(t0 + ms(100), over(1), (5.0, 5.0));
         assert_eq!(tip.deadline(), Some(t0 + D));
@@ -218,6 +226,7 @@ mod tests {
         assert_eq!(tip.deadline(), Some(t0 + ms(300) + D));
         assert!(!tip.tick(t0 + D));
         assert!(tip.tick(t0 + ms(300) + D));
+        assert!(tip.waiting().is_none(), "it shows, so it no longer waits");
         // Shown: moving within the control keeps it, and asks for no wake.
         assert!(!tip.hover_at(t0 + ms(900), over(1), (20.0, 9.0)));
         assert_eq!(tip.shown().unwrap().key, 1);
