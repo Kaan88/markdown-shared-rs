@@ -36,6 +36,8 @@ pub(super) struct Shared {
     pub(super) cursor: Cursor,
     pub(super) snap: Option<Rect>,
     pub(super) backdrop: Backdrop,
+    /// The application's veil over the backdrop ([`Cx::set_backdrop_veil`]).
+    pub(super) veil: Option<u8>,
     pub(super) pal: Palette,
     pub(super) exit: bool,
     /// A call asked for a redraw or said the accessibility tree changed.
@@ -234,6 +236,18 @@ impl<M: 'static> Cx<'_, M> {
         if self.st.backdrop != backdrop || self.st.pal != *pal {
             self.st.backdrop = backdrop;
             self.st.pal = *pal;
+            self.st.damage.all();
+        }
+    }
+
+    /// How much of the chrome's flat colour stays over the backdrop, 0 (none: all backdrop) to
+    /// 255 (opaque), in place of the backdrop's own (Mica 0, Acrylic 150, [`crate::frost::veil`]): for
+    /// an application whose backdrop strength is a setting. `None` (the default) goes back to
+    /// the backdrop's own. A change redraws the whole window; nothing else is asked of the
+    /// system.
+    pub fn set_backdrop_veil(&mut self, veil: Option<u8>) {
+        if self.st.veil != veil {
+            self.st.veil = veil;
             self.st.damage.all();
         }
     }
