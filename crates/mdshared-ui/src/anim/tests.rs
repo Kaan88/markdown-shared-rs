@@ -828,3 +828,83 @@ fn the_fluent_timings_are_whole_frames_at_sixty_hertz() {
     assert_eq!(fluent::ENTER.length(), Some(fluent::FAST));
     assert_eq!(fluent::web::CURVE_LINEAR.at(0.3), 0.3);
 }
+
+#[test]
+fn groups_say_which_regions_still_move_and_when() {
+    let clock = ManualClock::new();
+    let mut anim = Animator::new();
+    let blink = Duration::from_millis(500);
+    // A toast entering, the caret blinking, and nothing outside a group.
+    anim.begin_frame(clock.now());
+    anim.group("toast");
+    let t = anim.presence("toast-in", true, LINEAR_100, LINEAR_100);
+    anim.group("caret");
+    anim.blink("caret", blink, blink);
+    anim.ungroup();
+    anim.value("still", 1.0_f32, LINEAR_100);
+    let deadline = anim.end_frame().expect("something moves");
+    assert_eq!(t, 0.0);
+    let at = clock.now();
+    assert!(anim.group_due("toast", deadline));
+    assert!(
+        !anim.group_due("caret", deadline),
+        "the caret waits out its half-period"
+    );
+    assert!(anim.group_due("caret", at + blink));
+    assert_eq!(anim.ungrouped_deadline(), None);
+    assert_eq!(anim.group_deadlines().len(), 2);
+    // Once the toast has arrived only the caret is listed.
+    for _ in 0..12 {
+        clock.advance(FRAME);
+        anim.begin_frame(clock.now());
+        anim.group("toast");
+        anim.presence("toast-in", true, LINEAR_100, LINEAR_100);
+        anim.group("caret");
+        anim.blink("caret", blink, blink);
+        anim.end_frame();
+    }
+    let names: Vec<Id> = anim.group_deadlines().iter().map(|g| g.0).collect();
+    assert_eq!(names, vec![Id::new("caret")]);
+}
+
+#[test]
+fn a_kept_group_is_not_taken_for_new_after_a_frame_that_skipped_it() {
+    let clock = ManualClock::new();
+    let arrived = |keep: bool| {
+        let mut anim = Animator::new();
+        let ask = |anim: &mut Animator| {
+            anim.group("toast");
+            anim.presence("toast-in", true, LINEAR_100, LINEAR_100)
+        };
+        for _ in 0..15 {
+            clock.advance(FRAME);
+            anim.begin_frame(clock.now());
+            ask(&mut anim);
+            anim.end_frame();
+        }
+        // A frame that draws only the caret's line.
+        clock.advance(FRAME);
+        anim.begin_frame(clock.now());
+        anim.group("caret");
+        anim.blink(
+            "caret",
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        if keep {
+            anim.keep_group("toast");
+        }
+        anim.end_frame();
+        clock.advance(FRAME);
+        anim.begin_frame(clock.now());
+        let t = ask(&mut anim);
+        anim.end_frame();
+        t
+    };
+    assert_eq!(arrived(true), 1.0, "kept: still there");
+    assert_eq!(
+        arrived(false),
+        0.0,
+        "not kept: forgotten, and it enters again"
+    );
+}

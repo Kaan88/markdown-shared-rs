@@ -547,6 +547,8 @@ struct Track {
     seen: u64,
     /// The frame that last gave it a target: two different ones in one frame are a mistake.
     asked: u64,
+    /// The group it was last asked for in ([`Animator::group`]).
+    group: Option<u64>,
 }
 
 impl Track {
@@ -635,6 +637,12 @@ pub struct Animator {
     frame_interval: Duration,
     policy: Policy,
     system_reduced: bool,
+    /// The group the values asked for now belong to ([`group`](Self::group)).
+    group: Option<u64>,
+    /// What the last `end_frame` found: each group with something in flight, and when it next
+    /// needs drawing; and the same for what was asked outside every group.
+    groups: Vec<(Id, Instant)>,
+    loose: Option<Instant>,
 }
 
 impl Default for Animator {
@@ -662,6 +670,9 @@ impl Animator {
             frame_interval: Duration::from_nanos(1_000_000_000 / 60),
             policy: Policy::System,
             system_reduced: false,
+            group: None,
+            groups: Vec::new(),
+            loose: None,
         }
     }
 
@@ -722,6 +733,66 @@ impl Animator {
         }
         self.frame_at = Some(now);
         self.frame += 1;
+        self.group = None;
+    }
+
+    // ---- groups ----
+
+    /// Puts what is asked for from now on in the group `tag`, until another `group`,
+    /// [`ungroup`](Self::ungroup) or the next frame: the values, presences, cycles and blinks of
+    /// one region an application redraws on its own (a toast, the caret's line, the tab strip).
+    /// After [`end_frame`](Self::end_frame), [`group_deadlines`](Self::group_deadlines) says when
+    /// each group next needs drawing, so a window that repaints only what is damaged knows which
+    /// regions to draw, and [`keep_group`](Self::keep_group) keeps the groups a frame leaves
+    /// undrawn. A value asked for in another group, or in none, moves there. Groups change no
+    /// value and no deadline: a window that draws everything every frame needs none.
+    pub fn group(&mut self, tag: impl AsId) {
+        self.group = Some(tag.as_id().0);
+    }
+
+    /// What is asked for from now on belongs to no group.
+    pub fn ungroup(&mut self) {
+        self.group = None;
+    }
+
+    /// Keeps every value, cycle and blink of the group `tag` for a frame that does not draw its
+    /// region, as [`keep`](Self::keep) keeps one name: nothing of it is forgotten, so a toast at
+    /// rest is not taken for new (and made to enter again) after a frame that drew only the
+    /// caret.
+    pub fn keep_group(&mut self, tag: impl AsId) {
+        let tag = tag.as_id().0;
+        let (now, frame, animates) = (self.time, self.frame, self.animates());
+        for t in self.tracks.values_mut().filter(|t| t.group == Some(tag)) {
+            t.seen = frame;
+            if !animates {
+                t.motion.kind = Kind::Snap;
+            }
+            t.advance(now);
+        }
+        for r in self.runs.values_mut().filter(|r| r.group == Some(tag)) {
+            r.seen = frame;
+        }
+    }
+
+    /// The groups that had something in flight, or a cycle or blink, at the end of the last
+    /// frame, each with when it next needs drawing (at most the deadline
+    /// [`end_frame`](Self::end_frame) gave). A group not listed is at rest: its region need not
+    /// be drawn for its motion. At a deadline, draw the groups whose time has come
+    /// ([`group_due`](Self::group_due)).
+    pub fn group_deadlines(&self) -> &[(Id, Instant)] {
+        &self.groups
+    }
+
+    /// Whether the group `tag` needs drawing at `at`: something of it was in flight and its
+    /// time has come by then.
+    pub fn group_due(&self, tag: impl AsId, at: Instant) -> bool {
+        let tag = tag.as_id();
+        self.groups.iter().any(|&(g, when)| g == tag && when <= at)
+    }
+
+    /// When what was asked outside every group next needs drawing, if anything of it moves.
+    pub fn ungrouped_deadline(&self) -> Option<Instant> {
+        self.loose
     }
 
     /// Ends the frame: forgets the names the frame did not ask for, and says when the next
@@ -756,6 +827,7 @@ impl Animator {
         }
         self.animating = wait.is_some();
         let at = self.frame_at.unwrap_or_else(Instant::now);
+        self.note_groups(at);
         // A wait too long for the clock to hold (a blink of centuries) is no deadline.
         let mut deadline = wait.and_then(|w| at.checked_add(w));
         if let Some(wake) = self.wake.take() {
@@ -763,6 +835,32 @@ impl Animator {
         }
         self.planned = deadline.map_or(Duration::ZERO, |d| d.saturating_duration_since(at));
         deadline
+    }
+
+    /// When each group, and what is in none, next needs drawing: the waits `end_frame` works
+    /// out, per group. `at` is the frame's start.
+    fn note_groups(&mut self, at: Instant) {
+        let (time, interval) = (self.time, self.frame_interval);
+        let mut groups: Vec<(u64, Duration)> = Vec::new();
+        let mut loose: Option<Duration> = None;
+        let mut note = |group: Option<u64>, w: Duration| match group {
+            Some(g) => match groups.iter_mut().find(|(k, _)| *k == g) {
+                Some((_, old)) => *old = (*old).min(w),
+                None => groups.push((g, w)),
+            },
+            None => loose = Some(loose.map_or(w, |old| old.min(w))),
+        };
+        for t in self.tracks.values().filter(|t| !t.settled) {
+            note(t.group, t.start.saturating_sub(time).max(interval));
+        }
+        for r in self.runs.values() {
+            note(r.group, r.next.saturating_sub(time));
+        }
+        self.groups = groups
+            .into_iter()
+            .filter_map(|(g, w)| Some((Id(g), at.checked_add(w)?)))
+            .collect();
+        self.loose = loose.and_then(|w| at.checked_add(w));
     }
 
     /// Whether any value was still on its way, or anything that repeats was still asked for, at
@@ -846,6 +944,7 @@ impl Animator {
                 settled: true,
                 seen: frame,
                 asked: 0,
+                group: self.group,
             },
         );
     }
@@ -917,7 +1016,7 @@ impl Animator {
         motion: Motion,
         precision: f64,
     ) -> [f64; 4] {
-        let (now, frame) = (self.time, self.frame);
+        let (now, frame, group) = (self.time, self.frame, self.group);
         let in_frame = self.frame_at.is_some();
         // A target that is not a number cannot be moved to, nor waited for: it is taken as it
         // is, at once.
@@ -947,6 +1046,7 @@ impl Animator {
             settled: from == target,
             seen: frame,
             asked: frame,
+            group,
         };
         let t = match self.tracks.entry(id.0) {
             Entry::Vacant(slot) => slot.insert(fresh(initial.filter(|_| finite).unwrap_or(target))),
@@ -972,6 +1072,7 @@ impl Animator {
             }
         };
         (t.seen, t.asked, t.precision) = (frame, frame, precision);
+        t.group = group;
         if instant {
             // Motion was switched off while this one was on its way: it keeps only its wait.
             t.motion.kind = Kind::Snap;

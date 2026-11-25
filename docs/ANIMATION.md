@@ -165,6 +165,15 @@ Notes:
   never wrong, only without motion. A kept value goes on to its target and then stops asking for
   frames, as if it had been asked for; a `get` after `keep` reads this frame's value. The part
   itself still shows the frame that last drew it, so draw it once more when `anim.settled(id)`.
+- Groups make that bookkeeping the animator's (roadmap D1). Call `anim.group(tag)` before
+  drawing a region the window repaints on its own (a toast, the caret's line, the tab strip) and
+  `anim.ungroup()` after; what is asked for in between belongs to `tag`. After `end_frame`,
+  `anim.group_deadlines()` lists each group with something in flight and when it next needs
+  drawing (a fade: the next frame; a blink: when it toggles), `group_due(tag, at)` asks of one,
+  and `ungrouped_deadline()` covers what is in no group. At a deadline, damage the regions whose
+  groups are due. A frame that skips a region calls `anim.keep_group(tag)` for it, so nothing in
+  it is forgotten: without it a toast at rest, not asked for on a frame that drew only the caret,
+  would be taken for new and enter again. Groups change no value and no deadline.
 - A render that must not depend on time (`--shot`, a golden image) uses `Policy::Never`, or a
   `ManualClock`.
 
