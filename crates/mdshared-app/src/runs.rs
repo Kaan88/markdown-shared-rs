@@ -390,6 +390,10 @@ pub struct Record {
     /// no link, and for a record written before this field existed: undo then takes the lines
     /// out as [`with_removals`] does.
     pub added: Vec<Added>,
+    /// The copies a [`Kind::Copies`] run made of the owner's files: each copy with the file it is
+    /// a copy of and that file's digest, so undo removes a copy only while its original is where
+    /// it was (Fable's review of C1). Empty for every other kind.
+    pub copied: Vec<PictureRec>,
 }
 
 /// A record read from disk.
@@ -840,24 +844,17 @@ impl Record {
         let pictures: Vec<String> = self
             .pictures
             .iter()
-            .map(|p| {
-                let original = match &p.original {
-                    Some(o) => format!(
-                        ", \"original\": \"{}\", \"original_sha256\": \"{}\"",
-                        esc(&stored(o, library)),
-                        esc(&p.original_sha256)
-                    ),
-                    None => String::new(),
-                };
-                format!(
-                    "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"{original}}}",
-                    esc(&stored(&p.path, library)),
-                    p.created,
-                    esc(&p.sha256)
-                )
-            })
+            .map(|p| picture_json(p, library))
             .collect();
         s.push_str(&format!("  \"pictures\": [{}],\n", pictures.join(", ")));
+        if !self.copied.is_empty() {
+            let copied: Vec<String> = self
+                .copied
+                .iter()
+                .map(|p| picture_json(p, library))
+                .collect();
+            s.push_str(&format!("  \"copied\": [{}],\n", copied.join(", ")));
+        }
         let added: Vec<String> = self
             .added
             .iter()
@@ -1040,30 +1037,12 @@ impl Record {
         let pictures = json
             .get("pictures")
             .and_then(Json::arr)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| {
-                        Some(PictureRec {
-                            path: resolved(p.get("path")?.str()?, library),
-                            created: p.get("created").and_then(Json::bool).unwrap_or(false),
-                            sha256: p
-                                .get("sha256")
-                                .and_then(Json::str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            original: p
-                                .get("original")
-                                .and_then(Json::str)
-                                .map(|o| resolved(o, library)),
-                            original_sha256: p
-                                .get("original_sha256")
-                                .and_then(Json::str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
+            .unwrap_or_default();
+        let copied = json
+            .get("copied")
+            .and_then(Json::arr)
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
             .unwrap_or_default();
         let originals = json
             .get("originals")
@@ -1124,6 +1103,7 @@ impl Record {
             moved: None,
             originals,
             added,
+            copied,
         })
     }
 
@@ -1283,6 +1263,7 @@ pub fn start_rewrite(
         moved: None,
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     };
     let path = record.create(library)?;
     Ok((path, record))
@@ -1363,6 +1344,7 @@ fn links_record_of(
         moved: None,
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     };
     record.keep_added(&group.file, Some(before.to_string()), links, library);
     record
@@ -1383,15 +1365,25 @@ pub fn copies_record(
     let mut record = links_record_of(library, instruction, group, links, before);
     record.kind = Kind::Copies;
     for note in &mut record.notes {
-        if let Some((_, created, sha)) = written
+        if let Some(f) = written
             .files
             .iter()
-            .find(|(p, _, _)| same_path(p, &note.path))
+            .find(|f| same_path(&f.path, &note.path))
         {
-            note.created = *created;
-            note.sha256 = if *created { sha.clone() } else { String::new() };
+            note.created = f.created;
+            note.sha256 = if f.created {
+                f.sha256.clone()
+            } else {
+                String::new()
+            };
         }
     }
+    record.copied = written
+        .files
+        .iter()
+        .filter(|f| f.created && record.notes.iter().any(|n| same_path(&n.path, &f.path)))
+        .cloned()
+        .collect();
     record.pictures = written.pictures.clone();
     record.folders = written.folders.clone();
     let path = record.create(library)?;
@@ -2154,6 +2146,7 @@ fn planned(req: &Request, kind: Kind, secs: u64, started: &str, source: Source) 
         moved: None,
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     }
 }
 
@@ -3029,6 +3022,14 @@ impl Reach {
                     return Err(outside(&note.path));
                 }
             }
+            for copy in &record.copied {
+                if !reach.allows(&copy.path) {
+                    return Err(outside(&copy.path));
+                }
+                if copy.original.is_none() {
+                    return Err(foreign(&copy.path));
+                }
+            }
             for picture in &record.pictures {
                 if !reach.allows(&picture.path) {
                     return Err(outside(&picture.path));
@@ -3304,6 +3305,12 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(note.path.clone());
         } else if note.path.symlink_metadata().is_err() {
             plan.gone.push(note.path.clone());
+        } else if !copy_may_go(record, &note.path) {
+            // A copy whose original is gone or changed may be the only one left: it stays, and
+            // so does its line.
+            plan.kept.push(note.path.clone());
+            plan.notes_kept.push(note.path.clone());
+            continue;
         } else if digest_of(&note.path).is_some_and(|d| d.eq_ignore_ascii_case(&note.sha256)) {
             file_goes = true;
         } else {
@@ -3602,6 +3609,7 @@ pub fn undo_with(
         let matches = created_note(note).is_some_and(|n| {
             reach.allows(note)
                 && (record.kind == Kind::Copies || has_extension(note, &["md"]))
+                && copy_may_go(record, note)
                 && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
         });
         if !matches {
@@ -3758,6 +3766,59 @@ fn rewrite_chains(record: &Record) -> Vec<(&Original, &Original)> {
         }
     }
     chains
+}
+
+/// One picture (or copy) of a record as JSON: its original only when it has one.
+fn picture_json(p: &PictureRec, library: &Path) -> String {
+    let original = match &p.original {
+        Some(o) => format!(
+            ", \"original\": \"{}\", \"original_sha256\": \"{}\"",
+            esc(&stored(o, library)),
+            esc(&p.original_sha256)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"{original}}}",
+        esc(&stored(&p.path, library)),
+        p.created,
+        esc(&p.sha256)
+    )
+}
+
+/// One picture (or copy) read back from a record; `None` without a path.
+fn picture_of(p: &Json, library: &Path) -> Option<PictureRec> {
+    Some(PictureRec {
+        path: resolved(p.get("path")?.str()?, library),
+        created: p.get("created").and_then(Json::bool).unwrap_or(false),
+        sha256: p
+            .get("sha256")
+            .and_then(Json::str)
+            .unwrap_or_default()
+            .to_string(),
+        original: p
+            .get("original")
+            .and_then(Json::str)
+            .map(|o| resolved(o, library)),
+        original_sha256: p
+            .get("original_sha256")
+            .and_then(Json::str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// Whether a note a run made may go as far as its original is concerned: any note but a copy
+/// "Copy them in" made, and such a copy only while the record names its original and that file
+/// is where it was with the digest it had, so undo never removes the only copy (Fable's review
+/// of C1).
+fn copy_may_go(record: &Record, note: &Path) -> bool {
+    record.kind != Kind::Copies
+        || record
+            .copied
+            .iter()
+            .find(|c| same_path(&c.path, note))
+            .is_some_and(|c| c.original.is_some() && original_there(c))
 }
 
 /// Whether the file a picture was copied from is where it was, with the digest it had: always
@@ -5183,6 +5244,7 @@ mod tests {
             moved: None,
             originals: Vec::new(),
             added: Vec::new(),
+            copied: Vec::new(),
         };
         let text = record.to_json(&library);
         let back = Record::from_json(&text, &library).expect("it reads");
@@ -6748,6 +6810,7 @@ mod tests {
             moved: None,
             originals: Vec::new(),
             added: Vec::new(),
+            copied: Vec::new(),
         };
         let t0 = "# Trip\n\nThe owner's line.\n\n";
         let t1 = with_links_added(t0, &[link("One")]);

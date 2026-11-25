@@ -50,7 +50,7 @@ fn run(tag: &str) -> Run1 {
         },
     ];
     let plan = copy_in::plan(&wanted, std::slice::from_ref(&library));
-    let written = copy_in::write(&plan).expect("written");
+    let written = copy_in::write(&plan, &library, &home).expect("written");
     let copy = home.join("trip.md");
     let picture = home.join("img").join("beach.png");
     let links: Vec<Link> = plan
@@ -157,7 +157,7 @@ fn a_copy_of_any_extension_is_taken_away_by_undo() {
         }],
         std::slice::from_ref(&library),
     );
-    let written = copy_in::write(&plan).expect("written");
+    let written = copy_in::write(&plan, &library, &home).expect("written");
     let to = home.join("menu.pdf");
     let links = vec![Link {
         path: to.clone(),
@@ -253,4 +253,48 @@ fn a_picture_copy_that_names_no_original_is_not_acted_on() {
     r.record.pictures[0].original = None;
     let plan = prepare(&r.record, &r.library);
     assert!(plan.refusal.is_some(), "{plan:?}");
+}
+
+/// Fable's review of C1, 5: a copy of a text file whose original is gone may be the only copy
+/// left, so undo keeps it, and its line; the record read back names the original.
+#[test]
+fn undo_keeps_a_copy_whose_original_is_gone() {
+    let r = run("copies-note-orphan");
+    let loaded = load(&r.record_path, &r.library).expect("it reads back");
+    let original = r.dir.join("desk").join("trip.md");
+    let named = loaded
+        .copied
+        .iter()
+        .find(|c| same_path(&c.path, &r.copy))
+        .expect("the copy names its original");
+    assert!(same_path(
+        named.original.as_deref().expect("its path"),
+        &original
+    ));
+    std::fs::remove_file(&original).expect("the owner removed it");
+    let plan = prepare(&loaded, &r.library);
+    assert!(
+        plan.notes_kept.iter().any(|p| same_path(p, &r.copy)),
+        "{plan:?}"
+    );
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &loaded, &r.library, &mut gate);
+    assert!(
+        r.copy.exists(),
+        "the copy may be the only one now: {report:?}"
+    );
+    assert!(
+        read(&r.group).contains("trip"),
+        "its line stays with it: {report:?}"
+    );
+}
+
+/// Fable's review of C1, 5: a copy the record does not name an original for is never removed.
+#[test]
+fn undo_keeps_a_copy_the_record_names_no_original_for() {
+    let mut r = run("copies-note-unnamed");
+    r.record.copied.clear();
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
+    assert!(r.copy.exists(), "{report:?}");
 }

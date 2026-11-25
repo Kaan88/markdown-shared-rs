@@ -1656,6 +1656,7 @@ pub(crate) fn record_from_json(
         }),
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     })
 }
 
@@ -2624,6 +2625,7 @@ pub fn write_at(
         }),
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     };
     let record_path = match record.create(&req.library) {
         Ok(path) => path,

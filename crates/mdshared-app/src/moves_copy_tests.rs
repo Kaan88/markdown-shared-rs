@@ -85,7 +85,7 @@ fn a_file_is_copied_into_its_folder_and_the_original_is_left_as_it_was() {
             text: None
         }
     );
-    let done = write(&plan).expect("written");
+    let done = write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(bytes(&to), b"%PDF-1.4 the owner's\n");
     assert_eq!(
         bytes(&from),
@@ -93,7 +93,7 @@ fn a_file_is_copied_into_its_folder_and_the_original_is_left_as_it_was() {
         "the original is not touched"
     );
     assert_eq!(done.files.len(), 1);
-    assert!(done.files[0].1, "this run made it");
+    assert!(done.files[0].created, "this run made it");
     assert_eq!(done.folders, vec![w.group.clone()], "the folder it made");
 }
 
@@ -113,7 +113,7 @@ fn a_name_taken_by_other_bytes_gets_the_next_number() {
             text: None
         }
     );
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(
         text(&w.group.join("notes.txt")),
         "someone else's\n",
@@ -135,8 +135,8 @@ fn the_same_bytes_already_there_are_linked_and_not_written_again() {
             to: w.group.join("a.png")
         }
     );
-    let done = write(&plan).expect("written");
-    assert!(!done.files[0].1, "not this run's file");
+    let done = write(&plan, &w.library, &w.group).expect("written");
+    assert!(!done.files[0].created, "not this run's file");
     assert!(done.folders.is_empty());
 }
 
@@ -153,7 +153,7 @@ fn a_file_inside_the_library_stays_where_it_is() {
         }
     );
     assert_eq!(plan[0].target(), from.as_path());
-    let done = write(&plan).expect("nothing to write");
+    let done = write(&plan, &w.library, &w.group).expect("nothing to write");
     assert!(done.files.is_empty());
     assert!(!w.group.exists(), "no folder made for a file that stays");
 }
@@ -168,7 +168,7 @@ fn two_files_of_one_run_with_one_name_get_two_names() {
     let plan = plan(&[w.want(&a), w.want(&b)], &w.inside());
     assert_eq!(plan[0].target(), w.group.join("readme.md").as_path());
     assert_eq!(plan[1].target(), w.group.join("readme-2.md").as_path());
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(text(&w.group.join("readme.md")), "# One\n");
     assert_eq!(text(&w.group.join("readme-2.md")), "# Two\n");
 }
@@ -188,7 +188,7 @@ fn a_markdown_file_takes_the_pictures_below_it_and_its_words_do_not_change() {
         plan[0].rewrites, 0,
         "the picture is at the same place beside the copy"
     );
-    let done = write(&plan).expect("written");
+    let done = write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(text(&w.group.join("trip.md")), body);
     assert_eq!(bytes(&to_pic), b"\x89PNG beach");
     assert_eq!(done.pictures.len(), 1);
@@ -226,7 +226,7 @@ fn a_link_outside_its_folder_is_rewritten_to_lead_where_it_did() {
         "a picture above its folder is not carried"
     );
     assert_eq!(plan[0].rewrites, 2);
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     let copy = text(&w.group.join("trip.md"));
     let links = links::links(&copy, &w.group);
     assert_eq!(links.len(), 2, "{copy}");
@@ -254,7 +254,7 @@ fn a_link_to_another_file_of_the_run_leads_to_its_copy() {
     put(&a, "# One\n\nSee [two](../b/two.md).\n".as_bytes());
     put(&b, b"# Two\n");
     let plan = plan(&[w.want(&a), w.want(&b)], &w.inside());
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     let copy = text(&w.group.join("one.md"));
     assert!(copy.contains("](two.md)"), "{copy}");
 }
@@ -272,7 +272,7 @@ fn a_markdown_file_that_is_not_utf8_is_copied_byte_for_byte() {
         "its row says why its links are as they were"
     );
     assert!(plan[0].pictures.is_empty());
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(bytes(&w.group.join("old.md")), raw.to_vec());
 }
 
@@ -285,7 +285,7 @@ fn a_picture_of_two_files_is_copied_once() {
     put(&b, "![p](p.png)\n".as_bytes());
     put(&w.outside.join("p.png"), b"\x89PNG p");
     let plan = plan(&[w.want(&a), w.want(&b)], &w.inside());
-    let done = write(&plan).expect("written");
+    let done = write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(done.pictures.len(), 1, "{done:?}");
     assert!(done.pictures[0].created);
     assert_eq!(bytes(&w.group.join("p.png")), b"\x89PNG p");
@@ -301,7 +301,7 @@ fn a_picture_whose_place_holds_other_bytes_is_not_carried_and_its_link_leads_to_
     put(&w.group.join("p.png"), b"\x89PNG theirs");
     let plan = plan(&[w.want(&md)], &w.inside());
     assert!(plan[0].pictures.is_empty());
-    write(&plan).expect("written");
+    write(&plan, &w.library, &w.group).expect("written");
     assert_eq!(
         bytes(&w.group.join("p.png")),
         b"\x89PNG theirs",
@@ -322,7 +322,7 @@ fn a_failed_write_takes_away_what_it_made() {
     let plan = plan(&[w.want(&a), w.want(&b)], &w.inside());
     // Someone takes the second name between the plan and the write.
     put(&w.group.join("b.txt"), b"theirs\n");
-    let err = write(&plan).expect_err("the second copy cannot be made");
+    let err = write(&plan, &w.library, &w.group).expect_err("the second copy cannot be made");
     assert!(err.contains("b.txt"), "{err}");
     assert!(
         !w.group.join("a.txt").exists(),
@@ -338,10 +338,93 @@ fn a_failed_write_leaves_a_copy_that_was_changed_since() {
     let to = w.group.join("a.txt");
     put(&to, b"changed by someone\n");
     let done = Written {
-        files: vec![(to.clone(), true, sha_of(b"a\n"))],
+        files: vec![PictureRec {
+            path: to.clone(),
+            created: true,
+            sha256: sha_of(b"a\n"),
+            original: None,
+            original_sha256: String::new(),
+        }],
         pictures: Vec::new(),
         folders: vec![w.group.clone()],
+        made_outside: Vec::new(),
     };
     take_back(&done);
     assert_eq!(text(&to), "changed by someone\n");
+}
+
+/// Fable's review of C1, 1: a file whose name is chosen again (its links changed, so it no
+/// longer holds the bytes of the same-named file there) keeps the pictures it shows, and a
+/// picture two files show is written once, not marked as there for both.
+#[test]
+fn a_second_pass_keeps_each_picture_once() {
+    let w = World::new("second-pass");
+    let trip = w.outside.join("trip.md");
+    let trip_text = b"# Trip\n\n![a](img/a.png)\n\n[Notes](notes.txt)\n";
+    put(&trip, trip_text);
+    put(&w.outside.join("img").join("a.png"), b"PNG a");
+    let other = w.outside.join("other.md");
+    put(&other, b"# Other\n\n![a](img/a.png)\n");
+    let notes = w.outside.join("notes.txt");
+    put(&notes, b"mine\n");
+    // There already: trip.md with its very bytes, and a notes.txt of other bytes, so notes.txt
+    // goes to notes-2.txt, trip.md's link changes, and trip.md is named again.
+    put(&w.group.join("trip.md"), trip_text);
+    put(&w.group.join("notes.txt"), b"theirs\n");
+    let plan = plan(
+        &[w.want(&trip), w.want(&other), w.want(&notes)],
+        &w.inside(),
+    );
+    assert_eq!(plan[0].target(), w.group.join("trip-2.md"));
+    assert_eq!(plan[0].pictures.len(), 1, "{plan:?}");
+    write(&plan, &w.library, &w.group).expect("written");
+    assert_eq!(bytes(&w.group.join("img").join("a.png")), b"PNG a");
+    let copy = text(&w.group.join("trip-2.md"));
+    assert!(copy.contains("](img/a.png)"), "{copy}");
+    assert!(copy.contains("](notes-2.txt)"), "{copy}");
+    assert!(text(&w.group.join("other.md")).contains("](img/a.png)"));
+}
+
+/// Fable's review of C1, nit: a copy whose links change is named by the text it will hold, so
+/// a file there that holds exactly that text is linked, not copied again under another name.
+#[test]
+fn a_rewritten_copy_is_named_by_its_new_text() {
+    let w = World::new("renamed-by-text");
+    let x = w.outside.join("x.md");
+    put(&x, b"# X\n\n[Y](y.txt)\n");
+    let y = w.outside.join("y.txt");
+    put(&y, b"mine\n");
+    put(&w.group.join("y.txt"), b"theirs\n");
+    put(&w.group.join("x.md"), b"# X\n\n[Y](y-2.txt)\n");
+    let plan = plan(&[w.want(&x), w.want(&y)], &w.inside());
+    assert_eq!(
+        plan[0].copy,
+        Copy::There {
+            to: w.group.join("x.md")
+        },
+        "{plan:?}"
+    );
+}
+
+/// Fable's review of C1, 2: folders made above the group's home are not the record's, since
+/// undo may not touch them; a write that fails still takes them away.
+#[test]
+fn folders_made_outside_the_reach_are_kept_apart() {
+    let w = World::new("outside-folders");
+    let from = w.outside.join("a.txt");
+    put(&from, b"a\n");
+    let above = w.dir.join("away");
+    let home = above.join("home");
+    let plan = plan(
+        &[Wanted {
+            from: from.clone(),
+            dir: home.clone(),
+        }],
+        &w.inside(),
+    );
+    let done = write(&plan, &w.library, &home).expect("written");
+    assert_eq!(done.folders, vec![home.clone()]);
+    assert_eq!(done.made_outside, vec![above.clone()]);
+    take_back(&done);
+    assert!(!above.exists(), "taken back, both");
 }

@@ -1473,6 +1473,7 @@ fn sample_record(library: &Path) -> Record {
         }),
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
     }
 }
 

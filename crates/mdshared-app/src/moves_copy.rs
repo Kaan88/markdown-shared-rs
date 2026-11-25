@@ -93,31 +93,49 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
             }
         })
         .collect();
-    // Then each Markdown file's pictures and links. A file whose text changes is no longer the
-    // bytes a same-named file there holds, so it gets a name of its own; that can change where
-    // another file's link must lead, so this is done again until nothing moves (a few times at
-    // most: a file goes from There to New once).
+    // Then the pictures each Markdown file shows, once (Fable's review of C1: planned again,
+    // a picture already taken by this very file would be dropped, and a picture two files share
+    // would be marked as there for both, so neither wrote it).
+    let mut texts: Vec<Option<String>> = vec![None; out.len()];
+    for i in 0..out.len() {
+        let Some(w) = wanted.get(i) else { break };
+        if matches!(out[i].copy, Copy::Stays { .. }) || !is_markdown(&w.from) {
+            continue;
+        }
+        let Some(text) = links::note_text(&w.from) else {
+            out[i].note = Some("not UTF-8: copied with its links as they were".to_string());
+            continue;
+        };
+        let Some(from_dir) = w.from.parent() else {
+            continue;
+        };
+        out[i].pictures = pictures_of(&text, from_dir, &w.dir, inside, &out, i, &mut taken);
+        texts[i] = Some(text);
+    }
+    // Then each Markdown file's links. A file whose text changes is no longer the bytes it was
+    // named by, so its name is chosen again from the text it will hold: a file there may hold
+    // exactly that, or the name may be taken by other bytes. That can change where another
+    // file's link must lead, so this is done again until nothing moves (a few times at most).
     for _ in 0..4 {
         let mut moved = false;
         for i in 0..out.len() {
-            let Some(w) = wanted.get(i) else { break };
-            if matches!(out[i].copy, Copy::Stays { .. }) || !is_markdown(&w.from) {
-                continue;
-            }
-            let Some(text) = links::note_text(&w.from) else {
-                out[i].note = Some("not UTF-8: copied with its links as they were".to_string());
+            let (Some(w), Some(text)) = (wanted.get(i), texts.get(i).and_then(Option::as_ref))
+            else {
                 continue;
             };
+            if matches!(out[i].copy, Copy::Stays { .. }) {
+                continue;
+            }
             let Some(from_dir) = w.from.parent() else {
                 continue;
             };
-            let pictures = pictures_of(&text, from_dir, &w.dir, inside, &out, i, &mut taken);
             let places: Vec<(PathBuf, PathBuf)> = out
                 .iter()
                 .enumerate()
                 .filter(|(k, _)| *k != i)
                 .map(|(_, p)| (p.from.clone(), p.target().to_path_buf()))
                 .collect();
+            let pictures = &out[i].pictures;
             let place = |p: &Path| -> PathBuf {
                 if let Some(c) = pictures.iter().find(|c| same_path(&c.from, p)) {
                     return c.to.clone();
@@ -127,26 +145,32 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
                     None => p.to_path_buf(),
                 }
             };
-            let (new, n) = links::rewrite(&text, from_dir, &w.dir, &place, &[]);
-            out[i].pictures = pictures;
+            let (new, n) = links::rewrite(text, from_dir, &w.dir, &place, &[]);
             out[i].rewrites = n;
-            let text = (n > 0).then_some(new);
-            out[i].copy = match (&out[i].copy, text) {
-                (Copy::There { to }, Some(t)) if !holds(to, t.as_bytes()) => {
-                    moved = true;
-                    match free_name(w, t.as_bytes(), &mut taken) {
-                        Ok((to, there)) if there => Copy::There { to },
-                        Ok((to, _)) => Copy::New { to, text: Some(t) },
-                        Err(why) => Copy::Stays { why },
-                    }
-                }
-                (Copy::There { to }, _) => Copy::There { to: to.clone() },
-                (Copy::New { to, .. }, t) => Copy::New {
-                    to: to.clone(),
-                    text: t,
-                },
-                (s, _) => s.clone(),
+            let wants = (n > 0).then_some(new);
+            let same = match (&out[i].copy, &wants) {
+                (Copy::New { text: had, .. }, _) => had == &wants,
+                (Copy::There { to }, Some(t)) => holds(to, t.as_bytes()),
+                (Copy::There { .. }, None) => true,
+                (Copy::Stays { .. }, _) => true,
             };
+            if same {
+                continue;
+            }
+            let before = out[i].target().to_path_buf();
+            taken.retain(|t| !same_path(t, &before));
+            let bytes = wants
+                .as_deref()
+                .map(str::as_bytes)
+                .unwrap_or(text.as_bytes());
+            out[i].copy = match free_name(w, bytes, &mut taken) {
+                Ok((to, true)) => Copy::There { to },
+                Ok((to, false)) => Copy::New { to, text: wants },
+                Err(why) => Copy::Stays { why },
+            };
+            if !same_path(out[i].target(), &before) {
+                moved = true;
+            }
         }
         if !moved {
             break;
@@ -158,19 +182,27 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
 /// What is written, for the record.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Written {
-    /// Each file's copy: its path, whether this run made it, and the digest of its bytes.
-    pub files: Vec<(PathBuf, bool, String)>,
+    /// Each file's copy: its path, whether this run made it, the digest of its bytes, and the
+    /// file it is a copy of with that file's digest, so undo removes the copy only while the
+    /// original is where it was (Fable's review of C1).
+    pub files: Vec<PictureRec>,
     pub pictures: Vec<PictureRec>,
-    /// The folders this run made, parents first.
+    /// The folders this run made inside the library's reach (the library folder and the group's
+    /// home), parents first: the record's, which undo removes when they are empty.
     pub folders: Vec<PathBuf>,
+    /// The folders it made above the group's home, which undo may not touch: only
+    /// [`take_back`] removes them, when a write fails.
+    pub made_outside: Vec<PathBuf>,
 }
 
 /// Writes the copies `plan` gives. A file is read again here, and one that changed since its
 /// name was chosen is still copied as it is now. On the first failure everything this call made
-/// is taken away again (only while it is the bytes it wrote) and the reason is given.
-pub fn write(plan: &[Planned]) -> Result<Written, String> {
+/// is taken away again (only while it is the bytes it wrote) and the reason is given. `library`
+/// and `home` are the run's reach: a folder made outside them is not the record's.
+pub fn write(plan: &[Planned], library: &Path, home: &Path) -> Result<Written, String> {
     let mut done = Written::default();
-    let result = write_all(plan, &mut done);
+    let reach = |p: &Path| crate::runs::inside(library, home, p);
+    let result = write_all(plan, &reach, &mut done);
     if let Err(why) = result {
         take_back(&done);
         return Err(why);
@@ -178,24 +210,40 @@ pub fn write(plan: &[Planned]) -> Result<Written, String> {
     Ok(done)
 }
 
-fn write_all(plan: &[Planned], done: &mut Written) -> Result<(), String> {
+fn write_all(
+    plan: &[Planned],
+    reach: &dyn Fn(&Path) -> bool,
+    done: &mut Written,
+) -> Result<(), String> {
     for p in plan {
         match &p.copy {
             Copy::Stays { .. } => continue,
             Copy::There { to } => {
-                let sha = digest_of(to).unwrap_or_default();
-                done.files.push((to.clone(), false, sha));
+                done.files.push(PictureRec {
+                    path: to.clone(),
+                    created: false,
+                    sha256: digest_of(to).unwrap_or_default(),
+                    original: Some(p.from.clone()),
+                    original_sha256: digest_of(&p.from).unwrap_or_default(),
+                });
             }
             Copy::New { to, text } => {
+                let original = read_regular(&p.from, DIGEST_MAX_BYTES, false)
+                    .ok_or_else(|| format!("{} could not be read", p.from.display()))?;
                 let bytes = match text {
                     Some(t) => t.as_bytes().to_vec(),
-                    None => read_regular(&p.from, DIGEST_MAX_BYTES, false)
-                        .ok_or_else(|| format!("{} could not be read", p.from.display()))?,
+                    None => original.clone(),
                 };
-                make_dirs(to, done)?;
+                make_dirs(to, reach, done)?;
                 create_new(to, &bytes)
                     .map_err(|e| format!("{} could not be written: {e}", to.display()))?;
-                done.files.push((to.clone(), true, sha_of(&bytes)));
+                done.files.push(PictureRec {
+                    path: to.clone(),
+                    created: true,
+                    sha256: sha_of(&bytes),
+                    original: Some(p.from.clone()),
+                    original_sha256: sha_of(&original),
+                });
             }
         }
         for c in &p.pictures {
@@ -215,7 +263,7 @@ fn write_all(plan: &[Planned], done: &mut Written) -> Result<(), String> {
             }
             let bytes = read_regular(&c.from, DIGEST_MAX_BYTES, false)
                 .ok_or_else(|| format!("{} could not be read", c.from.display()))?;
-            make_dirs(&c.to, done)?;
+            make_dirs(&c.to, reach, done)?;
             create_new(&c.to, &bytes)
                 .map_err(|e| format!("{} could not be written: {e}", c.to.display()))?;
             done.pictures.push(PictureRec {
@@ -234,17 +282,14 @@ fn write_all(plan: &[Planned], done: &mut Written) -> Result<(), String> {
 /// folders while they are empty, deepest first. [`write`] calls it when it fails; a caller calls
 /// it when what comes after the copies (the library's lines) cannot be written.
 pub fn take_back(done: &Written) {
-    for (path, created, sha) in &done.files {
-        if *created && digest_of(path).is_some_and(|d| d.eq_ignore_ascii_case(sha)) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-    for p in &done.pictures {
+    for p in done.files.iter().chain(&done.pictures) {
         if p.created && digest_of(&p.path).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256)) {
             let _ = std::fs::remove_file(&p.path);
         }
     }
-    for folder in done.folders.iter().rev() {
+    let mut folders: Vec<&PathBuf> = done.folders.iter().chain(&done.made_outside).collect();
+    folders.sort_by_key(|f| std::cmp::Reverse(f.components().count()));
+    for folder in folders {
         let _ = std::fs::remove_dir(folder);
     }
 }
@@ -421,8 +466,9 @@ fn pictures_of(
     found
 }
 
-/// Makes the folders `file` needs, recording those that were not there, parents first.
-fn make_dirs(file: &Path, done: &mut Written) -> Result<(), String> {
+/// Makes the folders `file` needs, recording those that were not there, parents first: in
+/// `folders` when `reach` allows them, else in `made_outside`.
+fn make_dirs(file: &Path, reach: &dyn Fn(&Path) -> bool, done: &mut Written) -> Result<(), String> {
     let Some(dir) = file.parent() else {
         return Ok(());
     };
@@ -434,7 +480,11 @@ fn make_dirs(file: &Path, done: &mut Written) -> Result<(), String> {
     missing.reverse();
     for m in missing {
         std::fs::create_dir(&m).map_err(|e| format!("{} could not be made: {e}", m.display()))?;
-        done.folders.push(m);
+        if reach(&m) {
+            done.folders.push(m);
+        } else {
+            done.made_outside.push(m);
+        }
     }
     Ok(())
 }
