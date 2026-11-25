@@ -280,7 +280,19 @@ pub fn draw_disclosure(p: &mut Painter, cx: f32, cy: f32, size: f32, open: f32, 
 /// once, as the animator makes every value its target. A motion starts on the frame that asks
 /// for the new state and moves from the next one, as every value of the animator does.
 pub fn disclosure_turn(anim: &mut Animator, id: impl AsId, expanded: bool) -> f32 {
-    let t = anim.toggle(Id::new(id).with("disclosure"), expanded, DISCLOSURE_MOTION);
+    disclosure_turn_with(anim, id, expanded, DISCLOSURE_MOTION)
+}
+
+/// [`disclosure_turn`] by `motion` instead of [`DISCLOSURE_MOTION`], for an application that
+/// keeps its timings in one place. The same name as `disclosure_turn`: one disclosure is asked
+/// with one motion.
+pub fn disclosure_turn_with(
+    anim: &mut Animator,
+    id: impl AsId,
+    expanded: bool,
+    motion: Motion,
+) -> f32 {
+    let t = anim.toggle(Id::new(id).with("disclosure"), expanded, motion);
     if t.is_finite() {
         t.clamp(0.0, 1.0)
     } else if expanded {
@@ -306,6 +318,25 @@ pub fn draw_disclosure_animated(
     c: Rgb,
 ) {
     let open = disclosure_turn(anim, id, expanded);
+    draw_disclosure(p, cx, cy, size, open, c);
+}
+
+/// [`draw_disclosure_animated`] turning by `motion` instead of [`DISCLOSURE_MOTION`]
+/// ([`disclosure_turn_with`]). At rest it is the plain right or down chevron, as every motion
+/// ends where it rests.
+#[allow(clippy::too_many_arguments)] // drawing call: a point, a size, the state, a colour, a motion
+pub fn draw_disclosure_animated_with(
+    p: &mut Painter,
+    anim: &mut Animator,
+    id: impl AsId,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    expanded: bool,
+    c: Rgb,
+    motion: Motion,
+) {
+    let open = disclosure_turn_with(anim, id, expanded, motion);
     draw_disclosure(p, cx, cy, size, open, c);
 }
 
