@@ -166,6 +166,15 @@ Notes:
   never wrong, only without motion. A kept value goes on to its target and then stops asking for
   frames, as if it had been asked for; a `get` after `keep` reads this frame's value. The part
   itself still shows the frame that last drew it, so draw it once more when `anim.settled(id)`.
+- Groups make that bookkeeping the animator's (roadmap D1). Call `anim.group(tag)` before
+  drawing a region the window repaints on its own (a toast, the caret's line, the tab strip) and
+  `anim.ungroup()` after; what is asked for in between belongs to `tag`. After `end_frame`,
+  `anim.group_deadlines()` lists each group with something in flight and when it next needs
+  drawing (a fade: the next frame; a blink: when it toggles), `group_due(tag, at)` asks of one,
+  and `ungrouped_deadline()` covers what is in no group. At a deadline, damage the regions whose
+  groups are due. A frame that skips a region calls `anim.keep_group(tag)` for it, so nothing in
+  it is forgotten: without it a toast at rest, not asked for on a frame that drew only the caret,
+  would be taken for new and enter again. Groups change no value and no deadline.
 - A render that must not depend on time (`--shot`, a golden image) uses `Policy::Never`, or a
   `ManualClock`.
 
@@ -327,8 +336,9 @@ nothing listens (no bus, no signal) does a later call start another reading, at 
 second. A reading that fails or never ends leaves the last answer standing: a setting that is on
 is not taken for off because the portal was slow. Each reading is numbered when it asks, and an
 answer older than the one kept is dropped, so a late answer cannot undo a newer change.
-`platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux only;
-elsewhere the wake is dropped), so the application has the right value a moment after it
+`platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux, and
+on Windows when "Animation effects" is switched while the application runs, heard by the
+contrast watch's hidden window; on macOS the wake is dropped), so the application has the right value a moment after it
 starts and when the user changes the setting. The order of the two calls does not matter: a
 wake given after the portal already answered is called once at once.
 

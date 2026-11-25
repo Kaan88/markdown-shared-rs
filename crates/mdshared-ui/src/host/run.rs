@@ -428,6 +428,7 @@ impl<A: App> Host<A> {
         {
             let Win { window, bmp, .. } = win;
             let mut p = Painter::new(bmp, &mut self.gfx, scale);
+            p.set_frost_key(self.frost.key().copied());
             p.clip(damage);
             let mut cx = Cx {
                 window,
@@ -689,6 +690,10 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         // The contrast switch reaches no winit event on Windows: the host watches it (a no-op
         // elsewhere). After the first frame: it waits a few ms for its window.
         let proxy = self.proxy.0.clone();
+        let motion = proxy.clone();
+        platform::watch_motion_reduced(move || {
+            let _ = motion.send_event(Wake::Motion);
+        });
         platform::watch_contrast(move || {
             let _ = proxy.send_event(Wake::Contrast);
         });
@@ -706,6 +711,11 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         match wake {
             Wake::Message(m) => self.call(now, |app, cx| app.message(cx, m)),
             Wake::Contrast => self.read_contrast(now, true),
+            Wake::Motion => {
+                self.anim.set_system_reduced(platform::motion_reduced());
+                // What moves now snaps, or what was still starts: the frame says which.
+                self.st.damage.all();
+            }
             #[cfg(all(feature = "a11y", windows))]
             // Through `after`, so that a frame already asked for is drawn first and the
             // nodes read its layout.

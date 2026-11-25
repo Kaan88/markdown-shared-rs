@@ -613,6 +613,35 @@ impl Palette {
         )
     }
 
+    /// [`draw`](Self::draw) as the palette opens or closes: `t` is how present it is, 0 gone and
+    /// 1 there, from [`Animator::presence`](crate::anim::Animator::presence) with
+    /// [`crate::anim::document::MENU`] (roadmap X3). The card fades as a whole and drops
+    /// [`crate::menu::MENU_DROP`] px into place, as a menu does. At 1 this is `draw`, pixel for
+    /// pixel; at 0 it is laid out and nothing is drawn.
+    pub fn draw_presence(
+        &mut self,
+        p: &mut Painter,
+        pal: &Colors,
+        window: Rect,
+        title_h: f32,
+        caret_on: bool,
+        t: f32,
+    ) {
+        let card = self.layout(window, title_h);
+        crate::anim::pop(
+            p,
+            card.inset(-18.0),
+            t,
+            (0.0, -crate::menu::MENU_DROP),
+            |p| self.draw(p, pal, window, title_h, caret_on),
+        );
+    }
+
+    /// Everything [`draw_presence`](Self::draw_presence) touches at any `t`, as last laid out.
+    pub fn presence_bounds(&self) -> Rect {
+        crate::anim::pop_bounds(self.card.inset(-18.0), (0.0, -crate::menu::MENU_DROP))
+    }
+
     // ---- layout ------------------------------------------------------------------------------
 
     /// Places the card inside `window` (the whole window, in logical px; `title_h` is the height
@@ -1231,6 +1260,40 @@ mod tests {
             last = p.key(&KeyName::Char(ch), NONE, Some(&s));
         }
         last
+    }
+
+    /// The palette's entrance is its plain draw at 1, nothing at 0, and between them stays inside
+    /// its presence bounds.
+    #[test]
+    fn the_palette_enters_inside_its_bounds_and_is_the_plain_draw_at_one() {
+        let pal = crate::theme::LIGHT;
+        let shot = |t: Option<f32>| {
+            let mut pl = palette(entries(4));
+            let mut bmp = Bitmap::new(900, 640);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(WIN, pal.page);
+            match t {
+                Some(t) => pl.draw_presence(&mut p, &pal, WIN, 40.0, true, t),
+                None => pl.draw(&mut p, &pal, WIN, 40.0, true),
+            }
+            (bmp.pixels, pl.presence_bounds())
+        };
+        let (plain, _) = shot(None);
+        let (blank, _) = shot(Some(-1.0));
+        assert!(shot(Some(1.0)).0 == plain);
+        assert!(shot(Some(0.0)).0 == blank);
+        for t in [0.05, 0.5] {
+            let (px, out) = shot(Some(t));
+            for y in 0..640u32 {
+                for x in 0..900u32 {
+                    let o = ((y * 900 + x) * 4) as usize;
+                    if px[o..o + 4] != blank[o..o + 4] {
+                        assert!(out.contains(x as f32, y as f32), "{x},{y} outside at t {t}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

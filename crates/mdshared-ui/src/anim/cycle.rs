@@ -33,6 +33,8 @@ pub(super) struct Running {
     pub(super) seen: u64,
     /// The animator's time at which it next needs a frame.
     pub(super) next: Duration,
+    /// The group it was last asked for in ([`Animator::group`]).
+    pub(super) group: Option<u64>,
 }
 
 /// The least wait a blink asks for: a toggle a hair away is not a reason to spin.
@@ -172,13 +174,15 @@ impl Animator {
     /// The time since `id` was first asked for, on the animator's own clock; asking keeps it.
     /// `next` says, from that time, how long until `id` next needs a frame.
     fn run(&mut self, id: Id, next: impl FnOnce(Duration) -> Duration) -> Duration {
-        let (now, frame) = (self.time, self.frame);
+        let (now, frame, group) = (self.time, self.frame, self.group);
         let run = self.runs.entry(id.0).or_insert(Running {
             start: now,
             seen: frame,
             next: now,
+            group,
         });
         run.seen = frame;
+        run.group = group;
         let elapsed = now.saturating_sub(run.start);
         run.next = now.saturating_add(next(elapsed));
         elapsed

@@ -812,7 +812,7 @@ impl<T: Clone> Cascade<T> {
     }
 
     /// Everything the open menus draw, their shadows included: 18 px round them all for the
-    /// toolkit's shadow, and as far as each soft shadow reaches ([`Menu::presence_bounds`]).
+    /// toolkit's shadow, and as far as each soft shadow reaches.
     fn bounds(&self) -> Rect {
         let mut r = self.menus[0].rect();
         for m in &self.menus[1..] {
@@ -821,7 +821,7 @@ impl<T: Clone> Cascade<T> {
         let mut r = r.inset(-18.0);
         for m in &self.menus {
             if m.look().shadow && m.look().soft_shadow {
-                r = union(r, m.presence_bounds());
+                r = union(r, m.shadow_bounds());
             }
         }
         r
@@ -857,6 +857,25 @@ impl<T: Clone> Cascade<T> {
         });
     }
 
+    /// Everything [`draw_in_presence`](Self::draw_in_presence) and
+    /// [`draw_animated`](Self::draw_animated) touch at any `t`, as last placed: every open menu,
+    /// their shadows, the drop, a submenu's slide and a device pixel round them
+    /// ([`crate::anim::pop_bounds`]). The damage to mark while the cascade opens or closes, and
+    /// on the frame after it closed.
+    pub fn presence_bounds(&self) -> Rect {
+        let mut r = crate::anim::pop_bounds(self.bounds(), (0.0, self.drop()));
+        for menu in &self.menus[1..] {
+            let dx = if menu.opened_left() {
+                MENU_DROP
+            } else {
+                -MENU_DROP
+            };
+            let b = crate::anim::pop_bounds(menu.shadow_bounds(), (dx, 0.0));
+            r = union(r, b);
+        }
+        r
+    }
+
     /// [`draw_in_presence`](Self::draw_in_presence), with each submenu entering on its own as
     /// it opens: it fades in and slides [`MENU_DROP`] px out from its menu, by
     /// [`fluent::ENTER`], asked of `anim` under `id` and the submenu's path. A submenu that
@@ -889,7 +908,7 @@ impl<T: Clone> Cascade<T> {
                 } else {
                     -MENU_DROP
                 };
-                let b = menu.presence_bounds();
+                let b = menu.shadow_bounds();
                 pop(p, b, shown[k - 1], (dx, 0.0), |p| {
                     menu.draw_in(p, pal, area)
                 });

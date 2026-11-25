@@ -1254,3 +1254,168 @@ fn a_highlight_set_by_index_is_brought_into_view_and_refuses_what_cannot_be_chos
     menu.place_in(&mut p, area);
     assert_eq!(menu.scroll(), 0.0);
 }
+
+/// What `draw_in_presence` changes at any `t` lies in `presence_bounds`, for a menu below its
+/// anchor and one flipped above it, a toast and a dialog card, at 1x and 1.5x.
+#[test]
+fn presence_draws_stay_inside_presence_bounds() {
+    use crate::theme::LIGHT;
+    let area = Rect::new(0.0, 0.0, 400.0, 320.0);
+    let changed_outside = |scale: f32, out: Rect, draw: &dyn Fn(&mut Painter)| {
+        let (w, h) = ((400.0 * scale) as u32, (320.0 * scale) as u32);
+        let mut bmp = Bitmap::new(w, h);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+        p.fill(area, LIGHT.page);
+        let clean = bmp.pixels.clone();
+        let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+        draw(&mut p);
+        let mut n = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let o = ((y * w + x) * 4) as usize;
+                if bmp.pixels[o..o + 4] != clean[o..o + 4]
+                    && !out.contains(x as f32 / scale, y as f32 / scale)
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    for scale in [1.0, 1.5] {
+        let soft = Look {
+            shadow: true,
+            soft_shadow: true,
+            ..Look::ROUNDED
+        };
+        let hows = [
+            None,
+            Some(Entrance::Drop),
+            Some(Entrance::Unfold),
+            Some(Entrance::Side { leftward: false }),
+            Some(Entrance::Side { leftward: true }),
+            Some(Entrance::Fade),
+        ];
+        for (look, how, (ax, ay)) in [Look::ROUNDED, Look::FLAT, soft]
+            .into_iter()
+            .flat_map(|l| hows.map(move |h| (l, h)))
+            .flat_map(|(l, h)| [(40.0, 40.0), (40.0, 300.0)].map(move |a| (l, h, a)))
+        {
+            for t in [0.01, 0.1, 0.5, 0.95] {
+                let menu =
+                    std::cell::RefCell::new(Menu::new(many(5), ax, ay, false).with_look(look));
+                let draw = |p: &mut Painter| match how {
+                    None => menu.borrow_mut().draw_in_presence(p, &LIGHT, area, t),
+                    Some(how) => menu.borrow_mut().draw_in_entering(p, &LIGHT, area, t, how),
+                };
+                // Placed by the first draw; the bounds read after it.
+                let mut bmp = Bitmap::new(400, 320);
+                let mut gfx = Gfx::new();
+                menu.borrow_mut().draw_in(
+                    &mut Painter::new(&mut bmp, &mut gfx, scale),
+                    &LIGHT,
+                    area,
+                );
+                let out = menu.borrow().presence_bounds();
+                assert_eq!(
+                    changed_outside(scale, out, &draw),
+                    0,
+                    "menu at {ax},{ay}, t {t}, {look:?}, {how:?}"
+                );
+            }
+        }
+        for t in [0.01, 0.1, 0.5, 0.95] {
+            let mut bmp = Bitmap::new(400, 320);
+            let mut gfx = Gfx::new();
+            let toast = crate::overlay::Bubble::toast(
+                &mut Painter::new(&mut bmp, &mut gfx, scale),
+                "Saved",
+                area,
+            );
+            let out = toast.presence_bounds();
+            let draw = |p: &mut Painter| toast.draw_presence(p, &LIGHT, t);
+            assert_eq!(changed_outside(scale, out, &draw), 0, "toast, t {t}");
+            let card = crate::overlay::dialog_card(240.0, 160.0, 400.0, 320.0);
+            let out = crate::overlay::dialog_presence_bounds(card);
+            let draw = |p: &mut Painter| {
+                crate::anim::pop(
+                    p,
+                    crate::overlay::dialog_bounds(card),
+                    t,
+                    (0.0, crate::overlay::DIALOG_RISE),
+                    |p| {
+                        crate::overlay::draw_dialog_card(p, &LIGHT, card);
+                    },
+                )
+            };
+            assert_eq!(changed_outside(scale, out, &draw), 0, "dialog, t {t}");
+        }
+    }
+}
+
+/// The hover row's fade: at rest the plain draw, on its way something else, and under high
+/// contrast or with an animator that does not animate the plain draw at once.
+#[test]
+fn the_hover_row_fades_and_is_the_plain_draw_at_rest() {
+    use crate::anim::{Animator, Clock, ManualClock, Policy};
+    use crate::theme::LIGHT;
+    let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+    let shot = |menu: &mut Menu<u8>, anim: Option<&mut Animator>| {
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(area, LIGHT.page);
+        match anim {
+            Some(a) => menu.draw_in_animated(&mut p, &LIGHT, area, a, "menu"),
+            None => menu.draw_in(&mut p, &LIGHT, area),
+        }
+        bmp.pixels
+    };
+    let mut menu = Menu::new(many(4), 40.0, 40.0, false);
+    let clock = ManualClock::new();
+    let mut anim = Animator::new();
+    let mut frame = |menu: &mut Menu<u8>, ms: u64| {
+        clock.advance_ms(ms);
+        anim.begin_frame(clock.now());
+        let px = shot(menu, Some(&mut anim));
+        anim.end_frame();
+        px
+    };
+    menu.highlight(1);
+    assert!(
+        frame(&mut menu, 0) == shot(&mut menu, None),
+        "first seen: at rest"
+    );
+    menu.highlight(2);
+    frame(&mut menu, 16);
+    let moving = frame(&mut menu, 40);
+    assert!(
+        moving != shot(&mut menu, None),
+        "row 2 fading in, row 1 out"
+    );
+    for _ in 0..20 {
+        frame(&mut menu, 16);
+    }
+    assert!(frame(&mut menu, 16) == shot(&mut menu, None), "arrived");
+    let mut still = Animator::new();
+    still.set_policy(Policy::Never);
+    still.begin_frame(clock.now());
+    menu.highlight(3);
+    assert!(shot(&mut menu, Some(&mut still)) == shot(&mut menu, None));
+    still.end_frame();
+    menu.set_high_contrast(true);
+    menu.highlight(0);
+    let mut anim = Animator::new();
+    anim.begin_frame(clock.now());
+    shot(&mut menu, Some(&mut anim));
+    anim.end_frame();
+    menu.highlight(1);
+    clock.advance_ms(40);
+    anim.begin_frame(clock.now());
+    assert!(
+        shot(&mut menu, Some(&mut anim)) == shot(&mut menu, None),
+        "high contrast: at once"
+    );
+    anim.end_frame();
+}

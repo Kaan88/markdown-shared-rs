@@ -355,6 +355,8 @@ pub struct Menu<T> {
     /// The highlighted row is drawn in the palette's accent with `on_accent`
     /// ([`set_high_contrast`](Self::set_high_contrast)).
     high_contrast: bool,
+    /// Each row's hover fill, while [`draw_in_animated`](Self::draw_in_animated) draws.
+    fade: Option<Vec<f32>>,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -390,6 +392,7 @@ impl<T: Clone> Menu<T> {
             look: Look::ROUNDED,
             min_w: 0.0,
             high_contrast: false,
+            fade: None,
         }
     }
 
@@ -711,12 +714,26 @@ impl<T: Clone> Menu<T> {
             }
             let lit = self.hover == Some(i) && item.enabled;
             let strong = lit && self.high_contrast;
-            if lit {
-                let fill = if strong { pal.accent } else { pal.hover };
-                if look.hover_radius > 0.0 {
-                    p.rbox(r, look.hover_radius, fill);
-                } else {
-                    p.fill(r, fill);
+            match self.fade.as_ref().and_then(|f| f.get(i).copied()) {
+                // Under high contrast the highlight is at once, as the system's.
+                Some(a) if !self.high_contrast && a < 1.0 => {
+                    if a > 0.0 {
+                        if look.hover_radius > 0.0 {
+                            p.rbox_a(r, look.hover_radius, pal.hover, a);
+                        } else {
+                            p.fill_a(r, pal.hover, a);
+                        }
+                    }
+                }
+                _ => {
+                    if lit {
+                        let fill = if strong { pal.accent } else { pal.hover };
+                        if look.hover_radius > 0.0 {
+                            p.rbox(r, look.hover_radius, fill);
+                        } else {
+                            p.fill(r, fill);
+                        }
+                    }
                 }
             }
             // Under high contrast everything on the highlighted row reads on Highlight.
@@ -800,14 +817,40 @@ impl<T: Clone> Menu<T> {
         } else {
             -MENU_DROP
         };
-        let bounds = self.presence_bounds();
+        let bounds = self.shadow_bounds();
         crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
+    }
+
+    /// Everything [`draw_in_presence`](Self::draw_in_presence) and
+    /// [`draw_in_entering`](Self::draw_in_entering) touch at any `t`, with any [`Entrance`], as
+    /// last placed: the frame, its shadow, the drop or slide and a device pixel round them
+    /// ([`crate::anim::pop_bounds`]). The damage to mark while the menu opens or closes, and on
+    /// the frame after it closed.
+    pub fn presence_bounds(&self) -> Rect {
+        let b = self.shadow_bounds();
+        let drop = if self.opened_above() {
+            MENU_DROP
+        } else {
+            -MENU_DROP
+        };
+        let mut r = crate::anim::pop_bounds(b, (0.0, drop));
+        for side in [(-MENU_DROP, 0.0), (MENU_DROP, 0.0)] {
+            let s = crate::anim::pop_bounds(b, side);
+            let (x, y) = (r.x.min(s.x), r.y.min(s.y));
+            r = Rect::new(
+                x,
+                y,
+                r.right().max(s.right()) - x,
+                r.bottom().max(s.bottom()) - y,
+            );
+        }
+        r
     }
 
     /// What the menu draws where it was last placed, its shadow included: the rectangle a
     /// fade or a slide of it must take whole. 18 px round it for the toolkit's shadow; the
     /// soft shadow's reach ([`soft_bounds`]) in a look with [`Look::soft_shadow`].
-    pub(crate) fn presence_bounds(&self) -> Rect {
+    pub(crate) fn shadow_bounds(&self) -> Rect {
         if self.look.shadow && self.look.soft_shadow {
             soft_bounds(self.rect, &Shade::POPUP)
         } else {
@@ -852,7 +895,7 @@ impl<T: Clone> Menu<T> {
             // one above does.
             Entrance::Unfold if self.opened_above() => (0.0, drop),
             Entrance::Unfold => {
-                let (rect, bounds) = (self.rect, self.presence_bounds());
+                let (rect, bounds) = (self.rect, self.shadow_bounds());
                 crate::anim::unfold(p, rect, bounds, t, |p| draw(p, self));
                 return;
             }
@@ -860,14 +903,39 @@ impl<T: Clone> Menu<T> {
             Entrance::Side { leftward: true } => (MENU_DROP, 0.0),
             Entrance::Fade => (0.0, 0.0),
         };
-        let bounds = self.presence_bounds();
+        let bounds = self.shadow_bounds();
         crate::anim::pop(p, bounds, t, shift, |p| draw(p, self));
     }
 
     /// Everything the menu draws where it was last placed, its shadow included: what a fade of
     /// it must take whole.
     pub fn drawn_bounds(&self) -> Rect {
-        self.presence_bounds()
+        self.shadow_bounds()
+    }
+
+    /// [`draw_in`](Self::draw_in) with the hover row's fill fading in on the row the pointer or
+    /// the keys reach and out on the one they left (roadmap X3), by
+    /// [`crate::anim::document::HOVER`]. `id` names the menu in `anim`. At rest, and when the
+    /// animator does not animate, this is `draw_in`, pixel for pixel; under high contrast the
+    /// highlight is at once.
+    pub fn draw_in_animated(
+        &mut self,
+        p: &mut Painter,
+        pal: &Palette,
+        area: Rect,
+        anim: &mut crate::anim::Animator,
+        id: impl crate::anim::AsId,
+    ) {
+        let id = crate::anim::Id::new(id);
+        let fade = (0..self.items.len())
+            .map(|i| {
+                let on = self.hover == Some(i) && self.items[i].enabled;
+                anim.toggle(id.with(("row", i)), on, crate::anim::document::HOVER)
+            })
+            .collect();
+        self.fade = Some(fade);
+        self.draw_in(p, pal, area);
+        self.fade = None;
     }
 
     /// Where the menu was last placed.

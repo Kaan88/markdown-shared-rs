@@ -437,9 +437,38 @@ mod imp {
         ) == Some(0)
     }
 
-    /// Windows is asked directly and has nothing to watch here: the application reads again on
-    /// winit's `ThemeChanged` or when its window gains the focus.
-    pub fn watch_motion_reduced(_wake: impl Fn() + Send + Sync + 'static) {}
+    /// Whom to wake when "Animation effects" changes; replaced by each
+    /// [`watch_motion_reduced`].
+    static MOTION_WAKE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+    /// The setting as last seen by the watching window.
+    pub(super) static MOTION_SEEN: Mutex<Option<bool>> = Mutex::new(None);
+
+    /// The contrast's hidden window hears the change too (`SPI_SETCLIENTAREAANIMATION` comes as
+    /// a `WM_SETTINGCHANGE`); see the public doc.
+    pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
+        *MOTION_SEEN.lock().unwrap_or_else(PoisonError::into_inner) = Some(motion_reduced());
+        *MOTION_WAKE.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(wake));
+        contrast_window();
+    }
+
+    /// Reads "Animation effects" now and wakes the application if it is not what was seen
+    /// last. Nothing is read before a watch was asked for.
+    fn motion_maybe_changed() {
+        let wake = MOTION_WAKE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(wake) = wake else {
+            return;
+        };
+        let changed = super::note_change(
+            &mut MOTION_SEEN.lock().unwrap_or_else(PoisonError::into_inner),
+            motion_reduced(),
+        );
+        if changed {
+            wake();
+        }
+    }
 
     /// "Animation effects" in Settings, Accessibility, Visual effects (before Windows 11:
     /// "Show animations in Windows"), which is `SPI_GETCLIENTAREAANIMATION`: whether a window
@@ -582,6 +611,11 @@ mod imp {
         // setting's change finds nothing changed and wakes no one.
         if msg == WM_SETTINGCHANGE || msg == WM_SYSCOLORCHANGE {
             contrast_maybe_changed();
+        }
+        // "Animation effects" in Settings is `SPI_SETCLIENTAREAANIMATION`, broadcast as a
+        // setting change.
+        if msg == WM_SETTINGCHANGE {
+            motion_maybe_changed();
         }
         // SAFETY: the arguments are the ones this window procedure was called with.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1386,8 +1420,13 @@ pub fn motion_reduced() -> bool {
 /// time `wake` is given, `wake` is called once at once, on the caller's thread, so an answer
 /// that came first is not missed.
 ///
-/// On Windows and macOS nothing changes behind the application's back (the system tells the
-/// window, and the application reads again then), so the wake is dropped and never called.
+/// On Windows `wake` is also called when "Animation effects" is switched in Settings while the
+/// application runs: the hidden window of [`watch_contrast`] (made on the first call of either,
+/// with its thread) hears the setting's `WM_SETTINGCHANGE` and reads it again, and calls `wake`
+/// when it differs from what it read last. winit tells the window of no such change, so before
+/// this the setting was read only when the window got the keyboard back. On macOS nothing
+/// changes behind the application's back (the application reads again when its window gains
+/// the focus), so the wake is dropped and never called.
 pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
     imp::watch_motion_reduced(wake)
 }
@@ -1988,9 +2027,14 @@ mod contrast_tests {
         watch_contrast(|| panic!("never called"));
     }
 
+    /// The two tests of the hidden window send it messages that each other's watch hears.
+    #[cfg(windows)]
+    static HIDDEN_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(windows)]
     #[test]
     fn the_hidden_window_wakes_only_when_the_contrast_differs_from_the_last_seen() {
+        let _one = HIDDEN_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             SendMessageW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
         };
@@ -2016,6 +2060,38 @@ mod contrast_tests {
         send(WM_SYSCOLORCHANGE);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
         // Seen now: the next message wakes no one.
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_window_wakes_when_animation_effects_differ_from_the_last_seen() {
+        let _one = HIDDEN_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch_motion_reduced(move || {
+            _ = tx.send(());
+        });
+        let hwnd = imp::contrast_window().expect("the hidden window is made");
+        let send = |msg| {
+            // SAFETY: the window is ours and alive; both messages take no pointers here. The
+            // call returns once the window's thread has handled the message.
+            unsafe { SendMessageW(hwnd as _, msg, 0, 0) };
+        };
+        // Nothing changed: no wake.
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
+        // As just after a switch: what was seen differs from the system now.
+        *imp::MOTION_SEEN.lock().unwrap() = Some(!motion_reduced());
+        // A colour change is not a setting change.
+        send(WM_SYSCOLORCHANGE);
+        assert!(rx.try_recv().is_err());
+        send(WM_SETTINGCHANGE);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        // Seen now.
         send(WM_SETTINGCHANGE);
         assert!(rx.try_recv().is_err());
     }
