@@ -549,6 +549,18 @@ third of the blur, shadowed the corners' partial pixels whole, or ignored the st
 its limits, its soft shadow, its capitals, its neutral segments or `set_style`'s answer each
 failed a test. mdplay's shots show all of it (its own commit).
 
+The review's fixes (2026-11-25): a cascade (`submenu::Cascade::draw_in_presence`,
+`draw_animated`) fades and slides each soft-shadowed menu's whole shadow, as `Menu` does
+(`Menu::presence_bounds`), where it took 18 px round them; a cascade without the soft shadow
+takes what it took. A corner is cut into one strip per half deviation of its curve, the strips
+spaced round the curve and each taking off exactly the area the curve leaves in it, where it
+took a strip per pixel of radius whatever the blur: the shadow is within half a level of 255 of
+a corner cut finely (strips a pixel high were up to 1.8 levels off at the dialog's corners), and
+the Look dialog at 150% with its largest corners paints in 5.44 to 5.54 ms against 5.86 to 5.96
+(mdplay's shots, opt-level 3 without LTO). `draw_dialog_card_with` takes a radius that is not
+finite or is negative as the classic 10 for the shadow, the card and its footer alike. A form
+in the classic style is held to the frozen copy of the form before styles, pixel for pixel.
+
 Not verified: seen by the owner; Linux and macOS (CI not run); Wine; mdview and mdedit not
 rebuilt against the branch (they name none of it).
 
