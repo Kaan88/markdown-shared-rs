@@ -47,6 +47,29 @@ pub(super) struct Fx<'a> {
     high_contrast: bool,
 }
 
+impl<'a> Fx<'a> {
+    /// The motion of a form named `id` in `anim`; highlights change at once under
+    /// `high_contrast`. The paged form (`settings::pages`) draws with this too.
+    pub(super) fn new(anim: &'a mut Animator, id: Id, high_contrast: bool) -> Fx<'a> {
+        Fx {
+            anim,
+            id,
+            high_contrast,
+        }
+    }
+
+    /// The same motion with every name under `part` as well: the paged form names the values
+    /// of a page's rows under the page, so a row of another page at the same index and with
+    /// the same id starts at rest.
+    pub(super) fn under(&mut self, part: impl std::hash::Hash) -> Fx<'_> {
+        Fx {
+            anim: &mut *self.anim,
+            id: self.id.with(part),
+            high_contrast: self.high_contrast,
+        }
+    }
+}
+
 impl Fx<'_> {
     /// How far row `i`'s hover fill has come in, 0 to 1.
     pub(super) fn row(&mut self, i: usize, row_id: Option<u32>, hovered: bool) -> f32 {

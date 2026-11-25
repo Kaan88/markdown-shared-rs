@@ -1157,3 +1157,49 @@ An `#[ignore]`d sheet, `disclosure_sheet`, writes the turn in eleven steps at 10
 Only an agent has looked at that sheet. **Not seen by a person**, and not wired into mdview or
 mdedit: no tree in a running application has turned its chevron yet. Linux and macOS: not run
 (nothing here is platform code).
+
+## The paged settings form in motion (`settings::pages::Form::draw_animated`, 2026-11-25, `feat/pages-motion`, roadmap L10)
+
+Roadmap L10 gave the single-page `settings::Form` an opt-in animated draw, but mdview and mdedit
+draw the paged form, `settings::pages::Form`, which had none. It now has the same opt-in:
+`pages::Form::draw_animated(p, pal, window, caret_on, anim, id)` and
+`pages::Form::set_high_contrast(on) -> bool`, in `settings/pages/motion.rs`. Where the paged
+form has the single-page form's pieces it moves as that form does, through the same helpers
+(`settings/motion.rs`'s `Fx`, which gained a constructor and `under(part)`, a view with every
+name under one more part; nothing it did changed): a toggle row's knob slides and its fill
+fades in (`fluent::MOVE`); the chosen segment of a segmented choice slides to the new one (a
+disabled row's paler fill too; a label reads as chosen while the fill is under its middle);
+a page's hover fill in the list fades by `document::HOVER`; the open dropdown's hover row fades
+(`Menu::draw_in_animated`). Names in the animator are made from `id`, the page, the row's index
+and the row's id (the list's from `id` and the place in the list), so a row replaced by
+`set_pages`, or the row in the same place on another page, starts at rest, and two rows never
+ask one name in a frame. Under high contrast the list's hover, the menu's row and the chosen
+segment change at once; a switch still slides. A page shown is drawn at rest at once.
+
+The paged form has no row hover fill and no scrollbar (a page never scrolls), so neither has
+anything to animate; the hover of the ×, the steppers, the buttons, a text field's edge and a
+dropdown's field change at once, as the single-page form's Close button and steppers do. A
+number row the single-page form shows as a slider stays a stepper here. pages.rs gained only
+the hooks: a private `high_contrast` field, `draw` calling a shared `draw_with(.., None)`, and
+a branch on the animator at the category fill, the switch, the segmented choice and the menu.
+With no animator `draw_with` takes the paths `draw` took. `settings/pages/frozen.rs` is a copy
+of `draw` and `draw_row` as they stood on main (6ec1dee), for tests only.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (12 tests in
+`settings/pages/motion_tests.rs`, on `anim::ManualClock` in 16 ms frames: `draw` equals the
+frozen copy in 18 states (every page, a hover on every kind of target, a held press, the
+keyboard's rings, an open menu with a hover row, a disabled row) in both themes at scale 1 and
+1.5 and at 520 x 360; `draw_animated` equals `draw` once settled in all 18 states in both
+themes, and on every frame under `Policy::Never` after each of them and after values set from
+outside; it differs in motion for the switch (light and dark), the segment (light and dark),
+the disabled row's segment, the list's hover coming in and going out and the menu's row, and
+equals `draw` again once settled; a page shown mid-slide is at rest at once and the slide
+finishes when its page comes back; a row put in a moving switch's place by `set_pages` starts
+at rest; under high contrast the list's hover, a segment and the menu's row are at once while a
+switch slides; odd windows (empty, 1 x 1, NaN wide, a negative height) and odd pages do not
+panic), with `settings/pages/tests.rs`, `settings::unchanged`, `settings::frozen` and the style
+tests unchanged and passing; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
+Found, not changed: `pages::Form::draw` (on main as now) overflows an integer in `gfx.rs` in a
+debug build when the window is infinitely wide. Not seen by a person in a running app; mdview
+and mdedit do not call it yet.

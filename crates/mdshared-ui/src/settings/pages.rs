@@ -22,6 +22,7 @@
 //! and Ctrl+PageDown change page from anywhere and leave the keyboard in the list. Disabled rows
 //! are skipped. Escape closes an open dropdown, then the dialog.
 
+use super::motion::Fx;
 use super::{Outcome, Row, Value, draw_toggle, number_text, ring};
 use crate::gfx::{Face, Painter, Rect, mix};
 use crate::glyph;
@@ -744,6 +745,8 @@ pub struct Form {
     /// The current page's rows, valid while `placed_page` is the current page.
     placed: Vec<Placed>,
     placed_page: Option<usize>,
+    /// The system's contrast theme: `draw_animated` changes highlights at once (motion.rs).
+    high_contrast: bool,
 }
 
 impl Form {
@@ -764,6 +767,7 @@ impl Form {
             geo: Geo::default(),
             placed: Vec::new(),
             placed_page: None,
+            high_contrast: false,
         };
         f.set_pages(pages);
         f
@@ -1712,6 +1716,19 @@ impl Form {
     /// Lays the dialog out in `window` and draws it over a dimmed window. `caret_on` is the blink
     /// phase of a focused text box.
     pub fn draw(&mut self, p: &mut Painter, pal: &Colors, window: Rect, caret_on: bool) {
+        self.draw_with(p, pal, window, caret_on, None);
+    }
+
+    /// [`draw`](Self::draw), with the motion of [`draw_animated`](Self::draw_animated) when
+    /// `fx` is given. With `None` this is the drawing `draw` has always done.
+    fn draw_with(
+        &mut self,
+        p: &mut Painter,
+        pal: &Colors,
+        window: Rect,
+        caret_on: bool,
+        mut fx: Option<&mut Fx<'_>>,
+    ) {
         self.layout(p, window);
         draw_backdrop(p, pal, window.w, window.h);
         let g = self.geo;
@@ -1781,8 +1798,17 @@ impl Form {
                     MARK_W / 2.0,
                     pal.accent,
                 );
-            } else if self.hover == Some(Target::Category(c)) {
-                p.rbox(it, 6.0, pal.hover);
+            } else {
+                let hovered = self.hover == Some(Target::Category(c));
+                let fade = match fx.as_deref_mut() {
+                    Some(fx) => fx.category(c, hovered),
+                    None => f32::from(u8::from(hovered)),
+                };
+                if fade >= 1.0 {
+                    p.rbox(it, 6.0, pal.hover);
+                } else if fade > 0.0 {
+                    p.rbox_a(it, 6.0, pal.hover, fade);
+                }
             }
             p.text(
                 Face::Ui,
@@ -1796,7 +1822,8 @@ impl Form {
         }
         p.restore(old);
 
-        // The page.
+        // The page. Its rows' motion is named under the page.
+        let mut fx = fx.map(|fx| fx.under(("page", self.current)));
         let old = p.clip(g.page);
         let n = self.placed.len();
         for i in 0..n {
@@ -1807,13 +1834,16 @@ impl Form {
                 .placed
                 .get(i + 1)
                 .is_some_and(|pl| pl.kind != Kind::Gap);
-            self.draw_row(p, pal, i, next_is_row, caret_on);
+            self.draw_row(p, pal, i, next_is_row, caret_on, fx.as_mut());
         }
         p.restore(old);
 
         // An open dropdown, over everything.
-        if let Some((_, menu)) = &mut self.menu {
-            menu.draw_in(p, pal, window);
+        if let Some((row, menu)) = &mut self.menu {
+            match fx.as_mut() {
+                Some(fx) => fx.menu(p, pal, window, *row, menu),
+                None => menu.draw_in(p, pal, window),
+            }
         }
     }
 
@@ -1824,6 +1854,7 @@ impl Form {
         i: usize,
         next_is_row: bool,
         caret: bool,
+        mut fx: Option<&mut Fx<'_>>,
     ) {
         let g = self.geo;
         let Some(it) = self.item(i).cloned() else {
@@ -1904,18 +1935,15 @@ impl Form {
         let ctrl = pl.ctrl;
         let bg = pal.popup;
         match &it.row {
-            Row::Toggle { value, .. } => {
+            Row::Toggle { value, id, .. } => {
                 if ring_on {
                     ring(p, pal, ctrl, TOGGLE_H / 2.0, bg);
                 }
-                draw_toggle(
-                    p,
-                    pal,
-                    ctrl,
-                    *value,
-                    hov(Target::Toggle(i)),
-                    held(Target::Toggle(i)),
-                );
+                let (h, pr) = (hov(Target::Toggle(i)), held(Target::Toggle(i)));
+                match fx.as_deref_mut() {
+                    Some(fx) => fx.toggle(p, pal, (i, *id), ctrl, *value, h, pr),
+                    None => draw_toggle(p, pal, ctrl, *value, h, pr),
+                }
                 if off {
                     p.rbox_a(ctrl.inset(-1.0), TOGGLE_H / 2.0, pal.popup, 0.55);
                 }
@@ -1925,19 +1953,36 @@ impl Form {
                     ring(p, pal, ctrl, 6.0, bg);
                 }
                 p.frame(ctrl, 6.0, pal.field, pal.line);
+                let fill = if off {
+                    mix(pal.accent, pal.popup, 0.55)
+                } else {
+                    pal.accent
+                };
+                let pill = fx.and_then(|fx| {
+                    let to = self.segment(i, *value);
+                    fx.pill(i, it.row.id(), ctrl, to)
+                });
+                if let Some(pill) = pill {
+                    // In motion: the hovered segment's fill, then the chosen fill on its way.
+                    for k in 0..options.len() {
+                        if k != *value && hov(Target::Segment(i, k)) {
+                            p.rbox(self.segment(i, k), 4.0, pal.hover);
+                        }
+                    }
+                    p.rbox(pill, 4.0, fill);
+                }
                 for (k, o) in options.iter().enumerate() {
                     let s = self.segment(i, k);
                     let on = k == *value;
-                    if on {
-                        let fill = if off {
-                            mix(pal.accent, pal.popup, 0.55)
-                        } else {
-                            pal.accent
-                        };
+                    if pill.is_some() {
+                        // Drawn above.
+                    } else if on {
                         p.rbox(s, 4.0, fill);
                     } else if hov(Target::Segment(i, k)) {
                         p.rbox(s, 4.0, pal.hover);
                     }
+                    // In motion a label reads as chosen while the fill is under its middle.
+                    let on = pill.map_or(on, |r| r.contains(s.cx(), s.cy()));
                     let c = if on {
                         pal.on_accent
                     } else if off {
@@ -2055,5 +2100,11 @@ fn stepper_parts(c: Rect) -> (Rect, Rect, Rect) {
     )
 }
 
+mod motion;
+
+#[cfg(test)]
+mod frozen;
+#[cfg(test)]
+mod motion_tests;
 #[cfg(test)]
 mod tests;
