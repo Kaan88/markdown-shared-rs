@@ -3,7 +3,7 @@
 //! keycaps). The application chooses the texts, the card size and the hit ids.
 
 use crate::anim::pop;
-use crate::gfx::{Face, Painter, Rect, mix};
+use crate::gfx::{Face, LIGHT_SHADOW, Painter, Rect, Shade, mix};
 use crate::theme::Palette;
 
 // ---- toast, link hint, tooltip ---------------------------------------------------------------
@@ -114,12 +114,12 @@ impl Bubble {
                 );
             }
             Kind::Toast => {
-                p.shadow(r, 8.0, pal.dark);
+                p.shadow_under_frame(r, 8.0, pal.dark, 1.0);
                 p.frame(r, 8.0, pal.popup, pal.popup_line);
                 p.text_center(Face::Ui, 13.0, r.inset(10.0), &self.text, pal.text);
             }
             Kind::Tip => {
-                p.shadow(r, 5.0, pal.dark);
+                p.shadow_under_frame(r, 5.0, pal.dark, 1.0);
                 p.frame(r, 5.0, pal.popup, pal.popup_line);
                 p.text(
                     Face::Ui,
@@ -144,6 +144,9 @@ pub const TOAST_RISE: f32 = 8.0;
 /// Padding inside a dialog card, and the height of its button footer.
 pub const DIALOG_PAD: f32 = 24.0;
 pub const DIALOG_FOOTER: f32 = 72.0;
+/// The roundest a dialog card's corners go. Its footer rounds with it up to here (the footer
+/// is 72 px; a card this round is mostly corner already).
+pub const MAX_CARD_RADIUS: f32 = (DIALOG_FOOTER - 1.0 + 12.0) / 2.0 + 1.0;
 /// A `cw` x `ch` card centred in a `w` x `h` window, shrunk to fit small windows.
 pub fn dialog_card(cw: f32, ch: f32, w: f32, h: f32) -> Rect {
     let cw = cw.min(w - 32.0).max(200.0);
@@ -204,11 +207,45 @@ pub const DIALOG_RISE: f32 = 10.0;
 /// Draws the card's shadow, body and button footer. Returns the footer rectangle; buttons go
 /// at `footer.y + (DIALOG_FOOTER - 32.0) / 2.0`, 32 px high.
 pub fn draw_dialog_card(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
-    p.shadow(r, 10.0, pal.dark);
-    if pal.dark {
-        p.shadow(r, 10.0, true);
+    draw_dialog_card_with(p, pal, r, 10.0, None)
+}
+
+/// [`draw_dialog_card`] with corners of `radius` (the footer's follow them) and a choice of
+/// shadow: `None` is the toolkit's (twice on a dark palette), `Some(k)` the soft popup shadow
+/// a web page draws ([`Painter::soft_shadow`] with [`Shade::POPUP`]) at strength `k`, times
+/// [`LIGHT_SHADOW`] on a light palette; 0 draws none. `draw_dialog_card` is this with 10 and
+/// `None`, pixel for pixel. The soft shadow reaches further than [`dialog_bounds`]; its
+/// bounds are [`soft_bounds`](crate::gfx::soft_bounds)`(card, &Shade::POPUP)`. A radius that
+/// is not finite or is negative is the classic 10, for the shadow, the card and the footer alike;
+/// one larger than [`MAX_CARD_RADIUS`] is that, so the footer's corners can follow the card's.
+pub fn draw_dialog_card_with(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    radius: f32,
+    soft: Option<f32>,
+) -> Rect {
+    let radius = if radius.is_finite() && radius >= 0.0 {
+        radius.min(MAX_CARD_RADIUS)
+    } else {
+        10.0
+    };
+    match soft {
+        Some(k) => {
+            let k = k * if pal.dark { 1.0 } else { LIGHT_SHADOW };
+            p.soft_shadow(r, radius, &Shade::POPUP, k);
+        }
+        None => {
+            // The frame below covers the card's middle opaquely, so the shadow leaves it out:
+            // the pixels are those of the whole shadow, at a fraction of the cost under a large
+            // dialog.
+            p.shadow_under_frame(r, radius, pal.dark, 1.0);
+            if pal.dark {
+                p.shadow_under_frame(r, radius, true, 1.0);
+            }
+        }
     }
-    p.frame(r, 10.0, pal.popup, pal.popup_line);
+    p.frame(r, radius, pal.popup, pal.popup_line);
     let footer = Rect::new(
         r.x + 1.0,
         r.bottom() - DIALOG_FOOTER,
@@ -216,9 +253,12 @@ pub fn draw_dialog_card(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
         DIALOG_FOOTER - 1.0,
     );
     let old = p.clip(footer);
+    // The fill's top corners sit above the footer, out of its clip: lifted by the radius (12 at
+    // least, as it always was), a rounder card's could not reach down into it.
+    let lift = radius.max(12.0);
     p.rbox(
-        Rect::new(footer.x, footer.y - 12.0, footer.w, footer.h + 12.0),
-        9.0,
+        Rect::new(footer.x, footer.y - lift, footer.w, footer.h + lift),
+        (radius - 1.0).max(0.0),
         mix(
             pal.popup,
             if pal.dark { [0, 0, 0] } else { pal.bar },
@@ -577,5 +617,259 @@ mod tests {
         assert!(r.x >= 0.0 && r.y >= 0.0 && r.right() <= 520.0 && r.bottom() <= 360.0);
         let r = dialog_card(460.0, 236.0, 1000.0, 700.0);
         assert_eq!((r.x, r.y, r.w, r.h), (270.0, 232.0, 460.0, 236.0));
+    }
+
+    /// `draw_dialog_card` as it stood before its shadow left out what the card covers, copied
+    /// whole: the whole shadow (twice on a dark palette), then the card and its footer.
+    fn card_before(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
+        p.shadow(r, 10.0, pal.dark);
+        if pal.dark {
+            p.shadow(r, 10.0, true);
+        }
+        p.frame(r, 10.0, pal.popup, pal.popup_line);
+        let footer = Rect::new(
+            r.x + 1.0,
+            r.bottom() - DIALOG_FOOTER,
+            r.w - 2.0,
+            DIALOG_FOOTER - 1.0,
+        );
+        let old = p.clip(footer);
+        p.rbox(
+            Rect::new(footer.x, footer.y - 12.0, footer.w, footer.h + 12.0),
+            9.0,
+            mix(
+                pal.popup,
+                if pal.dark { [0, 0, 0] } else { pal.bar },
+                if pal.dark { 0.22 } else { 0.7 },
+            ),
+        );
+        p.restore(old);
+        let px = p.px();
+        p.fill(Rect::new(footer.x, footer.y, footer.w, px), pal.popup_line);
+        footer
+    }
+
+    /// A window with a backdrop and `draw` on it at `scale`. Under the backdrop is a pattern
+    /// that differs from one pixel to the next, so that a shadow blended where it was not
+    /// before cannot round away to the same bytes.
+    fn window(pal: &Palette, scale: f32, draw: impl FnOnce(&mut Painter<'_>)) -> Bitmap {
+        let mut bmp = Bitmap::new(420, 340);
+        for (i, px) in bmp.pixels.chunks_mut(4).enumerate() {
+            let v = (i * 37 % 251) as u8;
+            px.copy_from_slice(&[v, 255 - v, v / 2 + 60, 255]);
+        }
+        let mut gfx = Gfx::new();
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            p.rbox(Rect::new(30.0, 40.0, 150.0, 90.0), 6.0, pal.accent);
+            draw_backdrop(&mut p, pal, 420.0, 340.0);
+            draw(&mut p);
+        }
+        bmp
+    }
+
+    #[test]
+    fn a_dialog_card_draws_as_it_did_when_its_whole_shadow_was_blended() {
+        let cards = [
+            Rect::new(40.0, 30.0, 200.0, 160.0),
+            Rect::new(17.3, 21.65, 150.45, 111.15),
+            Rect::new(33.7, 12.2, 181.9, 123.35),
+            Rect::new(60.5, 50.5, 40.0, 70.0),
+            Rect::new(80.25, 40.75, 30.1, 20.3),
+            Rect::new(100.0, 100.0, 12.0, 4.0),
+            Rect::new(-20.4, -10.6, 120.0, 90.0),
+            Rect::new(150.9, 120.1, 300.0, 200.0),
+        ];
+        for pal in [&LIGHT, &DARK] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                for r in cards {
+                    let was = window(pal, scale, |p| {
+                        card_before(p, pal, r);
+                    });
+                    let now = window(pal, scale, |p| {
+                        draw_dialog_card(p, pal, r);
+                    });
+                    assert!(
+                        was.pixels == now.pixels,
+                        "{r:?} at {scale}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_toast_and_a_tip_draw_as_they_did_when_their_whole_shadow_was_blended() {
+        for pal in [&LIGHT, &DARK] {
+            for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+                for kind in [Kind::Toast, Kind::Tip] {
+                    for rect in [
+                        Rect::new(60.0, 40.0, 180.0, 36.0),
+                        Rect::new(41.35, 77.7, 133.3, 23.45),
+                    ] {
+                        let bubble = Bubble {
+                            kind,
+                            rect,
+                            text: "Saved to the library".to_string(),
+                        };
+                        let drawn = |whole: bool| {
+                            crate::gfx::WHOLE_SHADOW.with(|w| w.set(whole));
+                            let bmp = window(pal, scale, |p| bubble.draw(p, pal));
+                            crate::gfx::WHOLE_SHADOW.with(|w| w.set(false));
+                            bmp.pixels
+                        };
+                        assert!(
+                            drawn(true) == drawn(false),
+                            "{kind:?} {rect:?} at {scale}, dark {}",
+                            pal.dark
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_drawn_with_the_classic_corners_and_shadow_is_draw_dialog_card() {
+        let r = Rect::new(17.3, 21.65, 150.45, 111.15);
+        for pal in [&LIGHT, &DARK] {
+            for scale in [1.0, 1.5] {
+                let was = window(pal, scale, |p| {
+                    card_before(p, pal, r);
+                });
+                let now = window(pal, scale, |p| {
+                    draw_dialog_card_with(p, pal, r, 10.0, None);
+                });
+                assert!(was.pixels == now.pixels, "at {scale}, dark {}", pal.dark);
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_given_a_radius_out_of_reason_draws_with_the_classic_corners_throughout() {
+        // Not finite or negative: the shadow, the card and its footer all take 10, so no square
+        // footer corner pokes out of a pill-shaped card.
+        let r = Rect::new(17.3, 21.65, 150.45, 111.15);
+        for pal in [&LIGHT, &DARK] {
+            for soft in [None, Some(0.6)] {
+                let ten = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, 10.0, soft);
+                });
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0] {
+                    let got = window(pal, 1.0, |p| {
+                        draw_dialog_card_with(p, pal, r, bad, soft);
+                    });
+                    assert!(
+                        got.pixels == ten.pixels,
+                        "{bad}, {soft:?}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_round_cards_footer_is_flat_along_its_top_edge() {
+        // Corners over 13: the footer's fill used to start 12 px up, so its own top corners came
+        // down into the footer and showed the card's colour in two notches under its line.
+        let r = Rect::new(20.0, 18.0, 320.0, 260.0);
+        for pal in [&LIGHT, &DARK] {
+            for radius in [14.0, 30.0, MAX_CARD_RADIUS] {
+                let b = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, radius, None);
+                });
+                let y = r.bottom() - DIALOG_FOOTER + 3.0;
+                let mid = at(&b, r.cx(), y);
+                for x in [r.x + 2.5, r.right() - 2.5] {
+                    assert_eq!(at(&b, x, y), mid, "{radius} at {x}, dark {}", pal.dark);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_rounder_than_its_footer_can_follow_draws_at_the_roundest_it_can() {
+        // Past MAX_CARD_RADIUS the footer's fill cannot round with the card, so its bottom
+        // corners would stand out square beyond the card's curve: the card stops there instead.
+        let r = Rect::new(20.0, 18.0, 320.0, 260.0);
+        for pal in [&LIGHT, &DARK] {
+            for soft in [None, Some(0.6)] {
+                let most = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, MAX_CARD_RADIUS, soft);
+                });
+                let less = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, MAX_CARD_RADIUS - 8.0, soft);
+                });
+                assert!(
+                    less.pixels != most.pixels,
+                    "the radius still shows below the cap"
+                );
+                for big in [MAX_CARD_RADIUS + 0.5, 60.0, 500.0, f32::MAX] {
+                    let got = window(pal, 1.0, |p| {
+                        draw_dialog_card_with(p, pal, r, big, soft);
+                    });
+                    assert!(
+                        got.pixels == most.pixels,
+                        "{big}, {soft:?}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_soft_card_casts_the_popup_shadow_at_its_strength_and_none_at_zero() {
+        use crate::gfx::soft_bounds;
+        // On white, so the shadow's alpha reads back; the card's middle is its own colour.
+        let draw = |pal: &Palette, k: Option<f32>, radius: f32| {
+            let mut bmp = Bitmap::new(420, 340);
+            bmp.clear([255, 255, 255]);
+            let mut gfx = Gfx::new();
+            {
+                let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+                draw_dialog_card_with(&mut p, pal, Rect::new(60.0, 40.0, 300.0, 200.0), radius, k);
+            }
+            bmp
+        };
+        let alpha = |b: &Bitmap, y: f32| 1.0 - at(b, 210.0, y)[1] as f32 / 255.0;
+        let dark = draw(&DARK, Some(0.6), 8.0);
+        // Just under the card about a third dark, a sixth 8 px down, nothing 46 px down.
+        assert!(
+            (alpha(&dark, 240.0) - 0.35).abs() < 0.02,
+            "{}",
+            alpha(&dark, 240.0)
+        );
+        assert!(
+            (alpha(&dark, 248.0) - 0.18).abs() < 0.02,
+            "{}",
+            alpha(&dark, 248.0)
+        );
+        assert_eq!(alpha(&dark, 286.0), 0.0);
+        // Above the card it is faint: the shadow falls.
+        assert!(alpha(&dark, 39.0) < 0.12);
+        // .45 of it on a light palette; none at strength 0, and nothing past its bounds.
+        let light = draw(&LIGHT, Some(0.6), 8.0);
+        let (l, d) = (alpha(&light, 240.0), alpha(&dark, 240.0));
+        // Each layer at .45: under half as dark, a little over .45 of it where they overlap.
+        assert!(l > 0.4 * d && l < 0.5 * d, "light {l}, dark {d}");
+        let none = draw(&DARK, Some(0.0), 8.0);
+        assert_eq!(alpha(&none, 240.0), 0.0);
+        assert_eq!(alpha(&none, 39.0), 0.0);
+        let b = soft_bounds(Rect::new(60.0, 40.0, 300.0, 200.0), &Shade::POPUP);
+        for y in 0..340 {
+            for x in [0, 30, 210, 400] {
+                if !b.contains(x as f32 + 0.5, y as f32 + 0.5) {
+                    assert_eq!(at(&dark, x as f32, y as f32), [255, 255, 255], "({x}, {y})");
+                }
+            }
+        }
+        // The corners follow the radius: a square card's corner pixel is its line, an 8 px
+        // card's is outside its curve.
+        let square = draw(&DARK, Some(0.6), 0.0);
+        assert_eq!(at(&square, 60.0, 40.0), DARK.popup_line);
+        assert_ne!(at(&dark, 60.0, 40.0), DARK.popup_line);
     }
 }

@@ -11,8 +11,14 @@ use parley::{
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod covered;
+#[cfg(test)]
+pub(crate) use covered::WHOLE_SHADOW;
+mod rounding;
 mod shapes;
 pub use shapes::{Along, Path};
+mod soft;
+pub use soft::{LIGHT_SHADOW, Shade, soft_bounds};
 
 pub type Rgb = [u8; 3];
 type Brush = [u8; 4];
@@ -520,10 +526,23 @@ impl<'a> Painter<'a> {
         self.rbox_dev(x0, y0, x1, y1, 0.0, c, alpha);
     }
 
-    /// A soft drop shadow around `r`, for popups: a few expanding translucent boxes.
+    /// A soft drop shadow around `r`, for popups: a few expanding translucent boxes. It is
+    /// [`shadow_with`](Self::shadow_with) at strength 1.
     pub fn shadow(&mut self, r: Rect, radius: f32, dark: bool) {
+        self.shadow_with(r, radius, dark, 1.0);
+    }
+
+    /// The shadow of [`shadow`](Self::shadow) with each of its boxes `k` times as dark: 1 is
+    /// that shadow, pixel for pixel, 0.5 half as dark, 2 twice. It reaches as far at every
+    /// strength, so a popup's bounds do not depend on it. `k` is held to 0..=4; 0, a negative
+    /// number and NaN draw nothing.
+    pub fn shadow_with(&mut self, r: Rect, radius: f32, dark: bool, k: f32) {
+        if k.is_nan() || k <= 0.0 {
+            return;
+        }
         let steps = 10;
-        let strength = if dark { 0.024 } else { 0.010 };
+        let base: f32 = if dark { 0.024 } else { 0.010 };
+        let strength = base * k.min(4.0);
         for i in (1..=steps).rev() {
             let d = i as f32 * 1.4;
             let rr = Rect::new(r.x - d, r.y - d + 3.0, r.w + 2.0 * d, r.h + 2.0 * d);

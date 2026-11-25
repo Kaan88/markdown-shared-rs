@@ -1,6 +1,7 @@
 use super::*;
 use crate::anim::{Clock, ManualClock};
 use crate::gfx::{Face, Gfx};
+use crate::menu::PAD;
 use crate::theme::{DARK, LIGHT};
 use mdshared_text::Bitmap;
 
@@ -971,4 +972,159 @@ fn submenu_sheet() {
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
     }
+}
+
+#[test]
+fn a_cascade_with_a_look_gives_it_to_every_menu_and_places_submenus_by_it() {
+    let mut c = Cascade::at(tree(), 100.0, 100.0).with_look(crate::menu::Look::FLAT);
+    place(&mut c, AREA);
+    assert_eq!(c.menu(0).unwrap().look(), crate::menu::Look::FLAT);
+    let (x, y) = on(&c, 0, 1);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    let (root, sub) = (c.menu(0).unwrap(), c.menu(1).unwrap());
+    assert_eq!(sub.look(), crate::menu::Look::FLAT);
+    // Against its menu with no gap, its first row level with the row that opened it.
+    assert_eq!(sub.rect().x, root.rect().right());
+    assert_eq!(sub.row_rect(0).y, root.row_rect(1).y);
+    assert_eq!(root.row_rect(1).h, crate::menu::Look::FLAT.row);
+    // A cascade given no look is the rounded one, and `beside` is `beside_with` in it.
+    assert_eq!(opened().menu(0).unwrap().look(), crate::menu::Look::ROUNDED);
+    let item = Rect::new(100.0, 140.0, 180.0, 32.0);
+    for leftward in [false, true] {
+        assert_eq!(
+            beside(150.0, 200.0, item, AREA, leftward),
+            beside_with(
+                150.0,
+                200.0,
+                item,
+                AREA,
+                leftward,
+                &crate::menu::Look::ROUNDED
+            )
+        );
+    }
+}
+
+// ---- the soft shadow fades with the cascade -----------------------------------------------------
+
+/// The rounded look with the soft shadow at its strongest, so its far reach shows.
+fn soft_look() -> Look {
+    let mut look = Look::ROUNDED;
+    look.soft_shadow = true;
+    look.shadow_strength = 4.0;
+    look
+}
+
+/// [`recent_open`] in `look`.
+fn recent_open_in(look: Look, t0: Instant) -> Cascade<u8> {
+    let mut c = Cascade::at(tree(), 100.0, 100.0).with_look(look);
+    place(&mut c, AREA);
+    let (x, y) = on(&c, 0, 1);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    let r = c.menu(0).unwrap().row_rect(1);
+    c.pointer(r.right() - 10.0, r.cy(), t0);
+    c
+}
+
+/// How much darker than the page the pixel at (x, y) is, 0 to 1.
+fn dark_at(b: &Bitmap, x: f32, y: f32) -> f32 {
+    let i = (y as usize * b.width as usize + x as usize) * 4;
+    1.0 - b.pixels[i + 1] as f32 / LIGHT.page[1] as f32
+}
+
+#[test]
+fn a_soft_cascade_that_fades_fades_its_whole_shadow() {
+    // 21 px left of the root menu, at its middle: past the toolkit shadow's 18 px, inside the
+    // soft one's reach, and level with a fade's drop, which is vertical.
+    let clock = ManualClock::new();
+    let mut c = recent_open_in(soft_look(), clock.now());
+    let root = c.menu(0).unwrap().rect();
+    let (x, y) = (root.x - 21.0, root.cy());
+    let full = dark_at(
+        &drawn(&mut c, |c, p| c.draw_in_presence(p, &LIGHT, AREA, 1.0)),
+        x,
+        y,
+    );
+    assert!(full > 0.02, "the shadow reaches there: {full}");
+    let half = dark_at(
+        &drawn(&mut c, |c, p| c.draw_in_presence(p, &LIGHT, AREA, 0.5)),
+        x,
+        y,
+    );
+    assert!(half < 0.7 * full, "{half} at a half, {full} whole");
+    // And the same through draw_animated, once the submenu's entrance has played.
+    let mut anim = Animator::new();
+    anim.begin_frame(clock.now());
+    let _ = drawn(&mut c, |c, p| {
+        c.draw_animated(p, &LIGHT, AREA, 1.0, &mut anim, "m")
+    });
+    anim.end_frame();
+    clock.advance_ms(2000);
+    anim.begin_frame(clock.now());
+    let half = drawn(&mut c, |c, p| {
+        c.draw_animated(p, &LIGHT, AREA, 0.5, &mut anim, "m")
+    });
+    anim.end_frame();
+    let half = dark_at(&half, x, y);
+    assert!(
+        half < 0.7 * full,
+        "animated: {half} at a half, {full} whole"
+    );
+}
+
+#[test]
+fn a_soft_submenu_that_enters_fades_its_whole_shadow_in() {
+    // 20 px below the submenu's foot, at its middle: past the old 18 px, and out of the way of
+    // its sideways slide, so only the fade can lighten it while it enters.
+    let clock = ManualClock::new();
+    let mut c = recent_open_in(soft_look(), clock.now());
+    let rest = drawn(&mut c, |c, p| c.draw_in(p, &LIGHT, AREA));
+    let sub = c.menu(1).unwrap().rect();
+    let (x, y) = (sub.cx(), sub.bottom() + 20.0);
+    assert!(AREA.contains(x, y), "the probe is in the area");
+    let full = dark_at(&rest, x, y);
+    assert!(full > 0.015, "the shadow reaches there: {full}");
+    let mut anim = Animator::new();
+    anim.begin_frame(clock.now());
+    let _ = drawn(&mut c, |c, p| {
+        c.draw_animated(p, &LIGHT, AREA, 1.0, &mut anim, "m")
+    });
+    anim.end_frame();
+    clock.advance_ms(10);
+    anim.begin_frame(clock.now());
+    let mid = drawn(&mut c, |c, p| {
+        c.draw_animated(p, &LIGHT, AREA, 1.0, &mut anim, "m")
+    });
+    anim.end_frame();
+    let mid = dark_at(&mid, x, y);
+    assert!(mid < 0.6 * full, "entering {mid}, at rest {full}");
+}
+
+#[test]
+fn a_cascade_without_the_soft_shadow_fades_18_px_round_its_menus_as_before() {
+    // The toolkit's shadow: the fade takes the menus' bounds and 18 px, pixel for pixel.
+    let clock = ManualClock::new();
+    let mut c = recent_open(clock.now());
+    let half = drawn(&mut c, |c, p| c.draw_in_presence(p, &LIGHT, AREA, 0.5));
+    let (a, b) = (c.menu(0).unwrap().rect(), c.menu(1).unwrap().rect());
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let bounds = Rect::new(
+        x0,
+        y0,
+        a.right().max(b.right()) - x0,
+        a.bottom().max(b.bottom()) - y0,
+    )
+    .inset(-18.0);
+    let drop = -MENU_DROP;
+    let by_hand = drawn(&mut c, |c, p| {
+        pop(p, bounds, 0.5, (0.0, drop), |p| {
+            for k in 0..2 {
+                c.menu_mut(k).unwrap().draw_in(p, &LIGHT, AREA);
+            }
+        })
+    });
+    assert!(half.pixels == by_hand.pixels);
 }
