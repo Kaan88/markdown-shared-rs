@@ -1839,6 +1839,9 @@ impl Form {
             }
             Row::Text { placeholder, .. } => {
                 let ctrl = self.draw_swatch(p, pal, i).unwrap_or(ctrl);
+                // While a picker is open the keys go to it: the focused field keeps its
+                // underline but shows no caret (nor selection).
+                let typing = focused && self.colour_open_row().is_none();
                 let hov = self.hover == Some(Target::Text(i));
                 let edge = if hov && !focused {
                     mix(pal.line, pal.text, 0.18)
@@ -1866,7 +1869,7 @@ impl Form {
                     13.0,
                     &colors,
                     placeholder,
-                    focused,
+                    typing,
                     caret_on,
                 );
             }
