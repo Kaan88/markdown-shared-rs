@@ -212,7 +212,8 @@ pub fn draw_dialog_card(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
 /// a web page draws ([`Painter::soft_shadow`] with [`Shade::POPUP`]) at strength `k`, times
 /// [`LIGHT_SHADOW`] on a light palette; 0 draws none. `draw_dialog_card` is this with 10 and
 /// `None`, pixel for pixel. The soft shadow reaches further than [`dialog_bounds`]; its
-/// bounds are [`soft_bounds`](crate::gfx::soft_bounds)`(card, &Shade::POPUP)`.
+/// bounds are [`soft_bounds`](crate::gfx::soft_bounds)`(card, &Shade::POPUP)`. A radius that
+/// is not finite or is negative is the classic 10, for the shadow, the card and the footer alike.
 pub fn draw_dialog_card_with(
     p: &mut Painter,
     pal: &Palette,
@@ -220,6 +221,11 @@ pub fn draw_dialog_card_with(
     radius: f32,
     soft: Option<f32>,
 ) -> Rect {
+    let radius = if radius.is_finite() && radius >= 0.0 {
+        radius
+    } else {
+        10.0
+    };
     match soft {
         Some(k) => {
             let k = k * if pal.dark { 1.0 } else { LIGHT_SHADOW };
@@ -729,6 +735,30 @@ mod tests {
                     draw_dialog_card_with(p, pal, r, 10.0, None);
                 });
                 assert!(was.pixels == now.pixels, "at {scale}, dark {}", pal.dark);
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_given_a_radius_out_of_reason_draws_with_the_classic_corners_throughout() {
+        // Not finite or negative: the shadow, the card and its footer all take 10, so no square
+        // footer corner pokes out of a pill-shaped card.
+        let r = Rect::new(17.3, 21.65, 150.45, 111.15);
+        for pal in [&LIGHT, &DARK] {
+            for soft in [None, Some(0.6)] {
+                let ten = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, 10.0, soft);
+                });
+                for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -3.0] {
+                    let got = window(pal, 1.0, |p| {
+                        draw_dialog_card_with(p, pal, r, bad, soft);
+                    });
+                    assert!(
+                        got.pixels == ten.pixels,
+                        "{bad}, {soft:?}, dark {}",
+                        pal.dark
+                    );
+                }
             }
         }
     }
