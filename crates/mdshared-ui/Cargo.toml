@@ -14,6 +14,10 @@ zeno = "=0.3.3"
 # `recycle`. Without its default features: its date crate `jiff` is left out, and everything else
 # it needs is already in the lock at versions it accepts.
 trash = { version = "=5.4.0", default-features = false, features = ["coinit_apartmentthreaded", "freedesktop"], optional = true }
+# Accessibility (W8, the owner's decision 2026-11-24): AccessKit's tree, only with the `a11y`
+# feature. Pure Rust with no system library, so the tree builds on every system; only the adapter
+# that serves it (accesskit_winit, below) is Windows-only.
+accesskit = { version = "=0.25.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
@@ -34,6 +38,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_Accessibility",
 ] }
+# The winit adapter of the accessibility tree (W8, `a11y`): Windows only for now (UI Automation,
+# Purge's scope). Its default features (AT-SPI over zbus and async-io, winit's X11 and Wayland) are
+# left out. The tree itself (`accesskit`) is plain Rust and is in [dependencies].
+accesskit_winit = { version = "=0.34.2", optional = true, default-features = false, features = ["rwh_06"] }
+# The window host (src/host.rs, roadmap W1), only with the `host` feature: it presents the frame
+# itself. The version every application already uses, so it costs them nothing.
+softbuffer = { version = "=0.4.8", default-features = false, optional = true }
 # The system's media controls (src/media_session/smtc.rs) and toasts (src/notify/toast.rs), only
 # with the media-session or the notify feature.
 windows = { version = "=0.62.2", optional = true, features = [
@@ -50,6 +61,8 @@ rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", 
 # The settings portal, for the system's colour scheme. The same zbus the file dialogs bring in.
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# The window host's present (feature `host`), with the window systems winit uses here.
+softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"], optional = true }
 
 # The compositor-drawn shadow of undecorated windows (src/shadow.rs). KDE's own protocol: the same
 # crates winit and softbuffer already bring in, here named so the shadow can talk to the
@@ -69,12 +82,18 @@ winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] 
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSResponder", "NSScreen", "NSGraphics", "NSWorkspace", "NSAccessibility", "NSDocumentController"] }
 rfd = { version = "0.15.4", default-features = false }
 arboard = { version = "3", default-features = false }
+# The window host's present (feature `host`).
+softbuffer = { version = "=0.4.8", default-features = false, optional = true }
 # The appearance setting (dark mode) from the user defaults. The version winit's AppKit side and
 # rfd already bring in.
 # The open-documents Apple Event (src/open_documents.rs). The versions winit's AppKit side and rfd
 # already bring in.
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSUserDefaults", "NSAppleEventManager", "NSAppleEventDescriptor", "NSURL", "NSValue", "NSDictionary", "NSGeometry", "NSNotification", "objc2-core-services"] }
+
+# The window of examples/purge_shape.rs; the applications bring their own.
+[target.'cfg(windows)'.dev-dependencies]
+softbuffer = { version = "=0.4.8", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 softbuffer = { version = "=0.4.8", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
@@ -98,3 +117,21 @@ media-session = ["dep:windows"]
 # current user's registry; on Linux the desktop's notification server over the zbus already
 # there. Off: `Notifier::new` answers Unsupported, and the model types are still there.
 notify = ["dep:windows", "windows?/Data_Xml_Dom", "windows?/UI_Notifications"]
+# Accessibility: `a11y::*` builds an AccessKit tree from the widgets' models (the window host takes
+# an application's tree through `host::App::accessibility`), and the window's adapter serves it to
+# UI Automation (roadmap W8). The tree builds on every system; the adapter (accesskit_winit) is
+# there on Windows only, so elsewhere nothing serves the tree yet.
+a11y = ["dep:accesskit", "dep:accesskit_winit"]
+# The window host: `host::run` owns the winit loop and the softbuffer present of one window and
+# hands the application the toolkit's own events (roadmap W1, at Purge's scope). Off: the module
+# is not built, and softbuffer is not a dependency. With `a11y` too, the host serves the
+# application's AccessKit tree to UI Automation.
+host = ["dep:softbuffer"]
+
+[[example]]
+name = "purge_shape"
+required-features = ["a11y"]
+
+[[example]]
+name = "host"
+required-features = ["host"]

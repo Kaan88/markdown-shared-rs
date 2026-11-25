@@ -188,6 +188,7 @@ fn set_menu(backend: &mut Backend, items: &[Item<u32>]) -> io::Result<()> {
 
 /// A row of the system's menu: an item, or the line between two.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) enum Entry {
     Separator,
     Item {
@@ -206,6 +207,7 @@ pub(crate) enum Entry {
 
 /// The menu as the systems take it: the items in order with a separator wherever one asks for
 /// one before it (never first, never two in a row).
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn entries(items: &[Item<u32>]) -> Vec<Entry> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {

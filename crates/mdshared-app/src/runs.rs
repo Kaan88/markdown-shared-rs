@@ -149,6 +149,27 @@ pub enum Kind {
     Rewrite,
 
     Markdown,
+    /// Files linked into a library file and nothing else (the task window's "File them", a
+    /// folder added to the library): no note is written, no file is read or changed but the
+    /// library file. Its notes are all `created: false`, so undo takes out their lines and never
+    /// touches a file; it has no source.
+    Links,
+    /// Files copied into the library's folder and linked there ("Copy them in", D-209): the
+    /// lines lead to the copies. Its notes are the copies this run made (`created: true`, any
+    /// extension, removed by undo only while they are the bytes written and nothing else lists
+    /// them) and the files linked as they were (`created: false`); its pictures are the pictures
+    /// a Markdown file took along, each with the original it was copied from. It has no source:
+    /// nothing of the owner's was changed.
+    Copies,
+    /// Write notes (mdedit's `docs/ai-pictures-plan.md` section 10): notes a model wrote from
+    /// pictures and text files, and copies of the pictures beside them. Its notes are `.md` files
+    /// this run made; its pictures are the copies, each with the original it was made from and
+    /// that file's digest, or with none for a picture pasted from the clipboard, whose file was
+    /// in a temp folder that goes with the window. It has no source: no file was cut, and every
+    /// original is read and never changed. Undo removes a copy only while it is what was
+    /// written, its original (when it names one) is where it was with that digest, and no note
+    /// undo keeps shows it ([`UndoPlan::shown`]); it never touches an original.
+    Notes,
 }
 
 impl Kind {
@@ -159,6 +180,9 @@ impl Kind {
             Kind::Rewrite => "rewrite",
 
             Kind::Markdown => "markdown",
+            Kind::Links => "links",
+            Kind::Copies => "copies",
+            Kind::Notes => "notes",
         }
     }
 
@@ -169,6 +193,9 @@ impl Kind {
             "rewrite" => Some(Kind::Rewrite),
 
             "markdown" => Some(Kind::Markdown),
+            "links" => Some(Kind::Links),
+            "copies" => Some(Kind::Copies),
+            "notes" => Some(Kind::Notes),
             _ => None,
         }
     }
@@ -304,6 +331,12 @@ pub struct PictureRec {
     /// This run created the file: see [`NoteRec::created`].
     pub created: bool,
     pub sha256: String,
+    /// The file this one is a copy of, for a picture "Copy them in" took along with a Markdown
+    /// file ([`Kind::Copies`]): undo removes the copy only while this is where it was with the
+    /// digest it had, so the copy is never the only one. `None` for every other run's picture,
+    /// and the record then does not write it.
+    pub original: Option<PathBuf>,
+    pub original_sha256: String,
 }
 
 /// What a run's links did to one library file: the text it held before them, and the digest of
@@ -368,6 +401,16 @@ pub struct Record {
     /// no link, and for a record written before this field existed: undo then takes the lines
     /// out as [`with_removals`] does.
     pub added: Vec<Added>,
+    /// The copies a [`Kind::Copies`] run made of the owner's files: each copy with the file it is
+    /// a copy of and that file's digest, so undo removes a copy only while its original is where
+    /// it was (Fable's review of C1). Empty for every other kind.
+    pub copied: Vec<PictureRec>,
+    /// The originals a "Move them in" run took away (phase C2, D-210): `path` is where each
+    /// was and `sha256` its digest; `original` is the copy that holds its bytes now. Undo puts
+    /// one back only at that path, only while nothing is there, only with those bytes (the
+    /// copy's, or its text in `originals` when the copy's links were rewritten). Empty for every
+    /// other run.
+    pub removed: Vec<PictureRec>,
 }
 
 /// A record read from disk.
@@ -818,16 +861,25 @@ impl Record {
         let pictures: Vec<String> = self
             .pictures
             .iter()
-            .map(|p| {
-                format!(
-                    "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"}}",
-                    esc(&stored(&p.path, library)),
-                    p.created,
-                    esc(&p.sha256)
-                )
-            })
+            .map(|p| picture_json(p, library))
             .collect();
         s.push_str(&format!("  \"pictures\": [{}],\n", pictures.join(", ")));
+        if !self.copied.is_empty() {
+            let copied: Vec<String> = self
+                .copied
+                .iter()
+                .map(|p| picture_json(p, library))
+                .collect();
+            s.push_str(&format!("  \"copied\": [{}],\n", copied.join(", ")));
+        }
+        if !self.removed.is_empty() {
+            let removed: Vec<String> = self
+                .removed
+                .iter()
+                .map(|p| picture_json(p, library))
+                .collect();
+            s.push_str(&format!("  \"removed\": [{}],\n", removed.join(", ")));
+        }
         let added: Vec<String> = self
             .added
             .iter()
@@ -1010,21 +1062,17 @@ impl Record {
         let pictures = json
             .get("pictures")
             .and_then(Json::arr)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| {
-                        Some(PictureRec {
-                            path: resolved(p.get("path")?.str()?, library),
-                            created: p.get("created").and_then(Json::bool).unwrap_or(false),
-                            sha256: p
-                                .get("sha256")
-                                .and_then(Json::str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
+            .unwrap_or_default();
+        let copied = json
+            .get("copied")
+            .and_then(Json::arr)
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
+            .unwrap_or_default();
+        let removed = json
+            .get("removed")
+            .and_then(Json::arr)
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
             .unwrap_or_default();
         let originals = json
             .get("originals")
@@ -1085,6 +1133,8 @@ impl Record {
             moved: None,
             originals,
             added,
+            copied,
+            removed,
         })
     }
 
@@ -1244,9 +1294,201 @@ pub fn start_rewrite(
         moved: None,
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
+        removed: Vec::new(),
     };
     let path = record.create(library)?;
     Ok((path, record))
+}
+
+/// The record of a run that only linked files into `group.file` ([`Kind::Links`]), made after
+/// the links are in: `before` is the library file's text before them (for a file the run made,
+/// which `group.created` then says, the heading it was made with). Each link becomes a note the run did not make, so
+/// undo takes its line out and never the file; the headings `before` did not have are the run's
+/// own; and when the file holds exactly `before` plus the links, that is kept too, so undo can
+/// give the file back byte for byte while nothing else changed it.
+pub fn links_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+) -> io::Result<(PathBuf, Record)> {
+    let record = links_record_of(library, instruction, group, links, before);
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// The record [`links_record`] writes, not yet written.
+fn links_record_of(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+) -> Record {
+    let base = group.file.parent().unwrap_or(Path::new("")).to_path_buf();
+    let old = Some(library::parse(before, &base));
+    let mut sections_added: Vec<Vec<String>> = Vec::new();
+    for link in links {
+        for n in 1..=link.sections.len() {
+            let path: Vec<String> = link.sections[..n].to_vec();
+            let known = old
+                .as_ref()
+                .is_some_and(|p| p.sections.iter().any(|s| sections_eq(s, &path)));
+            if !known && !sections_added.iter().any(|s| sections_eq(s, &path)) {
+                sections_added.push(path);
+            }
+        }
+    }
+    let (secs, started) = now_utc();
+    let mut record = Record {
+        version: RECORD_VERSION,
+        kind: Kind::Links,
+        started,
+        started_secs: secs,
+        state: State::Done,
+        instruction: instruction.to_string(),
+        sent: None,
+        source: Source {
+            path: PathBuf::new(),
+            len: 0,
+            sha256: String::new(),
+            recycled: false,
+        },
+        group: group.clone(),
+        folders: Vec::new(),
+        notes: links
+            .iter()
+            .map(|l| NoteRec {
+                path: link_target(&l.path, &base),
+                created: false,
+                sha256: String::new(),
+                ranges: Vec::new(),
+                heading_shift: 0,
+                title_added: false,
+                sections: l.sections.clone(),
+                line: l.line.clone(),
+            })
+            .collect(),
+        pictures: Vec::new(),
+        sections_added,
+        moved: None,
+        originals: Vec::new(),
+        added: Vec::new(),
+        copied: Vec::new(),
+        removed: Vec::new(),
+    };
+    record.keep_added(&group.file, Some(before.to_string()), links, library);
+    record
+}
+
+/// The record of a "Copy them in" run ([`Kind::Copies`]), made as [`links_record`] makes its
+/// own, after the copies are written and the links are in: `written` is what
+/// [`crate::moves::copy_in::write`] made. A line that leads to a copy this run made marks that
+/// copy as the run's own, with its digest; every other line is a file linked as it was.
+pub fn copies_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+) -> io::Result<(PathBuf, Record)> {
+    let record = copies_record_of(library, instruction, group, links, before, written);
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// The record of a "Move them in" run (phase C2, D-210): [`copies_record`]'s, with the originals
+/// the move will take away and the library notes it will rewrite, written before either is done
+/// so undo can put back whatever was done of it. A rewritten note's text before is kept as a
+/// rewrite's original is; an original whose copy's text differs keeps its own text too.
+pub fn move_in_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+    moving: &crate::moves::copy_in::MovePlan,
+) -> io::Result<(PathBuf, Record)> {
+    let mut record = copies_record_of(library, instruction, group, links, before, written);
+    let sha = |t: &str| crate::update::sha256_hex(t.as_bytes());
+    for r in &moving.removes {
+        record.removed.push(PictureRec {
+            path: r.path.clone(),
+            created: false,
+            sha256: r.sha256.clone(),
+            original: Some(r.copy.clone()),
+            original_sha256: r.copy_sha256.clone(),
+        });
+        if let Some(text) = &r.text {
+            record.originals.push(Original {
+                path: r.path.clone(),
+                sha256: r.sha256.clone(),
+                written: String::new(),
+                len: text.len() as u64,
+                bom: false,
+                text: text.clone(),
+            });
+        }
+    }
+    for n in &moving.relinks {
+        record.originals.push(Original {
+            path: n.path.clone(),
+            sha256: sha(&n.before),
+            written: sha(&n.after),
+            len: n.before.len() as u64,
+            bom: false,
+            text: n.before.clone(),
+        });
+    }
+    // A record this program could not read back would leave the move with no undo: then nothing
+    // is moved, and the caller writes the copies' record instead (Fable's review of C2, 2).
+    if !reads_back(&mut record.clone(), library) {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            crate::moves::copy_in::RECORD_FULL,
+        ));
+    }
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+fn copies_record_of(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+) -> Record {
+    let mut record = links_record_of(library, instruction, group, links, before);
+    record.kind = Kind::Copies;
+    for note in &mut record.notes {
+        if let Some(f) = written
+            .files
+            .iter()
+            .find(|f| same_path(&f.path, &note.path))
+        {
+            note.created = f.created;
+            note.sha256 = if f.created {
+                f.sha256.clone()
+            } else {
+                String::new()
+            };
+        }
+    }
+    record.copied = written
+        .files
+        .iter()
+        .filter(|f| f.created && record.notes.iter().any(|n| same_path(&n.path, &f.path)))
+        .cloned()
+        .collect();
+    record.pictures = written.pictures.clone();
+    record.folders = written.folders.clone();
+    record
 }
 
 /// Writes one file of a rewrite run (`file.after`) and keeps `file.before` in the record first
@@ -1768,6 +2010,8 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                     path: path.clone(),
                     created: true,
                     sha256: crate::update::sha256_hex(&bytes),
+                    original: None,
+                    original_sha256: String::new(),
                 });
                 report.pictures_written.push(path.clone());
                 record.note_done(&record_path, &format!("picture {path:?}"));
@@ -1779,6 +2023,8 @@ fn write_of(req: &Request, kind: Kind, gate: &mut dyn Gate, secs: u64, started: 
                     path: path.clone(),
                     created: false,
                     sha256: crate::update::sha256_hex(&bytes),
+                    original: None,
+                    original_sha256: String::new(),
                 });
                 report.pictures_written.push(path);
             }
@@ -2001,6 +2247,8 @@ fn planned(req: &Request, kind: Kind, secs: u64, started: &str, source: Source) 
         moved: None,
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
+        removed: Vec::new(),
     }
 }
 
@@ -2391,6 +2639,14 @@ pub trait Bin {
     /// Puts the file at `path` in the bin; `Err` says why it did not go, and it is then where it
     /// was.
     fn recycle(&mut self, path: &Path) -> Result<(), String>;
+
+    /// Whether undo may write the file at `path` again (a note a move rewrote): `Err` says why
+    /// not, and it is then kept as it is. The default lets every file be written; the
+    /// application's refuses one a tab holds with changes not saved (Fable's review of C2, 3).
+    fn may_write(&mut self, path: &Path) -> Result<(), String> {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// The "bin" that removes the file: what undo did before the Recycle Bin was built (D-071), and
@@ -2519,11 +2775,24 @@ pub struct UndoPlan {
     pub restore_kept: Vec<PathBuf>,
     /// A rewrite's originals that are gone already: nothing to put back.
     pub restore_gone: usize,
+    /// What a "Move them in" run took away and will be put back where it was: its originals,
+    /// and the library's notes whose links it changed (D-210).
+    pub put_back: Vec<PathBuf>,
+    /// What of it cannot be put back (a file is where an original was, a note changed since):
+    /// kept, and listed.
+    pub put_back_kept: Vec<PathBuf>,
+    /// Copies "Copy them in" made that stay because their original is gone or changed since, so
+    /// the copy may be the only one (D-217). Also in `kept`.
+    pub copies_kept: Vec<PathBuf>,
     /// Notes and pictures this record marks as its own that a run started later names as its
     /// own too: this run died before it wrote them, and the later run found the names free and
     /// wrote them. They are that run's, and stay with their lines (review of the audit 4 fixes,
     /// S2).
     pub later: Vec<PathBuf>,
+    /// Copies a [`Kind::Notes`] run made that stay because a note undo keeps (changed since,
+    /// still listed, there before the run, a later run's) shows them: removing one would break
+    /// that note's picture (plan section 10). Also in `kept`. Empty for every other kind.
+    pub shown: Vec<PathBuf>,
 }
 
 impl UndoPlan {
@@ -2535,7 +2804,8 @@ impl UndoPlan {
                 || !self.links.is_empty()
                 || self.group_file.is_some()
                 || !self.folders.is_empty()
-                || !self.restore.is_empty())
+                || !self.restore.is_empty()
+                || !self.put_back.is_empty())
     }
 
     /// The question's sentence: what goes, and what stays.
@@ -2583,6 +2853,27 @@ impl UndoPlan {
         if !self.notes.is_empty() {
             goes.push(count(self.notes.len(), "note", "notes"));
         }
+        let back = if self.put_back.is_empty() {
+            String::new()
+        } else {
+            // Each file is named: the record says where, and a record can be carried to another
+            // computer (Fable's review of C2, 4; audit 4, A F8).
+            let named: Vec<String> = self
+                .put_back
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            format!(
+                "Puts back {} this run moved or changed, where {} were: {}. ",
+                count(self.put_back.len(), "file", "files"),
+                if self.put_back.len() == 1 {
+                    "it"
+                } else {
+                    "they"
+                },
+                named.join(", ")
+            )
+        };
         if !self.pictures.is_empty() {
             goes.push(count(self.pictures.len(), "picture", "pictures"));
         }
@@ -2620,7 +2911,36 @@ impl UndoPlan {
             s.push('.');
             s
         };
-        if !self.kept.is_empty() {
+        s = format!("{back}{s}");
+        if !self.put_back_kept.is_empty() {
+            s.push_str(&format!(
+                " {} cannot be put back, {} changed or taken since, and {} kept.",
+                count(self.put_back_kept.len(), "file", "files"),
+                if self.put_back_kept.len() == 1 {
+                    "its place"
+                } else {
+                    "their places"
+                },
+                if self.put_back_kept.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            ));
+        }
+        if !self.copies_kept.is_empty() {
+            s.push_str(&format!(
+                " {} kept: {} gone or changed since, so the copy may be the only one.",
+                count(self.copies_kept.len(), "copy is", "copies are"),
+                if self.copies_kept.len() == 1 {
+                    "its original is"
+                } else {
+                    "their originals are"
+                }
+            ));
+        }
+        let changed = self.notes_kept.len() + self.pictures_kept.len();
+        if changed > 0 {
             let mut said: Vec<String> = Vec::new();
             if !self.notes_kept.is_empty() {
                 said.push(format!(
@@ -2637,8 +2957,18 @@ impl UndoPlan {
             s.push_str(&format!(
                 " {} and {} kept.",
                 said.join(", "),
-                if self.kept.len() == 1 { "is" } else { "are" }
+                if changed == 1 { "is" } else { "are" }
             ));
+        }
+        if !self.shown.is_empty() {
+            s.push_str(&if self.shown.len() == 1 {
+                " 1 picture stays with the note that shows it.".to_string()
+            } else {
+                format!(
+                    " {} pictures stay with the notes that show them.",
+                    self.shown.len()
+                )
+            });
         }
         if !self.links_kept.is_empty() {
             s.push_str(&format!(
@@ -2846,10 +3176,92 @@ impl Reach {
         if !reach.is_library_file(file) {
             return Err(outside(file));
         }
+        // A run of links names files anywhere: they are the owner's, linked where they are, and
+        // undo never touches them, only their lines. So a record that says it made a file, a
+        // folder or a picture is not one a run of links writes, and none of it is acted on.
+        if record.kind == Kind::Links {
+            if let Some(note) = record.notes.iter().find(|n| n.created) {
+                return Err(foreign(&note.path));
+            }
+            if let Some(folder) = record.folders.first() {
+                return Err(foreign(folder));
+            }
+            if let Some(picture) = record.pictures.first() {
+                return Err(foreign(&picture.path));
+            }
+            return Ok(reach);
+        }
         for folder in &record.folders {
             if !reach.allows(folder) {
                 return Err(outside(folder));
             }
+        }
+        // A run of copies links the owner's files where they are as well as its copies: those
+        // are never touched, so only the copies it made must be inside the library's reach. A
+        // copy may have any extension (the owner's file had it); a picture it took along must
+        // name the original it is a copy of.
+        if record.kind == Kind::Copies {
+            for note in record.notes.iter().filter(|n| n.created) {
+                if !reach.allows(&note.path) {
+                    return Err(outside(&note.path));
+                }
+            }
+            for copy in &record.copied {
+                if !reach.allows(&copy.path) {
+                    return Err(outside(&copy.path));
+                }
+                if copy.original.is_none() {
+                    return Err(foreign(&copy.path));
+                }
+            }
+            // An original a move took away is put back only where it was, which is outside the
+            // library (D-210): an absolute path with no `..`, whose bytes are in a copy inside.
+            for r in &record.removed {
+                let Some(copy) = &r.original else {
+                    return Err(foreign(&r.path));
+                };
+                if !reach.allows(copy) {
+                    return Err(outside(copy));
+                }
+                if !r.path.is_absolute() || has_parent_dir(&r.path) {
+                    return Err(foreign(&r.path));
+                }
+                // Only a file of the kind its copy is, and only while that copy is one the
+                // record says the run made (Fable's review of C2, 4).
+                let ext = |p: &Path| {
+                    p.extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .unwrap_or_default()
+                };
+                let own = record.copied.iter().any(|c| same_path(&c.path, copy))
+                    || record.pictures.iter().any(|c| same_path(&c.path, copy))
+                    || record.notes.iter().any(|n| same_path(&n.path, copy));
+                if ext(&r.path) != ext(copy) || !own {
+                    return Err(foreign(&r.path));
+                }
+            }
+            for o in &record.originals {
+                if was_removed(record, &o.path) {
+                    continue;
+                }
+                if !reach.allows(&o.path) {
+                    return Err(outside(&o.path));
+                }
+                if !has_extension(&o.path, &["md", "markdown"]) {
+                    return Err(foreign(&o.path));
+                }
+            }
+            for picture in &record.pictures {
+                if !reach.allows(&picture.path) {
+                    return Err(outside(&picture.path));
+                }
+                if !has_extension(&picture.path, &PICTURE_EXTENSIONS)
+                    || (picture.created && picture.original.is_none())
+                {
+                    return Err(foreign(&picture.path));
+                }
+            }
+            return Ok(reach);
         }
         for note in &record.notes {
             if !reach.allows(&note.path) {
@@ -2892,6 +3304,12 @@ impl Reach {
                 )
             })
     }
+}
+
+/// The group's folder as undo will see it ([`declared_home`]), empty when it names none: the
+/// reach a run must stay inside for its undo to act on what it wrote (Fable's review of C2, nit).
+pub fn undo_home(group_file: &Path, library: &Path) -> PathBuf {
+    declared_home(group_file, library).unwrap_or_default()
 }
 
 /// The folder the group's library file names with `home:` as it reads now; `None` when the file
@@ -3066,7 +3484,14 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     // The original. Undo is the one thing that deletes, so it does not run unless the notes can
     // not be the only copy: the original is where it was, with the length and the digest it had.
     // A source in the Recycle Bin must be back for the same reason.
-    let state = source_state(&record.source);
+    // A run of links has no source: nothing was cut from a file, so nothing can be its only copy.
+    // Nor has a run of Write notes: its originals are read and never changed, and each copy is
+    // checked against its own original below.
+    let state = if matches!(record.kind, Kind::Links | Kind::Copies | Kind::Notes) {
+        SourceState::Same
+    } else {
+        source_state(&record.source)
+    };
     if state != SourceState::Same {
         plan.refusal = Some(source_refusal(record, state));
         return (plan, None);
@@ -3079,6 +3504,10 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
                 .to_string(),
         );
         return (plan, None);
+    }
+    // A move's originals and the notes it rewrote: what undo will put back (D-210).
+    if record.kind == Kind::Copies {
+        put_back_plan(record, &mut plan);
     }
     // What a later run wrote under the names this one marked: not this run's to take.
     let later =
@@ -3109,6 +3538,12 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(note.path.clone());
         } else if note.path.symlink_metadata().is_err() {
             plan.gone.push(note.path.clone());
+        } else if !copy_may_go(record, &note.path, &plan.put_back) {
+            // A copy whose original is gone or changed may be the only one left: it stays, and
+            // so does its line.
+            plan.kept.push(note.path.clone());
+            plan.copies_kept.push(note.path.clone());
+            continue;
         } else if digest_of(&note.path).is_some_and(|d| d.eq_ignore_ascii_case(&note.sha256)) {
             file_goes = true;
         } else {
@@ -3148,6 +3583,15 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(picture.path.clone());
         } else if picture.path.symlink_metadata().is_err() {
             plan.gone.push(picture.path.clone());
+        } else if !original_there(picture)
+            && !picture
+                .original
+                .as_ref()
+                .is_some_and(|o| plan.put_back.iter().any(|r| same_path(r, o)))
+        {
+            // A copy whose original is gone or changed may be the only one left: it stays.
+            plan.kept.push(picture.path.clone());
+            plan.copies_kept.push(picture.path.clone());
         } else if digest_of(&picture.path).is_some_and(|d| d.eq_ignore_ascii_case(&picture.sha256))
         {
             plan.pictures.push(picture.path.clone());
@@ -3155,6 +3599,16 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.kept.push(picture.path.clone());
             plan.pictures_kept.push(picture.path.clone());
         }
+    }
+    // A copy a note that stays shows stays with it.
+    if record.kind == Kind::Notes && !plan.pictures.is_empty() {
+        let shows = KeptNotes::of(record, &plan.notes);
+        let (kept, going): (Vec<PathBuf>, Vec<PathBuf>) = std::mem::take(&mut plan.pictures)
+            .into_iter()
+            .partition(|p| shows.show(p));
+        plan.pictures = going;
+        plan.kept.extend(kept.iter().cloned());
+        plan.shown = kept;
     }
     if !removals.is_empty() {
         plan.links = vec![(record.group.file.clone(), removals)];
@@ -3242,6 +3696,12 @@ pub struct UndoReport {
     pub restored: Vec<PathBuf>,
     /// A rewrite's originals changed since the run: kept.
     pub restore_kept: Vec<PathBuf>,
+    /// Copies a move made that stay because a note undo kept as the move left it still leads to
+    /// them. Also in `kept`.
+    pub led_to: Vec<PathBuf>,
+    /// Copies a [`Kind::Notes`] run made that stay because a note undo kept shows them
+    /// ([`UndoPlan::shown`]), worked out again after the notes went. Also in `kept`.
+    pub shown: Vec<PathBuf>,
     /// The record was marked "undone".
     pub marked: bool,
     pub mark_error: Option<String>,
@@ -3365,6 +3825,28 @@ pub fn undo_with(
         report.plan = Some(plan);
         return report;
     };
+    // 1b. A move's originals back where they were, and the notes it rewrote, before anything of
+    //     the copies goes: a copy goes only while its original is there again (D-210).
+    if record.kind == Kind::Copies {
+        put_back(record, &plan, &mut report, bin);
+    }
+    // A note the move rewrote and undo kept (changed since, open with changes not saved, or its
+    // original not back) still leads to the copies: those stay with it.
+    let kept_notes: Vec<(PathBuf, String)> = record
+        .originals
+        .iter()
+        .filter(|o| !was_removed(record, &o.path))
+        .filter(|o| report.restore_kept.iter().any(|k| same_path(k, &o.path)))
+        .filter_map(|o| {
+            let bytes = read_regular(&o.path, DIGEST_MAX_BYTES, false)?;
+            Some((o.path.clone(), String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .collect();
+    let led_to = |copy: &Path| {
+        kept_notes.iter().any(|(note, text)| {
+            crate::moves::links_to(text, note.parent().unwrap_or(Path::new("")), copy)
+        })
+    };
     // 2. The links first, so the pane never shows a link to a file that is gone.
     for (file, removals) in &plan.links {
         let headings = if same_path(file, &record.group.file) {
@@ -3400,9 +3882,15 @@ pub fn undo_with(
             report.held_back.push(note.clone());
             continue;
         }
+        if led_to(note) {
+            report.led_to.push(note.clone());
+            report.kept.push(note.clone());
+            continue;
+        }
         let matches = created_note(note).is_some_and(|n| {
             reach.allows(note)
-                && has_extension(note, &["md"])
+                && (record.kind == Kind::Copies || has_extension(note, &["md"]))
+                && copy_may_go(record, note, &[])
                 && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
         });
         if !matches {
@@ -3417,7 +3905,19 @@ pub fn undo_with(
             }
         }
     }
+    // The notes that stay, read again now that the others went: a copy one of them shows stays.
+    let shows = (record.kind == Kind::Notes).then(|| KeptNotes::of(record, &report.removed_notes));
     for picture in &plan.pictures {
+        if shows.as_ref().is_some_and(|s| s.show(picture)) {
+            report.shown.push(picture.clone());
+            report.kept.push(picture.clone());
+            continue;
+        }
+        if led_to(picture) {
+            report.led_to.push(picture.clone());
+            report.kept.push(picture.clone());
+            continue;
+        }
         let matches = record
             .pictures
             .iter()
@@ -3425,6 +3925,7 @@ pub fn undo_with(
             .is_some_and(|p| {
                 reach.allows(picture)
                     && has_extension(picture, &PICTURE_EXTENSIONS)
+                    && original_there(p)
                     && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
             });
         if !matches {
@@ -3447,7 +3948,7 @@ pub fn undo_with(
             report.group_kept = true;
         } else if reach.is_library_file(file)
             && file.symlink_metadata().is_ok_and(|m| m.is_file())
-            && only_heading_and_home(file)
+            && (only_heading_and_home(file) || holds_what_it_was_made_with(record, file))
         {
             if std::fs::remove_file(file).is_ok() {
                 report.group_removed = true;
@@ -3486,6 +3987,9 @@ pub fn undo_with(
     report.links_kept = plan.links_kept.clone();
     report.before = plan.before.clone();
     report.later = plan.later.clone();
+    let mut shown = plan.shown.clone();
+    shown.append(&mut report.shown);
+    report.shown = shown;
     report.plan = Some(plan);
     report
 }
@@ -3560,7 +4064,248 @@ fn rewrite_chains(record: &Record) -> Vec<(&Original, &Original)> {
     chains
 }
 
+/// One picture (or copy) of a record as JSON: its original only when it has one.
+fn picture_json(p: &PictureRec, library: &Path) -> String {
+    let original = match &p.original {
+        Some(o) => format!(
+            ", \"original\": \"{}\", \"original_sha256\": \"{}\"",
+            esc(&stored(o, library)),
+            esc(&p.original_sha256)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{{\"path\": \"{}\", \"created\": {}, \"sha256\": \"{}\"{original}}}",
+        esc(&stored(&p.path, library)),
+        p.created,
+        esc(&p.sha256)
+    )
+}
+
+/// One picture (or copy) read back from a record; `None` without a path.
+fn picture_of(p: &Json, library: &Path) -> Option<PictureRec> {
+    Some(PictureRec {
+        path: resolved(p.get("path")?.str()?, library),
+        created: p.get("created").and_then(Json::bool).unwrap_or(false),
+        sha256: p
+            .get("sha256")
+            .and_then(Json::str)
+            .unwrap_or_default()
+            .to_string(),
+        original: p
+            .get("original")
+            .and_then(Json::str)
+            .map(|o| resolved(o, library)),
+        original_sha256: p
+            .get("original_sha256")
+            .and_then(Json::str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+/// Whether a note a run made may go as far as its original is concerned: any note but a copy
+/// "Copy them in" made, and such a copy only while the record names its original and that file
+/// is where it was with the digest it had, so undo never removes the only copy (Fable's review
+/// of C1).
+fn copy_may_go(record: &Record, note: &Path, back: &[PathBuf]) -> bool {
+    record.kind != Kind::Copies
+        || record
+            .copied
+            .iter()
+            .find(|c| same_path(&c.path, note))
+            .is_some_and(|c| {
+                c.original
+                    .as_ref()
+                    .is_some_and(|o| original_there(c) || back.iter().any(|b| same_path(b, o)))
+            })
+}
+
+/// Whether a "Move them in" record took the file at `path` away.
+fn was_removed(record: &Record, path: &Path) -> bool {
+    record.removed.iter().any(|r| same_path(&r.path, path))
+}
+
+/// The bytes a moved original is put back with: its text the record kept, or its copy's bytes
+/// while they are the original's; `None` when neither is the file that was taken.
+fn removed_bytes(record: &Record, r: &PictureRec) -> Option<Vec<u8>> {
+    let bytes = match record
+        .originals
+        .iter()
+        .find(|o| same_path(&o.path, &r.path))
+    {
+        Some(o) => encoded(&o.text, o.bom),
+        None => read_regular(r.original.as_deref()?, DIGEST_MAX_BYTES, false)?,
+    };
+    crate::update::sha256_hex(&bytes)
+        .eq_ignore_ascii_case(&r.sha256)
+        .then_some(bytes)
+}
+
+/// What undo of a move puts back: each original whose path is free and whose bytes it has, in a
+/// folder that is still there; each note it rewrote while it holds what the run wrote. One that
+/// is there already as it was needs nothing; one changed since is kept, and listed.
+fn put_back_plan(record: &Record, plan: &mut UndoPlan) {
+    for r in &record.removed {
+        match std::fs::symlink_metadata(&r.path) {
+            Ok(_) if digest_of(&r.path).is_some_and(|d| d.eq_ignore_ascii_case(&r.sha256)) => {}
+            Ok(_) => plan.put_back_kept.push(r.path.clone()),
+            Err(_) => {
+                let folder = r.path.parent().is_some_and(Path::is_dir);
+                if folder && removed_bytes(record, r).is_some() {
+                    plan.put_back.push(r.path.clone());
+                } else {
+                    plan.put_back_kept.push(r.path.clone());
+                }
+            }
+        }
+    }
+    for o in &record.originals {
+        if was_removed(record, &o.path) {
+            continue;
+        }
+        match digest_of(&o.path) {
+            Some(d) if d.eq_ignore_ascii_case(&o.written) => plan.put_back.push(o.path.clone()),
+            Some(d) if d.eq_ignore_ascii_case(&o.sha256) => {}
+            None => {}
+            Some(_) => plan.put_back_kept.push(o.path.clone()),
+        }
+    }
+}
+
+/// Puts back what [`put_back_plan`] said, each read again just before: the originals first,
+/// each made new where it was (never over a file), then the notes, each only while it holds what
+/// the run wrote.
+fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport, bin: &mut dyn Bin) {
+    let planned = |p: &Path| plan.put_back.iter().any(|r| same_path(r, p));
+    for r in record.removed.iter().filter(|r| planned(&r.path)) {
+        let Some(bytes) = removed_bytes(record, r) else {
+            report.restore_kept.push(r.path.clone());
+            report.kept.push(r.path.clone());
+            continue;
+        };
+        let made = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&r.path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&bytes)?;
+                f.sync_all()
+            });
+        match made {
+            Ok(()) => report.restored.push(r.path.clone()),
+            Err(e) => report.failures.push(Failure::new(&r.path, e.to_string())),
+        }
+    }
+    for o in record
+        .originals
+        .iter()
+        .filter(|o| !was_removed(record, &o.path))
+    {
+        if !planned(&o.path) {
+            continue;
+        }
+        // A note goes back to leading to an original only once that original is there again:
+        // else it keeps leading to the copy, which is kept (Fable's review of C2, nit).
+        let base = o.path.parent().unwrap_or(Path::new(""));
+        let leads_to_one_not_back = record.removed.iter().any(|r| {
+            !digest_of(&r.path).is_some_and(|d| d.eq_ignore_ascii_case(&r.sha256))
+                && crate::moves::links_to(&o.text, base, &r.path)
+        });
+        if leads_to_one_not_back
+            || bin.may_write(&o.path).is_err()
+            || !digest_of(&o.path).is_some_and(|d| d.eq_ignore_ascii_case(&o.written))
+        {
+            report.restore_kept.push(o.path.clone());
+            report.kept.push(o.path.clone());
+            continue;
+        }
+        match crate::files::replace(&o.path, &encoded(&o.text, o.bom)) {
+            Ok(()) => report.restored.push(o.path.clone()),
+            Err(e) => report.failures.push(Failure::new(&o.path, e.to_string())),
+        }
+    }
+    report
+        .restore_kept
+        .extend(plan.put_back_kept.iter().cloned());
+    report.kept.extend(plan.put_back_kept.iter().cloned());
+}
+
+/// The notes of a [`Kind::Notes`] run that stay on disk after undo: every note the record names
+/// but those in `going`, as each reads now. A note that is there and cannot be read as text (not a
+/// regular file, too large, not UTF-8) may show any copy, so then every copy stays.
+struct KeptNotes {
+    /// Each note's path, its text, and its text in lower case.
+    texts: Vec<(PathBuf, String, String)>,
+    unreadable: bool,
+}
+
+impl KeptNotes {
+    fn of(record: &Record, going: &[PathBuf]) -> KeptNotes {
+        let mut kept = KeptNotes {
+            texts: Vec::new(),
+            unreadable: false,
+        };
+        for note in &record.notes {
+            if going.iter().any(|g| same_path(g, &note.path))
+                || note.path.symlink_metadata().is_err()
+                || kept.texts.iter().any(|(p, _, _)| same_path(p, &note.path))
+            {
+                continue;
+            }
+            match read_regular(&note.path, DIGEST_MAX_BYTES, false)
+                .and_then(|b| String::from_utf8(b).ok())
+            {
+                Some(text) => {
+                    let lower = text.to_lowercase();
+                    kept.texts.push((note.path.clone(), text, lower));
+                }
+                None => kept.unreadable = true,
+            }
+        }
+        kept
+    }
+
+    /// Whether a note that stays shows `copy`: a Markdown link or picture that leads to it, or,
+    /// so that a link written another way (HTML, a reference the reader does not take) never
+    /// breaks, its file name anywhere in the note's text, as it is or with its spaces as `%20`.
+    fn show(&self, copy: &Path) -> bool {
+        if self.unreadable {
+            return true;
+        }
+        let name = lower_name(copy);
+        let encoded = name.replace(' ', "%20");
+        self.texts.iter().any(|(note, text, lower)| {
+            crate::moves::links_to(text, note.parent().unwrap_or(Path::new("")), copy)
+                || (!name.is_empty() && (lower.contains(&name) || lower.contains(&encoded)))
+        })
+    }
+}
+
+/// Whether the file a picture was copied from is where it was, with the digest it had: always
+/// for a picture that names no original.
+fn original_there(picture: &PictureRec) -> bool {
+    match &picture.original {
+        None => true,
+        Some(o) => digest_of(o).is_some_and(|d| d.eq_ignore_ascii_case(&picture.original_sha256)),
+    }
+}
+
 /// Whether a library file holds nothing but its group's heading and its `home:` line.
+/// A run of links makes a group from the library's template (heading, `home:` and the lines
+/// that say what the file is), and records that text as the file's text before its links. Its
+/// group goes when the file holds that text exactly again: nothing the owner wrote is in it.
+fn holds_what_it_was_made_with(record: &Record, file: &Path) -> bool {
+    if !matches!(record.kind, Kind::Links | Kind::Copies) || !record.group.created {
+        return false;
+    }
+    let Some(added) = record.added.iter().find(|a| same_path(&a.file, file)) else {
+        return false;
+    };
+    library_text_of(file).is_some_and(|now| now == added.before)
+}
+
 fn only_heading_and_home(path: &Path) -> bool {
     let Some(bytes) = read_regular(path, library::MAX_FILE_BYTES as u64, false) else {
         return false;
@@ -3714,6 +4459,11 @@ fn link_parts(line: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // In `runs/tests/`, where a module of this inline one is looked for: a `#[path]` that
+    // climbs out of that directory with `..` resolves on Windows only, where it need not exist.
+    mod copies;
+    mod notes;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -4789,6 +5539,8 @@ mod tests {
             path: mine.clone(),
             created: true,
             sha256: digest("words I wrote\n"),
+            original: None,
+            original_sha256: String::new(),
         });
         let mut folder = good.clone();
         folder.folders = vec![outside_folder.clone()];
@@ -4956,6 +5708,8 @@ mod tests {
             moved: None,
             originals: Vec::new(),
             added: Vec::new(),
+            copied: Vec::new(),
+            removed: Vec::new(),
         };
         let text = record.to_json(&library);
         let back = Record::from_json(&text, &library).expect("it reads");
@@ -6521,6 +7275,8 @@ mod tests {
             moved: None,
             originals: Vec::new(),
             added: Vec::new(),
+            copied: Vec::new(),
+            removed: Vec::new(),
         };
         let t0 = "# Trip\n\nThe owner's line.\n\n";
         let t1 = with_links_added(t0, &[link("One")]);
@@ -6603,6 +7359,161 @@ mod tests {
         assert_eq!(done.later.len(), 3, "{done:?}");
         assert!(one.is_file() && two.is_file() && map.is_file());
         assert_eq!(read(&library.join("Trip.md")), group);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn links_of(base: &Path, files: &[(&Path, &str, &[&str])]) -> Vec<Link> {
+        let _ = base;
+        files
+            .iter()
+            .map(|(path, title, sections)| Link {
+                path: path.to_path_buf(),
+                title: title.to_string(),
+                sections: sections.iter().map(|s| s.to_string()).collect(),
+                line: library::link_line(title, path),
+            })
+            .collect()
+    }
+
+    /// The task window's "File them" and a folder added to the library write links only: their
+    /// record is a run of links, and its undo gives the library file back and never touches a
+    /// file it linked (the pictures plan, section 14).
+    #[test]
+    fn a_run_of_links_is_undone_to_the_byte_and_its_files_are_left_alone() {
+        let dir = scratch("links-undo");
+        let library = dir.join("library");
+        let group = library.join("food.md");
+        write_file(
+            &group,
+            "# Food
+
+- [Old](old.md)
+",
+        );
+        write_file(
+            &library.join("old.md"),
+            "# Old
+",
+        );
+        let pasta = dir.join("elsewhere").join("pasta.md");
+        write_file(
+            &pasta, "# Pasta
+",
+        );
+        let menu = dir.join("elsewhere").join("menu.pdf");
+        write_file(
+            &menu,
+            "%PDF-1.4
+",
+        );
+        let links = links_of(
+            &library,
+            &[(&pasta, "Pasta", &["Dinner"]), (&menu, "Menu", &[])],
+        );
+        let before = read(&group);
+        std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
+        let g = Group {
+            name: "Food".to_string(),
+            file: group.clone(),
+            created: false,
+            home: library.clone(),
+        };
+        let (path, record) = links_record(&library, "by dish", g, &links, &before).expect("made");
+        assert_eq!(record.kind, Kind::Links);
+        assert_eq!(record.state, State::Done);
+        assert!(record.notes.iter().all(|n| !n.created));
+        assert_eq!(record.sections_added, vec![vec!["Dinner".to_string()]]);
+        assert_eq!(record.added.len(), 1, "the add is kept to the byte");
+        let loaded = load(&path, &library).expect("it reads back");
+        assert_eq!(loaded.kind, Kind::Links);
+        assert_eq!(loaded.notes.len(), 2);
+
+        let plan = prepare(&loaded, &library);
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        let mut gate = TestGate::new();
+        let report = undo(&path, &loaded, &library, &mut gate);
+        assert_eq!(read(&group), before, "{report:?}");
+        assert_eq!(
+            read(&pasta),
+            "# Pasta
+",
+            "a linked file is never touched"
+        );
+        assert_eq!(
+            read(&menu),
+            "%PDF-1.4
+"
+        );
+        assert_eq!(load(&path, &library).map(|r| r.state), Some(State::Undone));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_of_links_that_says_it_made_a_file_is_not_acted_on() {
+        let dir = scratch("links-foreign");
+        let library = dir.join("library");
+        let group = library.join("food.md");
+        write_file(
+            &group, "# Food
+",
+        );
+        let pasta = dir.join("pasta.md");
+        write_file(
+            &pasta, "# Pasta
+",
+        );
+        let links = links_of(&library, &[(&pasta, "Pasta", &[])]);
+        let before = read(&group);
+        std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
+        let g = Group {
+            name: "Food".to_string(),
+            file: group.clone(),
+            created: false,
+            home: library.clone(),
+        };
+        let (_, mut record) = links_record(&library, "", g, &links, &before).expect("made");
+        record.notes[0].created = true;
+        let plan = prepare(&record, &library);
+        assert!(plan.refusal.is_some(), "a run of links makes no file");
+        assert!(!plan.acts());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_of_links_that_made_its_group_takes_the_group_away() {
+        let dir = scratch("links-group");
+        let library = dir.join("library");
+        let group = library.join("trips.md");
+        let pasta = dir.join("japan.md");
+        write_file(
+            &pasta, "# Japan
+",
+        );
+        let links = links_of(&library, &[(&pasta, "Japan", &["Asia"])]);
+        let made = library::new_group_with_home("Trips", Some(Path::new("trips"))).expect("made");
+        let made = made.as_str();
+        write_file(&group, &with_links_added(made, &links));
+        let g = Group {
+            name: "Trips".to_string(),
+            file: group.clone(),
+            created: true,
+            home: library.clone(),
+        };
+        let (path, record) = links_record(&library, "", g, &links, made).expect("made");
+        let mut gate = TestGate::new();
+        let report = undo(&path, &record, &library, &mut gate);
+        assert!(
+            !group.exists(),
+            "the group the run made goes: {:?} {:?}",
+            std::fs::read_to_string(&group),
+            record.added
+        );
+        let _ = report;
+        assert_eq!(
+            read(&pasta),
+            "# Japan
+"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

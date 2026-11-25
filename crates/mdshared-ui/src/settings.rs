@@ -1624,32 +1624,9 @@ impl Form {
                     }
                     let hov = self.hover == Some(Target::Dropdown(i))
                         || matches!(&self.menu, Some((k, _)) if *k == i);
-                    let fill = if hov {
-                        mix(pal.field, pal.text, 0.05)
-                    } else {
-                        pal.field
-                    };
-                    p.frame(
-                        ctrl,
-                        6.0,
-                        fill,
-                        if hov {
-                            mix(pal.line, pal.text, 0.18)
-                        } else {
-                            pal.line
-                        },
-                    );
                     let shown = options.get(*value).map_or("", String::as_str);
-                    p.text(
-                        Face::Ui,
-                        13.0,
-                        ctrl.x + 11.0,
-                        ctrl.cy(),
-                        shown,
-                        pal.text,
-                        ctrl.w - 36.0,
-                    );
-                    p.icon(glyph::DOWN, 10.0, ctrl.right() - 15.0, ctrl.cy(), pal.muted);
+                    // The same field as the standalone drop-down's.
+                    crate::dropdown::field(p, pal, ctrl, shown, hov, false);
                 }
             },
             Row::Number {
@@ -1814,49 +1791,10 @@ fn draw_neutral_segments(
     }
 }
 
-/// The Windows 11 switch: a pill, with the knob at the end that says on.
+/// The Windows 11 switch: a pill, with the knob at the end that says on. The drawing lives in
+/// [`toggle`](crate::toggle), whose standalone switch draws the same pixels.
 fn draw_toggle(p: &mut Painter, pal: &Colors, r: Rect, on: bool, hovered: bool, pressed: bool) {
-    let knob = if pressed {
-        14.0
-    } else if hovered {
-        13.0
-    } else {
-        12.0
-    };
-    if on {
-        let fill = if hovered {
-            mix(pal.accent, pal.popup, 0.1)
-        } else {
-            pal.accent
-        };
-        p.rbox(r, r.h / 2.0, fill);
-        p.rbox(
-            Rect::new(r.right() - 4.0 - knob, r.cy() - knob / 2.0, knob, knob),
-            knob / 2.0,
-            pal.on_accent,
-        );
-    } else {
-        let edge = if hovered {
-            mix(pal.muted, pal.popup, 0.2)
-        } else {
-            mix(pal.muted, pal.popup, 0.35)
-        };
-        p.frame(
-            r,
-            r.h / 2.0,
-            if hovered {
-                mix(pal.field, pal.text, 0.05)
-            } else {
-                pal.field
-            },
-            edge,
-        );
-        p.rbox(
-            Rect::new(r.x + 4.0, r.cy() - knob / 2.0, knob, knob),
-            knob / 2.0,
-            pal.muted,
-        );
-    }
+    crate::toggle::switch(p, pal, r, on, hovered, pressed);
 }
 
 impl Outcome {

@@ -35,7 +35,8 @@ run and what was not (no Windows run, KDE Plasma and sway only) is in
 Each application pins a commit of this repository in its `Cargo.toml`. The move was checked by
 rendering 43 states of the viewer before and after and comparing the files byte for byte.
 The window loop itself is not shared yet: each application has its own (step 4 of
-[docs/PLAN.md](docs/PLAN.md)). Licence: [MIT](LICENSE).
+[docs/PLAN.md](docs/PLAN.md)). An opt-in host for one window, `mdshared_ui::host` (feature
+`host`), is there for the applications that come next. Licence: [MIT](LICENSE).
 
 This repository exists so the editor never copies code out of the viewer, and so the viewer's
 size, memory and launch time are not touched by anything the editor needs.

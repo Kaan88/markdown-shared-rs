@@ -1,8 +1,10 @@
 # Checks on every push to main, feat/linux or f/macos and every pull request: formatting, clippy
 # (warnings are errors) and the tests, on Linux, on real Windows and on real Macs (Apple Silicon
 # and Intel). See docs/CI.md.
-# The Recycle Bin (feature `recycle`), the media session (feature `media-session`) and the
-# notifications (feature `notify`), off in the workspace build, are built and tested on their own.
+# The Recycle Bin (feature `recycle`), the media session (feature `media-session`), the
+# notifications (feature `notify`), the accessibility tree (feature `a11y`) and the window host
+# (feature `host`, alone and with `a11y`), off in the workspace build, are built and tested on
+# their own.
 name: ci
 
 on:
@@ -53,6 +55,12 @@ jobs:
       - run: cargo test --release -p mdshared-ui --features media-session media_session
       - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
       - run: cargo test --release -p mdshared-ui --features notify notify
+      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
 
   windows:
     runs-on: windows-latest
@@ -76,6 +84,14 @@ jobs:
       - run: cargo test --release -p mdshared-ui --features media-session media_session
       - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
       - run: cargo test --release -p mdshared-ui --features notify notify
+      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
+      # A smoke run of the host: a real window, a few frames, closed on its timer.
+      - run: cargo run --release -p mdshared-ui --features host,a11y --example host -- --seconds 2
 
   macos:
     strategy:
@@ -106,3 +122,9 @@ jobs:
       - run: cargo test --release -p mdshared-ui --features media-session media_session
       - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
       - run: cargo test --release -p mdshared-ui --features notify notify
+      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'

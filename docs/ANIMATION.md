@@ -269,6 +269,20 @@ anim.forget("caret");
 switched off) the caret is simply drawn. With reduced motion a cycle stands at phase 0 (or its
 `still_at`), a blink is steadily on, and neither asks for a frame.
 
+A `textfield::TextField` does this itself:
+
+```rust
+// Once a frame, between begin_frame and end_frame; `blink` is platform::caret_blink_time().
+field.draw_blinking(p, &mut anim, "search", blink, area, Face::Ui, 14.0, &colors, "Search", focused);
+// Or, for a caller that draws its own field: the `caret_on` it passes on.
+let caret_on = field.blink_caret(&mut anim, "search", blink, focused);
+```
+
+Every call that types, deletes, moves the caret or changes the selection starts the blink again,
+on, with no `forget` from the caller. While the field is not focused, and while a selection is
+shown (the caret is hidden over it, as on Windows), the animator is not asked, so `end_frame`
+gives no deadline for the caret and the window sleeps.
+
 ## Widgets with motion
 
 Each is a second function or method beside the one that existed, which is untouched. At rest,
@@ -293,8 +307,8 @@ Not done, and how each would be: the settings form (`settings::Form`) draws its 
 ticks and scrollbar and has no animator passed in, so it is unchanged; an application can still
 wrap the whole form in `pop` for its entrance. The bars of `notice` (update, crash, offer) take
 their height from the application's layout, which can animate that height with `anim.value`. The
-command palette, the tree's disclosure, the tab strip and the text field's caret have no motion
-(`Animator::blink` is there for the caret; `textfield` does not use it yet).
+command palette, the tree's disclosure and the tab strip have no motion. The text field's caret
+blinks through `TextField::draw_blinking` (above); the plain `TextField::draw` is unchanged.
 
 ## Reduced motion
 

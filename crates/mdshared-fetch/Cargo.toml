@@ -13,4 +13,4 @@ windows-sys = { version = "0.59", features = [
 
 # Loads the system libcurl at run time (no link-time dependency on it).
 [target.'cfg(not(windows))'.dependencies]
-libloading = "0.8"
+libloading = "=0.9.1"

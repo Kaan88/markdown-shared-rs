@@ -17,7 +17,8 @@ panel), and next a music player, a file manager and a terminal emulator.
 
 The toolkit draws everything itself. There is no native widget and no GPU: a software painter
 (`mdshared_ui::gfx::Painter`) draws a whole frame into a `Bitmap` of BGRA bytes, which the
-application shows with softbuffer. **There is no window loop here.** Each application owns its
+application shows with softbuffer. **There is no window loop here**, except the opt-in window
+host `mdshared_ui::host` (feature `host`, one window). Each application owns its
 winit 0.30 loop, redraws only on events (`ControlFlow::Wait` / `WaitUntil`), and calls into
 these crates for geometry, state and drawing. An idle window does no work; keep it so.
 
@@ -66,9 +67,17 @@ cargo clippy --release -p mdshared-ui --all-targets --features media-session -- 
 cargo test --release -p mdshared-ui --features media-session media_session
 cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
 cargo test --release -p mdshared-ui --features notify notify
+cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
+cargo test --release -p mdshared-ui --features a11y a11y
+cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
+cargo test --release -p mdshared-ui --features host host::
+cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
+cargo test --release -p mdshared-ui --features host,a11y host::
 ```
 
-Run all nine before you say a change is done. While working, the debug forms are faster
+Run all fifteen before you say a change is done. The Windows job of CI also runs the host's
+example for two seconds (`cargo run --release -p mdshared-ui --features host,a11y --example host
+-- --seconds 2`): run it too after a change to `host`. While working, the debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
 warnings`). Two traps:
 
@@ -96,7 +105,7 @@ is linked or run that way; say so when you report it.
 - A new direct dependency is pinned exactly: `name = "=1.2.3"`. (Some older entries are ranges;
   do not loosen any and do not copy that.) `Cargo.lock` is committed.
 - A dependency that only one platform needs goes under that platform's `[target]` table, and
-  one that only some applications need goes behind a feature (`recycle`, `client-margin`, `media-session`, `notify`).
+  one that only some applications need goes behind a feature (`recycle`, `client-margin`, `media-session`, `notify`, `a11y`).
 - Hand-written is the house style where the job is bounded: the HTML-to-Markdown converter,
   the language scanners, the VT parser, SHA-256, the date arithmetic are all written here.
 
@@ -122,7 +131,7 @@ is linked or run that way; say so when you report it.
   and hand-edited settings lines without panicking, and the tests feed them these.
 - **`unsafe` only at the system's edge.** It lives in the modules that call the OS: `platform`
   (and `platform/recycle`), `snap`, `corners`, `place`, `menu_bar`, `open_documents`,
-  `desktop_entry`, `blur/wl`, `shadow/wl`, `mdshared-app/crash`, `mdshared-fetch/winhttp` and
+  `desktop_entry`, `blur/wl`, `shadow/wl`, `mdshared-app/crash`, `mdshared-app/single_mutex`, `mdshared-fetch/winhttp` and
   `curl`. Every block has a `// SAFETY:` line. A model, a widget or a parser has none.
 - Logical pixels in every public API; the painter multiplies by the scale and snaps to device
   pixels. Functions that take device pixels say so in their name or doc (`fill_dev`, `blit`).

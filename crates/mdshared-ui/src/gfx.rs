@@ -6,7 +6,7 @@
 use mdshared_text::{Bitmap, TextEngine, shared_fonts};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontFamily, FontWeight, Layout, LayoutContext,
-    LineHeight, StyleProperty,
+    LineHeight, OverflowWrap, StyleProperty,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -82,6 +82,27 @@ pub enum Face {
     Mono,
 }
 
+/// Where a wrapped paragraph may break a line: what [`Painter::paragraph_wrapped`] and
+/// [`Painter::paragraph_lines_wrapped`] are told.
+///
+/// [`Words`](Wrap::Words) is what [`Painter::paragraph`] has always done: lines break only where
+/// a line may break between words (after a space, a hyphen, at a line break), so a word wider
+/// than the column runs past its right edge, where the clip cuts it. [`Anywhere`](Wrap::Anywhere)
+/// breaks the same way first, and then breaks a word that does not fit on a line of its own
+/// between any two clusters (parley's `OverflowWrap::Anywhere`, as CSS's
+/// `overflow-wrap: anywhere`), so a path such as `C:\Program Files\Mozilla Firefox\...` or a
+/// registry key with no space for a long stretch stays inside its column. Neither changes the
+/// text: the lines only say where it is broken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Wrap {
+    /// Break between words only; a word wider than the column overflows it.
+    #[default]
+    Words,
+    /// Break between words, and inside a word that would overflow the column.
+    Anywhere,
+}
+
 /// The interface's family list. On macOS the system's own (SF, which fontique reaches as the
 /// generic `system-ui`), then Helvetica Neue.
 const UI_FAMILY: &str = if cfg!(target_os = "macos") {
@@ -127,6 +148,21 @@ fn key(face: Face, size: f32, color: Rgb, wrap: f32, text: &str) -> u64 {
     h.finish()
 }
 
+/// The cache key of a layout that breaks by `mode`: [`key`] itself for [`Wrap::Words`], so the
+/// labels and paragraphs drawn before `Wrap` existed keep their keys, and a key that also hashes
+/// the mode otherwise, so the two layouts of one text never share an entry.
+fn layout_key(face: Face, size: f32, color: Rgb, wrap: f32, text: &str, mode: Wrap) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match mode {
+        Wrap::Words => key(face, size, color, wrap, text),
+        Wrap::Anywhere => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (face, size.to_bits(), color, wrap.to_bits(), text, mode).hash(&mut h);
+            h.finish()
+        }
+    }
+}
+
 impl Default for Gfx {
     fn default() -> Self {
         Gfx::new()
@@ -157,7 +193,21 @@ impl Gfx {
         wrap: f32,
         text: &str,
     ) -> Rc<Layout<Brush>> {
-        let k = key(face, size, color, wrap, text);
+        self.layout_wrapped(face, size, color, wrap, text, Wrap::Words)
+    }
+
+    /// [`layout`](Self::layout), breaking lines by `mode` (see [`Wrap`]). With
+    /// [`Wrap::Words`] it is `layout` exactly: the same cache entry and the same style.
+    fn layout_wrapped(
+        &mut self,
+        face: Face,
+        size: f32,
+        color: Rgb,
+        wrap: f32,
+        text: &str,
+        mode: Wrap,
+    ) -> Rc<Layout<Brush>> {
+        let k = layout_key(face, size, color, wrap, text, mode);
         if let Some(l) = self.cache.get(&k) {
             return l.clone();
         }
@@ -182,6 +232,9 @@ impl Gfx {
             )));
         }
         b.push_default(StyleProperty::Brush([color[0], color[1], color[2], 255]));
+        if mode == Wrap::Anywhere {
+            b.push_default(StyleProperty::OverflowWrap(OverflowWrap::Anywhere));
+        }
         mdshared_text::push_emoji_runs(&mut b, text, family);
         let mut layout = b.build(text);
         layout.break_all_lines(if wrap > 0.0 { Some(wrap) } else { None });
@@ -189,6 +242,12 @@ impl Gfx {
         let layout = Rc::new(layout);
         self.cache.insert(k, layout.clone());
         layout
+    }
+
+    /// How many laid-out labels the cache holds, for tests that check two calls share one.
+    #[cfg(test)]
+    pub(crate) fn cached_layouts(&self) -> usize {
+        self.cache.len()
     }
 
     /// The mask of an icon `side` device px across. The chrome draws the same few icons every
@@ -217,6 +276,27 @@ impl Gfx {
         self.icons.insert(k, mask.clone());
         mask
     }
+}
+
+/// One wrapped line of [`Painter::paragraph`], as [`Painter::paragraph_lines`] reports it.
+///
+/// `range` is the line's byte range in the whole paragraph, `y` is the top of its line box from
+/// the top of the paragraph, and `height` is the box's height, all in logical px. `stops` holds
+/// the x of every character boundary in the line from its left edge, the start of the line first
+/// and one entry after every char: `stops.len()` is `range`'s char count plus one.
+///
+/// `edges` has one entry per stop and says whether that stop is the edge of a cluster, a place
+/// a caret may stand. A cluster is what parley shapes as one unit: a letter with its combining
+/// accents, an emoji joined with zero-width joiners, a flag. The chars inside a cluster have
+/// `edges[i] == false` and the x of the cluster's start, so they have no position of their own.
+/// The first and the last stop of a line are always edges.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Line {
+    pub range: std::ops::Range<usize>,
+    pub y: f32,
+    pub height: f32,
+    pub stops: Vec<f32>,
+    pub edges: Vec<bool>,
 }
 
 /// Draws into one bitmap with a clip rectangle. Coordinates are logical px.
@@ -748,14 +828,226 @@ impl<'a> Painter<'a> {
         text: &str,
         c: Rgb,
     ) -> f32 {
+        self.paragraph_wrapped(face, size, x, y, w, text, c, Wrap::Words)
+    }
+
+    /// [`paragraph`](Self::paragraph), breaking its lines by `wrap`: with [`Wrap::Words`] it is
+    /// `paragraph` exactly, and with [`Wrap::Anywhere`] a word wider than the column (a path, a
+    /// registry key, a long URL) is broken between two clusters instead of running past the
+    /// column's right edge. Returns the height used. The layouts of the two modes are cached
+    /// apart, so a text drawn both ways is shaped twice.
+    #[allow(clippy::too_many_arguments)] // as `paragraph`, and the wrap
+    pub fn paragraph_wrapped(
+        &mut self,
+        face: Face,
+        size: f32,
+        x: f32,
+        y: f32,
+        w: f32,
+        text: &str,
+        c: Rgb,
+        wrap: Wrap,
+    ) -> f32 {
         if text.is_empty() {
             return 0.0;
         }
-        let layout = self
-            .gfx
-            .layout(face, size * self.scale, c, (w * self.scale).max(1.0), text);
+        let layout = self.gfx.layout_wrapped(
+            face,
+            size * self.scale,
+            c,
+            (w * self.scale).max(1.0),
+            text,
+            wrap,
+        );
         self.draw_layout(&layout, (x * self.scale).round(), (y * self.scale).round());
         layout.height() / self.scale
+    }
+
+    /// The height [`paragraph`](Self::paragraph) would use for `text` in a column `w` wide,
+    /// without drawing it: what a caller needs to size a wrapped block before it is laid out.
+    /// Empty text has no height. The column is taken as `paragraph` takes it: at least one
+    /// device px, so a narrow, negative or NaN width gives one word per line instead of a panic,
+    /// and an infinite width never wraps, so the text is one line.
+    pub fn paragraph_height(&mut self, face: Face, size: f32, w: f32, text: &str) -> f32 {
+        self.paragraph_height_wrapped(face, size, w, text, Wrap::Words)
+    }
+
+    /// The height [`paragraph_wrapped`](Self::paragraph_wrapped) would use with the same `wrap`:
+    /// [`paragraph_height`](Self::paragraph_height) for [`Wrap::Words`], and for
+    /// [`Wrap::Anywhere`] the height with the long words broken, which is never less.
+    pub fn paragraph_height_wrapped(
+        &mut self,
+        face: Face,
+        size: f32,
+        w: f32,
+        text: &str,
+        wrap: Wrap,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        // The same expression as in `paragraph`, so the two always agree (NaN.max(1.0) is 1.0).
+        let width = (w * self.scale).max(1.0);
+        self.gfx
+            .layout_wrapped(face, size * self.scale, [0, 0, 0], width, text, wrap)
+            .height()
+            / self.scale
+    }
+
+    /// The wrapped lines of [`paragraph`](Self::paragraph), without drawing them, for a caller
+    /// that must know where its text went: hit testing and a selection highlight.
+    ///
+    /// Give it the face, size, width, text and colour `paragraph` is given. Layouts are cached by
+    /// all five, colour included, so with the same five this reads the very layout `paragraph`
+    /// draws, from the cache, and the lines break exactly where the drawn text does; with another
+    /// colour it shapes the text a second time. `width` is the column width in logical px, as
+    /// `paragraph` takes it (zero or less is treated as one device px, as there). The first line
+    /// starts at y = 0; `y` is the top of the line's box and `height` its height, both logical px.
+    ///
+    /// `range` is the line's byte range in `text`, and `stops` holds the x of every character
+    /// boundary in that line from its left edge, in the order the text runs: one entry for the
+    /// start of the line, one after each char, so `stops.len()` is the line's char count plus
+    /// one. `stops` and `range` agree with the drawn glyph positions because they are read from
+    /// the same parley layout's runs, not measured again. The chars inside a cluster (an accent
+    /// after its letter, the parts of a joined emoji or a flag) get the x of the cluster's start
+    /// and `false` in `edges`. Empty text gives no lines; a line that wraps after a space
+    /// includes the space's width in its last stop.
+    ///
+    /// The work is linear in the length of the text.
+    pub fn paragraph_lines(
+        &mut self,
+        face: Face,
+        size: f32,
+        width: f32,
+        text: &str,
+        c: Rgb,
+    ) -> Vec<Line> {
+        self.paragraph_lines_wrapped(face, size, width, text, c, Wrap::Words)
+    }
+
+    /// The wrapped lines of [`paragraph_wrapped`](Self::paragraph_wrapped) with the same `wrap`,
+    /// as [`paragraph_lines`](Self::paragraph_lines) reports those of `paragraph`: with
+    /// [`Wrap::Words`] it is `paragraph_lines` exactly. With [`Wrap::Anywhere`] a line may end
+    /// inside a word; its `range` then ends where the next line's starts, as at any wrap without
+    /// a line break, and the lines still join back into the text with nothing added.
+    pub fn paragraph_lines_wrapped(
+        &mut self,
+        face: Face,
+        size: f32,
+        width: f32,
+        text: &str,
+        c: Rgb,
+        wrap: Wrap,
+    ) -> Vec<Line> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let layout = self.gfx.layout_wrapped(
+            face,
+            size * self.scale,
+            c,
+            (width * self.scale).max(1.0),
+            text,
+            wrap,
+        );
+        let mut lines = Vec::with_capacity(layout.len());
+        for line in layout.lines() {
+            let range = line.text_range();
+            let metrics = line.metrics();
+            let Some(piece) = text.get(range.clone()) else {
+                continue;
+            };
+            // The stop index of every char boundary of the line, by byte offset from its start,
+            // so a cluster finds its stops without counting chars from the start of the line.
+            let mut index = vec![usize::MAX; piece.len() + 1];
+            let mut count = 0;
+            for (b, _) in piece.char_indices() {
+                index[b] = count;
+                count += 1;
+            }
+            index[piece.len()] = count;
+            let count = count + 1;
+            // Device px, one entry per char boundary of the line, NaN until a run gives it.
+            let mut xs = vec![f32::NAN; count];
+            let mut edges = vec![true; count];
+            // A run may appear as several glyph runs when its styles differ; its clusters are
+            // all there once, on the first of them.
+            let mut seen = None;
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
+                if seen == Some(run.run().index()) {
+                    continue;
+                }
+                seen = Some(run.run().index());
+                let rtl = run.run().is_rtl();
+                let mut x = run.offset();
+                for cluster in run.run().visual_clusters() {
+                    let at = cluster.text_range();
+                    let advance = cluster.advance();
+                    let (a, b) = (
+                        at.start.clamp(range.start, range.end) - range.start,
+                        at.end.clamp(range.start, range.end) - range.start,
+                    );
+                    x += advance;
+                    let (Some(&first), Some(&last)) = (index.get(a), index.get(b)) else {
+                        continue;
+                    };
+                    if first == usize::MAX || last == usize::MAX || last < first {
+                        continue;
+                    }
+                    let left = x - advance;
+                    // Where the text of this cluster starts and ends, in reading order: for
+                    // right-to-left text the first char is at the cluster's right edge.
+                    let (from, to) = if rtl {
+                        (left + advance, left)
+                    } else {
+                        (left, left + advance)
+                    };
+                    // The chars inside the cluster sit at its start and are no edge.
+                    for (i, slot) in xs[first..last].iter_mut().enumerate() {
+                        if slot.is_nan() {
+                            *slot = from;
+                        }
+                        if i > 0 {
+                            edges[first + i] = false;
+                        }
+                    }
+                    if xs[last].is_nan() {
+                        xs[last] = if first == last { from } else { to };
+                    }
+                }
+            }
+            let left = (metrics.offset + metrics.inline_min_coord) / self.scale;
+            let first_known = xs.iter().position(|x| !x.is_nan());
+            match first_known {
+                Some(i) => {
+                    let v = xs[i];
+                    for slot in &mut xs[..i] {
+                        *slot = v;
+                    }
+                }
+                None => {
+                    xs.fill(left * self.scale);
+                }
+            }
+            for i in 1..xs.len() {
+                if xs[i].is_nan() {
+                    xs[i] = xs[i - 1];
+                }
+            }
+            edges[0] = true;
+            edges[count - 1] = true;
+            lines.push(Line {
+                range,
+                y: metrics.block_min_coord / self.scale,
+                height: (metrics.block_max_coord - metrics.block_min_coord) / self.scale,
+                stops: xs.into_iter().map(|x| x / self.scale).collect(),
+                edges,
+            });
+        }
+        lines
     }
 
     /// The x offset of each character boundary of `text` (one entry per `char`, plus the end), in
@@ -1030,6 +1322,194 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_lines_joins_back_into_the_text_and_covers_the_height_paragraph_draws() {
+        let mut bmp = Bitmap::new(8, 8);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let text = "The quick brown fox jumps over the lazy dog, and again, and again.";
+        let lines = p.paragraph_lines(Face::Ui, 13.0, 120.0, text, [0, 0, 0]);
+        assert!(
+            lines.len() >= 3,
+            "120 px wraps this text into {}",
+            lines.len()
+        );
+        let mut at = 0;
+        for l in &lines {
+            assert_eq!(l.range.start, at, "the lines are contiguous");
+            assert_eq!(
+                l.stops.len(),
+                text[l.range.clone()].chars().count() + 1,
+                "one stop per char boundary: {:?}",
+                l.range
+            );
+            assert!(
+                l.stops.windows(2).all(|w| w[0] <= w[1]),
+                "stops run left to right: {:?}",
+                l.stops
+            );
+            at = l.range.end;
+        }
+        assert_eq!(at, text.len(), "every byte is on a line");
+        assert_eq!(lines[0].y, 0.0, "the first line starts at the top");
+        let bottom = lines.last().unwrap().y + lines.last().unwrap().height;
+        let height = p.paragraph(Face::Ui, 13.0, 0.0, 0.0, 120.0, text, [0, 0, 0]);
+        let count = (height / lines[0].height).round() as usize;
+        assert_eq!(count, lines.len(), "{height} px of {lines:?} lines");
+        assert!(
+            (height - bottom).abs() < lines[0].height,
+            "paragraph draws {height} px where the lines end at {bottom}"
+        );
+        assert!(
+            p.paragraph_lines(Face::Ui, 13.0, 120.0, "", [0, 0, 0])
+                .is_empty()
+        );
+    }
+
+    /// `paragraph` now calls `paragraph_wrapped` with `Wrap::Words`: its pixels, its height, its
+    /// lines and its cache entry are those of the code it had before, copied here.
+    #[test]
+    fn paragraph_draws_as_before_and_wrapped_by_words_is_the_same_paragraph() {
+        let text = "Opening C:\\Program Files\\Mozilla Firefox\\uninstall\\helper.exe, a long \
+                    word and some short ones; café 日本語";
+        for scale in [1.0, 1.5] {
+            for w in [60.0, 140.0, 400.0] {
+                let draw = |f: &dyn Fn(&mut Painter) -> f32| {
+                    let mut bmp = Bitmap::new((420.0 * scale) as u32, (200.0 * scale) as u32);
+                    let mut gfx = Gfx::new();
+                    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                    let h = f(&mut p);
+                    let cached = gfx.cached_layouts();
+                    (bmp.pixels, h, cached)
+                };
+                // The body `paragraph` had, word for word.
+                let old = draw(&|p: &mut Painter| {
+                    let layout = p.gfx.layout(
+                        Face::Ui,
+                        13.0 * p.scale,
+                        [0, 0, 0],
+                        (w * p.scale).max(1.0),
+                        text,
+                    );
+                    p.draw_layout(&layout, (4.0 * p.scale).round(), (6.0 * p.scale).round());
+                    layout.height() / p.scale
+                });
+                let now = draw(&|p: &mut Painter| {
+                    p.paragraph(Face::Ui, 13.0, 4.0, 6.0, w, text, [0, 0, 0])
+                });
+                let words = draw(&|p: &mut Painter| {
+                    p.paragraph_wrapped(Face::Ui, 13.0, 4.0, 6.0, w, text, [0, 0, 0], Wrap::Words)
+                });
+                assert!(
+                    old.0 == now.0,
+                    "scale {scale}, {w} wide: paragraph drew other pixels"
+                );
+                assert_eq!((old.1, old.2), (now.1, now.2));
+                assert!(
+                    now.0 == words.0,
+                    "scale {scale}, {w} wide: Words is not paragraph"
+                );
+                assert_eq!((now.1, now.2), (words.1, words.2));
+
+                let mut bmp = Bitmap::new(8, 8);
+                let mut gfx = Gfx::new();
+                let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                assert_eq!(
+                    p.paragraph_lines(Face::Ui, 13.0, w, text, [0, 0, 0]),
+                    p.paragraph_lines_wrapped(Face::Ui, 13.0, w, text, [0, 0, 0], Wrap::Words)
+                );
+                assert_eq!(
+                    p.paragraph_height(Face::Ui, 13.0, w, text),
+                    p.paragraph_height_wrapped(Face::Ui, 13.0, w, text, Wrap::Words)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_anywhere_a_word_wider_than_the_column_breaks_inside_it_and_stays_in_the_column() {
+        let key = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\
+                   {ec8030f7-c20a-464f-9b0e-13a3a9e97384}";
+        for scale in [1.0, 1.5] {
+            for face in [Face::Ui, Face::Mono] {
+                let mut bmp = Bitmap::new(300, 400);
+                let mut gfx = Gfx::new();
+                let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                let w = 120.0;
+                let words = p.paragraph_lines(face, 12.0, w, key, [0, 0, 0]);
+                let anywhere =
+                    p.paragraph_lines_wrapped(face, 12.0, w, key, [0, 0, 0], Wrap::Anywhere);
+                let right = |l: &Line| l.stops.iter().copied().fold(0.0, f32::max);
+                assert!(
+                    words.iter().any(|l| right(l) > w),
+                    "{face:?} at {scale}: by words the key runs past the column"
+                );
+                assert!(anywhere.len() > words.len());
+                let mut at = 0;
+                for l in &anywhere {
+                    assert_eq!(l.range.start, at, "the lines are contiguous");
+                    assert!(right(l) <= w + 0.01, "{face:?} at {scale}: {l:?} past {w}");
+                    at = l.range.end;
+                }
+                assert_eq!(at, key.len(), "every byte is on a line, none added");
+                // The height measured is the height drawn, and the two modes are two cache
+                // entries of one text.
+                let measured = p.paragraph_height_wrapped(face, 12.0, w, key, Wrap::Anywhere);
+                let drawn =
+                    p.paragraph_wrapped(face, 12.0, 0.0, 0.0, w, key, [0, 0, 0], Wrap::Anywhere);
+                assert!(
+                    (measured - drawn).abs() < 1e-3,
+                    "{measured} against {drawn}"
+                );
+                assert!(drawn > p.paragraph_height(face, 12.0, w, key));
+            }
+        }
+        // Text whose words all fit breaks where it breaks by words; empty text is nothing.
+        let mut bmp = Bitmap::new(8, 8);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let short = "a few short words that wrap in a column of this width";
+        assert_eq!(
+            p.paragraph_lines(Face::Ui, 13.0, 120.0, short, [0, 0, 0]),
+            p.paragraph_lines_wrapped(Face::Ui, 13.0, 120.0, short, [0, 0, 0], Wrap::Anywhere)
+        );
+        assert!(
+            p.paragraph_lines_wrapped(Face::Ui, 13.0, 120.0, "", [0, 0, 0], Wrap::Anywhere)
+                .is_empty()
+        );
+        assert_eq!(
+            p.paragraph_wrapped(
+                Face::Ui,
+                13.0,
+                0.0,
+                0.0,
+                120.0,
+                "",
+                [0, 0, 0],
+                Wrap::Anywhere
+            ),
+            0.0
+        );
+        // Nonsense widths are taken as `paragraph` takes them, without a panic.
+        for w in [f32::NAN, -5.0, 0.0, f32::INFINITY] {
+            assert!(p.paragraph_height_wrapped(Face::Ui, 13.0, w, short, Wrap::Anywhere) > 0.0);
+        }
+        let before = gfx.cached_layouts();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.paragraph(Face::Ui, 13.0, 0.0, 0.0, 77.0, short, [0, 0, 0]);
+        p.paragraph_wrapped(
+            Face::Ui,
+            13.0,
+            0.0,
+            0.0,
+            77.0,
+            short,
+            [0, 0, 0],
+            Wrap::Anywhere,
+        );
+        assert_eq!(gfx.cached_layouts(), before + 2, "one entry for each mode");
+    }
+
+    #[test]
     fn the_monospace_face_measures_every_character_alike_and_the_interface_face_does_not() {
         let mut bmp = Bitmap::new(8, 8);
         let mut gfx = Gfx::new();
@@ -1058,5 +1538,54 @@ mod tests {
             mono.pixels, ui.pixels,
             "the monospace family drew nothing new"
         );
+    }
+
+    /// The measured height is the height the drawing then uses, at both scales and widths.
+    #[test]
+    fn a_paragraphs_measured_height_is_the_height_it_draws() {
+        for scale in [1.0, 1.5] {
+            let mut bmp = Bitmap::new(200, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            for w in [40.0, 90.0, 200.0] {
+                let text = "a few words that need more than one line in most columns";
+                let measured = p.paragraph_height(Face::Ui, 12.5, w, text);
+                let drawn = p.paragraph(Face::Ui, 12.5, 4.0, 4.0, w, text, [0, 0, 0]);
+                assert!(
+                    (measured - drawn).abs() < 1e-3,
+                    "at scale {scale}, {w} wide: measured {measured}, drew {drawn}"
+                );
+            }
+            assert_eq!(p.paragraph_height(Face::Ui, 12.5, 100.0, ""), 0.0);
+            // A width that is not a number still lays the words out one per line.
+            assert!(p.paragraph_height(Face::Ui, 12.5, f32::NAN, "two words") > 0.0);
+        }
+    }
+
+    /// Widths that are not ordinary numbers are measured as `paragraph` draws them: an infinite
+    /// column is one line, and NaN, a negative or an infinitely negative one is one word a line.
+    #[test]
+    fn a_paragraphs_measured_height_agrees_with_the_drawing_at_odd_widths() {
+        for scale in [1.0, 1.5] {
+            let mut bmp = Bitmap::new(200, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            let text = "a few words that need more than one line in most columns";
+            for w in [f32::INFINITY, f32::NAN, -40.0, f32::NEG_INFINITY, 0.0] {
+                let measured = p.paragraph_height(Face::Ui, 12.5, w, text);
+                let drawn = p.paragraph(Face::Ui, 12.5, 4.0, 4.0, w, text, [0, 0, 0]);
+                assert!(
+                    (measured - drawn).abs() < 1e-3,
+                    "at scale {scale}, {w} wide: measured {measured}, drew {drawn}"
+                );
+            }
+            let one_line = p.paragraph_height(Face::Ui, 12.5, f32::INFINITY, text);
+            let one_word = p.paragraph_height(Face::Ui, 12.5, 10_000.0, "a");
+            assert!(
+                (one_line - one_word).abs() < 1e-3,
+                "an infinite column wrapped: {one_line} against one line's {one_word}"
+            );
+            assert!(p.paragraph_height(Face::Ui, 12.5, f32::NAN, text) > 2.0 * one_line);
+        }
     }
 }

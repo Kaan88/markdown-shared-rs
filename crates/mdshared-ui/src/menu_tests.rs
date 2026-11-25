@@ -1129,3 +1129,128 @@ fn a_menu_entering_with_its_own_drawing_moves_that_drawing_with_it() {
     let (_, half, _, _) = draw(0.5);
     assert!(half != [255, 0, 0] && half != LIGHT.page, "{half:?}");
 }
+
+#[test]
+fn under_high_contrast_the_highlighted_row_is_highlight_with_highlight_text() {
+    let colors = crate::tokens::SystemColors {
+        window: crate::gfx::rgb(0xfffaef),
+        window_text: crate::gfx::rgb(0x3d3d3d),
+        highlight: crate::gfx::rgb(0x903909),
+        highlight_text: crate::gfx::rgb(0xfff5e3),
+        hot_light: crate::gfx::rgb(0x1c5e75),
+        gray_text: crate::gfx::rgb(0x676767),
+        button_face: crate::gfx::rgb(0xfffaef),
+        button_text: crate::gfx::rgb(0x3d3d3d),
+    };
+    let pal = crate::tokens::Tokens::from_system_colors(&colors).palette;
+    let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+    let draw = |hc: Option<bool>| {
+        let mut menu = Menu::new(many(3), 40.0, 40.0, false);
+        menu.highlight(1);
+        if let Some(on) = hc {
+            menu.set_high_contrast(on);
+        }
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(area, pal.page);
+        menu.draw_in(&mut p, &pal, area);
+        (bmp, menu.row_rect(0), menu.row_rect(1))
+    };
+    let px = |b: &Bitmap, x: f32, y: f32| {
+        let o = (y as usize * b.width as usize + x as usize) * 4;
+        [b.pixels[o + 2], b.pixels[o + 1], b.pixels[o]]
+    };
+    let count = |b: &Bitmap, r: Rect, c: crate::gfx::Rgb| {
+        let mut n = 0;
+        for y in r.y as usize..r.bottom() as usize {
+            for x in r.x as usize..r.right() as usize {
+                if px(b, x as f32, y as f32) == c {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let (plain, row0, row1) = draw(None);
+    let (off, _, _) = draw(Some(false));
+    let (on, _, _) = draw(Some(true));
+    assert!(
+        off.pixels == plain.pixels,
+        "off is the default, pixel for pixel"
+    );
+    assert_eq!(px(&plain, row1.x + 4.0, row1.cy()), pal.hover);
+    assert_eq!(px(&on, row1.x + 4.0, row1.cy()), colors.highlight);
+    // The label is drawn in HighlightText (light on Desert's dark Highlight); its
+    // antialiased edges blend, so count the pixels near it.
+    let mut light = 0;
+    for y in row1.y as usize..row1.bottom() as usize {
+        for x in row1.x as usize..row1.right() as usize {
+            let c = px(&on, x as f32, y as f32);
+            if c[0] >= 0xd0 && c[1] >= 0xc0 && c[2] >= 0xb0 {
+                light += 1;
+            }
+        }
+    }
+    assert!(
+        light > 10,
+        "the label is in HighlightText ({light} light pixels)"
+    );
+    assert_eq!(
+        count(&on, row1, pal.text),
+        0,
+        "no window text left on Highlight"
+    );
+    assert_eq!(
+        count(&on, row0, pal.text),
+        count(&plain, row0, pal.text),
+        "other rows unchanged"
+    );
+}
+
+#[test]
+fn a_least_width_widens_a_narrow_menu_and_nothing_else() {
+    let plain = placed_width(&mut menu_of(&["One", "Two"], false));
+    assert_eq!(plain, 180.0, "the menu's own least width");
+    for (asked, got) in [
+        (260.0, 260.0),
+        (100.0, plain),
+        (0.0, plain),
+        (-5.0, plain),
+        (f32::NAN, plain),
+        (f32::INFINITY, plain),
+        // The menu's own limit and the area still narrow it.
+        (9000.0, MAX_WIDTH),
+    ] {
+        let mut menu = menu_of(&["One", "Two"], false).min_width(asked);
+        assert_eq!(placed_width(&mut menu), got, "asked {asked}");
+    }
+    let mut menu = menu_of(&["One", "Two"], false).min_width(500.0);
+    let mut bmp = Bitmap::new(300, 300);
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+    menu.place(&mut p, 300.0, 300.0);
+    assert_eq!(menu.rect().w, 292.0);
+}
+
+#[test]
+fn a_highlight_set_by_index_is_brought_into_view_and_refuses_what_cannot_be_chosen() {
+    let mut items = many(30);
+    items[3].enabled = false;
+    let mut menu = Menu::new(items, 10.0, 10.0, false);
+    assert!(!menu.highlight(3), "a disabled item");
+    assert!(!menu.highlight(30), "past the last");
+    assert_eq!(menu.hover, None);
+    assert!(menu.highlight(25));
+    assert_eq!(menu.hover, Some(25));
+    let mut bmp = Bitmap::new(300, 300);
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+    let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+    menu.place_in(&mut p, area);
+    let row = menu.row_rect(25);
+    assert!(row.y >= menu.rect().y && row.bottom() <= menu.rect().bottom());
+    assert!(menu.highlight(0));
+    menu.place_in(&mut p, area);
+    assert_eq!(menu.scroll(), 0.0);
+}

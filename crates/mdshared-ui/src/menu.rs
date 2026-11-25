@@ -312,6 +312,11 @@ pub(crate) enum Around {
     Below(Rect),
     /// Beside the rectangle (an item as wide as its menu), on the left first when `true`.
     Beside(Rect, bool),
+    /// Below the rectangle, flipped above or to the left when it does not fit, and not over it:
+    /// where it fits on neither side it is cut to the room on the roomier side and scrolls (a
+    /// drop-down's list, which must not hide its field), unless not even one row would show on
+    /// either side, where it is placed as [`Around::Below`] places it.
+    Clear(Rect),
 }
 
 pub struct Menu<T> {
@@ -337,7 +342,7 @@ pub struct Menu<T> {
     access_visible: bool,
     /// Placed by a rectangle ([`around`](Self::around), [`beside`](Self::beside)) rather than
     /// from `anchor`.
-    around: Option<Around>,
+    pub(crate) around: Option<Around>,
     /// The last placement by a rectangle put the menu to the left of it, or above it.
     went_left: bool,
     went_up: bool,
@@ -345,6 +350,11 @@ pub struct Menu<T> {
     branches: Vec<bool>,
     /// How the menu is drawn, made sane when it was given.
     look: Look,
+    /// The least width the menu is placed at ([`min_width`](Self::min_width)); zero for none.
+    pub(crate) min_w: f32,
+    /// The highlighted row is drawn in the palette's accent with `on_accent`
+    /// ([`set_high_contrast`](Self::set_high_contrast)).
+    high_contrast: bool,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -378,6 +388,8 @@ impl<T: Clone> Menu<T> {
             went_up: false,
             branches: Vec::new(),
             look: Look::ROUNDED,
+            min_w: 0.0,
+            high_contrast: false,
         }
     }
 
@@ -423,6 +435,31 @@ impl<T: Clone> Menu<T> {
     pub fn beside(mut self, item: Rect, leftward: bool) -> Self {
         self.around = Some(Around::Beside(item, leftward));
         self
+    }
+
+    /// Makes the menu at least `w` logical px wide, as a drop-down's list is at least as wide as
+    /// its field. The widest row still widens it, the menu's own limit of 420 px and the area it
+    /// is placed in still narrow it, and a width that is not finite or not positive asks for
+    /// nothing. A menu not given one is as wide as before.
+    pub fn min_width(mut self, w: f32) -> Self {
+        self.set_min_width(w);
+        self
+    }
+
+    /// [`min_width`](Self::min_width) on a menu already made: the next placement uses it.
+    pub(crate) fn set_min_width(&mut self, w: f32) {
+        self.min_w = if w.is_finite() { w.max(0.0) } else { 0.0 };
+    }
+
+    /// Draws the highlighted row as Windows does under high contrast: filled with the palette's
+    /// `accent` and its label, mark, icon and hint in `on_accent`, which for the system's
+    /// contrast theme ([`crate::tokens::Tokens::from_system_colors`]) are its Highlight and
+    /// HighlightText ([`crate::tokens::selected`]). Off by default: the row is filled with
+    /// `hover` and keeps its colours, which under a contrast theme stays close to the popup.
+    /// Pass the host's `Cx::high_contrast` or
+    /// [`crate::platform::system_high_contrast`].
+    pub fn set_high_contrast(&mut self, on: bool) {
+        self.high_contrast = on;
     }
 
     pub(crate) fn set_around(&mut self, around: Around) {
@@ -547,7 +584,7 @@ impl<T: Clone> Menu<T> {
             let (label, _) = self.shown(&item.label);
             w = w.max(lead + p.measure(Face::Ui, look.text, &label) + hint + 16.0);
         }
-        let w = w.min(MAX_WIDTH).min(area.w - 8.0);
+        let w = w.max(self.min_w).min(MAX_WIDTH).min(area.w - 8.0);
         let h: f32 = 2.0 * look.pad
             + self
                 .items
@@ -567,6 +604,7 @@ impl<T: Clone> Menu<T> {
             Some(around) => {
                 let placed = match around {
                     Around::Below(anchor) => crate::submenu::around(w, h, anchor, area),
+                    Around::Clear(anchor) => crate::submenu::around_clear(w, h, anchor, area),
                     Around::Beside(item, leftward) => {
                         crate::submenu::beside_with(w, h, item, area, leftward, &look)
                     }
@@ -671,23 +709,28 @@ impl<T: Clone> Menu<T> {
                 );
                 p.fill(line, pal.popup_line);
             }
-            if self.hover == Some(i) && item.enabled {
+            let lit = self.hover == Some(i) && item.enabled;
+            let strong = lit && self.high_contrast;
+            if lit {
+                let fill = if strong { pal.accent } else { pal.hover };
                 if look.hover_radius > 0.0 {
-                    p.rbox(r, look.hover_radius, pal.hover);
+                    p.rbox(r, look.hover_radius, fill);
                 } else {
-                    p.fill(r, pal.hover);
+                    p.fill(r, fill);
                 }
             }
-            let color = if item.enabled { pal.text } else { pal.faint };
+            // Under high contrast everything on the highlighted row reads on Highlight.
+            let ink = |c| if strong { pal.on_accent } else { c };
+            let color = ink(if item.enabled { pal.text } else { pal.faint });
             let mut x = r.x + 9.0;
             if look.one_lead {
                 // One column for both, the label after it: the mark when the item is checked,
                 // else its icon.
                 let col = r.x + ONE_LEAD / 2.0;
                 if item.checked {
-                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), ink(pal.accent));
                 } else if !item.icon.is_empty() {
-                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    let c = ink(if item.enabled { pal.muted } else { pal.faint });
                     p.icon(item.icon, 14.0, col, r.cy(), c);
                 }
                 x = r.x + if marks || icons { ONE_LEAD } else { NO_LEAD };
@@ -697,19 +740,19 @@ impl<T: Clone> Menu<T> {
                 // icons would be.
                 let mut col = r.x + 18.0;
                 if item.checked {
-                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), ink(pal.accent));
                 }
                 if marks && icons {
                     col += MARK;
                 }
                 if icons && !item.icon.is_empty() {
-                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    let c = ink(if item.enabled { pal.muted } else { pal.faint });
                     p.icon(item.icon, 14.0, col, r.cy(), c);
                 }
                 x = col + 18.0;
             }
             let hint_w = if self.opens_submenu(i) {
-                let c = if item.enabled { pal.muted } else { pal.faint };
+                let c = ink(if item.enabled { pal.muted } else { pal.faint });
                 p.icon(crate::glyph::RIGHT, 12.0, r.right() - 12.0, r.cy(), c);
                 ARROW - 2.0
             } else if item.hint.is_empty() {
@@ -721,7 +764,7 @@ impl<T: Clone> Menu<T> {
                     r.right() - 10.0,
                     r.cy(),
                     &item.hint,
-                    pal.faint,
+                    ink(pal.faint),
                 ) + 18.0
             };
             let (label, key) = self.shown(&item.label);
@@ -867,6 +910,18 @@ impl<T: Clone> Menu<T> {
                 return;
             }
         }
+    }
+
+    /// Moves the keyboard highlight to row `index` and brings it into view at the next
+    /// placement, as [`step`](Self::step) does for the next row. Returns false, and changes
+    /// nothing, for an index past the last item or a disabled item.
+    pub fn highlight(&mut self, index: usize) -> bool {
+        if !self.items.get(index).is_some_and(|i| i.enabled) {
+            return false;
+        }
+        self.hover = Some(index);
+        self.reveal = Some(index);
+        true
     }
 
     /// Scrolls the rows down the list by `dy` logical px (negative goes back up) and moves the

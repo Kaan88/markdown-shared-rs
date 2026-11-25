@@ -1,9 +1,46 @@
 //! A single-line text field for the hand-drawn UI. It owns the text, the caret, the selection and
 //! the horizontal scroll; the app feeds it keys, pasted text and mouse positions, and draws it with
 //! a [`Painter`]. No clipboard or windowing code lives here.
+//!
+//! # The caret's blink
+//!
+//! [`TextField::draw`] is told whether the caret is on (`caret_on`) and keeps no time. For a
+//! caret that blinks at the system's rate, [`TextField::blink_caret`] gives that `caret_on`, and
+//! [`TextField::draw_blinking`] is `draw` with it. Both read the blink from an
+//! [`Animator`] the caller owns, through [`Animator::blink`], and are given the half-period the
+//! caller read from [`platform::caret_blink_time`](crate::platform::caret_blink_time).
+//!
+//! Why the animator, and not an `Instant` passed in: the animator already has a blink that asks
+//! for a frame only at the moments it changes, stands still with reduced motion, does not jump
+//! after a stall, and folds its deadline into the one deadline of the window
+//! ([`Animator::end_frame`]) with everything else in flight. A clock in the field would be a
+//! second copy of all that, and the loop would have two deadlines to merge. So the field keeps
+//! no time at all; it keeps one private flag, set by every call that types, deletes, moves the
+//! caret or changes the selection, and `blink_caret` turns that flag into
+//! [`Animator::forget`], so the next asking starts the blink again, on.
+//!
+//! The rules, as Windows has them:
+//!
+//! * Typing, moving the caret and focusing start the blink again with the caret shown.
+//! * While the field is not focused there is no caret, nothing is asked of the animator, and so
+//!   no deadline: the window sleeps.
+//! * While a selection is shown the caret is hidden, steadily, and there is no deadline either.
+//! * When the system's blink time is `None` (blinking switched off, `GetCaretBlinkTime` giving
+//!   `INFINITE`) the caret is steadily shown and there is no deadline. With reduced motion the
+//!   animator gives the same.
+//!
+//! The deadline is the animator's: the loop that called [`Animator::begin_frame`] takes
+//! [`Animator::end_frame`] and waits until it (`ControlFlow::WaitUntil`), and it is the moment
+//! the caret next turns on or off.
+//!
+//! Deliberately not here: reading the system's blink time (the caller passes it in, so a test
+//! can), a blink that stops after a while with no typing (the caller can stop asking), a caret
+//! wider than one pixel, and a fade between on and off.
 
+use crate::anim::{Animator, AsId};
 use crate::gfx::{Face, Painter, Rect, Rgb};
 use crate::keys::{KeyName, Mods};
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditKey {
@@ -25,13 +62,13 @@ pub struct FieldColors {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Space,
     Word,
     Other,
 }
 
-fn class(c: char) -> Class {
+pub(crate) fn class(c: char) -> Class {
     if c.is_whitespace() {
         Class::Space
     } else if c.is_alphanumeric() || c == '_' {
@@ -54,6 +91,9 @@ pub struct TextField {
     preedit: Option<Preedit>,
     /// A secret (an API key): drawn as dots, never copied or cut.
     secret: bool,
+    /// Set by every call that edits, moves the caret or changes the selection; taken by
+    /// [`TextField::blink_caret`], which starts the blink again. Nothing draws by it.
+    restart: bool,
 }
 
 /// What a secret field draws for each char.
@@ -124,6 +164,7 @@ impl TextField {
     /// Sets or clears what an input method is composing at the caret. Returns true if it changed.
     pub fn set_preedit(&mut self, preedit: Option<Preedit>) -> bool {
         let changed = self.preedit != preedit;
+        self.restart |= changed;
         self.preedit = preedit;
         changed
     }
@@ -134,6 +175,7 @@ impl TextField {
 
     /// Replaces the text, caret at the end, no selection.
     pub fn set_text(&mut self, text: &str) {
+        self.restart = true;
         self.text = clean(text);
         self.caret = self.text.len();
         self.anchor = self.caret;
@@ -142,6 +184,7 @@ impl TextField {
     }
 
     pub fn clear(&mut self) {
+        self.restart = true;
         self.preedit = None;
         self.text.clear();
         self.caret = 0;
@@ -150,6 +193,7 @@ impl TextField {
     }
 
     pub fn select_all(&mut self) {
+        self.restart = true;
         self.anchor = 0;
         self.caret = self.text.len();
     }
@@ -171,6 +215,7 @@ impl TextField {
     /// dropped; newlines and tabs become spaces. Returns true if the text changed.
     pub fn insert(&mut self, text: &str) -> bool {
         let clean = clean(text);
+        self.restart = true;
         self.preedit = None;
         if clean.is_empty() && !self.has_selection() {
             return false;
@@ -187,6 +232,7 @@ impl TextField {
         if !self.has_selection() {
             return false;
         }
+        self.restart = true;
         let (a, b) = self.sel_range();
         self.text.replace_range(a..b, "");
         self.caret = a;
@@ -260,6 +306,7 @@ impl TextField {
     /// held (extend the selection; ignored for Backspace/Delete). Left/Right without Shift collapse
     /// a selection to its start/end. Returns true if the TEXT changed.
     pub fn key(&mut self, key: EditKey, word: bool, extend: bool) -> bool {
+        self.restart = true;
         match key {
             EditKey::Left | EditKey::Right | EditKey::Home | EditKey::End => {
                 let (a, b) = self.sel_range();
@@ -389,6 +436,7 @@ impl TextField {
     /// adds its own scroll). `stops` is `Painter::caret_stops` for the current text. `extend` is
     /// Shift.
     pub fn press(&mut self, x: f32, stops: &[f32], extend: bool) {
+        self.restart = true;
         let at = self.offset_at(x + self.scroll, stops);
         self.caret = at;
         if !extend {
@@ -398,6 +446,7 @@ impl TextField {
 
     /// Mouse drag to `x`: extends the selection from the press anchor.
     pub fn drag(&mut self, x: f32, stops: &[f32]) {
+        self.restart = true;
         self.caret = self.offset_at(x + self.scroll, stops);
     }
 
@@ -437,6 +486,7 @@ impl TextField {
             }
             b += ch.len_utf8();
         }
+        self.restart = true;
         self.anchor = a;
         self.caret = b;
     }
@@ -545,6 +595,82 @@ impl TextField {
         }
         p.restore(old);
     }
+
+    /// Whether the caret is drawn now, for a caret that blinks at the system's rate: the
+    /// `caret_on` that [`draw`](Self::draw) (or a caller that draws its own field, as the
+    /// command palette does) is given. It is read from the blink named `id` of `anim`, which the
+    /// caller owns and has begun a frame on; `blink` is the half-period, on and off alike, from
+    /// [`platform::caret_blink_time`](crate::platform::caret_blink_time).
+    ///
+    /// It is false while the field is not `focused`, and false while a selection is shown (the
+    /// caret is hidden over a selection, as on Windows); in both cases the animator is not
+    /// asked, so it forgets the blink at the end of the frame and gives no deadline for it. It
+    /// is true, steadily and with no deadline, when `blink` is `None` (blinking switched off) or
+    /// zero, and with reduced motion. Otherwise it asks [`Animator::blink`], whose deadline at
+    /// [`end_frame`](Animator::end_frame) is the moment the caret next turns on or off.
+    ///
+    /// The blink starts again, on, the first time it is asked for after the field was typed
+    /// in, its caret moved or its selection changed (any of the calls that edit or move), and
+    /// after a frame in which the field was not focused: so the caret is solid while the user
+    /// types and the moment focus arrives.
+    ///
+    /// `focused` means the field has the keyboard in a window that has it too: a caller passes
+    /// false while its window is in the background (the host's `Event::Focus(false)`), or an
+    /// inactive window keeps waking twice a second to blink a caret nobody types into.
+    pub fn blink_caret(
+        &mut self,
+        anim: &mut Animator,
+        id: impl AsId,
+        blink: Option<Duration>,
+        focused: bool,
+    ) -> bool {
+        let id = id.as_id();
+        if std::mem::take(&mut self.restart) {
+            anim.forget(id);
+        }
+        if !focused {
+            // Not asked, so forgotten at the end of this frame; focus starts it on.
+            return false;
+        }
+        if self.selection_shown() {
+            // Asked for again once the selection goes; that move set the restart flag.
+            return false;
+        }
+        match blink {
+            Some(half) => anim.blink(id, half, half),
+            None => true,
+        }
+    }
+
+    /// [`draw`](Self::draw) with a caret that blinks at the system's rate: `caret_on` is
+    /// [`blink_caret`](Self::blink_caret) of the same `anim`, `id`, `blink` and `focused`. Draws
+    /// exactly what `draw` draws with that `caret_on`, and the loop waits for
+    /// [`Animator::end_frame`], which wakes it only while the field is focused and its caret
+    /// blinks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_blinking(
+        &mut self,
+        p: &mut Painter,
+        anim: &mut Animator,
+        id: impl AsId,
+        blink: Option<Duration>,
+        area: Rect,
+        face: Face,
+        size: f32,
+        colors: &FieldColors,
+        placeholder: &str,
+        focused: bool,
+    ) {
+        let caret_on = self.blink_caret(anim, id, blink, focused);
+        self.draw(p, area, face, size, colors, placeholder, focused, caret_on);
+    }
+
+    /// Whether `draw` would show a selection of a focused field: there is one, and no input
+    /// method is composing over it.
+    fn selection_shown(&self) -> bool {
+        let composing = self.preedit.is_some() && !self.secret;
+        self.has_selection() && !composing
+    }
 }
 
 impl TextField {
@@ -565,6 +691,10 @@ fn clean(text: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "textfield_tests.rs"]
+mod blink_tests;
 
 #[cfg(test)]
 mod tests {

@@ -150,6 +150,49 @@ pub fn around(w: f32, h: f32, anchor: Rect, area: Rect) -> Placement {
     }
 }
 
+/// The least height [`around_clear`] cuts a menu to beside its anchor: one row and the menu's
+/// padding. With less room on both sides it places the menu as [`around`] does, over the anchor.
+const MIN_CLEAR: f32 = 48.0;
+
+/// [`around`], except that a menu never covers `anchor` vertically: where it fits neither below
+/// nor above, it goes to the side with more room and is cut to that room (it scrolls), its edge
+/// against the anchor's, instead of being pushed over the anchor. Left and right are as in
+/// [`around`]. An anchor partly outside the area still gets a menu inside it: the result is
+/// pushed in as a last resort. For a drop-down's list, which must not hide its field, unless
+/// less than [`MIN_CLEAR`] would show on either side: then it is placed as [`around`] places it.
+pub(crate) fn around_clear(w: f32, h: f32, anchor: Rect, area: Rect) -> Placement {
+    let placed = around(w, h, anchor, area);
+    let room = room(area);
+    let h = size(h);
+    let (lo, hi) = (room.y, room.bottom());
+    if fits(anchor.bottom(), h, lo, hi) || fits(anchor.y - h, h, lo, hi) {
+        return placed;
+    }
+    let (below, above) = ((hi - anchor.bottom()).max(0.0), (anchor.y - lo).max(0.0));
+    let up = above > below;
+    let shown = h.min(if up { above } else { below }).min(room.h);
+    if shown < h.min(MIN_CLEAR) {
+        // Not even a row fits on either side: a sliver, or nothing, that still takes every
+        // key. Cover the anchor instead, as a plain menu does.
+        return placed;
+    }
+    let y = if up {
+        anchor.y - shown
+    } else {
+        anchor.bottom()
+    };
+    Placement {
+        rect: Rect::new(
+            placed.rect.x,
+            push_in(y, shown, lo, hi),
+            placed.rect.w,
+            shown,
+        ),
+        left: placed.left,
+        above: up,
+    }
+}
+
 /// Places a submenu `w` by `h` beside `item`, the row that opens it as wide as its menu,
 /// inside `area` less [`MARGIN`]: [`GAP`] px to the right of it, or to the left first when
 /// `leftward`, with its first row level with the item (the menu's padding above the item's
