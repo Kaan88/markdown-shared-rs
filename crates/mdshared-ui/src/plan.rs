@@ -66,28 +66,19 @@ pub const SEPARATE_AT: f32 = 6.0;
 
 // ---- small texts -----------------------------------------------------------------------------------
 
-/// 1,284.
+/// 1,284. The shared [`mdshared_app::fmt::count`].
 pub fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    mdshared_app::fmt::count(n as u64)
 }
 
-/// 1.9 KB.
+/// 1.9 KB. The shared [`mdshared_app::fmt::size`] up to a gigabyte; from there this one goes on
+/// in megabytes, as it always has (a plan's note is never that large, and what a caller was
+/// given for one does not change).
 pub fn size_text(bytes: usize) -> String {
-    let b = bytes as f64;
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", b / 1024.0)
+    if bytes < 1024 * 1024 * 1024 {
+        mdshared_app::fmt::size(bytes as u64)
     } else {
-        format!("{:.1} MB", b / (1024.0 * 1024.0))
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1864,6 +1855,56 @@ mod tests {
     use super::*;
     use crate::gfx::{Face, Gfx, Painter};
     use crate::theme::{DARK, LIGHT, Palette};
+
+    /// `thousands` and `size_text` as they were written here before they were handed to
+    /// `mdshared_app::fmt`: what they give must not have changed for any caller.
+    #[test]
+    fn the_shared_formatters_give_what_this_module_gave() {
+        let old_thousands = |n: usize| {
+            let digits = n.to_string();
+            let mut out = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            out
+        };
+        let old_size = |bytes: usize| {
+            let b = bytes as f64;
+            if bytes < 1024 {
+                format!("{bytes} B")
+            } else if bytes < 1024 * 1024 {
+                format!("{:.1} KB", b / 1024.0)
+            } else {
+                format!("{:.1} MB", b / (1024.0 * 1024.0))
+            }
+        };
+        let mut n: usize = 0;
+        for step in 0..4000usize {
+            assert_eq!(thousands(n), old_thousands(n), "{n}");
+            assert_eq!(size_text(n), old_size(n), "{n}");
+            // Small numbers one by one, then growing past a terabyte.
+            n = if step < 1100 {
+                n + 1
+            } else {
+                n + n / 97 + 1013
+            };
+        }
+        for edge in [
+            1023,
+            1024,
+            1_048_575,
+            1_048_576,
+            1_073_741_823,
+            1_073_741_824,
+            usize::MAX,
+        ] {
+            assert_eq!(thousands(edge), old_thousands(edge));
+            assert_eq!(size_text(edge), old_size(edge));
+        }
+    }
     use mdshared_app::split::Text;
     use mdshared_text::Bitmap;
 

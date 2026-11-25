@@ -176,7 +176,10 @@ pub fn overlap(
 // (`platform::backdrop_available`), the compositor took the request, and the window has the
 // keyboard. In every other case the chrome is its flat colours, opaque, as without the feature.
 // With the setting off nothing here runs beyond one comparison a frame. Which parts of a window
-// are chrome is the application's to say.
+// are chrome is the application's to say. Under high contrast the application passes the
+// setting through `tokens::allowed_backdrop`, which makes it `Off`: the system's own check
+// (`platform::backdrop_available`) is read only when the window gets the keyboard back, and
+// KDE's blur does not ask about contrast at all.
 
 /// What the window system is asked. The app's own is the real system; tests have a recording one.
 pub trait System {

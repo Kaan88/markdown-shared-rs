@@ -206,9 +206,18 @@ mod tests {
     fn names_show_while_they_fit_beside_the_button_and_icons_alone_below() {
         let w = widths();
         let full: f32 = w.iter().map(|w| w + 16.0).sum::<f32>() + SWITCH_LEFT + HEAD_ACTION;
+        // The plan's "about 210" was measured with Segoe UI, Windows's interface font. Other
+        // systems draw these names in their own fonts (DejaVu Sans on a bare Linux needs 231
+        // px), so there the number only has to fall between the two widths drawn below, which
+        // keeps both sides of the rule seen on every system.
+        #[cfg(windows)]
         assert!(
             (200.0..=215.0).contains(&full),
             "the names need {full} px: the plan's 'about 210'"
+        );
+        assert!(
+            160.0 < full && full < 300.0,
+            "the names need {full} px: between the narrow head and the wide one"
         );
         assert!(switch_labels_fit(&w, 300.0));
         assert!(switch_labels_fit(&w, full));

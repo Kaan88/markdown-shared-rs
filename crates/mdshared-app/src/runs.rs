@@ -4460,9 +4460,9 @@ fn link_parts(line: &str) -> (String, String) {
 mod tests {
     use super::*;
 
-    #[path = "../../runs_copies_tests.rs"]
+    // In `runs/tests/`, where a module of this inline one is looked for: a `#[path]` that
+    // climbs out of that directory with `..` resolves on Windows only, where it need not exist.
     mod copies;
-    #[path = "../../runs_notes_tests.rs"]
     mod notes;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

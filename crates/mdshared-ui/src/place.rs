@@ -280,11 +280,10 @@ fn remember(
 }
 
 /// The rectangle a maximized window goes back to when it is restored, where the system keeps one
-/// (Windows). Opaque: only [`set_normal_rect`] knows what to do with it (on Windows it is in
-/// the workspace coordinates of `GetWindowPlacement`, which are not screen coordinates when the
-/// taskbar is at the top or left).
+/// (Windows). It is in the coordinates `GetWindowPlacement` uses, which `SetWindowPlacement`
+/// takes back as they are.
 #[cfg(windows)]
-fn normal_rect(window: &Window) -> Option<Rect> {
+pub(crate) fn normal_rect(window: &Window) -> Option<Rect> {
     let wp = placement(window)?;
     let r = wp.rcNormalPosition;
     (r.right > r.left && r.bottom > r.top).then(|| Rect {
@@ -332,7 +331,7 @@ fn placement(
 }
 
 #[cfg(not(windows))]
-fn normal_rect(_window: &Window) -> Option<Rect> {
+pub(crate) fn normal_rect(_window: &Window) -> Option<Rect> {
     None
 }
 

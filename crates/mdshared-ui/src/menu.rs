@@ -1,4 +1,9 @@
 //! Popup menus drawn inside the window: the main menu, Recent and the right-click menus.
+//!
+//! A menu hangs from a point ([`Menu::new`], [`Menu::above`]) or is anchored to a rectangle
+//! and kept on screen at any corner ([`Menu::around`]). Submenus, their hover delay and their
+//! keys are [`submenu::Cascade`](crate::submenu::Cascade), which is made of these menus placed
+//! [`beside`](Menu::beside) one another.
 
 use crate::gfx::{Face, Painter, Rect};
 use crate::scroll;
@@ -120,8 +125,31 @@ pub fn same_letter(key: char, typed: char) -> bool {
 
 const ROW: f32 = 32.0;
 const SEP: f32 = 9.0;
-const PAD: f32 = 5.0;
+/// The padding above the first row and below the last, and at each side of the rows.
+pub(crate) const PAD: f32 = 5.0;
 const MAX_WIDTH: f32 = 420.0;
+
+/// How far from its place a menu starts when it is drawn by
+/// [`Menu::draw_in_presence`], in logical px.
+pub const MENU_DROP: f32 = 6.0;
+
+/// The room the arrow of a row that opens a submenu takes at the row's right, in place of a
+/// hint.
+const ARROW: f32 = 28.0;
+
+/// How a menu placed by [`Menu::around`] or [`Menu::beside`] stands to its rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Around {
+    /// Below the rectangle, flipped above or to the left when it does not fit.
+    Below(Rect),
+    /// Beside the rectangle (an item as wide as its menu), on the left first when `true`.
+    Beside(Rect, bool),
+    /// Below the rectangle, flipped above or to the left when it does not fit, and not over it:
+    /// where it fits on neither side it is cut to the room on the roomier side and scrolls (a
+    /// drop-down's list, which must not hide its field), unless not even one row would show on
+    /// either side, where it is placed as [`Around::Below`] places it.
+    Clear(Rect),
+}
 
 pub struct Menu<T> {
     pub items: Vec<Item<T>>,
@@ -144,6 +172,19 @@ pub struct Menu<T> {
     access: bool,
     /// Whether the marked letters are drawn underlined.
     access_visible: bool,
+    /// Placed by a rectangle ([`around`](Self::around), [`beside`](Self::beside)) rather than
+    /// from `anchor`.
+    pub(crate) around: Option<Around>,
+    /// The last placement by a rectangle put the menu to the left of it, or above it.
+    went_left: bool,
+    went_up: bool,
+    /// Which rows open a submenu and draw an arrow; empty in a menu without submenus.
+    branches: Vec<bool>,
+    /// The least width the menu is placed at ([`min_width`](Self::min_width)); zero for none.
+    pub(crate) min_w: f32,
+    /// The highlighted row is drawn in the palette's accent with `on_accent`
+    /// ([`set_high_contrast`](Self::set_high_contrast)).
+    high_contrast: bool,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -172,7 +213,105 @@ impl<T: Clone> Menu<T> {
             reveal: None,
             access: false,
             access_visible: !crate::keys::MAC,
+            around: None,
+            went_left: false,
+            went_up: false,
+            branches: Vec::new(),
+            min_w: 0.0,
+            high_contrast: false,
         }
+    }
+
+    /// Anchors the menu to `anchor` and keeps it on screen at any corner: a context menu on a
+    /// selected word or a cell, a drop-down under a button, or one at a right-click, which is a
+    /// rectangle of no size at the pointer. The menu opens below the anchor with its left edge
+    /// at the anchor's left; where it would cross the bottom of the area it opens above the
+    /// anchor instead, and where it would cross the right it opens to the left, its right edge at
+    /// the anchor's right. When it fits on neither side it goes to the side with more room and
+    /// is pushed inside the area, over the anchor; one taller than the area scrolls. This takes
+    /// the place of the point given to [`new`](Self::new), of its `align_right` and of
+    /// [`above`](Self::above). The geometry is [`submenu::around`](crate::submenu::around).
+    pub fn around(mut self, anchor: Rect) -> Self {
+        self.around = Some(Around::Below(anchor));
+        self
+    }
+
+    /// Places the menu beside `item` as a submenu: `item` is the row that opens it, as wide as
+    /// its menu ([`Menu::rect`]'s `x` and `w`, the row's `y` and `h`). The menu goes to the
+    /// right of it with its first row level with the item, or to the left first when `leftward`
+    /// (the menu it comes from opened to the left, so its submenus carry on that way); it flips
+    /// to the other side when it would leave the area, and slides up to stay inside it. The
+    /// geometry is [`submenu::beside`](crate::submenu::beside).
+    pub fn beside(mut self, item: Rect, leftward: bool) -> Self {
+        self.around = Some(Around::Beside(item, leftward));
+        self
+    }
+
+    /// Makes the menu at least `w` logical px wide, as a drop-down's list is at least as wide as
+    /// its field. The widest row still widens it, the menu's own limit of 420 px and the area it
+    /// is placed in still narrow it, and a width that is not finite or not positive asks for
+    /// nothing. A menu not given one is as wide as before.
+    pub fn min_width(mut self, w: f32) -> Self {
+        self.set_min_width(w);
+        self
+    }
+
+    /// [`min_width`](Self::min_width) on a menu already made: the next placement uses it.
+    pub(crate) fn set_min_width(&mut self, w: f32) {
+        self.min_w = if w.is_finite() { w.max(0.0) } else { 0.0 };
+    }
+
+    /// Draws the highlighted row as Windows does under high contrast: filled with the palette's
+    /// `accent` and its label, mark, icon and hint in `on_accent`, which for the system's
+    /// contrast theme ([`crate::tokens::Tokens::from_system_colors`]) are its Highlight and
+    /// HighlightText ([`crate::tokens::selected`]). Off by default: the row is filled with
+    /// `hover` and keeps its colours, which under a contrast theme stays close to the popup.
+    /// Pass the host's `Cx::high_contrast` or
+    /// [`crate::platform::system_high_contrast`].
+    pub fn set_high_contrast(&mut self, on: bool) {
+        self.high_contrast = on;
+    }
+
+    pub(crate) fn set_around(&mut self, around: Around) {
+        self.around = Some(around);
+    }
+
+    /// Whether the last placement put the menu to the left of the rectangle it was placed by:
+    /// flipped by [`around`](Self::around), or on the left by [`beside`](Self::beside). False
+    /// for a menu placed from a point.
+    pub fn opened_left(&self) -> bool {
+        self.went_left
+    }
+
+    /// Whether the menu stands above its anchor: flipped above by the last placement of
+    /// [`around`](Self::around), or, for a menu hung from a point, made [`above`](Self::above).
+    pub fn opened_above(&self) -> bool {
+        if self.around.is_some() {
+            self.went_up
+        } else {
+            self.above
+        }
+    }
+
+    /// Marks the rows at `rows` (indices into `items`) as rows that open a submenu: each draws a
+    /// right-pointing arrow at its right in place of its hint, and the menu keeps room for it.
+    /// An index past the last item is ignored. [`submenu::Cascade`](crate::submenu::Cascade)
+    /// marks its menus this way; a menu marked by nobody draws as it always did.
+    pub fn submenu_rows(mut self, rows: impl IntoIterator<Item = usize>) -> Self {
+        for row in rows {
+            if row < self.items.len() {
+                if self.branches.len() <= row {
+                    self.branches.resize(row + 1, false);
+                }
+                self.branches[row] = true;
+            }
+        }
+        self
+    }
+
+    /// Whether row `index` opens a submenu ([`submenu_rows`](Self::submenu_rows)).
+    pub fn opens_submenu(&self, index: usize) -> bool {
+        self.branches.get(index).copied().unwrap_or(false)
     }
 
     /// Reads the labels of this menu for access keys: `Open &files…` marks `f`, `&&` is a
@@ -240,8 +379,10 @@ impl<T: Clone> Menu<T> {
         let lead =
             if marks || icons { 40.0 } else { 14.0 } + if marks && icons { MARK } else { 0.0 };
         let mut w: f32 = 180.0;
-        for item in &self.items {
-            let hint = if item.hint.is_empty() {
+        for (i, item) in self.items.iter().enumerate() {
+            let hint = if self.opens_submenu(i) {
+                ARROW
+            } else if item.hint.is_empty() {
                 0.0
             } else {
                 p.measure(Face::Ui, 12.0, &item.hint) + 28.0
@@ -249,32 +390,48 @@ impl<T: Clone> Menu<T> {
             let (label, _) = self.shown(&item.label);
             w = w.max(lead + p.measure(Face::Ui, 13.5, &label) + hint + 16.0);
         }
-        let w = w.min(MAX_WIDTH).min(area.w - 8.0);
+        let w = w.max(self.min_w).min(MAX_WIDTH).min(area.w - 8.0);
         let h: f32 = 2.0 * PAD
             + self
                 .items
                 .iter()
                 .map(|i| ROW + if i.separator_before { SEP } else { 0.0 })
                 .sum::<f32>();
-        let top = area.y.max(4.0);
-        let bottom = area.bottom() - 4.0;
-        let mut x = if self.align_right {
-            self.anchor.0 - w
-        } else {
-            self.anchor.0
+        let (x, y, shown) = match self.around {
+            Some(around) => {
+                let placed = match around {
+                    Around::Below(anchor) => crate::submenu::around(w, h, anchor, area),
+                    Around::Clear(anchor) => crate::submenu::around_clear(w, h, anchor, area),
+                    Around::Beside(item, leftward) => {
+                        crate::submenu::beside(w, h, item, area, leftward)
+                    }
+                };
+                self.went_left = placed.left;
+                self.went_up = placed.above;
+                (placed.rect.x, placed.rect.y, placed.rect.h)
+            }
+            None => {
+                let top = area.y.max(4.0);
+                let bottom = area.bottom() - 4.0;
+                let mut x = if self.align_right {
+                    self.anchor.0 - w
+                } else {
+                    self.anchor.0
+                };
+                let mut y = if self.above {
+                    (self.anchor.1 - h).max(top)
+                } else {
+                    // Where it was opened, even when that is in the title row (a tab's own
+                    // menu); only being pushed up to fit stops at the area's top.
+                    self.anchor.1
+                };
+                x = x.min(area.right() - w - 4.0).max(area.x + 4.0);
+                if y + h > bottom {
+                    y = (bottom - h).max(top);
+                }
+                (x, y, h.min(bottom - top))
+            }
         };
-        let mut y = if self.above {
-            (self.anchor.1 - h).max(top)
-        } else {
-            // Where it was opened, even when that is in the title row (a tab's own menu); only
-            // being pushed up to fit stops at the area's top.
-            self.anchor.1
-        };
-        x = x.min(area.right() - w - 4.0).max(area.x + 4.0);
-        if y + h > bottom {
-            y = (bottom - h).max(top);
-        }
-        let shown = h.min(bottom - top);
         self.rect = Rect::new(x.round(), y.round(), w.round(), shown);
         self.content = h;
         let max = (h - shown).max(0.0);
@@ -325,10 +482,14 @@ impl<T: Clone> Menu<T> {
                 );
                 p.fill(line, pal.popup_line);
             }
-            if self.hover == Some(i) && item.enabled {
-                p.rbox(r, 5.0, pal.hover);
+            let lit = self.hover == Some(i) && item.enabled;
+            let strong = lit && self.high_contrast;
+            if lit {
+                p.rbox(r, 5.0, if strong { pal.accent } else { pal.hover });
             }
-            let color = if item.enabled { pal.text } else { pal.faint };
+            // Under high contrast everything on the highlighted row reads on Highlight.
+            let ink = |c| if strong { pal.on_accent } else { c };
+            let color = ink(if item.enabled { pal.text } else { pal.faint });
             let mut x = r.x + 9.0;
             if marks || icons {
                 // The check mark has a column of its own before the icons, so an item shows both
@@ -336,18 +497,22 @@ impl<T: Clone> Menu<T> {
                 // icons would be.
                 let mut col = r.x + 18.0;
                 if item.checked {
-                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), ink(pal.accent));
                 }
                 if marks && icons {
                     col += MARK;
                 }
                 if icons && !item.icon.is_empty() {
-                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    let c = ink(if item.enabled { pal.muted } else { pal.faint });
                     p.icon(item.icon, 14.0, col, r.cy(), c);
                 }
                 x = col + 18.0;
             }
-            let hint_w = if item.hint.is_empty() {
+            let hint_w = if self.opens_submenu(i) {
+                let c = ink(if item.enabled { pal.muted } else { pal.faint });
+                p.icon(crate::glyph::RIGHT, 12.0, r.right() - 12.0, r.cy(), c);
+                ARROW - 2.0
+            } else if item.hint.is_empty() {
                 0.0
             } else {
                 p.text_right(
@@ -356,7 +521,7 @@ impl<T: Clone> Menu<T> {
                     r.right() - 10.0,
                     r.cy(),
                     &item.hint,
-                    pal.faint,
+                    ink(pal.faint),
                 ) + 18.0
             };
             let (label, key) = self.shown(&item.label);
@@ -375,6 +540,26 @@ impl<T: Clone> Menu<T> {
         {
             scroll::draw_scrollbar(p, pal, track, thumb, false);
         }
+    }
+
+    /// Places the menu inside `area` and draws it as it opens or closes: `t` is how present it
+    /// is, 0 gone and 1 there, from [`Animator::presence`](crate::anim::Animator::presence) or
+    /// a [`Transient`](crate::anim::Transient) that holds the menu while it closes. The menu
+    /// fades as a whole and moves [`MENU_DROP`] px into place, downwards (upwards for a menu
+    /// that opens [`above`](Self::above) its anchor). At 1 this is
+    /// [`draw_in`](Self::draw_in), pixel for pixel; at 0 the menu is placed and nothing is
+    /// drawn. A menu that is closing takes no pointer and no keys: the application has let go
+    /// of it and only draws it.
+    pub fn draw_in_presence(&mut self, p: &mut Painter, pal: &Palette, area: Rect, t: f32) {
+        self.place_in(p, area);
+        let drop = if self.opened_above() {
+            MENU_DROP
+        } else {
+            -MENU_DROP
+        };
+        // The frame and the shadow round it.
+        let bounds = self.rect.inset(-18.0);
+        crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
     }
 
     /// Where the menu was last placed.
@@ -417,6 +602,18 @@ impl<T: Clone> Menu<T> {
                 return;
             }
         }
+    }
+
+    /// Moves the keyboard highlight to row `index` and brings it into view at the next
+    /// placement, as [`step`](Self::step) does for the next row. Returns false, and changes
+    /// nothing, for an index past the last item or a disabled item.
+    pub fn highlight(&mut self, index: usize) -> bool {
+        if !self.items.get(index).is_some_and(|i| i.enabled) {
+            return false;
+        }
+        self.hover = Some(index);
+        self.reveal = Some(index);
+        true
     }
 
     /// Scrolls the rows down the list by `dy` logical px (negative goes back up) and moves the
@@ -522,8 +719,136 @@ mod tests {
         menu
     }
 
+    #[test]
+    fn under_high_contrast_the_highlighted_row_is_highlight_with_highlight_text() {
+        let colors = crate::tokens::SystemColors {
+            window: crate::gfx::rgb(0xfffaef),
+            window_text: crate::gfx::rgb(0x3d3d3d),
+            highlight: crate::gfx::rgb(0x903909),
+            highlight_text: crate::gfx::rgb(0xfff5e3),
+            hot_light: crate::gfx::rgb(0x1c5e75),
+            gray_text: crate::gfx::rgb(0x676767),
+            button_face: crate::gfx::rgb(0xfffaef),
+            button_text: crate::gfx::rgb(0x3d3d3d),
+        };
+        let pal = crate::tokens::Tokens::from_system_colors(&colors).palette;
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        let draw = |hc: Option<bool>| {
+            let mut menu = Menu::new(many(3), 40.0, 40.0, false);
+            menu.highlight(1);
+            if let Some(on) = hc {
+                menu.set_high_contrast(on);
+            }
+            let mut bmp = Bitmap::new(300, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, pal.page);
+            menu.draw_in(&mut p, &pal, area);
+            (bmp, menu.row_rect(0), menu.row_rect(1))
+        };
+        let px = |b: &Bitmap, x: f32, y: f32| {
+            let o = (y as usize * b.width as usize + x as usize) * 4;
+            [b.pixels[o + 2], b.pixels[o + 1], b.pixels[o]]
+        };
+        let count = |b: &Bitmap, r: Rect, c: crate::gfx::Rgb| {
+            let mut n = 0;
+            for y in r.y as usize..r.bottom() as usize {
+                for x in r.x as usize..r.right() as usize {
+                    if px(b, x as f32, y as f32) == c {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let (plain, row0, row1) = draw(None);
+        let (off, _, _) = draw(Some(false));
+        let (on, _, _) = draw(Some(true));
+        assert!(
+            off.pixels == plain.pixels,
+            "off is the default, pixel for pixel"
+        );
+        assert_eq!(px(&plain, row1.x + 4.0, row1.cy()), pal.hover);
+        assert_eq!(px(&on, row1.x + 4.0, row1.cy()), colors.highlight);
+        // The label is drawn in HighlightText (light on Desert's dark Highlight); its
+        // antialiased edges blend, so count the pixels near it.
+        let mut light = 0;
+        for y in row1.y as usize..row1.bottom() as usize {
+            for x in row1.x as usize..row1.right() as usize {
+                let c = px(&on, x as f32, y as f32);
+                if c[0] >= 0xd0 && c[1] >= 0xc0 && c[2] >= 0xb0 {
+                    light += 1;
+                }
+            }
+        }
+        assert!(
+            light > 10,
+            "the label is in HighlightText ({light} light pixels)"
+        );
+        assert_eq!(
+            count(&on, row1, pal.text),
+            0,
+            "no window text left on Highlight"
+        );
+        assert_eq!(
+            count(&on, row0, pal.text),
+            count(&plain, row0, pal.text),
+            "other rows unchanged"
+        );
+    }
+
     fn many(n: u8) -> Vec<Item<u8>> {
         (0..n).map(|i| Item::new(i, format!("Item {i}"))).collect()
+    }
+
+    #[test]
+    fn a_menu_that_is_there_draws_as_before_and_one_opening_is_fainter_and_off_its_place() {
+        use crate::theme::LIGHT;
+        let area = Rect::new(0.0, 0.0, 300.0, 400.0);
+        let draw = |t: Option<f32>, above: bool| {
+            let mut menu = Menu::new(many(4), 60.0, 200.0, false);
+            if above {
+                menu = menu.above();
+            }
+            let mut bmp = Bitmap::new(300, 400);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, LIGHT.page);
+            match t {
+                Some(t) => menu.draw_in_presence(&mut p, &LIGHT, area, t),
+                None => menu.draw_in(&mut p, &LIGHT, area),
+            }
+            (bmp, menu.rect())
+        };
+        let mut blank = Bitmap::new(300, 400);
+        blank.clear(LIGHT.page);
+        for above in [false, true] {
+            let (plain, rect) = draw(None, above);
+            let (there, _) = draw(Some(1.0), above);
+            assert!(there.pixels == plain.pixels, "above {above}: at 1");
+            // Gone: placed all the same, so the caller's geometry holds, and nothing drawn.
+            let (gone, placed) = draw(Some(0.0), above);
+            assert!(gone.pixels == blank.pixels && placed == rect);
+            // Half way: the whole menu, shadow and text and all, at half strength, and half of
+            // the drop away from its place: 3 px up when it opens downwards, 3 px down when it
+            // opens upwards.
+            let (half, _) = draw(Some(0.5), above);
+            let shift: i32 = if above { -3 } else { 3 };
+            for y in 0..400i32 {
+                for x in 0..300usize {
+                    let from = (y + shift).clamp(0, 399) as usize;
+                    for c in 0..3 {
+                        let moved = plain.pixels[(from * 300 + x) * 4 + c] as u32;
+                        let under = blank.pixels[(y as usize * 300 + x) * 4 + c] as u32;
+                        assert_eq!(
+                            half.pixels[(y as usize * 300 + x) * 4 + c] as u32,
+                            (moved + under).div_ceil(2),
+                            "above {above} at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -802,5 +1127,52 @@ mod tests {
         menu.place_in(&mut p, area);
         assert_eq!(menu.hover, Some(19));
         assert!(menu.scroll() > 0.0);
+    }
+
+    #[test]
+    fn a_least_width_widens_a_narrow_menu_and_nothing_else() {
+        let plain = placed_width(&mut menu_of(&["One", "Two"], false));
+        assert_eq!(plain, 180.0, "the menu's own least width");
+        for (asked, got) in [
+            (260.0, 260.0),
+            (100.0, plain),
+            (0.0, plain),
+            (-5.0, plain),
+            (f32::NAN, plain),
+            (f32::INFINITY, plain),
+            // The menu's own limit and the area still narrow it.
+            (9000.0, MAX_WIDTH),
+        ] {
+            let mut menu = menu_of(&["One", "Two"], false).min_width(asked);
+            assert_eq!(placed_width(&mut menu), got, "asked {asked}");
+        }
+        let mut menu = menu_of(&["One", "Two"], false).min_width(500.0);
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        menu.place(&mut p, 300.0, 300.0);
+        assert_eq!(menu.rect().w, 292.0);
+    }
+
+    #[test]
+    fn a_highlight_set_by_index_is_brought_into_view_and_refuses_what_cannot_be_chosen() {
+        let mut items = many(30);
+        items[3].enabled = false;
+        let mut menu = Menu::new(items, 10.0, 10.0, false);
+        assert!(!menu.highlight(3), "a disabled item");
+        assert!(!menu.highlight(30), "past the last");
+        assert_eq!(menu.hover, None);
+        assert!(menu.highlight(25));
+        assert_eq!(menu.hover, Some(25));
+        let mut bmp = Bitmap::new(300, 300);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        menu.place_in(&mut p, area);
+        let row = menu.row_rect(25);
+        assert!(row.y >= menu.rect().y && row.bottom() <= menu.rect().bottom());
+        assert!(menu.highlight(0));
+        menu.place_in(&mut p, area);
+        assert_eq!(menu.scroll(), 0.0);
     }
 }

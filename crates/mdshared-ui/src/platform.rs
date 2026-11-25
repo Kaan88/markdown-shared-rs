@@ -156,6 +156,8 @@ pub fn pick_save_async(
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use crate::tokens::SystemColors;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::System::DataExchange::{
@@ -435,10 +437,228 @@ mod imp {
         ) == Some(0)
     }
 
+    /// Windows is asked directly and has nothing to watch here: the application reads again on
+    /// winit's `ThemeChanged` or when its window gains the focus.
+    pub fn watch_motion_reduced(_wake: impl Fn() + Send + Sync + 'static) {}
+
+    /// "Animation effects" in Settings, Accessibility, Visual effects (before Windows 11:
+    /// "Show animations in Windows"), which is `SPI_GETCLIENTAREAANIMATION`: whether a window
+    /// animates what is inside it. Off means less motion is asked for. A call that fails says
+    /// nothing was asked.
+    pub fn motion_reduced() -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SystemParametersInfoW,
+        };
+        let mut animates: i32 = 1;
+        // SAFETY: this action writes one BOOL through the pointer, which is to a live i32.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                (&mut animates as *mut i32).cast(),
+                0,
+            )
+        };
+        ok != 0 && animates == 0
+    }
+
+    /// The desktop's accent (Settings, Personalisation, Colours): the DWM's `AccentColor`,
+    /// kept as 0xAABBGGRR. None where it was never set.
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        let v = reg_dword("Software\\Microsoft\\Windows\\DWM", "AccentColor")?;
+        Some([v as u8, (v >> 8) as u8, (v >> 16) as u8])
+    }
+
+    /// Whether a high-contrast theme is on (`SPI_GETHIGHCONTRAST`). A call that fails says no.
+    pub fn system_high_contrast() -> bool {
+        use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SPI_GETHIGHCONTRAST, SystemParametersInfoW,
+        };
+        let mut hc = HIGHCONTRASTW {
+            cbSize: size_of::<HIGHCONTRASTW>() as u32,
+            dwFlags: 0,
+            lpszDefaultScheme: std::ptr::null_mut(),
+        };
+        // SAFETY: this action fills the HIGHCONTRASTW whose size is in its first field; the
+        // scheme name it points to belongs to the system and is not read here.
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETHIGHCONTRAST,
+                hc.cbSize,
+                (&mut hc as *mut HIGHCONTRASTW).cast(),
+                0,
+            )
+        };
+        ok != 0 && hc.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+
+    /// The eight system colours of [`SystemColors`], read with `GetSysColor` whether or not a
+    /// contrast theme is on (without one they are the classic theme's, which nothing uses).
+    pub(super) fn sys_colors() -> SystemColors {
+        use windows_sys::Win32::Graphics::Gdi::{
+            COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+            COLOR_HOTLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
+        };
+        let get = |index| {
+            // SAFETY: no pointers; an index the system does not know gives 0, which is black.
+            let v = unsafe { GetSysColor(index) };
+            // A COLORREF is 0x00BBGGRR.
+            [v as u8, (v >> 8) as u8, (v >> 16) as u8]
+        };
+        SystemColors {
+            window: get(COLOR_WINDOW),
+            window_text: get(COLOR_WINDOWTEXT),
+            highlight: get(COLOR_HIGHLIGHT),
+            highlight_text: get(COLOR_HIGHLIGHTTEXT),
+            hot_light: get(COLOR_HOTLIGHT),
+            gray_text: get(COLOR_GRAYTEXT),
+            button_face: get(COLOR_BTNFACE),
+            button_text: get(COLOR_BTNTEXT),
+        }
+    }
+
+    pub fn system_contrast_colors() -> Option<SystemColors> {
+        system_high_contrast().then(sys_colors)
+    }
+
+    /// Whom to wake when the contrast changes; replaced by each [`watch_contrast`].
+    static CONTRAST_WAKE: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+    /// The contrast as last seen by the watching window: on, and the colours.
+    pub(super) static CONTRAST_SEEN: Mutex<Option<(bool, SystemColors)>> = Mutex::new(None);
+    /// The watching window, 0 when it could not be made.
+    static CONTRAST_WINDOW: OnceLock<isize> = OnceLock::new();
+
+    pub fn watch_contrast(wake: impl Fn() + Send + Sync + 'static) {
+        *CONTRAST_WAKE.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(wake));
+        contrast_window();
+    }
+
+    /// The hidden window that hears of contrast changes, made with its thread on the first
+    /// call; None when it could not be made.
+    pub(super) fn contrast_window() -> Option<isize> {
+        let hwnd = *CONTRAST_WINDOW.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("mdshared-contrast".into())
+                .spawn(move || contrast_thread(tx));
+            if spawned.is_err() {
+                return 0;
+            }
+            rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0)
+        });
+        (hwnd != 0).then_some(hwnd)
+    }
+
+    /// Reads the contrast now and wakes the application if it is not what was seen last.
+    fn contrast_maybe_changed() {
+        let now = (system_high_contrast(), sys_colors());
+        let changed = super::note_change(
+            &mut CONTRAST_SEEN.lock().unwrap_or_else(PoisonError::into_inner),
+            now,
+        );
+        // The wake is taken out of the lock first, so a wake that calls `watch_contrast` does
+        // not wait on itself.
+        let wake = CONTRAST_WAKE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let (true, Some(wake)) = (changed, wake) {
+            wake();
+        }
+    }
+
+    unsafe extern "system" fn contrast_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: windows_sys::Win32::Foundation::WPARAM,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+        };
+        // A switch of the contrast theme sends both: the setting (`SPI_SETHIGHCONTRAST`, and
+        // "WindowsThemeElement") and, once the colours are in place, the colours. Any other
+        // setting's change finds nothing changed and wakes no one.
+        if msg == WM_SETTINGCHANGE || msg == WM_SYSCOLORCHANGE {
+            contrast_maybe_changed();
+        }
+        // SAFETY: the arguments are the ones this window procedure was called with.
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    /// The watching window's thread: notes the contrast as it is, makes the window, answers
+    /// `tx` with it (0 when it could not be made), and runs the window's loop for the rest of
+    /// the process. A hidden top-level window, not a message-only one: only top-level windows
+    /// hear the broadcasts `WM_SETTINGCHANGE` and `WM_SYSCOLORCHANGE`.
+    fn contrast_thread(tx: std::sync::mpsc::Sender<isize>) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage,
+            WNDCLASSW, WS_OVERLAPPED,
+        };
+        *CONTRAST_SEEN.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((system_high_contrast(), sys_colors()));
+        let class = wide("mdshared-contrast");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(contrast_proc),
+            lpszClassName: class.as_ptr(),
+            // SAFETY: an all-zero WNDCLASSW is valid for the fields not set.
+            ..unsafe { std::mem::zeroed() }
+        };
+        // SAFETY: `wc` and the class name outlive the call. The class is registered once, by
+        // this thread, which is started once.
+        unsafe { RegisterClassW(&wc) };
+        let title = wide("");
+        // SAFETY: the class is registered; the window is never shown and has no state.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        _ = tx.send(hwnd as isize);
+        if hwnd.is_null() {
+            return;
+        }
+        // SAFETY: an ordinary message loop on the window's own thread.
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
     pub fn double_click_time() -> Duration {
         // SAFETY: no preconditions.
         let ms = unsafe { GetDoubleClickTime() };
         Duration::from_millis(if ms == 0 { 500 } else { ms as u64 })
+    }
+
+    pub fn double_click_size() -> (u32, u32) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXDOUBLECLK, SM_CYDOUBLECLK,
+        };
+        // SAFETY: no preconditions; 0 is the answer for a failure.
+        let (w, h) = unsafe {
+            (
+                GetSystemMetrics(SM_CXDOUBLECLK),
+                GetSystemMetrics(SM_CYDOUBLECLK),
+            )
+        };
+        let clean = |v: i32| if v > 0 { v as u32 } else { 4 };
+        (clean(w), clean(h))
     }
 
     pub fn caret_blink_time() -> Option<Duration> {
@@ -733,6 +953,74 @@ mod imp {
             .spawn()
             .is_ok()
     }
+    /// The desktop's accent: not read on macOS yet (`NSColor.controlAccentColor`).
+    #[cfg(target_os = "macos")]
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        None
+    }
+
+    /// Whether high contrast is asked for: not read on macOS yet ("Increase contrast").
+    #[cfg(target_os = "macos")]
+    pub fn system_high_contrast() -> bool {
+        false
+    }
+
+    /// The desktop's accent from the settings portal (`org.freedesktop.appearance`
+    /// `accent-color`, three numbers from 0 to 1; one outside that range means none was
+    /// chosen), read on a helper thread and given up after half a second.
+    #[cfg(not(target_os = "macos"))]
+    pub fn system_accent() -> Option<crate::gfx::Rgb> {
+        use zbus::zvariant::Value;
+        portal_read(Duration::from_millis(500), || {
+            let bus = zbus::blocking::Connection::session().ok()?;
+            read_setting(&bus, "org.freedesktop.appearance", "accent-color", |v| {
+                let Value::Structure(s) = v else {
+                    return None;
+                };
+                let mut out = [0u8; 3];
+                let fields = s.fields();
+                if fields.len() != 3 {
+                    return None;
+                }
+                for (o, f) in out.iter_mut().zip(fields) {
+                    let x = f64::try_from(f).ok()?;
+                    if !(0.0..=1.0).contains(&x) {
+                        return None;
+                    }
+                    *o = (x * 255.0).round() as u8;
+                }
+                Some(out)
+            })
+        })
+    }
+
+    /// Whether the settings portal asks for high contrast (`org.freedesktop.appearance`
+    /// `contrast` is 1), read as [`system_accent`] is.
+    #[cfg(not(target_os = "macos"))]
+    pub fn system_high_contrast() -> bool {
+        portal_read(Duration::from_millis(500), || {
+            let bus = zbus::blocking::Connection::session().ok()?;
+            read_setting(&bus, "org.freedesktop.appearance", "contrast", |v| {
+                u32::try_from(v).ok()
+            })
+        }) == Some(1)
+    }
+
+    /// Runs `read` on a helper thread and waits for it at most `timeout`: a portal that is not
+    /// running may be started by the bus, and that can take long.
+    #[cfg(not(target_os = "macos"))]
+    fn portal_read<T: Send + 'static>(
+        timeout: Duration,
+        read: impl FnOnce() -> Option<T> + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mdshared-portal".into())
+            .spawn(move || _ = tx.send(read()))
+            .ok()?;
+        rx.recv_timeout(timeout).ok().flatten()
+    }
+
     /// The system's appearance: `AppleInterfaceStyle` in the global defaults is "Dark" while dark
     /// mode is on (also while "Auto" is in its dark half) and absent otherwise. A read of the
     /// defaults database, cheap enough for every call and safe off the main thread.
@@ -775,15 +1063,30 @@ mod imp {
 
     #[cfg(not(target_os = "macos"))]
     fn read_color_scheme() -> Option<u32> {
-        use zbus::zvariant::{OwnedValue, Value};
         let bus = zbus::blocking::Connection::session().ok()?;
+        read_setting(&bus, "org.freedesktop.appearance", "color-scheme", |v| {
+            u32::try_from(v).ok()
+        })
+    }
+
+    /// One value of the settings portal, read by `read` once the variants it is wrapped in are
+    /// taken off. `None` when the portal does not answer, does not know the key, or `read`
+    /// refuses the value's type.
+    #[cfg(not(target_os = "macos"))]
+    fn read_setting<T>(
+        bus: &zbus::blocking::Connection,
+        namespace: &str,
+        key: &str,
+        read: impl Fn(&zbus::zvariant::Value) -> Option<T>,
+    ) -> Option<T> {
+        use zbus::zvariant::{OwnedValue, Value};
         let call = |method: &str| {
             bus.call_method(
                 Some("org.freedesktop.portal.Desktop"),
                 "/org/freedesktop/portal/desktop",
                 Some("org.freedesktop.portal.Settings"),
                 method,
-                &("org.freedesktop.appearance", "color-scheme"),
+                &(namespace, key),
             )
         };
         // `ReadOne` (portal version 2) answers with the value; the older `Read` wraps it once more.
@@ -793,7 +1096,154 @@ mod imp {
         while let Value::Value(inner) = value {
             value = inner;
         }
-        u32::try_from(value).ok()
+        read(value)
+    }
+
+    /// macOS: Accessibility, Display, Reduce motion.
+    #[cfg(target_os = "macos")]
+    pub fn motion_reduced() -> bool {
+        objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+    /// macOS is asked directly and has nothing to watch here: the application reads again on
+    /// winit's `ThemeChanged` or when its window gains the focus.
+    #[cfg(target_os = "macos")]
+    pub fn watch_motion_reduced(_wake: impl Fn() + Send + Sync + 'static) {}
+
+    /// What the settings portal last said about motion, kept between calls.
+    #[cfg(not(target_os = "macos"))]
+    static MOTION: LastGood = LastGood::new();
+
+    /// The least time between two readings of the portal that [`motion_reduced`] starts.
+    #[cfg(not(target_os = "macos"))]
+    const MOTION_EVERY: Duration = Duration::from_secs(1);
+
+    /// The desktop's wish for less motion, as the settings portal last said it. It never waits
+    /// for the portal: it gives the last answer at once (false until there has been one) and,
+    /// at most once a second and only while no thread listens for changes, starts a helper
+    /// thread that asks again. A portal that is slow, hung or absent costs the caller nothing
+    /// and leaves the last answer standing.
+    #[cfg(not(target_os = "macos"))]
+    pub fn motion_reduced() -> bool {
+        use std::time::Instant;
+        if MOTION.claim_reading(Instant::now(), MOTION_EVERY) {
+            let spawned = std::thread::Builder::new()
+                .name("mdshared-motion".into())
+                .spawn(read_and_watch_motion);
+            if spawned.is_err() {
+                MOTION.reading_done(Instant::now());
+            }
+        }
+        MOTION.get()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
+        MOTION.set_wake(std::sync::Arc::new(wake));
+    }
+
+    /// The body of the helper thread: one reading of the portal, and then, if no other thread
+    /// is doing so already, listening for the portal's `SettingChanged` signal for as long as
+    /// the bus is there, reading again at each change. Every answer goes to [`MOTION`]; no
+    /// answer (no bus, no portal, an error) leaves the last one standing.
+    #[cfg(not(target_os = "macos"))]
+    fn read_and_watch_motion() {
+        use std::time::Instant;
+        use zbus::zvariant::OwnedValue;
+        let bus = zbus::blocking::Connection::session().ok();
+        // The one thread that listens subscribes before it reads, so that a change between the
+        // reading and the subscription is not lost.
+        let watching = bus.is_some() && MOTION.claim_watching();
+        let signals = bus.as_ref().filter(|_| watching).and_then(|bus| {
+            zbus::blocking::Proxy::new(
+                bus,
+                "org.freedesktop.portal.Desktop",
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+            )
+            .and_then(|portal| portal.receive_signal("SettingChanged"))
+            .ok()
+        });
+        // Each reading takes its number before it asks, so an answer that comes back late
+        // loses to one asked for after it.
+        let stamp = MOTION.stamp();
+        MOTION.answer(stamp, bus.as_ref().and_then(read_reduced_motion));
+        MOTION.reading_done(Instant::now());
+        if let (Some(bus), Some(signals)) = (&bus, signals) {
+            for change in signals {
+                // The signal carries the namespace, the key and the new value. Only the three
+                // namespaces read below matter; a signal that cannot be read is taken to.
+                let ours = change
+                    .body()
+                    .deserialize::<(String, String, OwnedValue)>()
+                    .map_or(true, |(namespace, _, _)| {
+                        MOTION_NAMESPACES.contains(&namespace.as_str())
+                    });
+                if ours {
+                    let stamp = MOTION.stamp();
+                    MOTION.answer(stamp, read_reduced_motion(bus));
+                }
+            }
+        }
+        if watching {
+            // The bus went away, or the portal has no signal: a later reading listens again.
+            MOTION.watching_done();
+        }
+    }
+
+    /// The namespaces of the settings portal that [`read_reduced_motion`] reads.
+    #[cfg(not(target_os = "macos"))]
+    const MOTION_NAMESPACES: [&str; 3] = [
+        "org.freedesktop.appearance",
+        "org.gnome.desktop.interface",
+        "org.kde.kdeglobals.KDE",
+    ];
+
+    /// The first of these the portal answers:
+    ///
+    /// 1. `org.freedesktop.appearance` `reduced-motion`, the portal's own key (1 asks for less
+    ///    motion, 0 has no wish), where the portal is new enough to have it;
+    /// 2. `org.gnome.desktop.interface` `enable-animations` (GNOME's Settings, Accessibility,
+    ///    Seeing, "Animation effects"; false asks for less), which the GNOME and GTK portals
+    ///    pass on;
+    /// 3. `org.kde.kdeglobals.KDE` `AnimationDurationFactor` (Plasma's System Settings,
+    ///    "Animation speed"; 0 is its "instant" end), which the KDE portal passes on.
+    ///
+    /// `None` when the portal answers none of them: there is then no new answer, and the last
+    /// one is kept.
+    #[cfg(not(target_os = "macos"))]
+    fn read_reduced_motion(bus: &zbus::blocking::Connection) -> Option<bool> {
+        use zbus::zvariant::Value;
+        let wish = read_setting(bus, "org.freedesktop.appearance", "reduced-motion", |v| {
+            u32::try_from(v).ok()
+        });
+        if let Some(wish) = wish {
+            return Some(wish == 1);
+        }
+        let animations = read_setting(
+            bus,
+            "org.gnome.desktop.interface",
+            "enable-animations",
+            |v| bool::try_from(v).ok(),
+        );
+        if let Some(on) = animations {
+            return Some(!on);
+        }
+        // KDE stores its settings as text; a portal may also hand the number over as one.
+        let factor = read_setting(
+            bus,
+            "org.kde.kdeglobals.KDE",
+            "AnimationDurationFactor",
+            |v| match v {
+                Value::Str(s) => s.as_str().trim().parse::<f64>().ok(),
+                Value::F64(f) => Some(*f),
+                _ => None,
+            },
+        )?;
+        Some(factor == 0.0)
+    }
+    /// Neither Linux nor macOS says how far a double click may stray: Windows' default, 4 px.
+    pub fn double_click_size() -> (u32, u32) {
+        (4, 4)
     }
     /// macOS: the interval set in Settings (`NSEvent.doubleClickInterval`). Elsewhere 500 ms.
     pub fn double_click_time() -> Duration {
@@ -822,6 +1272,13 @@ mod imp {
         Some(Duration::from_millis(530))
     }
     pub fn style_window(_hwnd: isize, _dark: bool) {}
+    /// No system here gives the colours of a contrast theme.
+    pub fn system_contrast_colors() -> Option<crate::tokens::SystemColors> {
+        None
+    }
+    /// Nothing is watched here: the application reads again on winit's `ThemeChanged` or
+    /// when its window gains the focus.
+    pub fn watch_contrast(_wake: impl Fn() + Send + Sync + 'static) {}
     pub fn backdrop_available() -> bool {
         false
     }
@@ -886,8 +1343,193 @@ pub fn open_file(path: &Path, extensions: &[&str]) -> bool {
 pub fn reveal_in_file_manager(path: &Path) -> bool {
     imp::reveal_in_file_manager(path)
 }
+/// Whether the system asks for less motion, on every system this crate runs on: what an
+/// [`Animator`](crate::anim::Animator) is told through
+/// [`set_system_reduced`](crate::anim::Animator::set_system_reduced). The application reads it
+/// at start and again when the system says its settings changed (winit's `ThemeChanged` is a
+/// good moment, and so is the window gaining the focus); it is cheap enough for that, not for
+/// every frame.
+///
+/// - Windows: Settings, Accessibility, Visual effects, "Animation effects" switched off
+///   (`SPI_GETCLIENTAREAANIMATION`).
+/// - macOS: System Settings, Accessibility, Display, "Reduce motion".
+/// - Linux: the settings portal, asked for its own `reduced-motion` key, then GNOME's
+///   `enable-animations`, then Plasma's animation speed at "instant". Without a portal the
+///   answer is false.
+///
+/// It never blocks. On Windows and macOS the system answers at once. On Linux the portal is
+/// another process that may be slow, hung or not there, so it is asked on a helper thread and
+/// this call gives the last answer it gave (false before the first one), taking only a lock
+/// for a moment. The first call starts a reading that then stays to listen for the portal's
+/// `SettingChanged` signal, so a change of the setting is read when it is made. Only while
+/// nothing listens (no session bus, a portal without the signal) does a later call start
+/// another reading, at most once a second. A reading that fails or never ends leaves the last
+/// answer standing: a setting that was on is not taken for off because the portal did not
+/// answer in time, and an answer that comes back after a newer one is dropped.
+///
+/// Because the first call on Linux comes before the first answer, an application that wants
+/// the right value from its first frame gives [`watch_motion_reduced`] a wake and reads again
+/// when woken.
+pub fn motion_reduced() -> bool {
+    imp::motion_reduced()
+}
+
+/// Has `wake` called whenever the answer of [`motion_reduced`] changes behind the
+/// application's back, which is on Linux only: when the helper thread's first reading of the
+/// settings portal differs from false, and when the user changes the setting. `wake` runs on
+/// that helper thread, so it must only wake the application's loop (send a user event through
+/// winit's `EventLoopProxy`); the loop then calls [`motion_reduced`] and passes the answer to
+/// its animators. Like the wake of a [`Job`](mdshared_app::job), nothing here looks at what it
+/// does. A second call replaces the wake of the first.
+///
+/// The order of the two calls does not matter: when the portal has already answered by the
+/// time `wake` is given, `wake` is called once at once, on the caller's thread, so an answer
+/// that came first is not missed.
+///
+/// On Windows and macOS nothing changes behind the application's back (the system tells the
+/// window, and the application reads again then), so the wake is dropped and never called.
+pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
+    imp::watch_motion_reduced(wake)
+}
+
+/// An answer from a service that may be slow or absent, kept between askings: the last good
+/// answer, who is asking now, and whom to wake when it changes. The part of the Linux
+/// [`motion_reduced`] that is plain logic, apart from the bus so that it is tested on every
+/// system. Time comes in as an argument.
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+struct LastGood {
+    held: std::sync::Mutex<Held>,
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+struct Held {
+    /// The last answer; false until there is one.
+    value: bool,
+    /// A reading is under way.
+    reading: bool,
+    /// When the last reading ended.
+    read_at: Option<std::time::Instant>,
+    /// A thread is listening for changes.
+    watching: bool,
+    /// There has been an answer.
+    answered: bool,
+    /// The number the last reading was given by [`stamp`](LastGood::stamp); 0 before any.
+    issued: u64,
+    /// The number of the reading whose answer `value` is; 0 before any.
+    newest: u64,
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+impl LastGood {
+    const fn new() -> LastGood {
+        LastGood {
+            held: std::sync::Mutex::new(Held {
+                value: false,
+                reading: false,
+                read_at: None,
+                watching: false,
+                answered: false,
+                issued: 0,
+                newest: 0,
+                wake: None,
+            }),
+        }
+    }
+
+    /// The lock, also after a thread panicked while holding it: the state is a few plain
+    /// values, all of them valid whatever was half done.
+    fn held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The last answer.
+    fn get(&self) -> bool {
+        self.held().value
+    }
+
+    /// A number for a reading about to ask, larger than every one given before: what orders
+    /// the answers of readings that run side by side.
+    fn stamp(&self) -> u64 {
+        let mut held = self.held();
+        held.issued += 1;
+        held.issued
+    }
+
+    /// Takes the answer of the reading numbered `stamp`. `None` (the service did not answer)
+    /// changes nothing: the last answer stands. Neither does an answer from a reading older
+    /// than the one the kept answer came from: it is stale. An answer that differs from the
+    /// last one calls the wake, after the lock is let go, so a wake that reads the value at
+    /// once does not wait on itself.
+    fn answer(&self, stamp: u64, answer: Option<bool>) {
+        let wake = {
+            let mut held = self.held();
+            match answer {
+                Some(value) if stamp >= held.newest => {
+                    held.newest = stamp;
+                    held.answered = true;
+                    let changed = value != held.value;
+                    held.value = value;
+                    held.wake.clone().filter(|_| changed)
+                }
+                _ => None,
+            }
+        };
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    /// Whether the caller should start a reading now: none is under way, no thread listens
+    /// for changes (it reads each change itself), and the last reading ended at least `every`
+    /// ago (or there was none). When true, the reading is the caller's, and it says
+    /// [`reading_done`](Self::reading_done) when it ends. A reading that never ends is never
+    /// followed by another: one stuck thread, not one a call.
+    fn claim_reading(&self, now: std::time::Instant, every: Duration) -> bool {
+        let mut held = self.held();
+        let due = held
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every);
+        let claim = !held.reading && !held.watching && due;
+        held.reading |= claim;
+        claim
+    }
+
+    fn reading_done(&self, now: std::time::Instant) {
+        let mut held = self.held();
+        held.reading = false;
+        held.read_at = Some(now);
+    }
+
+    /// Whether the caller should listen for changes: no thread does. When true the listening
+    /// is the caller's, and it says [`watching_done`](Self::watching_done) if it ever stops.
+    fn claim_watching(&self) -> bool {
+        !std::mem::replace(&mut self.held().watching, true)
+    }
+
+    fn watching_done(&self) {
+        self.held().watching = false;
+    }
+
+    /// Keeps `wake` for the answers to come, and calls it once now (after the lock is let
+    /// go) if an answer came before it: the caller may have read the value before that
+    /// answer, and would otherwise not hear of it until the next change.
+    fn set_wake(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        let answered = {
+            let mut held = self.held();
+            held.wake = Some(wake.clone());
+            held.answered
+        };
+        if answered {
+            wake();
+        }
+    }
+}
+
 /// Whether the system asks for less motion (macOS: Accessibility, Display, Reduce motion), so
-/// animations stay still. False elsewhere, where the applications ask the system themselves.
+/// animations stay still. False elsewhere, where the applications ask the system themselves;
+/// [`motion_reduced`] asks on every system, and is what new code calls. This one is kept as it
+/// was for the applications that already use it.
 pub fn reduces_motion() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -921,9 +1563,65 @@ pub fn note_recent_document(path: &Path) {
 pub fn system_is_dark() -> bool {
     imp::system_is_dark()
 }
+/// The desktop's accent colour, where the system gives one: the DWM's on Windows, the
+/// settings portal's on Linux; none on macOS yet. For [`crate::tokens::Tokens::from_system`].
+pub fn system_accent() -> Option<crate::gfx::Rgb> {
+    imp::system_accent()
+}
+/// Whether the system asks for high contrast: a high-contrast theme on Windows, the settings
+/// portal's `contrast` on Linux; never on macOS yet.
+pub fn system_high_contrast() -> bool {
+    imp::system_high_contrast()
+}
+/// The colours of the system's contrast theme while one is on ([`system_high_contrast`]):
+/// on Windows the eight `GetSysColor` colours of [`crate::tokens::SystemColors`]. None while
+/// no contrast theme is on, and always on Linux and macOS, which give no such colours (the
+/// toolkit's own high-contrast palettes stand in there). Nine quick calls to the system, no
+/// waiting. For [`crate::tokens::Tokens::from_system`].
+pub fn system_contrast_colors() -> Option<crate::tokens::SystemColors> {
+    imp::system_contrast_colors()
+}
+
+/// Has `wake` called when a contrast theme is switched on or off, or another is chosen,
+/// while the application runs, so that it makes its tokens again
+/// ([`crate::tokens::Tokens::from_system`]), passes the backdrop through
+/// [`crate::tokens::allowed_backdrop`] again, and repaints. Windows tells no winit event of
+/// this. Here a thread of its own keeps a hidden window that hears the system's
+/// `WM_SETTINGCHANGE` and `WM_SYSCOLORCHANGE` broadcasts; at each it reads whether high
+/// contrast is on and the eight colours, and calls `wake` when they differ from what it read
+/// last. One switch can call it twice (the setting first, the colours a moment later); reading
+/// again each time gives the right look. Other settings' changes do not call it.
+///
+/// `wake` runs on that thread, so it must only wake the application's loop (send a user event
+/// through winit's `EventLoopProxy`). A second call replaces the wake of the first. The thread
+/// and its window are made on the first call, which waits for them (a few milliseconds), and
+/// stay until the process ends. If the window cannot be made, nothing is called.
+///
+/// On Linux and macOS the wake is dropped and never called: the application reads again on
+/// winit's `ThemeChanged` or when its window gains the focus.
+pub fn watch_contrast(wake: impl Fn() + Send + Sync + 'static) {
+    imp::watch_contrast(wake)
+}
+
+/// Keeps `now` as the last seen and says whether it differs from what was seen before
+/// (nothing seen counts as a difference). The watching window's rule, apart so it is tested on
+/// every system.
+#[cfg(any(test, windows))]
+fn note_change<T: PartialEq>(seen: &mut Option<T>, now: T) -> bool {
+    let changed = seen.as_ref() != Some(&now);
+    *seen = Some(now);
+    changed
+}
+
 /// The system double-click interval, default 500 ms.
 pub fn double_click_time() -> Duration {
     imp::double_click_time()
+}
+/// The rectangle, width by height in device px, that the second press of a double click must
+/// fall in, centred on the first: `SM_CXDOUBLECLK` and `SM_CYDOUBLECLK` on Windows (4 x 4 by
+/// default; a failed call gives 4), and 4 x 4 on Linux and macOS, which do not say.
+pub fn double_click_size() -> (u32, u32) {
+    imp::double_click_size()
 }
 /// The caret blink half-period; None when blinking is disabled.
 pub fn caret_blink_time() -> Option<Duration> {
@@ -983,6 +1681,252 @@ pub fn set_backdrop(hwnd: isize, backdrop: Backdrop) -> bool {
 }
 
 #[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    /// The system is asked and answers. What it answers depends on the machine the test runs
+    /// on, so only that it answers is held; on Windows and macOS, where the system itself is
+    /// asked, also that it answers the same when asked again at once. (On Linux the helper
+    /// thread's first answer may come between the two calls.)
+    #[test]
+    fn the_wish_for_less_motion_is_read_without_failing() {
+        let reduced = motion_reduced();
+        println!("the system asks for less motion: {reduced}");
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(motion_reduced(), reduced);
+        }
+        // The older call is what it was: macOS's answer, and false elsewhere.
+        if !cfg!(target_os = "macos") {
+            assert!(!reduces_motion());
+        }
+    }
+
+    /// The call does not wait for the portal: asked on a thread of its own, many times over, it
+    /// has answered long before a portal's time limit could run out even once. Whether a
+    /// portal is there or not, and whatever it says.
+    #[test]
+    fn asking_for_the_wish_never_waits_for_the_system() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                motion_reduced();
+            }
+            _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(20))
+            .expect("two hundred calls took longer than twenty seconds: the call waits");
+    }
+
+    /// A wake can be set on every system, and setting it calls nothing by itself on the two
+    /// where nothing changes behind the application's back.
+    #[test]
+    fn a_wake_for_the_wish_can_be_set_and_replaced() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..2 {
+            let calls = calls.clone();
+            watch_motion_reduced(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        if cfg!(any(windows, target_os = "macos")) {
+            motion_reduced();
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn the_last_good_answer_stands_when_the_service_does_not_answer() {
+        let last = LastGood::new();
+        assert!(!last.get(), "false before any answer");
+        last.answer(last.stamp(), None);
+        assert!(!last.get());
+        last.answer(last.stamp(), Some(true));
+        assert!(last.get());
+        // A reading that failed or timed out is no answer: the setting that was on stays on.
+        for _ in 0..3 {
+            last.answer(last.stamp(), None);
+            assert!(last.get(), "a failed reading must not switch the wish off");
+        }
+        last.answer(last.stamp(), Some(false));
+        assert!(!last.get());
+        last.answer(last.stamp(), None);
+        assert!(!last.get());
+    }
+
+    #[test]
+    fn a_wake_is_called_when_the_answer_changes_and_only_then() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let last = Arc::new(LastGood::new());
+        let seen = Arc::new(AtomicUsize::new(0));
+        // The wake reads the value at once, as an application woken by it will: it must not
+        // wait on the lock the answer was stored under.
+        let (reader, count) = (last.clone(), seen.clone());
+        last.set_wake(Arc::new(move || {
+            count.fetch_add(if reader.get() { 100 } else { 1 }, Ordering::SeqCst);
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = last.clone();
+        std::thread::spawn(move || {
+            worker.answer(worker.stamp(), Some(false)); // as it was: no wake
+            worker.answer(worker.stamp(), None); // no answer: no wake
+            worker.answer(worker.stamp(), Some(true)); // changed: woken, and the wake reads true
+            worker.answer(worker.stamp(), Some(true)); // the same again: no wake
+            worker.answer(worker.stamp(), None);
+            worker.answer(worker.stamp(), Some(false)); // changed back: woken, and the wake reads false
+            _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the wake waited on the lock of the answer it was called for");
+        assert_eq!(seen.load(Ordering::SeqCst), 101);
+        // A second wake replaces the first; there has been an answer, so it is called once
+        // when given, and then on the next change.
+        let count = seen.clone();
+        last.set_wake(Arc::new(move || {
+            count.fetch_add(10_000, Ordering::SeqCst);
+        }));
+        assert_eq!(seen.load(Ordering::SeqCst), 10_101);
+        last.answer(last.stamp(), Some(false)); // as it was: no wake
+        last.answer(last.stamp(), Some(true)); // changed: woken
+        assert_eq!(seen.load(Ordering::SeqCst), 20_101);
+        // Without a wake an answer is just kept.
+        let quiet = LastGood::new();
+        quiet.answer(quiet.stamp(), Some(true));
+        assert!(quiet.get());
+    }
+
+    #[test]
+    fn one_reading_at_a_time_no_more_than_one_an_interval_and_one_listener() {
+        let every = Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let last = LastGood::new();
+        // The first call reads; while that reading is under way no other is started, however
+        // long it takes (a hung portal is one stuck thread, not one a call).
+        assert!(last.claim_reading(at(0), every));
+        for ms in [0, 10, 5_000, 3_600_000] {
+            assert!(
+                !last.claim_reading(at(ms), every),
+                "a second reading at {ms} ms"
+            );
+        }
+        // It ended: the next is due an interval after its end, not before.
+        last.reading_done(at(400));
+        assert!(!last.claim_reading(at(400), every));
+        assert!(!last.claim_reading(at(1_399), every));
+        assert!(last.claim_reading(at(1_400), every));
+        assert!(!last.claim_reading(at(9_000), every));
+        last.reading_done(at(1_450));
+        // A clock that reads earlier than the last reading's end starts nothing.
+        assert!(!last.claim_reading(at(100), every));
+        assert!(last.claim_reading(at(2_450), every));
+        // One listener: the first to ask is it, until it says it stopped.
+        assert!(last.claim_watching());
+        assert!(!last.claim_watching());
+        assert!(!last.claim_watching());
+        last.watching_done();
+        assert!(last.claim_watching());
+        // None of this touched the answer.
+        assert!(!last.get());
+    }
+
+    #[test]
+    fn no_reading_is_started_while_a_thread_listens_for_changes() {
+        let every = Duration::from_secs(1);
+        let start = std::time::Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let last = LastGood::new();
+        // The first reading becomes the listener and ends its reading.
+        assert!(last.claim_reading(at(0), every));
+        assert!(last.claim_watching());
+        last.reading_done(at(0));
+        // As long as it listens, no call starts a reading, however long after.
+        for s in [1, 2, 60, 3_600] {
+            assert!(!last.claim_reading(at(s), every), "a reading at {s} s");
+        }
+        // It stopped (the bus went away): readings start again.
+        last.watching_done();
+        assert!(last.claim_reading(at(3_601), every));
+    }
+
+    #[test]
+    fn an_answer_older_than_the_one_kept_is_dropped() {
+        let last = LastGood::new();
+        // Two readings run side by side; the later one (a change the listener read) answers
+        // first, then the earlier one comes back with what was true before it.
+        let early = last.stamp();
+        let late = last.stamp();
+        assert!(late > early);
+        last.answer(late, Some(true));
+        last.answer(early, Some(false));
+        assert!(last.get(), "a stale answer overwrote a newer one");
+        // An older reading that did not answer changes nothing either; a newer one counts.
+        last.answer(early, None);
+        assert!(last.get());
+        let next = last.stamp();
+        last.answer(next, Some(false));
+        assert!(!last.get());
+        // A reading that failed does not hold its place: a newer reading's answer is taken,
+        // and an older one that comes back after it still loses.
+        let (a, b, c) = (last.stamp(), last.stamp(), last.stamp());
+        last.answer(c, None);
+        last.answer(b, Some(true));
+        assert!(last.get());
+        last.answer(a, Some(false));
+        assert!(last.get());
+    }
+
+    #[test]
+    fn a_wake_given_after_the_first_answer_is_called_once_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = |seen: &Arc<AtomicUsize>| {
+            let seen = seen.clone();
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        // No answer yet: the wake waits for one, as before.
+        let last = LastGood::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        last.set_wake(count(&seen));
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        last.answer(last.stamp(), None);
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        // The portal answered before the wake was given (true, or even false as assumed):
+        // the wake is called once when given, whichever the answer, and then only on changes.
+        for answer in [true, false] {
+            let last = LastGood::new();
+            last.answer(last.stamp(), Some(answer));
+            let seen = Arc::new(AtomicUsize::new(0));
+            last.set_wake(count(&seen));
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "answer {answer}");
+            last.answer(last.stamp(), Some(answer));
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "answer {answer}");
+            last.answer(last.stamp(), Some(!answer));
+            assert_eq!(seen.load(Ordering::SeqCst), 2, "answer {answer}");
+            // A replacing wake is called once too, and the one it replaced no more.
+            let other = Arc::new(AtomicUsize::new(0));
+            last.set_wake(count(&other));
+            assert_eq!(other.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.load(Ordering::SeqCst), 2);
+        }
+        // A wake given on another thread that reads the value at once does not wait on itself.
+        let last = Arc::new(LastGood::new());
+        last.answer(last.stamp(), Some(true));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = last.clone();
+        std::thread::spawn(move || {
+            let reader = worker.clone();
+            worker.set_wake(Arc::new(move || {
+                _ = tx.send(reader.get());
+            }));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true));
+    }
+}
+
+#[cfg(test)]
 mod backdrop_tests {
     use super::*;
 
@@ -1005,6 +1949,75 @@ mod backdrop_tests {
     fn there_is_no_backdrop_off_windows() {
         assert!(!backdrop_available());
         assert!(!set_backdrop(0, Backdrop::Mica));
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_is_noted_once_and_the_same_again_is_no_change() {
+        let mut seen = None;
+        assert!(note_change(&mut seen, (false, 1)));
+        assert!(!note_change(&mut seen, (false, 1)));
+        assert!(note_change(&mut seen, (true, 1)));
+        assert!(note_change(&mut seen, (true, 2)));
+        assert!(!note_change(&mut seen, (true, 2)));
+        assert_eq!(seen, Some((true, 2)));
+    }
+
+    /// The system's own colours are printed, never compared: they are this machine's.
+    #[test]
+    fn the_contrast_colours_are_read_without_failing() {
+        let on = system_high_contrast();
+        let colors = system_contrast_colors();
+        println!("high contrast {on}: {colors:?}");
+        #[cfg(windows)]
+        {
+            println!("GetSysColor now: {:?}", imp::sys_colors());
+            assert_eq!(colors.is_some(), on);
+        }
+        #[cfg(not(windows))]
+        assert_eq!(colors, None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_a_contrast_wake_is_dropped() {
+        watch_contrast(|| panic!("never called"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_window_wakes_only_when_the_contrast_differs_from_the_last_seen() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        watch_contrast(move || {
+            _ = tx.send(());
+        });
+        let hwnd = imp::contrast_window().expect("the hidden window is made");
+        let send = |msg| {
+            // SAFETY: the window is ours and alive; both messages take no pointers here. The
+            // call returns once the window's thread has handled the message.
+            unsafe { SendMessageW(hwnd as _, msg, 0, 0) };
+        };
+        // Nothing changed: the messages alone wake no one.
+        send(WM_SYSCOLORCHANGE);
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
+        // What was seen last differs from the system now, as just after a switch.
+        let now = (system_high_contrast(), imp::sys_colors());
+        let mut other = now.1;
+        other.window = [other.window[0] ^ 1, other.window[1], other.window[2]];
+        *imp::CONTRAST_SEEN.lock().unwrap() = Some((!now.0, other));
+        send(WM_SYSCOLORCHANGE);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        // Seen now: the next message wakes no one.
+        send(WM_SETTINGCHANGE);
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -1082,6 +2095,17 @@ mod tests {
             super::imp::select_argument(Path::new("C:/docs/a b/read me.md")),
             "/select,\"C:\\docs\\a b\\read me.md\""
         );
+    }
+}
+
+#[cfg(test)]
+mod double_click_tests {
+    #[test]
+    fn the_double_click_rectangle_is_at_least_a_pixel_each_way() {
+        let (w, h) = super::double_click_size();
+        assert!(w >= 1 && h >= 1, "{w} x {h}");
+        #[cfg(not(windows))]
+        assert_eq!((w, h), (4, 4));
     }
 }
 
