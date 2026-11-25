@@ -1110,3 +1110,50 @@ panic), `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdsh
 -- -D warnings`, `cargo fmt --all --check`, on Windows only. `settings_motion_sheet` (ignored)
 writes the slider row and a frame in motion, light and dark, at 1 and 1.5. Not seen by a person
 in a running app; no application uses it yet.
+
+## The tree's disclosure turns (`Painter::icon_rotated`, `glyph::draw_disclosure`, 2026-11-25, `feat/x3-disclosure`, roadmap X3)
+
+The last open part of X3. The toolkit draws no tree rows: the applications draw them and swap
+`glyph::RIGHT` and `glyph::DOWN` for a folder's chevron. Now the chevron can turn between the two.
+
+- **`Painter::icon_rotated(glyph, size, cx, cy, degrees, c)`** (`gfx/turned.rs`). The glyph's
+  path is turned clockwise about the centre of its square and then stroked, as `icon` strokes it,
+  so it stays crisp; no bitmap is resampled. At 0 degrees, or a whole number of turns, it calls
+  `icon`: the same cached mask and the same pixels. A turned mask is not cached, so an animation,
+  which asks for a new angle every frame, does not fill the icon cache. The blend that `icon`
+  did is now one private function both use, moved unchanged.
+- **`glyph::draw_disclosure(p, cx, cy, size, open, c)`**: `RIGHT` turned by `open` times 90
+  degrees. At `open` 0 or less (and NaN) it is `p.icon(RIGHT, ..)`, at 1 or more
+  `p.icon(DOWN, ..)`, pixel for pixel, so an application that switches to it draws the same rows
+  at rest. `RIGHT`'s points turned a quarter are `DOWN`'s, so the turn ends where `DOWN` begins.
+- **`glyph::disclosure_turn(anim, id, expanded)`** and **`draw_disclosure_animated`**: the turn
+  as a value of the animator under `Id::new(id).with("disclosure")`, moving by
+  `DISCLOSURE_MOTION`, which is `fluent::MOVE` (167 ms, point to point, the same both ways).
+  Chosen because the chevron stays on screen and moves, which is what `MOVE` is for; `ENTER` and
+  `EXIT` are for things that appear and leave, and `anim::document` has no motion for a part of a
+  control. 167 ms is also the expander body's time, so the two end together. Reduced motion and
+  `Policy::Never` turn it at once.
+- **`expander::draw_expander_turning`**, opt in: `draw_expander_animated` with the chevron
+  turning. `draw_header` and `draw_expander_animated` keep the swap; they now draw the chevron
+  through `draw_disclosure` at 0 or 1, which is the same `icon` call they made.
+
+Run: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings` and `cargo test -p mdshared-ui --lib --features
+host,a11y` on Windows (debug). The new tests: a turn of 0, -0, 360, -360 and 720 degrees is
+`icon` for every glyph in `ALL`; `RIGHT` turned 90 (and -270) degrees matches `DOWN`, and 270
+(and -90) matches `UP` (ink within 3%, centroid within a quarter pixel, box within a pixel, no
+pixel more than 32 of 255 apart); turns of 9 to 200 degrees match a second drawing of `RIGHT`'s
+points turned by hand and drawn upright (no pixel more than 4 apart) and are neither resting
+chevron; turned masks leave the cache's size alone; the clip and the offset hold; nonsense
+angles and sizes draw nothing. The disclosure at rest is the plain `RIGHT` and `DOWN` icons,
+light and dark; between, it is `RIGHT` turned `open` times 90 degrees and neither rest. On a
+`ManualClock` at 16 ms a frame: the frame that asks still shows the old state and asks for
+another; the turn rises steadily and rests at 1 on the 10th to 12th frame with no frame asked;
+back as long; a row first seen open is open; reduced motion and `Policy::Never` jump with no
+frame asked; the turn does not touch a value under the row's own name.
+`draw_expander_turning` and `draw_expander_animated` give the same pixels and body rectangles
+at rest and the same frames asked, and differ on the frames of the turn. All at scale 1 and 1.5.
+An `#[ignore]`d sheet, `disclosure_sheet`, writes the turn in eleven steps at 10, 12 and 16 px.
+Only an agent has looked at that sheet. **Not seen by a person**, and not wired into mdview or
+mdedit: no tree in a running application has turned its chevron yet. Linux and macOS: not run
+(nothing here is platform code).

@@ -18,6 +18,7 @@ mod rounding;
 mod shapes;
 pub use shapes::{Along, Path};
 mod soft;
+mod turned;
 pub use soft::{LIGHT_SHADOW, Shade, soft_bounds};
 
 pub type Rgb = [u8; 3];
@@ -803,35 +804,7 @@ impl<'a> Painter<'a> {
     pub fn icon(&mut self, glyph: &str, size: f32, cx: f32, cy: f32, c: Rgb) {
         let side = size * self.scale;
         let mask = self.gfx.icon(glyph, side);
-        if mask.width == 0 {
-            return;
-        }
-        let x0 = (cx * self.scale - side / 2.0).round() as i32 + mask.left + self.origin.0;
-        let y0 = (cy * self.scale - side / 2.0).round() as i32 + mask.top + self.origin.1;
-        let (xa, xb) = (
-            x0.max(self.clip.0),
-            (x0 + mask.width as i32).min(self.clip.2),
-        );
-        if xa >= xb {
-            return;
-        }
-        for (row, cover) in mask.data.chunks_exact(mask.width).enumerate() {
-            let y = y0 + row as i32;
-            if y < self.clip.1 || y >= self.clip.3 {
-                continue;
-            }
-            let o = (y as usize * self.bmp.width as usize + xa as usize) * 4;
-            let dst = &mut self.bmp.pixels[o..o + (xb - xa) as usize * 4];
-            let cover = &cover[(xa - x0) as usize..(xb - x0) as usize];
-            for (d, &a) in dst.as_chunks_mut::<4>().0.iter_mut().zip(cover) {
-                // 255 has to come out as the colour itself.
-                let a = a as u32 + (a as u32 >> 7);
-                let ia = 256 - a;
-                d[0] = ((c[2] as u32 * a + d[0] as u32 * ia) >> 8) as u8;
-                d[1] = ((c[1] as u32 * a + d[1] as u32 * ia) >> 8) as u8;
-                d[2] = ((c[0] as u32 * a + d[2] as u32 * ia) >> 8) as u8;
-            }
-        }
+        self.blit_icon_mask(&mask, side, cx, cy, c);
     }
 
     /// Wrapped text in a column `w` wide starting at `(x, y)`. Returns the height used.
