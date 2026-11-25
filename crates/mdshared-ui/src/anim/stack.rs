@@ -165,6 +165,20 @@ impl<T> Stack<T> {
         }
     }
 
+    /// [`replace`](Self::replace) on the newest shown thing, or [`push`](Self::push) when none is
+    /// shown (nothing there, or only things leaving): a readout that changes in place (a zoom
+    /// step under key repeat) keeps its key, presence and lift, with no exit and no entrance.
+    /// Returns the key.
+    pub fn replace_newest(&mut self, item: T, until: Option<Instant>) -> u64 {
+        match self.items.iter().rev().find(|e| e.shown).map(|e| e.key) {
+            Some(key) => {
+                self.replace(key, item, until);
+                key
+            }
+            None => self.push(item, until),
+        }
+    }
+
     /// Takes the thing `key` away at once, with no exit; the ones above move down into its
     /// place.
     pub fn remove(&mut self, key: u64) {
@@ -410,6 +424,27 @@ mod tests {
         // A different one is pushed as before.
         assert_ne!(stack.show("saved", None), a);
         assert_eq!(stack.current().count(), 2);
+    }
+
+    /// A readout that changes in place: the same key, at rest, no exit or entrance; with none
+    /// shown, a push.
+    #[test]
+    fn replace_newest_changes_a_readout_in_place() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new();
+        let k = stack.replace_newest("Zoom 110%", None);
+        after(400, &mut stack, &mut anim, &clock);
+        for z in ["Zoom 120%", "Zoom 130%", "Zoom 140%"] {
+            assert_eq!(stack.replace_newest(z, None), k);
+            clock.advance_ms(16);
+            assert_eq!(run(&mut stack, &mut anim, &clock), vec![(z, 1.0, 0.0)]);
+        }
+        // Leaving: a new one is pushed, and the leaving one finishes its exit.
+        stack.hide(k);
+        assert_ne!(stack.replace_newest("Zoom 150%", None), k);
+        let out = after(600, &mut stack, &mut anim, &clock);
+        assert_eq!(out, vec![("Zoom 150%", 1.0, 0.0)]);
     }
 
     /// Bringing one back keeps to the most shown: the oldest other is sent away.
