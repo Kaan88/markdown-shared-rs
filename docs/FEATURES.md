@@ -1400,7 +1400,24 @@ was lost. Noted for later:
   `Cache::hex_stops` have no direct test. The release and feature runs of AGENTS.md were not
   run.
 
-## A veil strength for the backdrop (`Cx::set_backdrop_veil`, `Frost::set_veil`, 2026-11-25, `feat/backdrop-veil`, roadmap X11)
+## A second launch's hand-over reaching a winit window (`mdshared_ui::handover`, 2026-11-25, `feat/handover`, roadmap P8b)
+
+`single_mutex::send` hands the first instance's window a `WM_COPYDATA`, which is sent, not
+posted, so winit's `with_msg_hook` never sees it and a winit window refused it. `handover::listen
+(&window, app_id, wake)` replaces the window procedure once (with `SetWindowLongPtrW`, chained
+by `CallWindowProcW` as `snap` does, so either may come first): a `WM_COPYDATA` that
+`single_mutex::received` takes for `app_id` is queued, answered with 1 (so `send` gives true) and
+calls `wake`; everything else goes on to winit. `handover::take(&window)` gives the queued
+arguments, oldest first. The entry goes with the window (`WM_NCDESTROY`). Called from another
+thread, and off Windows, `listen` gives false and `take` nothing. Wanted by Barbican; Purge does
+not need it.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `handover.rs`,
+with a window of the test's own: before `listen` a hand-over is refused; after it two are
+queued in order, answered and wake once each, not passed on; a second `listen` keeps the first
+id; another application's hand-over passes on and is refused; the window's destruction removes
+its entry); `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y
+-- -D warnings`; `cargo fmt --all --check`; on Windows only. Not seen in an application.
 
 Asked for by Purge, whose Mica and Acrylic strength is a setting and which re-keyed the frost
 itself because the veil was fixed (Mica 0, Acrylic 150, `frost::veil`). `Frost::set_veil(Some(v))`
@@ -1436,6 +1453,26 @@ both seen failing without the change. Left for later, from Fable's review: an in
 composition sent to the row while its picker is open is not shown; hover stays as it was when the
 picker opened, as under a dropdown; the caret test does not check that the card leaves the field
 uncovered. Not seen by a person.
+
+## The pool: cancel by key, and results in the order asked for (`Pool::cancel`, `Pool::drain_ordered`, 2026-11-25, `feat/pool-cancel`, roadmap X5)
+
+`Pool::cancel(&key)` does for one key what `set_generation` does for a generation: queued work
+under it is dropped unrun, running work under it sees `Token::cancelled` and its result is thrown
+away when it ends, and a result of it waiting to be drained is thrown away; other keys are left
+alone, and work submitted under the key afterwards runs as usual. It says whether there was
+anything under the key. `Pool::drain_ordered()` is `drain` with the results that wait ordered by
+priority, highest first, then by submission (a piece submitted again under its key counts from
+then), whatever order they finished in; it orders only what waits and does not hold a result
+back for one still running. Nothing changes for a caller that uses neither: `drain` still gives
+the order of finishing.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `pool.rs`: three
+pieces finishing c, a, b come out b, a, c by `drain_ordered` and c, a, b by `drain`; cancel
+drops a queued key unrun, tells a running one (its token says so) and throws its result away,
+throws away a waiting result, leaves another key's result, answers false for a key with
+nothing, and the key runs again when submitted again; the pool tests ran 30 times in a row
+without a failure); `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
 
 ## No one-frame hover flash on the title row (`chrome`, 2026-11-26, `fix/hover-flash`, asked by md, roadmap D4)
 
