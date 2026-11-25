@@ -604,3 +604,20 @@ fn a_move_whose_record_would_be_too_large_writes_none() {
     assert!(!library.join(RUNS_DIR).exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A note undo keeps because a tab holds it unsaved still leads to the copy: the copy stays,
+/// though its original is back.
+#[test]
+fn a_copy_a_kept_note_leads_to_stays() {
+    let r = move_run("move-note-copy-kept");
+    let mut gate = TestGate::new();
+    let report = undo_with(
+        &r.record_path,
+        &r.record,
+        &r.library,
+        &mut gate,
+        &mut Unsaved(r.note.clone()),
+    );
+    assert!(r.md.exists(), "{report:?}");
+    assert!(r.copy.exists(), "the kept note leads to it: {report:?}");
+}

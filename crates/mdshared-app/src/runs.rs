@@ -3787,6 +3787,23 @@ pub fn undo_with(
     if record.kind == Kind::Copies {
         put_back(record, &plan, &mut report, bin);
     }
+    // A note the move rewrote and undo kept (changed since, open with changes not saved, or its
+    // original not back) still leads to the copies: those stay with it.
+    let kept_notes: Vec<(PathBuf, String)> = record
+        .originals
+        .iter()
+        .filter(|o| !was_removed(record, &o.path))
+        .filter(|o| report.restore_kept.iter().any(|k| same_path(k, &o.path)))
+        .filter_map(|o| {
+            let bytes = read_regular(&o.path, DIGEST_MAX_BYTES, false)?;
+            Some((o.path.clone(), String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .collect();
+    let led_to = |copy: &Path| {
+        kept_notes.iter().any(|(note, text)| {
+            crate::moves::links_to(text, note.parent().unwrap_or(Path::new("")), copy)
+        })
+    };
     // 2. The links first, so the pane never shows a link to a file that is gone.
     for (file, removals) in &plan.links {
         let headings = if same_path(file, &record.group.file) {
@@ -3822,12 +3839,13 @@ pub fn undo_with(
             report.held_back.push(note.clone());
             continue;
         }
-        let matches = created_note(note).is_some_and(|n| {
-            reach.allows(note)
-                && (record.kind == Kind::Copies || has_extension(note, &["md"]))
-                && copy_may_go(record, note, &[])
-                && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
-        });
+        let matches = !led_to(note)
+            && created_note(note).is_some_and(|n| {
+                reach.allows(note)
+                    && (record.kind == Kind::Copies || has_extension(note, &["md"]))
+                    && copy_may_go(record, note, &[])
+                    && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
+            });
         if !matches {
             report.kept.push(note.clone());
             continue;
@@ -3841,16 +3859,17 @@ pub fn undo_with(
         }
     }
     for picture in &plan.pictures {
-        let matches = record
-            .pictures
-            .iter()
-            .find(|p| p.created && same_path(&p.path, picture))
-            .is_some_and(|p| {
-                reach.allows(picture)
-                    && has_extension(picture, &PICTURE_EXTENSIONS)
-                    && original_there(p)
-                    && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
-            });
+        let matches = !led_to(picture)
+            && record
+                .pictures
+                .iter()
+                .find(|p| p.created && same_path(&p.path, picture))
+                .is_some_and(|p| {
+                    reach.allows(picture)
+                        && has_extension(picture, &PICTURE_EXTENSIONS)
+                        && original_there(p)
+                        && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
+                });
         if !matches {
             report.kept.push(picture.clone());
             continue;
