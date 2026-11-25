@@ -46,7 +46,7 @@ pub mod spring;
 pub use cycle::Periodic;
 pub use ease::{Bezier, Easing, cubic_bezier};
 pub use page::{Edge, PageEffect, PageTransition};
-pub use presence::{Transient, pop};
+pub use presence::{Transient, pop, pop_bounds};
 pub use region::Snapshot;
 pub use spring::Spring;
 

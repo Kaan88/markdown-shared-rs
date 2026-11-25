@@ -100,6 +100,22 @@ impl<T> Transient<T> {
     }
 }
 
+/// Everything [`pop`] touches for `bounds` and `shift` at any `t`: `bounds` at rest and where
+/// the shift moves it, in one, grown by 2 logical px for the device pixel it saves round that
+/// (a device pixel is at most 2 logical px down to a scale of 0.5). The rectangle an application
+/// that redraws only what changed marks as damaged while something enters or leaves, and once
+/// more on the frame after it went.
+pub fn pop_bounds(bounds: Rect, shift: (f32, f32)) -> Rect {
+    let (dx, dy) = shift;
+    Rect::new(
+        bounds.x + dx.min(0.0),
+        bounds.y + dy.min(0.0),
+        bounds.w + dx.abs(),
+        bounds.h + dy.abs(),
+    )
+    .inset(-2.0)
+}
+
 /// Draws something that is entering or leaving: what `draw` draws, at opacity `t` as a whole and
 /// moved by `shift` (logical px) times what is left of the way, `1 - t`. `t` is a presence from
 /// [`Animator::presence`] or [`Transient::frame`]: at 1 `draw` runs as if it were called
@@ -154,6 +170,41 @@ mod tests {
     use mdshared_text::Bitmap;
 
     const LINEAR_100: Motion = Motion::tween_ms(100, Easing::Linear);
+
+    /// Every pixel `pop` changes, at any `t` and either sign of shift, is inside `pop_bounds`.
+    #[test]
+    fn pop_touches_nothing_outside_its_bounds() {
+        let bounds = Rect::new(60.0, 50.0, 80.0, 40.0);
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for shift in [(0.0, 8.0), (0.0, -6.0), (6.0, 0.0), (-6.0, 4.0)] {
+                for t in [0.05, 0.3, 0.5, 0.9] {
+                    let (w, h) = ((200.0 * scale) as u32, (150.0 * scale) as u32);
+                    let mut bmp = Bitmap::new(w, h);
+                    let mut gfx = Gfx::new();
+                    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                    p.fill(Rect::new(0.0, 0.0, 200.0, 150.0), crate::gfx::rgb(0x336699));
+                    let clean = bmp.pixels.clone();
+                    let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+                    pop(&mut p, bounds, t, shift, |p| {
+                        p.fill(bounds, crate::gfx::rgb(0xffcc00))
+                    });
+                    let out = pop_bounds(bounds, shift);
+                    for y in 0..h {
+                        for x in 0..w {
+                            let o = ((y * w + x) * 4) as usize;
+                            if bmp.pixels[o..o + 4] != clean[o..o + 4] {
+                                let (lx, ly) = (x as f32 / scale, y as f32 / scale);
+                                assert!(
+                                    out.contains(lx, ly),
+                                    "{lx},{ly} changed outside {out:?} (scale {scale}, shift {shift:?}, t {t})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn at(bmp: &Bitmap, x: u32, y: u32) -> [u8; 3] {
         let o = ((y * bmp.width + x) * 4) as usize;

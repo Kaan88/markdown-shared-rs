@@ -830,6 +830,31 @@ impl<T: Clone> Cascade<T> {
         });
     }
 
+    /// Everything [`draw_in_presence`](Self::draw_in_presence) and
+    /// [`draw_animated`](Self::draw_animated) touch at any `t`, as last placed: every open menu,
+    /// their shadows, the drop, a submenu's slide and a device pixel round them
+    /// ([`crate::anim::pop_bounds`]). The damage to mark while the cascade opens or closes, and
+    /// on the frame after it closed.
+    pub fn presence_bounds(&self) -> Rect {
+        let mut r = crate::anim::pop_bounds(self.bounds(), (0.0, self.drop()));
+        for menu in &self.menus[1..] {
+            let dx = if menu.opened_left() {
+                MENU_DROP
+            } else {
+                -MENU_DROP
+            };
+            let b = crate::anim::pop_bounds(menu.rect().inset(-18.0), (dx, 0.0));
+            let (x, y) = (r.x.min(b.x), r.y.min(b.y));
+            r = Rect::new(
+                x,
+                y,
+                r.right().max(b.right()) - x,
+                r.bottom().max(b.bottom()) - y,
+            );
+        }
+        r
+    }
+
     /// [`draw_in_presence`](Self::draw_in_presence), with each submenu entering on its own as
     /// it opens: it fades in and slides [`MENU_DROP`] px out from its menu, by
     /// [`fluent::ENTER`], asked of `anim` under `id` and the submenu's path. A submenu that

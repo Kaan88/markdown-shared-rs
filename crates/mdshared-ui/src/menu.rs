@@ -562,6 +562,19 @@ impl<T: Clone> Menu<T> {
         crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
     }
 
+    /// Everything [`draw_in_presence`](Self::draw_in_presence) touches at any `t`, as last
+    /// placed: the frame, its shadow, the drop and a device pixel round them
+    /// ([`crate::anim::pop_bounds`]). The damage to mark while the menu opens or closes, and on
+    /// the frame after it closed.
+    pub fn presence_bounds(&self) -> Rect {
+        let drop = if self.opened_above() {
+            MENU_DROP
+        } else {
+            -MENU_DROP
+        };
+        crate::anim::pop_bounds(self.rect.inset(-18.0), (0.0, drop))
+    }
+
     /// Where the menu was last placed.
     pub fn rect(&self) -> Rect {
         self.rect
@@ -795,6 +808,85 @@ mod tests {
             count(&plain, row0, pal.text),
             "other rows unchanged"
         );
+    }
+
+    /// What `draw_in_presence` changes at any `t` lies in `presence_bounds`, for a menu below its
+    /// anchor and one flipped above it, a toast and a dialog card, at 1x and 1.5x.
+    #[test]
+    fn presence_draws_stay_inside_presence_bounds() {
+        use crate::theme::LIGHT;
+        let area = Rect::new(0.0, 0.0, 400.0, 320.0);
+        let changed_outside = |scale: f32, out: Rect, draw: &dyn Fn(&mut Painter)| {
+            let (w, h) = ((400.0 * scale) as u32, (320.0 * scale) as u32);
+            let mut bmp = Bitmap::new(w, h);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            p.fill(area, LIGHT.page);
+            let clean = bmp.pixels.clone();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            draw(&mut p);
+            let mut n = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    let o = ((y * w + x) * 4) as usize;
+                    if bmp.pixels[o..o + 4] != clean[o..o + 4]
+                        && !out.contains(x as f32 / scale, y as f32 / scale)
+                    {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        for scale in [1.0, 1.5] {
+            for (ax, ay) in [(40.0, 40.0), (40.0, 300.0)] {
+                for t in [0.01, 0.1, 0.5, 0.95] {
+                    let menu = std::cell::RefCell::new(Menu::new(many(5), ax, ay, false));
+                    let draw =
+                        |p: &mut Painter| menu.borrow_mut().draw_in_presence(p, &LIGHT, area, t);
+                    // Placed by the first draw; the bounds read after it.
+                    let mut bmp = Bitmap::new(400, 320);
+                    let mut gfx = Gfx::new();
+                    menu.borrow_mut().draw_in(
+                        &mut Painter::new(&mut bmp, &mut gfx, scale),
+                        &LIGHT,
+                        area,
+                    );
+                    let out = menu.borrow().presence_bounds();
+                    assert_eq!(
+                        changed_outside(scale, out, &draw),
+                        0,
+                        "menu at {ax},{ay}, t {t}"
+                    );
+                }
+            }
+            for t in [0.01, 0.1, 0.5, 0.95] {
+                let mut bmp = Bitmap::new(400, 320);
+                let mut gfx = Gfx::new();
+                let toast = crate::overlay::Bubble::toast(
+                    &mut Painter::new(&mut bmp, &mut gfx, scale),
+                    "Saved",
+                    area,
+                );
+                let out = toast.presence_bounds();
+                let draw = |p: &mut Painter| toast.draw_presence(p, &LIGHT, t);
+                assert_eq!(changed_outside(scale, out, &draw), 0, "toast, t {t}");
+                let card = crate::overlay::dialog_card(240.0, 160.0, 400.0, 320.0);
+                let out = crate::overlay::dialog_presence_bounds(card);
+                let draw = |p: &mut Painter| {
+                    crate::anim::pop(
+                        p,
+                        crate::overlay::dialog_bounds(card),
+                        t,
+                        (0.0, crate::overlay::DIALOG_RISE),
+                        |p| {
+                            crate::overlay::draw_dialog_card(p, &LIGHT, card);
+                        },
+                    )
+                };
+                assert_eq!(changed_outside(scale, out, &draw), 0, "dialog, t {t}");
+            }
+        }
     }
 
     fn many(n: u8) -> Vec<Item<u8>> {

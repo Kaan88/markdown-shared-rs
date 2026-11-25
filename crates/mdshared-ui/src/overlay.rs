@@ -90,12 +90,23 @@ impl Bubble {
     /// At 1 this is [`draw`](Self::draw), pixel for pixel; at 0 it draws nothing. What it
     /// touches is still [`bounds`](Self::bounds), grown downwards by the rise for a toast.
     pub fn draw_presence(&self, p: &mut Painter, pal: &Palette, t: f32) {
-        let rise = if self.kind == Kind::Toast {
+        pop(p, self.bounds(), t, (0.0, self.rise()), |p| {
+            self.draw(p, pal)
+        });
+    }
+
+    /// Everything [`draw_presence`](Self::draw_presence) touches at any `t`: the bubble, its
+    /// shadow, a toast's rise and a device pixel round them ([`crate::anim::pop_bounds`]).
+    pub fn presence_bounds(&self) -> Rect {
+        crate::anim::pop_bounds(self.bounds(), (0.0, self.rise()))
+    }
+
+    fn rise(&self) -> f32 {
+        if self.kind == Kind::Toast {
             TOAST_RISE
         } else {
             0.0
-        };
-        pop(p, self.bounds(), t, (0.0, rise), |p| self.draw(p, pal));
+        }
     }
 
     pub fn draw(&self, p: &mut Painter, pal: &Palette) {
@@ -196,6 +207,13 @@ pub fn draw_backdrop_presence(p: &mut Painter, pal: &Palette, w: f32, h: f32, t:
 /// ```
 pub fn dialog_bounds(card: Rect) -> Rect {
     card.inset(-18.0)
+}
+
+/// Everything a dialog card at `card` touches as it enters or leaves through [`pop`] with
+/// [`dialog_bounds`] and [`DIALOG_RISE`], at any `t`: the card, its shadow, the rise and a device
+/// pixel round them. The backdrop ([`draw_backdrop_presence`]) is the whole window besides.
+pub fn dialog_presence_bounds(card: Rect) -> Rect {
+    crate::anim::pop_bounds(dialog_bounds(card), (0.0, DIALOG_RISE))
 }
 
 /// How far below its place a dialog starts when it enters through [`pop`], in logical px.
