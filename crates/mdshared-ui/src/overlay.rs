@@ -144,8 +144,8 @@ pub const TOAST_RISE: f32 = 8.0;
 /// Padding inside a dialog card, and the height of its button footer.
 pub const DIALOG_PAD: f32 = 24.0;
 pub const DIALOG_FOOTER: f32 = 72.0;
-/// The roundest a dialog card's corners go: the footer's fill (the footer and 12 px above it,
-/// inset by 1) can round no further, so beyond this its corners would poke out of the card's.
+/// The roundest a dialog card's corners go. Its footer rounds with it up to here (the footer
+/// is 72 px; a card this round is mostly corner already).
 pub const MAX_CARD_RADIUS: f32 = (DIALOG_FOOTER - 1.0 + 12.0) / 2.0 + 1.0;
 /// A `cw` x `ch` card centred in a `w` x `h` window, shrunk to fit small windows.
 pub fn dialog_card(cw: f32, ch: f32, w: f32, h: f32) -> Rect {
@@ -253,8 +253,11 @@ pub fn draw_dialog_card_with(
         DIALOG_FOOTER - 1.0,
     );
     let old = p.clip(footer);
+    // The fill's top corners sit above the footer, out of its clip: lifted by the radius (12 at
+    // least, as it always was), a rounder card's could not reach down into it.
+    let lift = radius.max(12.0);
     p.rbox(
-        Rect::new(footer.x, footer.y - 12.0, footer.w, footer.h + 12.0),
+        Rect::new(footer.x, footer.y - lift, footer.w, footer.h + lift),
         (radius - 1.0).max(0.0),
         mix(
             pal.popup,
@@ -762,6 +765,25 @@ mod tests {
                         "{bad}, {soft:?}, dark {}",
                         pal.dark
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_round_cards_footer_is_flat_along_its_top_edge() {
+        // Corners over 13: the footer's fill used to start 12 px up, so its own top corners came
+        // down into the footer and showed the card's colour in two notches under its line.
+        let r = Rect::new(20.0, 18.0, 320.0, 260.0);
+        for pal in [&LIGHT, &DARK] {
+            for radius in [14.0, 30.0, MAX_CARD_RADIUS] {
+                let b = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, radius, None);
+                });
+                let y = r.bottom() - DIALOG_FOOTER + 3.0;
+                let mid = at(&b, r.cx(), y);
+                for x in [r.x + 2.5, r.right() - 2.5] {
+                    assert_eq!(at(&b, x, y), mid, "{radius} at {x}, dark {}", pal.dark);
                 }
             }
         }
