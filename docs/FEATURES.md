@@ -1203,3 +1203,35 @@ mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on
 Found, not changed: `pages::Form::draw` (on main as now) overflows an integer in `gfx.rs` in a
 debug build when the window is infinitely wide. Not seen by a person in a running app; mdview
 and mdedit do not call it yet.
+
+## Fonts warmed before the first paint (`Gfx::warm_fonts`, `mdshared_text::warm_fonts_with`, 2026-11-25, `feat/warm-fonts`, asked for by mdplay)
+
+`Gfx::warm_fonts()` starts, on a thread named `mdshared-fonts` and at most once per process,
+building the font context `shared_fonts()` keeps and laying out a sample line in each `Face`
+(the UI face regular and semibold, the mono face, with the symbols U+2630, U+2713 and U+2026),
+so the families are resolved and their fonts loaded there. A `Gfx` made after it
+(`fonts_warming()` true) takes that context at its first text, not in `Gfx::new`, waiting if it
+is still being built; from then on everything is as before. In `mdshared-text`: `warm_fonts()`
+(build only), `warm_fonts_with(prime)` (build, then `prime` on the same thread),
+`fonts_warming()`. If the thread cannot start or panics, in the build or in the priming (caught
+on that thread), the first text builds on the calling thread as without it. Without a call
+nothing changes: `Gfx::new` takes `shared_fonts()` as before. The thread runs at normal priority
+(a lower one needs the Windows API, which `mdshared-text` does not use, and the window may wait
+for it).
+
+Measured on this machine (Windows 11, release, three runs, `cargo test -p mdshared-ui --release
+--lib -- --ignored --nocapture first_measure_timing`), on a fresh thread: cold, `Gfx::new`
+1.6-1.7 ms, the first measure in the UI face 15.7-16.4 ms, the first U+2630 0.64-0.66 ms; after
+a finished warm, `Gfx::new` 0.06-0.09 ms, the first measure 0.07-0.08 ms, U+2630 0.03 ms.
+Building the context alone (`mdshared-text`'s `warm_timing`, `first_paint_probe`) is about 1 ms:
+fontique is lazy, and the cost is the first lookup of a family. Inside foobar2000 it was not
+measured here.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `fonts.rs`: a
+warmed context is built and primed once and taken once, a second start is a no-op; never
+started, a panicking build and a panicking priming give nothing to take; `shared_fonts` after
+`warm_fonts` works on a fresh thread; `FontContext: Send` at compile time. In
+`gfx_warm_tests.rs`: a primed context lays out every face at two sizes to the same widths as a
+cold one; a `Gfx` on a fresh thread after `Gfx::warm_fonts` (called twice) measures as a cold
+one); `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y --
+-D warnings`; `cargo fmt --all --check`; on Windows only. Not seen in a running app.

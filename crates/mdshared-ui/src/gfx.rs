@@ -124,6 +124,23 @@ const MONO_FAMILY: &str = if cfg!(target_os = "macos") {
     "DejaVu Sans Mono, Noto Sans Mono, Liberation Mono, Noto Color Emoji, monospace"
 };
 
+/// What [`Gfx::warm_fonts`] lays out on its thread: a line in each face at the usual sizes, with
+/// the symbols the chrome draws, so the families and the fallback are resolved and loaded.
+fn prime_faces(fonts: &mut FontContext) {
+    const SAMPLE: &str = "Playback stopped. 0123456789 \u{2630} \u{2713} \u{2026}";
+    let mut layouts = LayoutContext::<Brush>::new();
+    for (family, weight) in [(UI_FAMILY, 400.0), (UI_FAMILY, 600.0), (MONO_FAMILY, 400.0)] {
+        let mut b = layouts.ranged_builder(fonts, SAMPLE, 1.0, true);
+        b.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
+        b.push_default(StyleProperty::FontSize(13.0));
+        b.push_default(StyleProperty::FontWeight(FontWeight::new(weight)));
+        b.push_default(StyleProperty::Brush([0, 0, 0, 255]));
+        mdshared_text::push_emoji_runs(&mut b, SAMPLE, family);
+        let mut layout = b.build(SAMPLE);
+        layout.break_all_lines(None);
+    }
+}
+
 /// An icon stroked at one size: coverage, one byte per device pixel, and where its top left
 /// corner sits from the corner of the icon's square.
 struct IconMask {
@@ -135,7 +152,9 @@ struct IconMask {
 
 /// Font contexts, the glyph cache and a cache of laid-out labels. One per window.
 pub struct Gfx {
-    fonts: FontContext,
+    /// `None` only while [`Gfx::warm_fonts`]'s context is still to be taken: the first layout
+    /// takes it.
+    fonts: Option<FontContext>,
     layouts: LayoutContext<Brush>,
     engine: TextEngine,
     cache: HashMap<u64, Rc<Layout<Brush>>>,
@@ -176,12 +195,25 @@ impl Gfx {
         let mut engine = TextEngine::new(2 << 20);
         engine.set_subpixel(crate::platform::subpixel_order());
         Gfx {
-            fonts: shared_fonts(),
+            // After `warm_fonts`, the context is taken at the first text, not here, so the
+            // window's creation does not wait for it.
+            fonts: (!mdshared_text::fonts_warming()).then(shared_fonts),
             layouts: LayoutContext::new(),
             engine,
             cache: HashMap::new(),
             icons: HashMap::new(),
         }
+    }
+
+    /// Starts building the font context on a background thread and laying out a sample in each
+    /// [`Face`] there (and a symbol from the fallback), at most once per process: call it when
+    /// the window is created, before the first paint. A `Gfx` made after it takes that context
+    /// at its first text, waiting if it is still being built, instead of resolving the faces
+    /// then (18-21 ms for the UI face on the first measure, mdplay measured). If the thread
+    /// fails or panics, the first text builds the context as without it; nothing reaches the
+    /// caller. Without a call nothing changes. See [`mdshared_text::warm_fonts_with`].
+    pub fn warm_fonts() {
+        mdshared_text::warm_fonts_with(prime_faces);
     }
 
     /// A laid-out label. `size` is in device px; `wrap` is a device-px line width, or 0 for one
@@ -215,9 +247,12 @@ impl Gfx {
         if self.cache.len() > 4000 {
             self.cache.clear();
         }
-        let mut b = self
-            .layouts
-            .ranged_builder(&mut self.fonts, text, 1.0, true);
+        let mut b = self.layouts.ranged_builder(
+            self.fonts.get_or_insert_with(shared_fonts),
+            text,
+            1.0,
+            true,
+        );
         let family = if face == Face::Mono {
             MONO_FAMILY
         } else {
@@ -1580,3 +1615,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gfx_warm_tests.rs"]
+mod warm_tests;

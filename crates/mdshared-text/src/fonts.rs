@@ -1,9 +1,13 @@
 use parley::FontContext;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 
 thread_local! {
     /// System fonts are enumerated once per thread; every renderer starts from a clone of this. A
     /// window makes several renderers (one per tab and a spare for `mem::take`), and enumerating
-    /// fonts for each cost about 35 ms apiece at launch.
+    /// fonts for each cost about 35 ms apiece at launch (measured again on 2026-11-25 on
+    /// Windows: about 1 ms in release, a few ms with the first layout; docs/FEATURES.md).
     static FONTS: std::cell::RefCell<Option<FontContext>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -13,16 +17,116 @@ thread_local! {
 /// The context has [`add_fallbacks`] applied on every system, Windows included (the viewer drew
 /// U+2714 and U+2764 as boxes on Windows without it, where the editor already applied it).
 /// Applying it again on a clone changes nothing.
+///
+/// After [`warm_fonts`], the first call on a thread that has none yet takes the context built in
+/// the background (waiting for it if it is still being built) instead of enumerating again.
 pub fn shared_fonts() -> FontContext {
     FONTS.with(|cell| {
         cell.borrow_mut()
-            .get_or_insert_with(|| {
-                let mut fonts = FontContext::new();
-                add_fallbacks(&mut fonts);
-                fonts
-            })
+            .get_or_insert_with(|| WARM.take().unwrap_or_else(build_fonts))
             .clone()
     })
+}
+
+/// Starts building the font context on a background thread, for a window that wants its first
+/// paint not to wait for it: call it when the window is created, before the first
+/// [`shared_fonts`]. Building the context is cheap (fontique is lazy, about 1 ms); the first
+/// text laid out in a family is what costs (18-21 ms for the UI face, mdplay measured), so a
+/// caller that knows its families uses [`warm_fonts_with`], which lays them out there too.
+/// `mdshared_ui::gfx::Gfx::warm_fonts` does that for the toolkit's faces. The next `shared_fonts` on a thread that has no context yet takes the one
+/// built there, waiting for it if it is still being built. Only that one thread takes it; any
+/// other thread enumerates for itself as before.
+///
+/// At most once per process: a second call does nothing. If the thread cannot be started or
+/// panics, `shared_fonts` builds on the calling thread as it does without this; the panic stays
+/// on that thread and never unwinds into the caller. Without a call nothing changes.
+pub fn warm_fonts() {
+    WARM.start(build_fonts, |_| {});
+}
+
+/// [`warm_fonts`], then `prime` on the built context on the same thread: lay out a sample in
+/// each family the first paint uses, so the families are resolved and their fonts loaded before
+/// the context is handed over. What the priming loads stays with the context and its clones.
+/// A panic in `prime` is caught there like one in the build, and `shared_fonts` then builds on
+/// the calling thread. Only the first of `warm_fonts` and `warm_fonts_with` in a process starts.
+pub fn warm_fonts_with(prime: fn(&mut FontContext)) {
+    WARM.start(build_fonts, prime);
+}
+
+/// True while a context started by [`warm_fonts`] waits to be taken, built or not: a caller
+/// that makes its renderer early (`Gfx::new` in the window's creation) can then take the
+/// context at its first text instead, so the build and priming run while the rest of the
+/// window is made.
+pub fn fonts_warming() -> bool {
+    WARM.waiting()
+}
+
+/// The context [`shared_fonts`] keeps: the system's fonts with [`add_fallbacks`] applied.
+fn build_fonts() -> FontContext {
+    let mut fonts = FontContext::new();
+    add_fallbacks(&mut fonts);
+    fonts
+}
+
+static WARM: Warm = Warm::new();
+
+/// A font context built on a background thread, taken once ([`warm_fonts`]).
+struct Warm {
+    started: AtomicBool,
+    built: Mutex<Option<Receiver<FontContext>>>,
+}
+
+impl Warm {
+    const fn new() -> Warm {
+        Warm {
+            started: AtomicBool::new(false),
+            built: Mutex::new(None),
+        }
+    }
+
+    /// Starts `build`, then `prime` on what it built, on a thread, the first time only.
+    fn start(&self, build: fn() -> FontContext, prime: fn(&mut FontContext)) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (send, recv) = mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("mdshared-fonts".into())
+            .spawn(move || {
+                // A panic drops `send`, and the taker builds for itself.
+                let built = std::panic::catch_unwind(|| {
+                    let mut fonts = build();
+                    prime(&mut fonts);
+                    fonts
+                });
+                if let Ok(fonts) = built {
+                    let _ = send.send(fonts);
+                }
+            });
+        if spawned.is_ok() {
+            *self.built.lock().unwrap_or_else(|e| e.into_inner()) = Some(recv);
+        }
+    }
+
+    /// Whether a started context waits to be taken.
+    fn waiting(&self) -> bool {
+        self.built
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// The context built by [`start`](Self::start), waiting for it; `None` when it was never
+    /// started, was taken already, or failed.
+    fn take(&self) -> Option<FontContext> {
+        // Out of the lock before waiting, so another thread finds it taken at once.
+        let recv = self
+            .built
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        recv.recv().ok()
+    }
 }
 
 /// Families tried after the system's fallback for a script, for characters it lacks: the
@@ -250,6 +354,97 @@ pub fn push_emoji_runs<B: parley::Brush>(
 mod tests {
     use super::*;
     use parley::fontique::{FallbackKey, Script};
+    use std::sync::atomic::AtomicUsize;
+
+    const _: () = {
+        const fn send<T: Send>() {}
+        send::<FontContext>();
+    };
+
+    #[test]
+    fn a_warmed_context_is_built_once_and_taken_once() {
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        fn counted() -> FontContext {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            build_fonts()
+        }
+        static PRIMED: AtomicUsize = AtomicUsize::new(0);
+        fn prime(_: &mut FontContext) {
+            PRIMED.fetch_add(1, Ordering::SeqCst);
+        }
+        let warm = Warm::new();
+        assert!(!warm.waiting());
+        warm.start(counted, prime);
+        warm.start(counted, prime);
+        assert!(warm.waiting(), "waits to be taken, built or not");
+        let mut fonts = warm.take().expect("the built context");
+        assert!(!warm.waiting());
+        assert_eq!(
+            PRIMED.load(Ordering::SeqCst),
+            1,
+            "primed once, before the hand-over"
+        );
+        assert!(
+            fonts.collection.family_names().count() > 0,
+            "it has the fonts"
+        );
+        assert!(
+            warm.take().is_none(),
+            "taken once; the next thread builds its own"
+        );
+        assert_eq!(
+            BUILDS.load(Ordering::SeqCst),
+            1,
+            "a second start does nothing"
+        );
+    }
+
+    #[test]
+    fn without_a_start_or_after_a_panic_nothing_is_taken() {
+        assert!(
+            Warm::new().take().is_none(),
+            "never started: built as before"
+        );
+        let warm = Warm::new();
+        warm.start(|| panic!("no fonts"), |_| {});
+        assert!(warm.take().is_none(), "the panic stays on its thread");
+        let warm = Warm::new();
+        warm.start(build_fonts, |_| panic!("priming failed"));
+        assert!(warm.take().is_none(), "so does one in the priming");
+    }
+
+    /// The public pair: a thread with no context yet gets a working one after `warm_fonts`.
+    #[test]
+    fn shared_fonts_after_warm_fonts_works() {
+        warm_fonts();
+        warm_fonts();
+        let mut fonts = std::thread::spawn(shared_fonts).join().unwrap();
+        assert!(fonts.collection.family_names().count() > 0);
+    }
+
+    /// Times `shared_fonts` on a fresh thread: cold, and after a finished warm.
+    /// `cargo test -p mdshared-text --release -- --ignored --nocapture warm_timing`
+    #[test]
+    #[ignore]
+    fn warm_timing() {
+        let cold = std::thread::spawn(|| {
+            let t = std::time::Instant::now();
+            shared_fonts();
+            t.elapsed()
+        })
+        .join()
+        .unwrap();
+        warm_fonts();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let taken = std::thread::spawn(|| {
+            let t = std::time::Instant::now();
+            shared_fonts();
+            t.elapsed()
+        })
+        .join()
+        .unwrap();
+        println!("cold shared_fonts {cold:?}; shared_fonts after a finished warm {taken:?}");
+    }
 
     #[test]
     fn the_extra_families_that_are_installed_follow_the_system_ones_once() {

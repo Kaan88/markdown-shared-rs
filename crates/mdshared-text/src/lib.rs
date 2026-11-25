@@ -7,6 +7,7 @@ pub mod text;
 
 pub use bitmap::{Bitmap, decode_png_rgba};
 pub use fonts::{
-    EMOJI_FAMILIES, add_fallbacks, emoji_presentation_runs, push_emoji_runs, shared_fonts,
+    EMOJI_FAMILIES, add_fallbacks, emoji_presentation_runs, fonts_warming, push_emoji_runs,
+    shared_fonts, warm_fonts, warm_fonts_with,
 };
 pub use text::{CacheStats, Subpixel, TextEngine};

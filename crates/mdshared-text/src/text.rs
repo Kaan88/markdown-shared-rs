@@ -498,6 +498,58 @@ mod tests {
         layout
     }
 
+    /// Where a cold first paint spends its time. Not a test; run alone in release:
+    /// `cargo test -p mdshared-text --release -- --ignored --nocapture first_paint_probe`
+    #[test]
+    #[ignore]
+    fn first_paint_probe() {
+        use std::time::Instant;
+        let lay = |fonts: &mut parley::FontContext, text: &str| {
+            let mut layouts = LayoutContext::<Brush>::new();
+            let mut b = layouts.ranged_builder(fonts, text, 1.0, true);
+            b.push_default(StyleProperty::FontFamily(FontFamily::from(
+                "Segoe UI, Noto Sans, DejaVu Sans, sans-serif",
+            )));
+            b.push_default(StyleProperty::FontSize(14.0));
+            b.push_default(StyleProperty::Brush([0, 0, 0, 255]));
+            let mut layout = b.build(text);
+            layout.break_all_lines(Some(400.0));
+            layout
+        };
+        let t = Instant::now();
+        let mut fonts = parley::FontContext::new();
+        let new = t.elapsed();
+        let t = Instant::now();
+        crate::add_fallbacks(&mut fonts);
+        let fallbacks = t.elapsed();
+        let t = Instant::now();
+        let layout = lay(&mut fonts, "Library  Artist  Album  Title  3:45");
+        let first_layout = t.elapsed();
+        let t = Instant::now();
+        lay(&mut fonts, "Another line of text 0123456789");
+        let second_layout = t.elapsed();
+        let mut engine = TextEngine::new(4 << 20);
+        let mut fb = Bitmap::new(500, 40);
+        let t = Instant::now();
+        engine.draw_layout(&mut fb, &layout, 0.0, 0.0);
+        let first_draw = t.elapsed();
+        // A clone on another thread of a context that has laid out once: does it start warm?
+        let clone = fonts.clone();
+        let cloned_layout = std::thread::spawn(move || {
+            let mut fonts = clone;
+            let t = Instant::now();
+            lay(&mut fonts, "Library  Artist  Album  Title  3:45");
+            t.elapsed()
+        })
+        .join()
+        .unwrap();
+        println!(
+            "new {new:?}; add_fallbacks {fallbacks:?}; first layout {first_layout:?}; \
+             second layout {second_layout:?}; first draw {first_draw:?}; \
+             first layout on a clone elsewhere {cloned_layout:?}"
+        );
+    }
+
     const SAMPLE: &str = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen \
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
 
