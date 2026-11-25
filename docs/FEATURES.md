@@ -508,6 +508,90 @@ A review against parley 0.12.0 found faults, fixed in a second commit (`paragrap
   from the rounded corner of the area as the glyphs are, so they agree at a fractional x.
   Select all is disabled on empty text.
 
+## Accessibility for UI Automation (`mdshared_ui::a11y`, feature `a11y`, roadmap W8 at Purge's scope)
+
+An AccessKit tree built from the same models that draw, served to UI Automation on Windows by
+`accesskit_winit`; the module doc says how it is built (ids from author ids, every row of a list in
+the tree, bounds cut to the viewport, updates of only what changed). The consumer is
+`examples/purge_shape.rs`, driven by `tests/uia/purge_shape.ps1`. These are the limits and the
+choices a rig or a reader meets, as found by the Fable audit of the Purge fast track and fixed or
+written down after it (2026-11-25):
+
+- **Several rows cannot be selected through UIA.** AccessKit 0.25.2 turns SelectionItem's
+  `Select`, `AddToSelection` and `RemoveFromSelection` all into the same `Click`, so the window
+  cannot tell them apart, and nothing here pretends to. A multi-select list still says so
+  (Selection's CanSelectMultiple is true), and `Select` gives one row. A rig selects several rows
+  as a person does: Ctrl+click on each, or Shift and the arrows, typed into the window with
+  SendInput.
+- **A row out of view has an empty rectangle, and IsOffscreen false.** Its bounds are left out so
+  that it cannot take hits meant for the toolbar or the footer; AccessKit does not set
+  IsOffscreen, so UIA reports false for every node. A rig that needs a row on screen calls
+  ScrollIntoView (or SetFocus: in `purge_shape` a Focus request on a row moves the cursor there
+  and scrolls it into view, as the keyboard does) and waits until the rectangle is not empty.
+- **For Narrator:** `a11y::switch` carries the role description "toggle switch" (UIA
+  LocalizedControlType), since AccessKit gives a switch UIA's Button control type. `a11y::tab`
+  takes its place in the set and `a11y::tab_list` carries the count, so a tab says "2 of 4" as a
+  list row does. A dialog's body is a `text` child before its buttons (`ConfirmBody` in
+  `purge_shape`), and also its description (FullDescription); with only the description a reader
+  that walks the dialog misses it. A field's hint is its placeholder (`Node::set_placeholder`,
+  UIA HelpText): `purge_shape`'s search field gives "Search (Ctrl+F)". `a11y::column_header` makes
+  a column's header (AccessKit gives it UIA's DataItem control type with the ARIA role
+  "columnheader"); `purge_shape` puts "Name" and "Size" in a group above the list, and each row's
+  name holds both columns ("Program 0005, 160 MB"). `a11y::clip` cuts a node's bounds to a pane,
+  for the items of a scrolled pane.
+- **A known cost: typing in the search.** Each key that narrows the search drops rows from the
+  tree, and AccessKit's adapter handles every removed row on its own (its platform node is
+  dropped and it is looked at for events to raise), so a first letter that hides most of 2,000
+  rows costs that many removals. Found in AccessKit's source by the audit; not measured, and not
+  redesigned (realizing only the visible rows would cost the reach the list is for).
+- **Two top-level windows.** A UIA client that finds the window by process id also finds winit's
+  hidden helper, class `Winit Thread Event Target`, with no name. `purge_shape.ps1` finds the
+  window by its title and leaves that class out as well, and checks that the helper is there and
+  is not what it found.
+
+The script needs Windows PowerShell 5.1 (`powershell.exe`): it makes the interop assembly for
+UIA's COM client with `TypeLibConverter` and `AssemblyBuilder.Save`, which only .NET Framework
+has, and keeps it in `%TEMP%\mdshared-uia\Interop.UIAutomationClient.dll`. Its `-FarRow N`
+(default 1500, from 40 to 2000) picks the far program; the Value section searches for that
+program's name less its last two digits and works out how many programs that shows.
+
+**C1, launch time** (2026-11-25, this Windows 11 laptop, release builds, no UIA client
+connected): `tests/uia/first_frame.ps1 -Runs 10` ran `bare_window` and `purge_shape` with
+`--first-frame` ten times each, alternately, after one untimed run of each. "First frame" is what
+the example prints: from the start of `main` to the first frame drawn and presented into the
+window while it is still hidden, and the window asked to show. It leaves out the process's start
+before `main` and the moment the compositor puts the window on screen, which nothing in the
+process waits for. "Launch to exit" is the script's clock from starting the process to its end,
+the teardown included.
+
+| | First frame, median | range | Launch to exit, median | range |
+|---|---|---|---|---|
+| `bare_window` (winit and softbuffer only) | 41.7 ms | 39.2 to 59.4 ms | 60.4 ms | 56.7 to 77.6 ms |
+| `purge_shape` (the toolkit, 2,000 rows in the tree, the UIA adapter) | 63.9 ms | 62.4 to 94.4 ms | 87.4 ms | 85.3 to 121.2 ms |
+
+So the toolkit's window costs about 22 ms over a bare window to its first frame here. In the
+same session one run of `purge_shape.ps1` timed, from `Start-Process`, the bare window found by
+its title after 467 ms and `purge_shape`'s names visible to UIA (UninstallButton found by its
+AutomationId) after 395 ms: those include the UIA client's polling and the tree's first transfer
+(2,000 rows), one run each, so they are coarse. Purge's own gate (400 ms with its real engine, on
+its laptop) is Purge's to measure.
+
+**C2, the UIA script:** `purge_shape.ps1` ran 50 checks, all passing (exit 0), with the default
+`-FarRow` and again with 1234, 42 and 2000 (2026-11-25, this laptop, scale 1). It covers Invoke,
+Toggle, SelectionItem, ScrollItem, ExpandCollapse, Value, RangeValue, the modal dialog, the
+position in set, the hint, the column headers, focus events from SetFocus and from a Tab typed
+into the window, the helper window and C3.
+
+**C3, the size:** `purge_shape.exe` (release, feature `a11y`) is 3,631,616 bytes (3.46 MB),
+under the 10 MB gate; `purge_shape.ps1` prints it and fails at 10 MB or more.
+
+Run: 29 unit tests of `a11y` (`cargo test --release -p mdshared-ui --features a11y a11y`),
+among them `clip` against a cut of each axis on its own over 2,000 pseudo-random rectangles, and
+the tabs' place in the set. **Not tried with Narrator**, nor any other screen reader: what a
+reader says is inferred from the UIA properties the script reads back. The look of
+`purge_shape` (its column header now from `head_rect`, unchanged in place) was not seen by a
+person. Linux and macOS: the tree type-checks there (the Linux clippy), nothing serves it.
+
 ## The window host for one window (`mdshared_ui::host`, feature `host`, roadmap W1 at Purge's scope)
 
 `host::run(Config, app)` owns the winit loop, the softbuffer surface, the bitmap, the `Gfx` and
