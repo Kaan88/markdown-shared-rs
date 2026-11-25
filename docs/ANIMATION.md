@@ -310,11 +310,11 @@ and on every frame under reduced motion, each draws exactly the pixels of the pl
 | `overlay::draw_backdrop` | `draw_backdrop_presence(p, pal, w, h, t)` | The dimming follows the dialog's presence |
 | `overlay::draw_dialog_card` | `pop(p, dialog_bounds(card), t, (0.0, DIALOG_RISE), …)` | A dialog fades and rises as one thing |
 | `menu::Menu::draw_in` | `Menu::draw_in_presence(p, pal, area, t)` | The menu fades and drops 6 px into place |
+| `settings::Form::draw` | `Form::draw_animated(p, pal, window, caret_on, anim, id)` | Switches slide, the chosen segment slides, the row, category and dropdown-menu hover fills fade, the scrollbar widens, a slider row's thumb glides; highlights at once after `set_high_contrast(true)` |
 | `menu::Menu::draw_in` | `Menu::draw_in_entering(p, pal, area, t, Entrance)` | `Drop` as above; `Unfold` opens from its top edge, starting 60% opaque (`anim::unfold`), and rises when above its anchor; `Side` slides 6 px in from beside its row (a submenu); `Fade` only fades (a menu closing) |
 
-Not done, and how each would be: the settings form (`settings::Form`) draws its own switches,
-ticks and scrollbar and has no animator passed in, so it is unchanged; an application can still
-wrap the whole form in `pop` for its entrance. The bars of `notice` (update, crash, offer) take
+Not done, and how each would be: the settings form's entrance (an application wraps the whole
+form in `pop`) and the paged settings form (`settings::pages`), which has no motion. The bars of `notice` (update, crash, offer) take
 their height from the application's layout, which can animate that height with `anim.value`. The
 command palette, the tree's disclosure and the tab strip have no motion. The text field's caret
 blinks through `TextField::draw_blinking` (above); the plain `TextField::draw` is unchanged.

@@ -9,6 +9,11 @@
 //! the pointer and the wheel to it instead of the page. The form updates its own rows when a
 //! control changes, so the next frame is right even before the application has applied the value.
 //!
+//! Motion is opt-in: [`Form::draw_animated`] draws the same form with its switches sliding and
+//! its hover fills fading, in the window's animator (see `settings/motion.rs`); `draw` is
+//! unchanged. A [`Row::Slider`] is a number moved on a track (see `settings/slider_row.rs`); a
+//! host with one passes the pointer to [`Form::pointer`], which reports a drag's changes.
+//!
 //! All coordinates are logical px. No callbacks, no threads: every event returns an [`Outcome`].
 
 use crate::gfx::{Face, Painter, Rect, mix};
@@ -23,10 +28,15 @@ use crate::scroll;
 use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette as Colors;
 
+mod motion;
 pub mod pages;
+mod slider_row;
 
 #[cfg(test)]
 mod frozen;
+#[cfg(test)]
+#[path = "settings/motion_tests.rs"]
+mod motion_tests;
 #[cfg(test)]
 #[path = "settings/style_tests.rs"]
 mod style_tests;
@@ -66,6 +76,18 @@ pub enum Row {
     },
     /// A stepper: minus, the value with its unit, plus.
     Number {
+        id: u32,
+        label: String,
+        help: String,
+        value: i32,
+        min: i32,
+        max: i32,
+        step: i32,
+        unit: String,
+    },
+    /// A slider: the value with its unit, then a track with a thumb, moved by the pointer and
+    /// the keys. Its fields are a number row's; see [`Row::slider`].
+    Slider {
         id: u32,
         label: String,
         help: String,
@@ -148,21 +170,33 @@ impl Row {
             Row::Toggle { help, .. }
             | Row::Choice { help, .. }
             | Row::Number { help, .. }
+            | Row::Slider { help, .. }
             | Row::Text { help, .. } => *help = text.into(),
             _ => {}
         }
         self
     }
-    /// The step of a number row.
+    /// The step of a number row, or of a slider row (whose value then snaps to it).
     pub fn step(mut self, by: i32) -> Row {
-        if let Row::Number { step, .. } = &mut self {
-            *step = by.max(1);
+        match &mut self {
+            Row::Number { step, .. } => *step = by.max(1),
+            Row::Slider {
+                step,
+                value,
+                min,
+                max,
+                ..
+            } => {
+                *step = by.max(1);
+                *value = slider_row::snap(*value, *min, *max, *step);
+            }
+            _ => {}
         }
         self
     }
-    /// The unit shown after a number, "px" or "%".
+    /// The unit shown after a number (of a number or a slider row), "px" or "%".
     pub fn unit(mut self, text: impl Into<String>) -> Row {
-        if let Row::Number { unit, .. } = &mut self {
+        if let Row::Number { unit, .. } | Row::Slider { unit, .. } = &mut self {
             *unit = text.into();
         }
         self
@@ -188,6 +222,7 @@ impl Row {
             Row::Toggle { id, .. }
             | Row::Choice { id, .. }
             | Row::Number { id, .. }
+            | Row::Slider { id, .. }
             | Row::Text { id, .. }
             | Row::Action { id, .. } => Some(*id),
         }
@@ -199,6 +234,7 @@ impl Row {
             Row::Toggle { label, .. }
             | Row::Choice { label, .. }
             | Row::Number { label, .. }
+            | Row::Slider { label, .. }
             | Row::Text { label, .. }
             | Row::Action { label, .. } => label,
         }
@@ -209,6 +245,7 @@ impl Row {
             Row::Toggle { help, .. }
             | Row::Choice { help, .. }
             | Row::Number { help, .. }
+            | Row::Slider { help, .. }
             | Row::Text { help, .. } => help,
             _ => "",
         }
@@ -218,7 +255,7 @@ impl Row {
         Some(match self {
             Row::Toggle { value, .. } => Value::Bool(*value),
             Row::Choice { value, .. } => Value::Choice(*value),
-            Row::Number { value, .. } => Value::Number(*value),
+            Row::Number { value, .. } | Row::Slider { value, .. } => Value::Number(*value),
             Row::Text { value, .. } => Value::Text(value.clone()),
             _ => return None,
         })
@@ -282,6 +319,8 @@ enum Target {
     Button(usize),
     Category(usize),
     Close,
+    /// The track and thumb of a slider row.
+    Slider(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -289,6 +328,9 @@ enum Drag {
     None,
     Bar(f32),
     Text(usize),
+    /// A slider row's thumb in hand: the row, its model with the grab, and the value last
+    /// reported in an [`Outcome::Changed`].
+    Slider(usize, crate::slider::Slider, i32),
 }
 
 /// How a choice row is drawn.
@@ -300,6 +342,8 @@ enum Look {
     Dropdown(f32),
     Stepper(f32),
     Button(f32),
+    /// The width of the value's text before the track.
+    Slider(f32),
 }
 
 /// How a form is drawn: its card's corners and shadow, the chosen segment of a segmented
@@ -386,6 +430,8 @@ pub struct Form {
     /// One page: the groups are headings in the scrolling body, with no category list.
     single_page: bool,
     style: Style,
+    /// Highlights change at once in [`Form::draw_animated`]: the system's contrast theme.
+    high_contrast: bool,
 
     // The last layout.
     laid: bool,
@@ -422,6 +468,7 @@ impl Form {
             pending_jump: None,
             single_page: false,
             style: Style::CLASSIC,
+            high_contrast: false,
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -540,6 +587,16 @@ impl Form {
                 },
                 Value::Number(v),
             ) => *value = v.clamp(*min, *max),
+            (
+                Row::Slider {
+                    value,
+                    min,
+                    max,
+                    step,
+                    ..
+                },
+                Value::Number(v),
+            ) => *value = slider_row::snap(v, *min, *max, *step),
             (Row::Text { value, .. }, Value::Text(v)) => {
                 self.fields[i].set_text(&v);
                 *value = self.fields[i].text().to_string();
@@ -729,6 +786,19 @@ impl Form {
             Row::Action { button, .. } => {
                 Look::Button((p.measure(Face::Ui, 13.0, button) + 32.0).ceil().max(80.0))
             }
+            Row::Slider {
+                min,
+                max,
+                value,
+                unit,
+                ..
+            } => {
+                let widest = [min, max, value]
+                    .iter()
+                    .map(|v| p.measure(Face::Ui, 13.0, &number_text(**v, unit)))
+                    .fold(0.0, f32::max);
+                Look::Slider(widest.ceil().max(24.0))
+            }
             _ => Look::None,
         }
     }
@@ -748,8 +818,8 @@ impl Form {
         self.row_rect(i)
     }
 
-    /// The control of row `i`: its toggle, segmented control, dropdown, stepper, text box or
-    /// button, at the right of the row. Empty for a header.
+    /// The control of row `i`: its toggle, segmented control, dropdown, stepper, slider (the
+    /// value and the track), text box or button, at the right of the row. Empty for a header.
     pub fn control_rect(&self, i: usize) -> Rect {
         let r = self.row_rect(i);
         let Some(row) = self.rows.get(i) else {
@@ -765,6 +835,9 @@ impl Form {
             (Row::Number { .. }, Some(Look::Stepper(vw))) => (STEP_W * 2.0 + vw + 8.0, CONTROL_H),
             (Row::Text { .. }, _) => (TEXT_W, CONTROL_H),
             (Row::Action { .. }, Some(Look::Button(w))) => (*w, CONTROL_H),
+            (Row::Slider { .. }, Some(Look::Slider(vw))) => {
+                (vw + slider_row::GAP + slider_row::TRACK_W, CONTROL_H)
+            }
             _ => return Rect::default(),
         };
         Rect::new(
@@ -887,6 +960,7 @@ impl Form {
                 }
                 Row::Text { .. } if self.control_rect(i).contains(x, y) => Target::Text(i),
                 Row::Action { .. } if self.control_rect(i).contains(x, y) => Target::Button(i),
+                Row::Slider { .. } if self.slider_rect(i).contains(x, y) => Target::Slider(i),
                 _ => Target::Row(i),
             });
         }
@@ -1052,9 +1126,9 @@ impl Form {
 
     /// A key press; `typed` is the text the event produced. Escape closes (it closes an open
     /// dropdown first). Tab and Shift+Tab (and Up and Down) move the focus over the controls and
-    /// the Close button; Space and Enter toggle, open or press; Left and Right change a choice or
-    /// a number (Ctrl takes bigger steps), Home and End go to the ends; a text box takes the usual
-    /// editing keys.
+    /// the Close button; Space and Enter toggle, open or press; Left and Right change a choice, a
+    /// number or a slider (Ctrl takes bigger steps), Home and End go to the ends, Page Up and
+    /// Page Down take big steps of a number or a slider; a text box takes the usual editing keys.
     pub fn key(&mut self, key: &KeyName, mods: Mods, typed: Option<&str>) -> Outcome {
         if let Some((i, menu)) = &mut self.menu {
             let i = *i;
@@ -1145,9 +1219,11 @@ impl Form {
                     Row::Toggle { .. } => self.toggle(f, Some(d > 0)),
                     Row::Choice { .. } => self.pick_by(f, d, false),
                     Row::Number { .. } => self.number_by(f, d, step),
+                    Row::Slider { .. } => self.slider_key(f, d > 0, mods.ctrl),
                     _ => Outcome::Unused,
                 }
             }
+            _ if matches!(self.rows[f], Row::Slider { .. }) => self.slider_other_key(f, key),
             KeyName::Char('+' | '=') => self.number_by(f, 1, step),
             KeyName::Char('-') => self.number_by(f, -1, step),
             KeyName::PageUp => self.number_by(f, 1, 10),
@@ -1171,7 +1247,9 @@ impl Form {
 
     // ---- pointer -----------------------------------------------------------------------------
 
-    /// The pointer moved. Returns true when something needs redrawing (hover, a drag).
+    /// The pointer moved. Returns true when something needs redrawing (hover, a drag). A
+    /// slider row's thumb in hand follows the pointer, but its change is reported only by
+    /// [`release`](Self::release); [`pointer`](Self::pointer) reports it as it happens.
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
         if let Some((_, menu)) = &mut self.menu {
             return menu.pointer(x, y);
@@ -1196,6 +1274,7 @@ impl Form {
                 self.fields[i].drag(rel, &self.stops[i]);
                 self.fields[i].caret() != before
             }
+            Drag::Slider(..) => self.slide(x, y),
             Drag::None => {
                 let hover = self.target_at(x, y);
                 let on_bar = self.bar().is_some_and(|(t, _)| t.contains(x, y));
@@ -1219,8 +1298,9 @@ impl Form {
 
     /// A mouse button went down; `clicks` is 1, or 2 for a double click. Controls act when the
     /// button comes up over the same control ([`release`](Self::release)); a text box places its
-    /// caret at once; the scrollbar is grabbed; a press outside the card closes the dialog (and,
-    /// with a dropdown open, only the dropdown).
+    /// caret at once; the scrollbar is grabbed; a slider row takes hold of its thumb and a press
+    /// on its track moves the value there at once ([`Outcome::Changed`]); a press outside the
+    /// card closes the dialog (and, with a dropdown open, only the dropdown).
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
         self.drag = Drag::None;
         self.pressed = None;
@@ -1287,6 +1367,7 @@ impl Form {
                 Outcome::Redraw
             }
             Some(Target::Category(_)) => Outcome::Redraw,
+            Some(Target::Slider(i)) => self.slider_press(i, x, y),
             Some(Target::Row(i)) if self.control_rect(i).contains(x, y) => {
                 // The value of a stepper: not a button, but the row's control.
                 self.focus = Some(i);
@@ -1297,7 +1378,12 @@ impl Form {
     }
 
     /// The button went up: the control the press began on acts if the pointer is still on it.
+    /// A slider row's thumb is let go, with an [`Outcome::Changed`] when its value moved since
+    /// the last one reported.
     pub fn release(&mut self, x: f32, y: f32) -> Outcome {
+        if let Drag::Slider(i, _, reported) = self.drag {
+            return self.slider_release(i, reported);
+        }
         self.drag = Drag::None;
         if let Some((i, menu)) = &mut self.menu {
             let i = *i;
@@ -1334,7 +1420,7 @@ impl Form {
                 self.jump_to_category(c);
                 Outcome::Redraw
             }
-            Target::Text(_) | Target::Row(_) => Outcome::None,
+            Target::Text(_) | Target::Row(_) | Target::Slider(_) => Outcome::None,
         }
     }
 
@@ -1397,6 +1483,19 @@ impl Form {
     /// Lays the dialog out in `window` and draws it over a dimmed window. `caret_on` is the blink
     /// phase of a focused text box.
     pub fn draw(&mut self, p: &mut Painter, pal: &Colors, window: Rect, caret_on: bool) {
+        self.draw_with(p, pal, window, caret_on, None);
+    }
+
+    /// [`draw`](Self::draw), with the motion of [`draw_animated`](Self::draw_animated) when
+    /// `fx` is given. With `None` this is the drawing `draw` has always done.
+    fn draw_with(
+        &mut self,
+        p: &mut Painter,
+        pal: &Colors,
+        window: Rect,
+        caret_on: bool,
+        mut fx: Option<&mut motion::Fx<'_>>,
+    ) {
         self.layout(p, window);
         let dim = self.style.backdrop;
         if dim.is_nan() || dim >= 1.0 {
@@ -1422,6 +1521,10 @@ impl Form {
             for (c, name) in self.categories().iter().enumerate() {
                 let it = self.category_rect(c);
                 let hovered = self.hover == Some(Target::Category(c));
+                let fade = match fx.as_deref_mut() {
+                    Some(fx) => fx.category(c, hovered && c != cur),
+                    None => f32::from(u8::from(hovered)),
+                };
                 if c == cur {
                     p.rbox(it.inset(1.0), 6.0, pal.on);
                     p.rbox(
@@ -1429,8 +1532,10 @@ impl Form {
                         1.5,
                         pal.accent,
                     );
-                } else if hovered {
+                } else if fade >= 1.0 {
                     p.rbox(it.inset(1.0), 6.0, pal.hover);
+                } else if fade > 0.0 {
+                    p.rbox_a(it.inset(1.0), 6.0, pal.hover, fade);
                 }
                 p.text(
                     Face::Ui,
@@ -1455,17 +1560,15 @@ impl Form {
             if row.bottom() < self.body.y || row.y > self.body.bottom() {
                 continue;
             }
-            self.draw_row(p, pal, i, row, caret_on);
+            self.draw_row(p, pal, i, row, caret_on, fx.as_deref_mut());
         }
         p.restore(old);
         if let Some((track, thumb)) = self.bar() {
-            scroll::draw_scrollbar(
-                p,
-                pal,
-                track,
-                thumb,
-                self.bar_hover || matches!(self.drag, Drag::Bar(_)),
-            );
+            let active = self.bar_hover || matches!(self.drag, Drag::Bar(_));
+            match fx.as_deref_mut() {
+                Some(fx) => fx.scrollbar(p, pal, track, thumb, active),
+                None => scroll::draw_scrollbar(p, pal, track, thumb, active),
+            }
         }
 
         // The footer's Close button, primary as in the other dialogs.
@@ -1484,12 +1587,23 @@ impl Form {
         );
 
         // An open dropdown, over everything.
-        if let Some((_, menu)) = &mut self.menu {
-            menu.draw_in(p, pal, window);
+        if let Some((row, menu)) = &mut self.menu {
+            match fx {
+                Some(fx) => fx.menu(p, pal, window, *row, menu),
+                None => menu.draw_in(p, pal, window),
+            }
         }
     }
 
-    fn draw_row(&mut self, p: &mut Painter, pal: &Colors, i: usize, row: Rect, caret_on: bool) {
+    fn draw_row(
+        &mut self,
+        p: &mut Painter,
+        pal: &Colors,
+        i: usize,
+        row: Rect,
+        caret_on: bool,
+        mut fx: Option<&mut motion::Fx<'_>>,
+    ) {
         let row_bg = |hover: bool| {
             if hover {
                 mix(pal.popup, pal.text, 0.035)
@@ -1524,17 +1638,24 @@ impl Form {
             return;
         }
         let hovered = self.hover_in_row(i);
-        if hovered {
+        // How far the row's hover fill has come in: 0 or 1 but in motion.
+        let fade = match fx.as_deref_mut() {
+            Some(fx) => fx.row(i, self.rows[i].id(), hovered),
+            None => f32::from(u8::from(hovered)),
+        };
+        if fade >= 1.0 {
             p.rbox(row, 6.0, row_bg(true));
+        } else if fade > 0.0 {
+            p.rbox_a(row, 6.0, row_bg(true), fade);
         }
         // A hairline under the row, unless a header follows or it is the last.
         let last = i + 1 >= self.rows.len() || matches!(self.rows[i + 1], Row::Header(_));
-        if !last && !hovered {
+        if !last && fade < 1.0 {
             let px = p.px().max(1.0);
             p.fill_a(
                 Rect::new(row.x + 12.0, row.bottom() - px, row.w - 24.0, px),
                 pal.popup_line,
-                0.6,
+                0.6 * (1.0 - fade),
             );
         }
         let ctrl = self.control_rect(i);
@@ -1563,21 +1684,22 @@ impl Form {
         }
         let focused = self.focus == Some(i);
         let ring_on = focused && self.focus_visible;
-        let bg = row_bg(hovered);
+        let bg = if fade > 0.0 && fade < 1.0 {
+            mix(row_bg(false), row_bg(true), fade)
+        } else {
+            row_bg(hovered)
+        };
         match &self.rows[i] {
-            Row::Toggle { value, .. } => {
+            Row::Toggle { value, id, .. } => {
                 if ring_on {
                     ring(p, pal, ctrl, TOGGLE_H / 2.0, bg);
                 }
                 let hov = self.hover == Some(Target::Toggle(i));
-                draw_toggle(
-                    p,
-                    pal,
-                    ctrl,
-                    *value,
-                    hov,
-                    self.pressed == Some(Target::Toggle(i)),
-                );
+                let pressed = self.pressed == Some(Target::Toggle(i));
+                match fx.as_deref_mut() {
+                    Some(fx) => fx.toggle(p, pal, (i, *id), ctrl, *value, hov, pressed),
+                    None => draw_toggle(p, pal, ctrl, *value, hov, pressed),
+                }
             }
             Row::Choice { options, value, .. } => match &self.looks[i] {
                 Look::Segmented(_) if self.style.neutral_segments => {
@@ -1593,22 +1715,43 @@ impl Form {
                         Some(Target::Segment(row, k)) if row == i => Some(k),
                         _ => None,
                     };
-                    draw_neutral_segments(p, pal, ctrl, &segments, *value, hovered);
+                    let pill = fx.as_deref_mut().and_then(|fx| {
+                        let to = self.segment_rect(i, *value);
+                        fx.pill(i, self.rows[i].id(), ctrl, to)
+                    });
+                    draw_neutral_segments(p, pal, ctrl, &segments, *value, hovered, pill);
                 }
                 Look::Segmented(_) => {
                     if ring_on {
                         ring(p, pal, ctrl, 6.0, bg);
                     }
                     p.frame(ctrl, 6.0, pal.field, pal.line);
+                    let pill = fx.as_deref_mut().and_then(|fx| {
+                        let to = self.segment_rect(i, *value);
+                        fx.pill(i, self.rows[i].id(), ctrl, to)
+                    });
+                    if let Some(pill) = pill {
+                        // In motion: the hovered segment's fill, then the accent on its way.
+                        for k in 0..options.len() {
+                            if k != *value && self.hover == Some(Target::Segment(i, k)) {
+                                p.rbox(self.segment_rect(i, k), 4.0, pal.hover);
+                            }
+                        }
+                        p.rbox(pill, 4.0, pal.accent);
+                    }
                     for (k, o) in options.iter().enumerate() {
                         let s = self.segment_rect(i, k);
                         let on = k == *value;
                         let hov = self.hover == Some(Target::Segment(i, k));
-                        if on {
+                        if pill.is_some() {
+                            // Drawn above.
+                        } else if on {
                             p.rbox(s, 4.0, pal.accent);
                         } else if hov {
                             p.rbox(s, 4.0, pal.hover);
                         }
+                        // In motion a label reads as chosen while the pill is under its middle.
+                        let on = pill.map_or(on, |r| r.contains(s.cx(), s.cy()));
                         p.text_center(
                             if on { Face::Semibold } else { Face::Ui },
                             13.0,
@@ -1712,6 +1855,7 @@ impl Form {
                     self.pressed == Some(Target::Button(i)),
                 );
             }
+            Row::Slider { .. } => self.draw_slider_row(p, pal, i, ring_on, fx),
             Row::Header(_) => {}
         }
     }
@@ -1726,7 +1870,8 @@ impl Form {
                 | Target::Minus(k)
                 | Target::Plus(k)
                 | Target::Text(k)
-                | Target::Button(k),
+                | Target::Button(k)
+                | Target::Slider(k),
             ) => k == i,
             _ => false,
         }
@@ -1760,7 +1905,8 @@ fn ring(p: &mut Painter, pal: &Colors, r: Rect, radius: f32, bg: crate::gfx::Rgb
 /// shade off the card with a faint line, the chosen segment a raised pill (a lighter grey on a
 /// dark palette, white with a faint line on a light one), a hovered one a lighter shade, the
 /// chosen label brightest and the others a little dimmer. `segments` are the segments'
-/// rectangles and labels.
+/// rectangles and labels. `pill` is where the chosen segment's pill is on its way to it, in
+/// motion; `None` draws it on the chosen segment.
 fn draw_neutral_segments(
     p: &mut Painter,
     pal: &Colors,
@@ -1768,20 +1914,37 @@ fn draw_neutral_segments(
     segments: &[(Rect, &str)],
     chosen: usize,
     hovered: Option<usize>,
+    pill: Option<Rect>,
 ) {
     let shade = |t: f32| mix(pal.popup, pal.text, t);
+    let raised = |p: &mut Painter, s: Rect| {
+        if pal.dark {
+            p.rbox(s, 4.0, shade(0.2));
+        } else {
+            p.frame(s, 4.0, [255, 255, 255], shade(0.14));
+        }
+    };
     p.frame(ctrl, 6.0, shade(0.04), shade(0.1));
+    if let Some(pill) = pill {
+        // In motion (`Form::draw_animated`): the hovered fill, then the pill on its way.
+        for (k, (s, _)) in segments.iter().enumerate() {
+            if k != chosen && hovered == Some(k) {
+                p.rbox(*s, 4.0, shade(0.1));
+            }
+        }
+        raised(p, pill);
+    }
     for (k, (s, label)) in segments.iter().enumerate() {
         let on = k == chosen;
-        if on {
-            if pal.dark {
-                p.rbox(*s, 4.0, shade(0.2));
-            } else {
-                p.frame(*s, 4.0, [255, 255, 255], shade(0.14));
-            }
+        if pill.is_some() {
+            // Drawn above.
+        } else if on {
+            raised(p, *s);
         } else if hovered == Some(k) {
             p.rbox(*s, 4.0, shade(0.1));
         }
+        // In motion a label reads as chosen while the pill is under its middle.
+        let on = pill.map_or(on, |r| r.contains(s.cx(), s.cy()));
         let color = match (on, pal.dark) {
             (true, true) => mix(pal.text, [255, 255, 255], 0.6),
             (true, false) => pal.text,

@@ -1049,3 +1049,55 @@ field as an Edit, and its Invoke reached the app as a Click. **Not seen by a per
 Mica and frost, the drag, resize and snap, the tooltip (no pointer rested on it), the
 first-frame rules (no white flash, no flip). Linux (`host` and `host,a11y`) and macOS were only
 type-checked; the KDE Wayland fix (no backdrop off Windows) was not run there.
+
+## The settings form in motion, and a slider row (`settings::Form::draw_animated`, `Row::slider`, 2026-11-25, `feat/l10-settings-motion`, roadmap L10)
+
+`Form::draw_animated(p, pal, window, caret_on, anim, id)` draws the form `draw` draws, with
+motion from the window's `anim::Animator` (the caller begins and ends the frame; `id` names the
+form in it). A toggle row's knob slides and its fill fades in (`fluent::MOVE`, the motion of
+`toggle::draw_toggle_animated`); the chosen segment of a segmented choice slides to the new
+one, in the classic and the neutral look (held as a place inside the control, so a scroll is
+not a motion; a label reads as chosen while the pill is under its middle); a row's hover fill
+(its hairline fading out under it), a category's hover fill and the open dropdown's hover row
+(`Menu::draw_in_animated`) fade by `document::HOVER`; the scrollbar widens under the pointer
+(`scroll::draw_scrollbar_animated`); a slider row's thumb glides (`slider::draw_animated`).
+Names in the animator are made from `id`, the row's index and the row's id, so a row replaced
+by another starts at rest and two rows with one id cannot ask one name twice.
+`Form::set_high_contrast(on)` makes the highlights (hover fills, scrollbar, menu row, chosen
+segment) change at once in `draw_animated`; a switch's knob and a slider's thumb still move.
+It changes nothing in `draw`.
+
+`draw` and `draw_animated` share one drawing (`draw_with`); with no animator it takes exactly
+the paths it took before, and the existing freezes (`settings::unchanged`, `settings::frozen`,
+the style tests, the toggle's and the dropdown's frozen copies) pass unchanged. Not done: the
+form has no check box, so "ticks" has nothing to animate (the dropdown's menu draws its
+chosen mark as the menu draws it); the stepper's and the Close button's hover change at once.
+
+`Row::slider(id, label, value, min, max)` (with `.step(n)`, to whose multiples from `min` the
+value snaps, `.unit("%")`, `.help(..)`) is a new variant `Row::Slider` with a number row's
+fields; its value is `Value::Number`. It draws the value and unit, then a 160 px track
+(`Form::slider_rect(i)`) drawn by `slider::draw`. Keys: Left and Right a step (Ctrl a page),
+Page Up and Page Down a page, Home and End the ends, `+` and `-` a step, each an
+`Outcome::Changed`; Up and Down still move the keyboard, as from every row of this form. A
+press on the track moves the value there at once (`Changed`) and takes the thumb; a press on
+the thumb takes it where it is. `Form::pointer(x, y) -> Outcome` is `pointer_move` with a
+drag's changes reported as they happen; with `pointer_move` (a `bool`) the change is reported
+by `release`. The wheel scrolls the body over a slider row, as over a number row. The paged
+form (`settings::pages`) draws and moves a slider row as its stepper.
+
+Compatibility: `Row` is a public enum without `non_exhaustive`, so a new variant breaks an
+application that matches it with no `_` arm. The copies of mdview's and mdedit's code on this
+machine (their tests) match `Row` only with `_` arms; the applications themselves were not
+compiled against this branch.
+
+Run: `cargo test -p mdshared-ui --lib --features host,a11y` (17 tests in
+`settings/motion_tests.rs`: the animated form equals `draw` at rest in both themes and under
+`Policy::Never` after each kind of change; it differs in motion for the switch, a row's hover,
+the segment in both looks, the slider's thumb, the scrollbar and the dropdown menu's row, and
+equals `draw` again once settled; under high contrast a hover, the scrollbar and a choice are
+at once while a switch still slides; the slider row's keys, press, drag, release and
+`set_value` give the values and outcomes stated; odd windows and rows replaced under a drag do
+not panic), `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y
+-- -D warnings`, `cargo fmt --all --check`, on Windows only. `settings_motion_sheet` (ignored)
+writes the slider row and a frame in motion, light and dark, at 1 and 1.5. Not seen by a person
+in a running app; no application uses it yet.

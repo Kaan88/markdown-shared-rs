@@ -172,6 +172,24 @@ pub fn draw_toggle_animated(
     draw_at(p, pal, r, t, look);
 }
 
+/// The settings dialog's switch with the knob `t` of the way from off to on, for the motion of
+/// `settings::Form::draw_animated`: [`draw_at`] with no ring and not disabled.
+pub(crate) fn switch_at(
+    p: &mut Painter,
+    pal: &Palette,
+    r: Rect,
+    t: f32,
+    hovered: bool,
+    pressed: bool,
+) {
+    let look = Look {
+        hovered,
+        pressed,
+        ..Look::default()
+    };
+    draw_at(p, pal, r, t, look);
+}
+
 /// The switch with the knob `t` of the way from off (0) to on (1). At 0 and 1 this is exactly
 /// the settings dialog's switch.
 fn draw_at(p: &mut Painter, pal: &Palette, r: Rect, t: f32, look: Look) {
