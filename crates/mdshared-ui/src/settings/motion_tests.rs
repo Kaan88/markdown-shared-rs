@@ -40,7 +40,7 @@ fn rows() -> Vec<Row> {
             1,
         ),
         Row::number(4, "Tab width", 4, 1, 8),
-        Row::slider(SLIDER, "Volume", 40, 0, 100).step(5).unit("%"),
+        Row::number(SLIDER, "Volume", 40, 0, 100).step(5).unit("%"),
         Row::header("More"),
     ];
     for k in 0..8 {
@@ -50,7 +50,9 @@ fn rows() -> Vec<Row> {
 }
 
 fn form() -> Form {
-    Form::new("Settings", rows()).single_page()
+    let mut f = Form::new("Settings", rows()).single_page();
+    assert!(f.show_as_slider(SLIDER));
+    f
 }
 
 /// The form drawn over a window of one grey: by `draw`, or by `draw_animated` in `anim`.
@@ -311,31 +313,49 @@ fn laid() -> (Form, usize) {
 }
 
 #[test]
-fn a_slider_row_is_made_inside_its_ends_and_on_its_step() {
-    let r = Row::slider(1, "a", 500, 0, 100);
-    assert!(matches!(r, Row::Slider { value: 100, .. }));
-    let r = Row::slider(1, "a", 3, 10, 0);
-    assert!(matches!(
-        r,
-        Row::Slider {
-            value: 10,
-            min: 10,
-            max: 10,
-            ..
-        }
-    ));
-    let r = Row::slider(1, "a", 42, 0, 100).step(5).unit("%").help("h");
-    assert!(
-        matches!(&r, Row::Slider { value: 40, step: 5, unit, help, .. } if unit == "%" && help == "h")
+fn a_number_row_is_a_slider_only_when_the_form_is_told_and_by_its_id() {
+    let mut f = Form::new(
+        "s",
+        vec![
+            Row::number(1, "a", 44, 0, 100).step(10),
+            Row::toggle(2, "b", true),
+        ],
     );
-    let r = Row::slider(1, "a", 0, i32::MIN, i32::MAX).step(0);
-    assert!(matches!(r, Row::Slider { step: 1, .. }));
-    let mut f = Form::new("s", vec![Row::slider(1, "a", 0, 0, 100).step(10)]);
-    assert!(f.set_value(1, Value::Number(44)));
-    assert_eq!(f.value(1), Some(Value::Number(40)));
+    // Not told: a stepper, as ever.
+    shot(&mut f, &LIGHT, None);
+    assert_eq!(f.slider_rect(0), Rect::default());
+    assert!(!f.show_as_slider(2), "a toggle is not a number row");
+    assert!(!f.show_as_slider(9), "no such row yet");
+    assert!(f.show_as_slider(1));
+    assert!(f.show_as_slider(1), "asking twice is asking once");
+    shot(&mut f, &LIGHT, None);
+    assert!(f.slider_rect(0).w > 0.0);
+    assert_eq!(f.slider_rect(1), Rect::default());
+    // The value is the number row's: not snapped by being shown, clamped as a number is.
+    assert_eq!(f.value(1), Some(Value::Number(44)));
     assert!(f.set_value(1, Value::Number(-7)));
     assert_eq!(f.value(1), Some(Value::Number(0)));
     assert!(!f.set_value(1, Value::Bool(true)));
+    // The marks are ids: they outlast new rows, and mark a row that comes later.
+    f.set_rows(vec![
+        Row::header("h"),
+        Row::number(9, "later", 3, 0, 10),
+        Row::number(1, "again", 50, 0, 100),
+    ]);
+    shot(&mut f, &LIGHT, None);
+    assert!(f.slider_rect(1).w > 0.0 && f.slider_rect(2).w > 0.0);
+    assert_eq!(f.slider_rect(0), Rect::default());
+}
+
+#[test]
+fn a_form_never_told_of_a_slider_draws_as_before() {
+    let mut a = Form::new("s", rows()).single_page();
+    let mut b = Form::new("s", rows()).single_page();
+    b.show_as_slider(777);
+    assert!(shot(&mut a, &DARK, None) == shot(&mut b, &DARK, None));
+    // And told, the row is drawn otherwise.
+    b.show_as_slider(SLIDER);
+    assert!(shot(&mut a, &DARK, None) != shot(&mut b, &DARK, None));
 }
 
 #[test]
@@ -397,7 +417,7 @@ fn a_slider_row_survives_its_rows_being_replaced_under_a_drag() {
     let r = f.slider_rect(i);
     f.press(r.cx(), r.cy(), NONE, 1);
     f.set_rows(vec![Row::toggle(1, "only", true)]);
-    assert_eq!(f.pointer(r.x, r.cy()), Outcome::None);
+    assert!(!matches!(f.pointer(r.x, r.cy()), Outcome::Changed { .. }));
     assert!(!f.pointer_move(r.x, r.cy()));
     f.release(r.x, r.cy());
     shot(&mut f, &LIGHT, None);
@@ -488,4 +508,137 @@ fn settings_motion_sheet() {
             );
         }
     }
+}
+
+#[test]
+fn a_drag_ends_when_the_rows_are_replaced_with_another_slider_in_its_place() {
+    let (mut f, i) = laid();
+    let r = f.slider_rect(i);
+    f.press(r.cx(), r.cy(), NONE, 1);
+    // Another slider at the same index.
+    let mut rows = rows();
+    rows[i] = Row::number(6, "Other", 3, 0, 10);
+    f.show_as_slider(6);
+    f.set_rows(rows);
+    shot(&mut f, &LIGHT, None);
+    assert!(!matches!(f.pointer(r.x, r.cy()), Outcome::Changed { .. }));
+    assert!(!f.pointer_move(r.right(), r.cy()) || f.value(6) == Some(Value::Number(3)));
+    assert_eq!(f.value(6), Some(Value::Number(3)));
+    assert!(!matches!(f.release(r.x, r.cy()), Outcome::Changed { .. }));
+    assert_eq!(f.value(6), Some(Value::Number(3)));
+}
+
+#[test]
+fn a_drag_ends_when_a_row_is_put_in_above_it() {
+    let (mut f, i) = laid();
+    let r = f.slider_rect(i);
+    f.press(r.cx(), r.cy(), NONE, 1);
+    let mut rows = rows();
+    rows.insert(1, Row::number(8, "Above", 1, 0, 5));
+    f.set_rows(rows);
+    shot(&mut f, &LIGHT, None);
+    assert!(!matches!(
+        f.pointer(r.right(), r.cy()),
+        Outcome::Changed { .. }
+    ));
+    assert!(!matches!(
+        f.release(r.right(), r.cy()),
+        Outcome::Changed { .. }
+    ));
+    assert_eq!(f.value(SLIDER), Some(Value::Number(40)));
+    assert_eq!(f.value(8), Some(Value::Number(1)));
+}
+
+#[test]
+fn a_dropdown_opened_during_a_drag_lets_the_thumb_go() {
+    let (mut f, i) = laid();
+    let r = f.slider_rect(i);
+    f.press(r.cx(), r.cy(), NONE, 1);
+    let before = f.value(SLIDER);
+    // The keyboard goes up to the dropdown and opens it, the button still down.
+    f.key(&KeyName::Up, NONE, None);
+    f.key(&KeyName::Up, NONE, None);
+    assert_eq!(f.focus_id(), Some(3));
+    assert_eq!(f.key(&KeyName::Enter, NONE, None), Outcome::Redraw);
+    assert!(!matches!(f.pointer(r.x, r.cy()), Outcome::Changed { .. }));
+    assert_eq!(f.value(SLIDER), before);
+}
+
+#[test]
+fn a_hand_built_row_with_its_ends_crossed_does_not_panic() {
+    let crossed = Row::Number {
+        id: 1,
+        label: "x".into(),
+        help: String::new(),
+        value: 5,
+        min: 10,
+        max: 0,
+        step: 1,
+        unit: String::new(),
+    };
+    let mut f = Form::new("s", vec![crossed]);
+    f.show_as_slider(1);
+    let mut fr = Frames::new();
+    fr.frame(&mut f, &LIGHT, 0);
+    f.focus_row(1);
+    assert_eq!(
+        f.key(&KeyName::End, NONE, None),
+        Outcome::Changed {
+            id: 1,
+            value: Value::Number(10)
+        }
+    );
+    f.key(&KeyName::Home, NONE, None);
+    f.key(&KeyName::PageUp, NONE, None);
+    f.key(&KeyName::Left, CTRL, None);
+    let r = f.slider_rect(0);
+    f.press(r.right() - 1.0, r.cy(), NONE, 1);
+    f.pointer(r.x, r.cy());
+    f.release(r.x, r.cy());
+    assert_eq!(f.value(1), Some(Value::Number(0)));
+    fr.frame(&mut f, &LIGHT, 16);
+}
+
+#[test]
+fn whole_numbers_beyond_an_f32s_are_exact_by_the_keys_and_inside_the_ends_by_the_pointer() {
+    const BIG: i32 = 16_777_217; // 2^24 + 1: no f32 holds it.
+    let mut f = Form::new("s", vec![Row::number(1, "big", BIG, BIG - 2, BIG + 2)]);
+    f.show_as_slider(1);
+    shot(&mut f, &LIGHT, None);
+    f.focus_row(1);
+    let n = |v: i32| Outcome::Changed {
+        id: 1,
+        value: Value::Number(v),
+    };
+    assert_eq!(f.key(&KeyName::Right, NONE, None), n(BIG + 1));
+    assert_eq!(f.key(&KeyName::Right, NONE, None), n(BIG + 2));
+    assert_eq!(f.key(&KeyName::Left, NONE, None), n(BIG + 1));
+    assert_eq!(f.key(&KeyName::Home, NONE, None), n(BIG - 2));
+    assert_eq!(f.key(&KeyName::Right, NONE, None), n(BIG - 1));
+    let r = f.slider_rect(0);
+    assert_eq!(f.press(r.right() - 1.0, r.cy(), NONE, 1), n(BIG + 2));
+    for k in 0..=40 {
+        f.pointer(r.x - 20.0 + k as f32 * 6.0, r.cy());
+        match f.value(1) {
+            Some(Value::Number(v)) => assert!((BIG - 2..=BIG + 2).contains(&v), "{v}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    f.pointer(r.x, r.cy());
+    f.release(r.x, r.cy());
+    assert_eq!(f.value(1), Some(Value::Number(BIG - 2)));
+    // The widest range: the keys' arithmetic does not overflow.
+    let mut f = Form::new("s", vec![Row::number(1, "all", 0, i32::MIN, i32::MAX)]);
+    f.show_as_slider(1);
+    shot(&mut f, &LIGHT, None);
+    f.focus_row(1);
+    assert_eq!(f.key(&KeyName::End, NONE, None), n(i32::MAX));
+    assert_eq!(f.key(&KeyName::PageUp, NONE, None), Outcome::None);
+    assert_eq!(f.key(&KeyName::Right, NONE, None), Outcome::None);
+    assert_eq!(f.key(&KeyName::Home, NONE, None), n(i32::MIN));
+    assert_eq!(f.key(&KeyName::PageDown, NONE, None), Outcome::None);
+    assert!(matches!(
+        f.key(&KeyName::PageUp, NONE, None),
+        Outcome::Changed { .. }
+    ));
 }

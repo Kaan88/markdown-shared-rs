@@ -310,7 +310,7 @@ and on every frame under reduced motion, each draws exactly the pixels of the pl
 | `overlay::draw_backdrop` | `draw_backdrop_presence(p, pal, w, h, t)` | The dimming follows the dialog's presence |
 | `overlay::draw_dialog_card` | `pop(p, dialog_bounds(card), t, (0.0, DIALOG_RISE), …)` | A dialog fades and rises as one thing |
 | `menu::Menu::draw_in` | `Menu::draw_in_presence(p, pal, area, t)` | The menu fades and drops 6 px into place |
-| `settings::Form::draw` | `Form::draw_animated(p, pal, window, caret_on, anim, id)` | Switches slide, the chosen segment slides, the row, category and dropdown-menu hover fills fade, the scrollbar widens, a slider row's thumb glides; highlights at once after `set_high_contrast(true)` |
+| `settings::Form::draw` | `Form::draw_animated(p, pal, window, caret_on, anim, id)` | Switches slide, the chosen segment slides, the row, category and dropdown-menu hover fills fade, the scrollbar widens, the thumb of a number row shown as a slider (`show_as_slider`) glides; highlights at once after `set_high_contrast(true)` |
 | `menu::Menu::draw_in` | `Menu::draw_in_entering(p, pal, area, t, Entrance)` | `Drop` as above; `Unfold` opens from its top edge, starting 60% opaque (`anim::unfold`), and rises when above its anchor; `Side` slides 6 px in from beside its row (a submenu); `Fade` only fades (a menu closing) |
 
 Not done, and how each would be: the settings form's entrance (an application wraps the whole

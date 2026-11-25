@@ -13,8 +13,7 @@
 //! page needs: a child indented under its parent, a disabled row with its reason in the help
 //! slot, a text field on its own line, a button beside the control. A [`Row::Header`] on a page
 //! is a gap between two groups; its text is not drawn. The ids, [`Value`] and [`Outcome`] are
-//! the single-page form's, so a host's code for what a change does stays as it is. A
-//! [`Row::Slider`] is drawn and moved here as a stepper, with the same value.
+//! the single-page form's, so a host's code for what a change does stays as it is.
 //!
 //! Keyboard: the dialog opens with the keyboard in the list. Up, Down, Home, End, PageUp and
 //! PageDown there show another page at once; a letter goes to the next page starting with it.
@@ -209,8 +208,7 @@ impl Item {
             // reworded or a model offers one more level.
             Row::Choice { options, .. } if options.len() <= 3 && !self.dropdown => Kind::Segmented,
             Row::Choice { .. } => Kind::Dropdown,
-            // This form has no slider: a slider row is a stepper here, with the same value.
-            Row::Number { .. } | Row::Slider { .. } => Kind::Stepper,
+            Row::Number { .. } => Kind::Stepper,
             Row::Text { .. } if self.stacked => Kind::Stacked,
             Row::Text { .. } => Kind::Text,
             Row::Action { .. } => Kind::Action,
@@ -650,13 +648,6 @@ fn check_row(p: &mut Painter, it: &Item, pl: &Placed, g: &Geo, out: &mut Vec<Str
                 max,
                 unit,
                 ..
-            }
-            | Row::Slider {
-                value,
-                min,
-                max,
-                unit,
-                ..
             },
             _,
         ) => {
@@ -894,9 +885,6 @@ impl Form {
             }
             (
                 Row::Number {
-                    value, min, max, ..
-                }
-                | Row::Slider {
                     value, min, max, ..
                 },
                 Value::Number(v),
@@ -1271,22 +1259,13 @@ impl Form {
     }
 
     fn number_by(&mut self, i: usize, dir: i32, times: i32) -> Outcome {
-        if let Some(
-            Row::Number {
-                value,
-                min,
-                max,
-                step,
-                ..
-            }
-            | Row::Slider {
-                value,
-                min,
-                max,
-                step,
-                ..
-            },
-        ) = self.row_mut(i)
+        if let Some(Row::Number {
+            value,
+            min,
+            max,
+            step,
+            ..
+        }) = self.row_mut(i)
         {
             let by = dir.saturating_mul(*step).saturating_mul(times);
             let next = value.saturating_add(by).clamp(*min, *max);
@@ -1299,14 +1278,9 @@ impl Form {
     }
 
     fn number_to(&mut self, i: usize, end: bool) -> Outcome {
-        if let Some(
-            Row::Number {
-                value, min, max, ..
-            }
-            | Row::Slider {
-                value, min, max, ..
-            },
-        ) = self.row_mut(i)
+        if let Some(Row::Number {
+            value, min, max, ..
+        }) = self.row_mut(i)
         {
             let next = if end { *max } else { *min };
             if next != *value {
@@ -1986,13 +1960,6 @@ impl Form {
                 crate::dropdown::field(p, pal, ctrl, shown, h, off);
             }
             Row::Number {
-                value,
-                min,
-                max,
-                unit,
-                ..
-            }
-            | Row::Slider {
                 value,
                 min,
                 max,

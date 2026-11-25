@@ -2,7 +2,8 @@
 //! [`Form::draw`]. A switch's knob slides and its fill fades in; the chosen segment of a
 //! segmented choice slides to the one chosen; a row's hover fill, a category's and the open
 //! dropdown's hover row fade in and out; the scrollbar widens and its track fades in under
-//! the pointer; a slider row's thumb glides to a value set by a key or a click. Every motion
+//! the pointer; the thumb of a number row shown as a slider ([`Form::show_as_slider`])
+//! glides to a value set by a key or a click. Every motion
 //! is the toolkit's own for that widget (`toggle::draw_toggle_animated`,
 //! `scroll::draw_scrollbar_animated`, `slider::draw_animated`, `Menu::draw_in_animated`), and
 //! the fades are [`document::HOVER`].

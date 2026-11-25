@@ -11,8 +11,9 @@
 //!
 //! Motion is opt-in: [`Form::draw_animated`] draws the same form with its switches sliding and
 //! its hover fills fading, in the window's animator (see `settings/motion.rs`); `draw` is
-//! unchanged. A [`Row::Slider`] is a number moved on a track (see `settings/slider_row.rs`); a
-//! host with one passes the pointer to [`Form::pointer`], which reports a drag's changes.
+//! unchanged. A number row can be shown as a slider instead of a stepper
+//! ([`Form::show_as_slider`], see `settings/slider_row.rs`); a host with one passes the pointer
+//! to [`Form::pointer`], which reports a drag's changes.
 //!
 //! All coordinates are logical px. No callbacks, no threads: every event returns an [`Outcome`].
 
@@ -76,18 +77,6 @@ pub enum Row {
     },
     /// A stepper: minus, the value with its unit, plus.
     Number {
-        id: u32,
-        label: String,
-        help: String,
-        value: i32,
-        min: i32,
-        max: i32,
-        step: i32,
-        unit: String,
-    },
-    /// A slider: the value with its unit, then a track with a thumb, moved by the pointer and
-    /// the keys. Its fields are a number row's; see [`Row::slider`].
-    Slider {
         id: u32,
         label: String,
         help: String,
@@ -170,33 +159,21 @@ impl Row {
             Row::Toggle { help, .. }
             | Row::Choice { help, .. }
             | Row::Number { help, .. }
-            | Row::Slider { help, .. }
             | Row::Text { help, .. } => *help = text.into(),
             _ => {}
         }
         self
     }
-    /// The step of a number row, or of a slider row (whose value then snaps to it).
+    /// The step of a number row.
     pub fn step(mut self, by: i32) -> Row {
-        match &mut self {
-            Row::Number { step, .. } => *step = by.max(1),
-            Row::Slider {
-                step,
-                value,
-                min,
-                max,
-                ..
-            } => {
-                *step = by.max(1);
-                *value = slider_row::snap(*value, *min, *max, *step);
-            }
-            _ => {}
+        if let Row::Number { step, .. } = &mut self {
+            *step = by.max(1);
         }
         self
     }
-    /// The unit shown after a number (of a number or a slider row), "px" or "%".
+    /// The unit shown after a number, "px" or "%".
     pub fn unit(mut self, text: impl Into<String>) -> Row {
-        if let Row::Number { unit, .. } | Row::Slider { unit, .. } = &mut self {
+        if let Row::Number { unit, .. } = &mut self {
             *unit = text.into();
         }
         self
@@ -222,7 +199,6 @@ impl Row {
             Row::Toggle { id, .. }
             | Row::Choice { id, .. }
             | Row::Number { id, .. }
-            | Row::Slider { id, .. }
             | Row::Text { id, .. }
             | Row::Action { id, .. } => Some(*id),
         }
@@ -234,7 +210,6 @@ impl Row {
             Row::Toggle { label, .. }
             | Row::Choice { label, .. }
             | Row::Number { label, .. }
-            | Row::Slider { label, .. }
             | Row::Text { label, .. }
             | Row::Action { label, .. } => label,
         }
@@ -245,7 +220,6 @@ impl Row {
             Row::Toggle { help, .. }
             | Row::Choice { help, .. }
             | Row::Number { help, .. }
-            | Row::Slider { help, .. }
             | Row::Text { help, .. } => help,
             _ => "",
         }
@@ -255,7 +229,7 @@ impl Row {
         Some(match self {
             Row::Toggle { value, .. } => Value::Bool(*value),
             Row::Choice { value, .. } => Value::Choice(*value),
-            Row::Number { value, .. } | Row::Slider { value, .. } => Value::Number(*value),
+            Row::Number { value, .. } => Value::Number(*value),
             Row::Text { value, .. } => Value::Text(value.clone()),
             _ => return None,
         })
@@ -432,6 +406,8 @@ pub struct Form {
     style: Style,
     /// Highlights change at once in [`Form::draw_animated`]: the system's contrast theme.
     high_contrast: bool,
+    /// The ids of the number rows drawn as sliders ([`Form::show_as_slider`]).
+    sliders: Vec<u32>,
 
     // The last layout.
     laid: bool,
@@ -469,6 +445,7 @@ impl Form {
             single_page: false,
             style: Style::CLASSIC,
             high_contrast: false,
+            sliders: Vec::new(),
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -547,6 +524,10 @@ impl Form {
             })
             .collect();
         self.rows = rows;
+        if matches!(self.drag, Drag::Slider(..)) {
+            // The thumb in hand may now be another row's, or no row's.
+            self.drag = Drag::None;
+        }
         self.stops = vec![Vec::new(); self.rows.len()];
         self.stops_text = vec![String::new(); self.rows.len()];
         self.menu = None;
@@ -587,16 +568,6 @@ impl Form {
                 },
                 Value::Number(v),
             ) => *value = v.clamp(*min, *max),
-            (
-                Row::Slider {
-                    value,
-                    min,
-                    max,
-                    step,
-                    ..
-                },
-                Value::Number(v),
-            ) => *value = slider_row::snap(v, *min, *max, *step),
             (Row::Text { value, .. }, Value::Text(v)) => {
                 self.fields[i].set_text(&v);
                 *value = self.fields[i].text().to_string();
@@ -776,17 +747,14 @@ impl Form {
                 value,
                 unit,
                 ..
-            } => {
+            } if self.is_slider(i) => {
                 let widest = [min, max, value]
                     .iter()
                     .map(|v| p.measure(Face::Ui, 13.0, &number_text(**v, unit)))
                     .fold(0.0, f32::max);
-                Look::Stepper((widest + 24.0).ceil().max(64.0))
+                Look::Slider(widest.ceil().max(24.0))
             }
-            Row::Action { button, .. } => {
-                Look::Button((p.measure(Face::Ui, 13.0, button) + 32.0).ceil().max(80.0))
-            }
-            Row::Slider {
+            Row::Number {
                 min,
                 max,
                 value,
@@ -797,7 +765,10 @@ impl Form {
                     .iter()
                     .map(|v| p.measure(Face::Ui, 13.0, &number_text(**v, unit)))
                     .fold(0.0, f32::max);
-                Look::Slider(widest.ceil().max(24.0))
+                Look::Stepper((widest + 24.0).ceil().max(64.0))
+            }
+            Row::Action { button, .. } => {
+                Look::Button((p.measure(Face::Ui, 13.0, button) + 32.0).ceil().max(80.0))
             }
             _ => Look::None,
         }
@@ -832,12 +803,12 @@ impl Form {
                 (ws.iter().sum::<f32>() + 4.0, CONTROL_H)
             }
             (Row::Choice { .. }, Some(Look::Dropdown(w))) => (*w, CONTROL_H),
+            (Row::Number { .. }, Some(Look::Slider(vw))) => {
+                (vw + slider_row::GAP + slider_row::TRACK_W, CONTROL_H)
+            }
             (Row::Number { .. }, Some(Look::Stepper(vw))) => (STEP_W * 2.0 + vw + 8.0, CONTROL_H),
             (Row::Text { .. }, _) => (TEXT_W, CONTROL_H),
             (Row::Action { .. }, Some(Look::Button(w))) => (*w, CONTROL_H),
-            (Row::Slider { .. }, Some(Look::Slider(vw))) => {
-                (vw + slider_row::GAP + slider_row::TRACK_W, CONTROL_H)
-            }
             _ => return Rect::default(),
         };
         Rect::new(
@@ -948,6 +919,13 @@ impl Form {
                         _ => Target::Dropdown(i),
                     }
                 }
+                Row::Number { .. } if self.is_slider(i) => {
+                    if self.slider_rect(i).contains(x, y) {
+                        Target::Slider(i)
+                    } else {
+                        Target::Row(i)
+                    }
+                }
                 Row::Number { .. } if self.control_rect(i).contains(x, y) => {
                     let (m, _, p) = self.stepper_parts(i);
                     if m.contains(x, y) {
@@ -960,7 +938,6 @@ impl Form {
                 }
                 Row::Text { .. } if self.control_rect(i).contains(x, y) => Target::Text(i),
                 Row::Action { .. } if self.control_rect(i).contains(x, y) => Target::Button(i),
-                Row::Slider { .. } if self.slider_rect(i).contains(x, y) => Target::Slider(i),
                 _ => Target::Row(i),
             });
         }
@@ -1058,6 +1035,10 @@ impl Form {
         let mut menu = Menu::new(items, c.right(), c.bottom() + 4.0, true);
         menu.hover = Some(*value);
         self.menu = Some((i, menu));
+        if matches!(self.drag, Drag::Slider(..)) {
+            // The menu takes the pointer: the thumb is let go.
+            self.drag = Drag::None;
+        }
     }
 
     /// Activates the control the keyboard is on.
@@ -1218,12 +1199,12 @@ impl Form {
                 match &self.rows[f] {
                     Row::Toggle { .. } => self.toggle(f, Some(d > 0)),
                     Row::Choice { .. } => self.pick_by(f, d, false),
+                    Row::Number { .. } if self.is_slider(f) => self.slider_key(f, d > 0, mods.ctrl),
                     Row::Number { .. } => self.number_by(f, d, step),
-                    Row::Slider { .. } => self.slider_key(f, d > 0, mods.ctrl),
                     _ => Outcome::Unused,
                 }
             }
-            _ if matches!(self.rows[f], Row::Slider { .. }) => self.slider_other_key(f, key),
+            _ if self.is_slider(f) => self.slider_other_key(f, key),
             KeyName::Char('+' | '=') => self.number_by(f, 1, step),
             KeyName::Char('-') => self.number_by(f, -1, step),
             KeyName::PageUp => self.number_by(f, 1, 10),
@@ -1772,6 +1753,7 @@ impl Form {
                     crate::dropdown::field(p, pal, ctrl, shown, hov, false);
                 }
             },
+            Row::Number { .. } if self.is_slider(i) => self.draw_slider_row(p, pal, i, ring_on, fx),
             Row::Number {
                 value,
                 min,
@@ -1855,7 +1837,6 @@ impl Form {
                     self.pressed == Some(Target::Button(i)),
                 );
             }
-            Row::Slider { .. } => self.draw_slider_row(p, pal, i, ring_on, fx),
             Row::Header(_) => {}
         }
     }
