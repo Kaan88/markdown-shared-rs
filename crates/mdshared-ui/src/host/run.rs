@@ -100,6 +100,7 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         cursor: Cursor::Default,
         snap: None,
         backdrop: Backdrop::Off,
+        veil: None,
         pal: LIGHT,
         exit: false,
         touched: false,
@@ -366,6 +367,7 @@ impl<A: App> Host<A> {
             return false;
         };
         let mut sys = crate::frost::WindowSystem(hwnd(&win.window));
+        self.frost.set_veil(self.st.veil);
         let changed = self
             .frost
             .sync(want, self.st.focused, &self.st.pal, &mut sys);

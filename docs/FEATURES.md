@@ -1400,6 +1400,23 @@ was lost. Noted for later:
   `Cache::hex_stops` have no direct test. The release and feature runs of AGENTS.md were not
   run.
 
+## A veil strength for the backdrop (`Cx::set_backdrop_veil`, `Frost::set_veil`, 2026-11-25, `feat/backdrop-veil`, roadmap X11)
+
+Asked for by Purge, whose Mica and Acrylic strength is a setting and which re-keyed the frost
+itself because the veil was fixed (Mica 0, Acrylic 150, `frost::veil`). `Frost::set_veil(Some(v))`
+keeps `v` of 255 of the chrome's flat colour over the backdrop in place of the backdrop's own,
+for Mica and Acrylic alike; `None`, the default, goes back to it. The next `sync` makes the key
+with it and says the look changed when the key did. The host's `Cx::set_backdrop_veil` passes it
+on and redraws the whole window on a change; the window system is asked nothing new. Without a
+call nothing changes.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `frost.rs`: the
+veil takes the backdrop's place for Acrylic and Mica, a change is a change of the look and then
+settles, the same key under another backdrop is no change, `None` goes back, no key without
+focus, the system asked nothing more); `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
+Not seen on a frosted window.
+
 ## The pool: cancel by key, and results in the order asked for (`Pool::cancel`, `Pool::drain_ordered`, 2026-11-25, `feat/pool-cancel`, roadmap X5)
 
 `Pool::cancel(&key)` does for one key what `set_generation` does for a generation: queued work

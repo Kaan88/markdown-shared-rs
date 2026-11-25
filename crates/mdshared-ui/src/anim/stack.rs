@@ -100,7 +100,9 @@ impl<T> Stack<T> {
 
     /// The same stack with a new thing waiting for room: pushed onto things already there, it
     /// starts its entrance only once they have lifted to make room ([`fluent::MOVE`], 167 ms),
-    /// so the one above never covers it on the way. Onto an empty stack it enters at once.
+    /// so the one above never covers it on the way. Onto an empty stack it enters at once, and
+    /// so it does when the animator does not animate (reduced motion, [`Policy::Never`]
+    /// (crate::anim::Policy::Never)): nothing lifts, so nothing is waited for.
     /// Without it the new thing enters while the others lift.
     pub fn with_wait_for_lift(mut self) -> Stack<T> {
         self.wait_for_lift = true;
@@ -291,11 +293,17 @@ impl<T> Stack<T> {
         // The lift's length: an entrance that waits for room starts when the lift ends, both
         // being asked for from the same frame.
         let lift = fluent::MOVE.length().unwrap_or_default();
+        // With nothing moving there is no lift to wait for: a delay would be kept as a wait.
+        let waits = anim.animates();
         let ts: Vec<f32> = self
             .items
             .iter()
             .map(|e| {
-                let enter = if e.wait { enter.delayed(lift) } else { enter };
+                let enter = if e.wait && waits {
+                    enter.delayed(lift)
+                } else {
+                    enter
+                };
                 anim.presence(id.with(("in", e.key)), e.shown, enter, exit)
             })
             .collect();
@@ -345,7 +353,7 @@ impl<T: PartialEq> Stack<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anim::{Clock, ManualClock};
+    use crate::anim::{Clock, ManualClock, Policy};
     use std::time::Duration;
 
     fn run(
@@ -509,6 +517,30 @@ mod tests {
             plain.iter().any(|&(t, lift)| t > 0.0 && lift < 44.0),
             "without it, it enters while the other lifts"
         );
+    }
+
+    /// When nothing animates (reduced motion, `Policy::Never`) a new toast with the wait is
+    /// there on the frame it is pushed, beside the one above: no lift, so no wait.
+    #[test]
+    fn with_nothing_moving_a_new_toast_does_not_wait() {
+        for still in [Policy::Never, Policy::System] {
+            let clock = ManualClock::new();
+            let mut anim = Animator::new();
+            anim.set_policy(still);
+            if still == Policy::System {
+                anim.set_system_reduced(true);
+            }
+            let mut stack = Stack::new().with_wait_for_lift();
+            stack.push("saved", None);
+            run(&mut stack, &mut anim, &clock);
+            stack.push("copied", None);
+            let now = run(&mut stack, &mut anim, &clock);
+            assert_eq!(
+                now,
+                vec![("copied", 1.0, 0.0), ("saved", 1.0, 44.0)],
+                "{still:?}"
+            );
+        }
     }
 
     /// Bringing one back keeps to the most shown: the oldest other is sent away.
