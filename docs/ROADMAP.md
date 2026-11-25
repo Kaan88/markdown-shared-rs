@@ -57,6 +57,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
+| B | **Barbican fast track** (the owner, 2026-11-25): after the md and Purge items, or whenever it is convenient; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
 ## Shell and window
@@ -201,6 +202,51 @@ New, fast-tracked:
 | D5 | **One preset set for document apps** (menu, tip, toast, dialog), so both apps tune their durations in one place | S | low | `anim` presets | done, on main: `anim::document` (`MENU`, `TIP`, `TOAST`, `DIALOG`, `HOVER`, `TIP_DELAY`); the toolkit's own animated draws still use `fluent::ENTER`/`EXIT` directly, which are `MENU`'s |
 | D6 | **A shared tooltip model**: the delay, blocked after a press, the anchor; both apps carry the same `Tip` struct and timer | S | low | `overlay::Bubble` | done, on main: module `tooltip`, `Tooltip<K>` from mdedit's `Tip` and `tip_blocked` (delay, warm neighbour, blocked after a press, `deadline`); mdview's not read (not on this machine) |
 | D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | done, on main: `platform::watch_motion_reduced` now wakes on Windows too, from the contrast watch's hidden window (`WM_SETTINGCHANGE`, the setting read again and compared); the host takes it (`Wake::Motion`). Tested by messages sent to the window; the setting itself was not switched |
+
+## Barbican (fast track, 2026-11-25)
+
+Barbican (`Kaan88/barbican`), the mail, calendar and contacts client, drops Slint and moves its UI
+onto this toolkit. The analysis is Barbican's `docs/UI-TOOLKIT-EVAL.md` (on its main, e9f9bd6):
+section 4 has the K items with their reasons and sources, section 5.7 the milestones. The mockups
+the owner approved, in this toolkit's look, are in its `docs/mockups/`; each screen lists the
+widgets it uses and marks the missing ones NEW. Both of Barbican's feature cuts are applied, so
+the list below is as short as it gets. Asked for by the Barbican session on the owner's word:
+put it here and fast-track it after the md and Purge items, or whenever it is convenient.
+Barbican pins a toolkit commit and builds on whatever has landed; it prepares its own side
+(U0-U3) meanwhile. When a milestone lands on `main`, send the Barbican session a short note.
+
+Barbican calls its toolkit milestones T1-T5; here they are **BT1-BT5**, as T1-T7 are the
+terminal's. The K ids are Barbican's and clash with nothing here.
+
+| Milestone | Items | Needs | Done when |
+|---|---|---|---|
+| BT1 | K5, K11, K7, K14 | none | CI; a specimen sheet |
+| BT3 | K1 (shrunk) | none | damage tests; the host example blinks a caret while a list scrolls, in two damage regions |
+| BT2 | K4 | BT1 | pixel tests and a sheet; seen by the owner |
+| BT4 | K3 | BT3 | two child windows placed by the layout in an example; a capture under a scrim; DPI across two monitors |
+| then | K8, K9 (form open: Barbican decides before its composer milestone), K10 | | |
+| BT5, after Barbican's switch-over, no rush | K2; also K12, K6 | BT3 | a menu over a child window in the example; DPI across two monitors; no focus taken from the owner |
+
+| Id | What | Size | Risk | Builds on | Status |
+|---|---|---|---|---|---|
+| K5 | **A layout helper.** Pure arithmetic: rows and columns with fixed, flexible, minimum and maximum sizes, padding, gaps, alignment and wrapping, returning rectangles; no tree is kept. Every Barbican screen waits on it | M | low | `gfx::Rect` | open |
+| K11 | **A scroll area**: one helper tying `viewport`, both scrollbars, the clip, wheel and keys, and revealing the focused control; a dialog whose body scrolls | S | low | `viewport`, `scroll`, `focus`, `overlay` | open |
+| K7 | **Rich text through the painter.** A public way to draw a caller's parley layout with per-run brushes, a wavy underline as one path (spelling squiggles), mixed families per run | S | low | `Painter`'s layout drawing (`gfx.rs`) | open |
+| K14 | **Pictures kept at their drawn size**: an image prepared once at device size and blitted after (`Painter::image` scales on every draw), plus a decoder slot an application fills (Barbican's GIF, WebP, ICO, SVG). Avatars and badges are on most screens | S | low | `mdshared_text::image`, `thumbs` | open |
+| K1 | **Host additions for one window** (shrunk): several named timers folded into one wake-up; the main window hidden but alive (close to tray); regions with their own damage, so a caret blink and a list scroll do not repaint one union rectangle. Not wanted: run-time top-level windows, tabs, per-window animators or a11y adapters | M | medium | `host`, the damage part of W1 | open |
+| K4 | **Everyday controls.** Push buttons (primary, secondary, subtle, destructive), an icon button with a tooltip, a button that opens a menu, a split button, a framed text field (leading icon, clear button, error state), a check box with a label and a mixed state, a radio group, a chip with remove, a badge and a count, a card (dashboard tiles), a divider, an avatar (initials or picture, round) | L | low | `overlay::draw_dialog_button`, `check`, `textfield`, `menu::Menu::around`, `link`, `tooltip`, K14 | open |
+| K3 | **Native child windows in the layout** (WebView2 through wry): rectangles laid out each frame given to child windows, bounds set before the present; shown and hidden by rule; keyboard focus handed back on a press elsewhere; scale changes; a capture of a child (PrintWindow) for frames when something covers it (a scrim, a page transition). More than one child, or one moved between places | M | medium-high | `host`; Barbican's `src/mailview.rs` and `src/capture.rs` as the source | open |
+| K8 | **Drag and drop** (= L7): a threshold, a drag image, drop targets that light up, the insert position between rows, auto-scroll; files hovered and dropped from the system reduced to host events | M | medium | `rows`, `sections`, `select`, `anim`, `host` | open |
+| K9 | **A multi-line plain text area**: wrapping, scrolling, selection, undo, IME, find. Owner or Barbican decides its form first: this, a smaller M without find, or Barbican's own rich text editor in a plain mode and no K9 | M-L | medium | `textfield`, `viewport`, `seltext`; mdedit's editor as a source | open (form undecided) |
+| K10 | **IME on Windows**: allowed while a text surface has focus, the candidate window at the caret (`set_ime_cursor_area`), preedit drawn in fields and in a caller's rich text; the emoji panel (Win+.) and dead keys must type | S | medium | `textfield::Preedit`, `host` | open |
+| K13 | **A time-grid model** (optional; Barbican may keep it): day and week columns, 15-minute snapping, overlapping events packed into lanes, move and resize by drag, an all-day strip, month cells | M | low | `grid`, K8 | open (optional) |
+| K2 | **Popups in owned surfaces** (after Barbican's switch-over): one kind of extra window, borderless, owned, never activated, no taskbar entry, its own bitmap and present; menus, cascades, flyouts, drop-down lists, tooltips and toasts drawn into it in screen coordinates, kept on the work area, with the DWM corners and shadow; closed when the owner moves, deactivates or minimises. Puts a menu above a WebView2 child | L | high | `host`, `menu`, `submenu`, `flyout`, `dropdown`, `overlay`, `anim::presence` | open (after the switch) |
+| K12 | **Accessibility past Purge's scope** (after the switch): text ranges for editors and fields, tree items, a grid, menus in their own surfaces (with K2), live regions for toasts; tried with Narrator | L | high | `a11y`, K2 | open (after the switch) |
+| K6 | **A whole skin as data** (optional, later, with themes): faces and families as run-time values, widgets reading sizes from `tokens::Sizes`, a `Look` for every widget, a replaceable icon table, one `Skin` passed to `_with(skin)` draws, opt-in | M-L | medium | `tokens`, `appearance`, every `draw_*` | open (optional) |
+
+Also wanted by Barbican, already rows here: L5 (rename in place), P8b (the hand-over reaching a
+winit window); L9 (images on the clipboard) after its switch. No longer wanted by Barbican: W9,
+X6, L4, and W1 beyond its damage regions.
 
 ## Left over from what exists
 
