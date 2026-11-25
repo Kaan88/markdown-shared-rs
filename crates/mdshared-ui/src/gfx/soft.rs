@@ -71,6 +71,20 @@ const SIGMAS: f32 = 3.0;
 /// The most strips a rounded corner is cut into.
 const MAX_STRIPS: usize = 48;
 
+/// How many strips a corner of `rad` device px is cut into under a blur of deviation `sigma`:
+/// one for each half deviation of its curve (strips are spaced evenly round the curve, not down
+/// it), as the blur smooths away a step much finer than itself. A popup's wide layer at 150%
+/// (18 px corners, a deviation of 18) takes four; strips a pixel high took eighteen whatever
+/// the blur. The shadow stays within half a level of 255 of the corner cut finely
+/// (`coarse_strips_cost_under_half_a_level`).
+fn strips_for(rad: f32, sigma: f32) -> usize {
+    if rad > 0.0 {
+        ((std::f32::consts::PI * rad / sigma).ceil() as usize).clamp(1, MAX_STRIPS)
+    } else {
+        0
+    }
+}
+
 /// Everything [`Painter::soft_shadow`] with these layers can touch around `r`, in logical px:
 /// for the damage rectangle of something that fades or moves with its shadow. An empty
 /// rectangle at `r` when no layer draws.
@@ -150,6 +164,18 @@ struct Layer {
     cut_row: Vec<bool>,
 }
 
+/// The area a corner of radius `rad` leaves outside its curve between `lo` and `hi` into the
+/// corner (0 at the box's top or bottom edge, `rad` where the curve meets the side): the integral
+/// of the notch's width, `rad - sqrt(rad^2 - (rad - t)^2)`, from `lo` to `hi`.
+fn notch(rad: f32, lo: f32, hi: f32) -> f32 {
+    // The integral of sqrt(rad^2 - u^2) du.
+    let g = |u: f32| {
+        let u = u.clamp(-rad, rad);
+        (u * (rad * rad - u * u).max(0.0).sqrt() + rad * rad * (u / rad).asin()) / 2.0
+    };
+    (rad * (hi - lo) - (g(rad - lo) - g(rad - hi))).max(0.0)
+}
+
 /// Below this a strip's share is left out.
 const NEGLIGIBLE: f32 = 1e-5;
 
@@ -159,13 +185,26 @@ impl Layer {
     #[allow(clippy::too_many_arguments)] // a box, a blur and an area: no natural grouping
     fn new(
         alpha: f32,
-        (x0, y0, x1, y1): (f32, f32, f32, f32),
+        b: (f32, f32, f32, f32),
         rad: f32,
         sigma: f32,
         cx0: i32,
         cols: usize,
         cy0: i32,
         rows: usize,
+    ) -> Layer {
+        let strips = strips_for(rad, sigma);
+        Layer::with_strips(alpha, b, rad, sigma, (cx0, cols, cy0, rows), strips)
+    }
+
+    /// [`Layer::new`] with the corners cut into `strips` strips (none for square corners).
+    fn with_strips(
+        alpha: f32,
+        (x0, y0, x1, y1): (f32, f32, f32, f32),
+        rad: f32,
+        sigma: f32,
+        (cx0, cols, cy0, rows): (i32, usize, i32, usize),
+        strips: usize,
     ) -> Layer {
         let at = |v: i32, i: usize| (v + i as i32) as f32 + 0.5;
         let across: Vec<f32> = (0..cols)
@@ -180,19 +219,23 @@ impl Layer {
                 phi((y1 - y) / sigma) - phi((y0 - y) / sigma)
             })
             .collect();
-        // The corner the curve cuts off, as strips across: strip k lies `t` into the corner
-        // from the box's top (or bottom), `dt` high, and the curve leaves `cut` of it.
-        let strips = if rad > 0.0 {
-            ((rad / sigma.min(1.0)).ceil() as usize).clamp(1, MAX_STRIPS)
-        } else {
-            0
-        };
-        let dt = if strips > 0 { rad / strips as f32 } else { 0.0 };
-        let cuts: Vec<(f32, f32)> = (0..strips)
+        // The corner the curve cuts off, as strips across: strip k lies from `lo` to `hi` into
+        // the corner from the box's top (or bottom), and is cut `cut` deep at the box's side,
+        // the notch's own width averaged over the strip, so each strip takes off exactly the
+        // area the curve leaves in it. The strips take equal turns of the curve, so they are
+        // thin where it runs nearly level, along the box's edge, and deep where it runs down.
+        let strips = if rad > 0.0 { strips } else { 0 };
+        let step = std::f32::consts::FRAC_PI_2 / strips.max(1) as f32;
+        let depth = |k: usize| rad * (1.0 - (k as f32 * step).cos());
+        let cuts: Vec<(f32, f32, f32)> = (0..strips)
             .map(|k| {
-                let t = (k as f32 + 0.5) * dt;
-                let h = rad - t;
-                (t, rad - (rad * rad - h * h).max(0.0).sqrt())
+                let (lo, hi) = (depth(k), if k + 1 == strips { rad } else { depth(k + 1) });
+                let cut = if hi > lo {
+                    notch(rad, lo, hi) / (hi - lo)
+                } else {
+                    0.0
+                };
+                (lo, hi, cut)
             })
             .collect();
         let mut cut_across = vec![0.0; cols * strips];
@@ -205,7 +248,7 @@ impl Layer {
                 continue;
             }
             let mut any = false;
-            for (k, &(_, cut)) in cuts.iter().enumerate() {
+            for (k, &(_, _, cut)) in cuts.iter().enumerate() {
                 let left = phi((x0 + cut - x) / sigma) - phi((x0 - x) / sigma);
                 let right = phi((x1 - x) / sigma) - phi((x1 - cut - x) / sigma);
                 let v = left + right;
@@ -222,11 +265,9 @@ impl Layer {
                 continue;
             }
             let mut any = false;
-            for (k, &(t, _)) in cuts.iter().enumerate() {
-                let band = |mid: f32| {
-                    phi((mid + dt / 2.0 - y) / sigma) - phi((mid - dt / 2.0 - y) / sigma)
-                };
-                let v = band(y0 + t) + band(y1 - t);
+            for (k, &(lo, hi, _)) in cuts.iter().enumerate() {
+                let band = |a: f32, b: f32| phi((b - y) / sigma) - phi((a - y) / sigma);
+                let v = band(y0 + lo, y0 + hi) + band(y1 - hi, y1 - lo);
                 any |= v > NEGLIGIBLE;
                 cut_down[r * strips + k] = v;
             }

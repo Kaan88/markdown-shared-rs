@@ -257,6 +257,67 @@ fn a_tail_too_faint_to_take_half_a_level_off_a_dark_page_leaves_it_as_it_was() {
 }
 
 #[test]
+fn a_corner_is_cut_into_strips_by_its_blur_not_by_its_pixels() {
+    // A popup's layers at 150% round the Look dialog's largest corners (18 px): four strips
+    // under the wide one, thirteen under the sharp one, where a strip a pixel high made
+    // eighteen each; square corners none; at most MAX_STRIPS.
+    assert_eq!(strips_for(18.0, 18.0), 4);
+    assert_eq!(strips_for(18.0, 4.5), 13);
+    assert_eq!(strips_for(2.0, 36.0), 1);
+    assert_eq!(strips_for(0.0, 6.0), 0);
+    assert_eq!(strips_for(500.0, 0.5), MAX_STRIPS);
+}
+
+/// The most a layer of alpha 1 round a box with corners of `rad` under a deviation of `sigma`,
+/// its corners cut into `strips`, differs from the same cut into strips a twentieth of a pixel
+/// apart, in levels of 255.
+fn strip_error(rad: f32, sigma: f32, strips: usize) -> f32 {
+    let b = (
+        100.0,
+        100.0,
+        100.0 + 4.0 * rad + 40.0,
+        100.0 + 3.0 * rad + 40.0,
+    );
+    let reach = (SIGMAS * sigma + 2.0).ceil() as i32;
+    let (cx0, cy0) = (100 - reach, 100 - reach);
+    let cols = (b.2 - b.0) as usize + 2 * reach as usize;
+    let rows = (b.3 - b.1) as usize + 2 * reach as usize;
+    let area = (cx0, cols, cy0, rows);
+    let coarse = Layer::with_strips(1.0, b, rad, sigma, area, strips);
+    let fine = Layer::with_strips(1.0, b, rad, sigma, area, (rad * 20.0).ceil() as usize);
+    let mut worst = 0.0f32;
+    for r in 0..rows {
+        for c in 0..cols {
+            worst = worst.max((coarse.cover(c, r) - fine.cover(c, r)).abs());
+        }
+    }
+    worst * 255.0
+}
+
+#[test]
+fn coarse_strips_cost_under_half_a_level() {
+    // For corners small to large and blurs from a pixel to very wide, the strips the blur asks
+    // for against strips a twentieth of a pixel apart: under half a level of 255, wherever the
+    // count is not held to MAX_STRIPS.
+    let mut tried = 0;
+    for rad in [2.0f32, 4.0, 6.0, 9.0, 12.0, 18.0, 24.0, 36.0] {
+        for sigma in [1.0f32, 1.5, 2.0, 3.0, 4.5, 6.0, 9.0, 12.0, 18.0, 36.0] {
+            let n = strips_for(rad, sigma);
+            if n == MAX_STRIPS {
+                continue;
+            }
+            tried += 1;
+            let e = strip_error(rad, sigma, n);
+            assert!(
+                e < 0.5,
+                "corners {rad}, deviation {sigma}, {n} strips: {e} levels"
+            );
+        }
+    }
+    assert!(tried > 60, "{tried} cases");
+}
+
+#[test]
 fn the_strength_scales_every_layer_and_zero_draws_nothing() {
     let r = Rect::new(20.0, 20.0, 300.0, 100.0);
     let at = |k: f32| {
