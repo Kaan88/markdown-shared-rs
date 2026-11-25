@@ -13,9 +13,11 @@
 //! its hover fills fading, in the window's animator (see `settings/motion.rs`); `draw` is
 //! unchanged. A number row can be shown as a slider instead of a stepper
 //! ([`Form::show_as_slider`], see `settings/slider_row.rs`); a host with one passes the pointer
-//! to [`Form::pointer`], which reports a drag's changes. A text row holding a hex colour can be
-//! shown as a swatch with a picker in a popover ([`Form::show_as_colour`], see
-//! `settings/colour_row.rs`).
+//! to [`Form::pointer`], which reports a drag's changes. A number row's value can also be
+//! dragged left and right while it stays a stepper ([`Form::make_draggable`], see
+//! `settings/drag_number.rs`), with [`Form::cursor_at`] for the pointer's shape. A text row
+//! holding a hex colour can be shown as a swatch with a picker in a popover
+//! ([`Form::show_as_colour`], see `settings/colour_row.rs`).
 //!
 //! All coordinates are logical px. No callbacks, no threads: every event returns an [`Outcome`].
 
@@ -32,6 +34,7 @@ use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette as Colors;
 
 mod colour_row;
+mod drag_number;
 mod motion;
 pub mod pages;
 mod slider_row;
@@ -39,6 +42,9 @@ mod slider_row;
 #[cfg(test)]
 #[path = "settings/colour_tests.rs"]
 mod colour_tests;
+#[cfg(test)]
+#[path = "settings/drag_number_tests.rs"]
+mod drag_number_tests;
 #[cfg(test)]
 mod frozen;
 #[cfg(test)]
@@ -311,6 +317,8 @@ enum Drag {
     /// A slider row's thumb in hand: the row, its model with the grab, and the value last
     /// reported in an [`Outcome::Changed`].
     Slider(usize, crate::slider::Slider, i32),
+    /// A draggable number row's value in hand ([`Form::make_draggable`]).
+    Number(drag_number::Held),
 }
 
 /// How a choice row is drawn.
@@ -416,6 +424,8 @@ pub struct Form {
     sliders: Vec<u32>,
     /// The text rows drawn as colours, and their picker ([`Form::show_as_colour`]).
     colours: colour_row::Colours,
+    /// The ids of the number rows whose value is dragged ([`Form::make_draggable`]).
+    draggable: Vec<u32>,
 
     // The last layout.
     laid: bool,
@@ -455,6 +465,7 @@ impl Form {
             high_contrast: false,
             sliders: Vec::new(),
             colours: colour_row::Colours::default(),
+            draggable: Vec::new(),
             laid: false,
             window: Rect::default(),
             card: Rect::default(),
@@ -533,7 +544,7 @@ impl Form {
             })
             .collect();
         self.rows = rows;
-        if matches!(self.drag, Drag::Slider(..)) {
+        if matches!(self.drag, Drag::Slider(..) | Drag::Number(_)) {
             // The thumb in hand may now be another row's, or no row's.
             self.drag = Drag::None;
         }
@@ -1046,7 +1057,7 @@ impl Form {
         let mut menu = Menu::new(items, c.right(), c.bottom() + 4.0, true);
         menu.hover = Some(*value);
         self.menu = Some((i, menu));
-        if matches!(self.drag, Drag::Slider(..)) {
+        if matches!(self.drag, Drag::Slider(..) | Drag::Number(_)) {
             // The menu takes the pointer: the thumb is let go.
             self.drag = Drag::None;
         }
@@ -1123,6 +1134,9 @@ impl Form {
     /// Page Down take big steps of a number or a slider; a text box takes the usual editing keys.
     pub fn key(&mut self, key: &KeyName, mods: Mods, typed: Option<&str>) -> Outcome {
         if let Some(o) = self.colour_key(key, mods, typed) {
+            return o;
+        }
+        if let Some(o) = self.drag_number_key(key) {
             return o;
         }
         if let Some((i, menu)) = &mut self.menu {
@@ -1273,6 +1287,7 @@ impl Form {
                 self.fields[i].caret() != before
             }
             Drag::Slider(..) => self.slide(x, y),
+            Drag::Number(_) => self.drag_number_to(x, None),
             Drag::None => {
                 let hover = self.target_at(x, y);
                 let on_bar = self.bar().is_some_and(|(t, _)| t.contains(x, y));
@@ -1373,6 +1388,7 @@ impl Form {
             Some(Target::Row(i)) if self.control_rect(i).contains(x, y) => {
                 // The value of a stepper: not a button, but the row's control.
                 self.focus = Some(i);
+                self.drag_number_press(i, x, y, mods);
                 Outcome::Redraw
             }
             _ => Outcome::None,
@@ -1388,6 +1404,9 @@ impl Form {
         }
         if let Drag::Slider(i, _, reported) = self.drag {
             return self.slider_release(i, reported);
+        }
+        if matches!(self.drag, Drag::Number(_)) {
+            return self.drag_number_release();
         }
         self.drag = Drag::None;
         if let Some((i, menu)) = &mut self.menu {

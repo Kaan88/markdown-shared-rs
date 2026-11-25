@@ -34,6 +34,8 @@ struct Entry<T> {
     shown: bool,
     /// When it leaves of itself; `None` for when it is hidden.
     until: Option<Instant>,
+    /// Its entrance waits for the ones above to lift ([`Stack::with_wait_for_lift`]).
+    wait: bool,
 }
 
 /// A stack of things that enter and leave each on its own.
@@ -46,6 +48,8 @@ pub struct Stack<T> {
     max: usize,
     /// At most this many kept, the leaving ones counted ([`with_max_drawn`](Stack::with_max_drawn)).
     max_drawn: Option<usize>,
+    /// A new thing enters once the ones above have lifted ([`with_wait_for_lift`](Stack::with_wait_for_lift)).
+    wait_for_lift: bool,
 }
 
 impl<T> Default for Stack<T> {
@@ -65,6 +69,7 @@ impl<T> Stack<T> {
             exit: fluent::EXIT,
             max: 3,
             max_drawn: None,
+            wait_for_lift: false,
         }
     }
 
@@ -93,16 +98,27 @@ impl<T> Stack<T> {
         self
     }
 
+    /// The same stack with a new thing waiting for room: pushed onto things already there, it
+    /// starts its entrance only once they have lifted to make room ([`fluent::MOVE`], 167 ms),
+    /// so the one above never covers it on the way. Onto an empty stack it enters at once.
+    /// Without it the new thing enters while the others lift.
+    pub fn with_wait_for_lift(mut self) -> Stack<T> {
+        self.wait_for_lift = true;
+        self
+    }
+
     /// Adds `item` at the bottom, to leave of itself at `until` (`None`: when hidden). Returns
     /// its key. The oldest shown things beyond the stack's most are sent away.
     pub fn push(&mut self, item: T, until: Option<Instant>) -> u64 {
         let key = self.next;
         self.next += 1;
+        let wait = self.wait_for_lift && !self.items.is_empty();
         self.items.push(Entry {
             key,
             item,
             shown: true,
             until,
+            wait,
         });
         self.cap(key);
         key
@@ -142,7 +158,7 @@ impl<T> Stack<T> {
     pub fn replace(&mut self, key: u64, item: T, until: Option<Instant>) -> bool {
         match self.items.iter_mut().find(|e| e.key == key) {
             Some(e) => {
-                (e.item, e.until, e.shown) = (item, until, true);
+                (e.item, e.until, e.shown, e.wait) = (item, until, true, false);
                 self.cap(key);
                 true
             }
@@ -157,7 +173,7 @@ impl<T> Stack<T> {
     pub fn revive(&mut self, key: u64, until: Option<Instant>) -> bool {
         match self.items.iter_mut().find(|e| e.key == key) {
             Some(e) => {
-                (e.shown, e.until) = (true, until);
+                (e.shown, e.until, e.wait) = (true, until, false);
                 self.cap(key);
                 true
             }
@@ -272,10 +288,16 @@ impl<T> Stack<T> {
     ) -> Vec<Shown<'_, T>> {
         let id = Id::new(id);
         let (enter, exit) = (self.enter, self.exit);
+        // The lift's length: an entrance that waits for room starts when the lift ends, both
+        // being asked for from the same frame.
+        let lift = fluent::MOVE.length().unwrap_or_default();
         let ts: Vec<f32> = self
             .items
             .iter()
-            .map(|e| anim.presence(id.with(("in", e.key)), e.shown, enter, exit))
+            .map(|e| {
+                let enter = if e.wait { enter.delayed(lift) } else { enter };
+                anim.presence(id.with(("in", e.key)), e.shown, enter, exit)
+            })
             .collect();
         let mut i = 0;
         let mut kept = Vec::with_capacity(ts.len());
@@ -445,6 +467,48 @@ mod tests {
         assert_ne!(stack.replace_newest("Zoom 150%", None), k);
         let out = after(600, &mut stack, &mut anim, &clock);
         assert_eq!(out, vec![("Zoom 150%", 1.0, 0.0)]);
+    }
+
+    /// With `with_wait_for_lift` a new toast stays out until the one above has lifted, then
+    /// enters; nothing overlaps. Onto an empty stack it enters at once. Without it, it enters
+    /// while the other lifts.
+    #[test]
+    fn a_new_toast_waits_for_the_lift_when_asked_to() {
+        let pushed = |wait: bool| {
+            let clock = ManualClock::new();
+            let mut anim = Animator::new();
+            let mut stack = if wait {
+                Stack::new().with_wait_for_lift()
+            } else {
+                Stack::new()
+            };
+            stack.push("saved", None);
+            let first = after(32, &mut stack, &mut anim, &clock);
+            assert!(first[0].1 > 0.0, "onto an empty stack: at once");
+            after(400, &mut stack, &mut anim, &clock);
+            stack.push("copied", None);
+            // Frame by frame: the new toast's presence and the older one's lift.
+            let mut seen = Vec::new();
+            for _ in 0..30 {
+                clock.advance_ms(16);
+                let out = run(&mut stack, &mut anim, &clock);
+                seen.push((out[0].1, out[1].2));
+            }
+            seen
+        };
+        for (t, lift) in pushed(true) {
+            assert!(
+                t == 0.0 || lift == 44.0,
+                "in only once lifted: t {t} at lift {lift}"
+            );
+        }
+        let waited = pushed(true);
+        assert_eq!(waited.last().unwrap().0, 1.0, "and then it enters");
+        let plain = pushed(false);
+        assert!(
+            plain.iter().any(|&(t, lift)| t > 0.0 && lift < 44.0),
+            "without it, it enters while the other lifts"
+        );
     }
 
     /// Bringing one back keeps to the most shown: the oldest other is sent away.

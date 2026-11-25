@@ -244,6 +244,9 @@ impl Form {
         if let Some(o) = self.colour_pointer(x, y) {
             return o;
         }
+        if matches!(self.drag, Drag::Number(_)) {
+            return self.drag_number_pointer(x, None);
+        }
         if let Drag::Slider(i, ..) = self.drag {
             if !self.slide(x, y) {
                 return Outcome::None;
