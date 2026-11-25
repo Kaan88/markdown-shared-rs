@@ -1416,3 +1416,19 @@ settles, the same key under another backdrop is no change, `None` goes back, no 
 focus, the system asked nothing more); `cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
 Not seen on a frosted window.
+
+## No one-frame hover flash on the title row (`chrome`, 2026-11-26, `fix/hover-flash`, asked by md, roadmap D4)
+
+mdview measured a one-frame flash on its caption buttons. On the first frame of a hover
+(`t = 0`, the pointer already on the control), `draw_win_button_animated`,
+`draw_tab_animated`, `draw_new_tab_button_animated` and `button_fill_animated` drew the full
+hover look; the next frame dropped to the fade's first step. They now decide the look at the
+ends by the fade (`t > 0`), not by the pointer, as `Menu::draw_in_animated`, `check` and
+`dropdown` already did. A press and an open menu still show at once; a held press shows only while the pointer is on the button, also on the frame it leaves. A quiet tab hovered at
+`t = 0` draws the rest look with its close button, which shows at once as before.
+
+A window that does not animate (`Policy::Never`, reduced motion) is unchanged: there the fade is
+at its end on the first frame. Test (`chrome::tests::the_animated_pieces_are_the_plain_ones_at_rest`,
+extended): the first frame of a hover is not the full hover, and the caption buttons, the new-tab button and the tab (left of its label) are at rest
+there; the way back starts from the full hover. Seen failing without the change. Not seen by a
+person.
