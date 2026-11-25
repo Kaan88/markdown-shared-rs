@@ -1203,3 +1203,59 @@ mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on
 Found, not changed: `pages::Form::draw` (on main as now) overflows an integer in `gfx.rs` in a
 debug build when the window is infinitely wide. Not seen by a person in a running app; mdview
 and mdedit do not call it yet.
+
+## Number rows dragged left and right (`settings::Form::make_draggable`, 2026-11-25, `feat/drag-numbers`, roadmap L10)
+
+Asked for by mdplay for its Look dialog, which is the single-page `settings::Form`.
+`Form::make_draggable(id) -> bool` lets the value of the number row `id` be dragged, as the
+number fields of a drawing or a sound program are, while the row stays its stepper: the − and +
+buttons, the keys and the drawing are unchanged. A press on the value's text, then a horizontal
+drag, moves the value one `step` for every 4 logical px right of the press (`PX_PER_STEP`), down
+for every 4 px left, counted towards zero; with Shift one step per 16 px (`FINE_PX_PER_STEP`),
+never a fraction of the step, so the value stays on the numbers the buttons reach. Shift
+changed during the drag carries on from the value and place it had, with no jump. The value is
+held inside the row's ends; the place follows the pointer, so after a drag past an end the
+pointer comes back over that stretch before the value leaves it. A hand-built row with `min`
+over `max` is read with its ends swapped, a step of 0 or less as 1, in `i64` arithmetic over
+the whole `i32` range; a place that is not a number moves nothing. `Form::pointer` reports
+each change as `Outcome::Changed` when it happens, and `Form::pointer_with(x, y, mods)` does so
+with the pace following Shift; with `pointer_move` (a `bool`) the change is reported by
+`release`, as for a slider. Escape during the drag puts back the value it started from
+(`Changed` when it had moved) and ends it, and the release after does nothing; the release, a
+new press, `set_rows` (no report: the row in hand may be another) and a dropdown opened by the
+keys end it too. Other keys act as without a drag. `Form::cursor_at(x, y) -> Option<Cursor>`
+answers `Cursor::ResizeEw` over a draggable value and all through its drag, `None` elsewhere,
+with a dropdown open, before a layout and in a form never told; the host lists it first in
+`cursor::pick` and passes the result to `CursorState::set`. `ResizeEw` is winit's
+`CursorIcon::EwResize`, which winit shows on Windows as `IDC_SIZEWE`; a host setting the
+cursor itself loads `IDC_SIZEWE`. The marks are ids kept through `set_rows`, as the slider
+marks are; a row that is also `show_as_slider` is a slider (its thumb is dragged). No `Row`
+variant, no field and no `Value` was added, no timer runs and no clock is read. The paged form
+(`settings::pages::Form`, mdview's and mdedit's) has no such marks: its focus, press and
+pointer code is its own, it has no `pointer -> Outcome` to report a live drag through, and
+mdplay does not draw it, so it was left alone. The code is `settings/drag_number.rs`;
+settings.rs gained a private `Drag::Number`, a `draggable` field and one-line hooks in
+`set_rows`, `open_menu`, `key`, `pointer_move`, `press` and `release` (and `pointer` in
+`slider_row.rs`). mdplay passes the pointer with `pointer_move` today, so to see the value
+change during a drag it calls `pointer` or `pointer_with` instead.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (12 tests in
+`settings/drag_number_tests.rs`, no clock: a drag right and left moves by the step per 4 px,
+for a step of 1 and of 25; the ends hold, and infinities and NaN do not move or panic; Shift
+gives 16 px per step at the press and mid-drag, without a jump either way; Escape puts the
+value back and reports it, under `pointer` and under `pointer_move`, and Escape with no drag
+still closes; `pointer_move` reports on release; a click on the value and the buttons and keys
+of a marked row answer as before; an unmarked row in forms with no mark, another row's mark
+and marks on a toggle and a missing id gives the same outcomes and pixels as the frozen copy of
+the old form (`settings::frozen`) through a press, four moves, Escape and a release; a marked
+form draws as an unmarked one at rest, hovered and during a drag (against one given the same
+value by `set_value`), light and dark; `set_rows` ends a drag and the mark outlasts it; marks
+by id, rows added later, a slider wins; crossed ends, a step of 0 and the whole `i32` range
+with a step of `i32::MAX`; the cursor over the value, not over the buttons, the label or an
+unmarked row, held through the drag, not with a dropdown open nor before a layout), with
+`settings::unchanged`, `settings::frozen`, the motion and style tests unchanged and passing;
+`cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D
+warnings`; `cargo fmt --all --check`; on Windows only. Found, not changed: the stepper's own
+buttons and keys (`number_by` in settings.rs, on main) panic on a hand-built row with `min`
+over `max`, as `i32::clamp` does. Not seen by a person in a running app; mdplay does not call
+it yet.
