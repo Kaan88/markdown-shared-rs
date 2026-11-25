@@ -43,9 +43,9 @@ impl Bubble {
             .max(80.0);
         let rect = Rect::new(
             (page.cx() - w / 2.0).round(),
-            (page.bottom() - 36.0 - 28.0).round(),
+            (page.bottom() - TOAST_H - 28.0).round(),
             w.round(),
-            36.0,
+            TOAST_H,
         );
         Bubble {
             kind: Kind::Toast,
@@ -149,6 +149,10 @@ impl Bubble {
 /// How far below its place a toast starts when it is drawn by
 /// [`Bubble::draw_presence`], in logical px.
 pub const TOAST_RISE: f32 = 8.0;
+
+/// A toast's height ([`Bubble::toast`]), in logical px: what a stack of toasts
+/// ([`crate::anim::Stack::frame`]) lifts each one by, with the gap.
+pub const TOAST_H: f32 = 36.0;
 
 // ---- dialogs ---------------------------------------------------------------------------------
 
