@@ -44,6 +44,8 @@ pub struct Stack<T> {
     enter: Motion,
     exit: Motion,
     max: usize,
+    /// At most this many kept, the leaving ones counted ([`with_max_drawn`](Stack::with_max_drawn)).
+    max_drawn: Option<usize>,
 }
 
 impl<T> Default for Stack<T> {
@@ -62,6 +64,7 @@ impl<T> Stack<T> {
             enter: fluent::ENTER,
             exit: fluent::EXIT,
             max: 3,
+            max_drawn: None,
         }
     }
 
@@ -76,6 +79,15 @@ impl<T> Stack<T> {
     /// the oldest away.
     pub fn with_max(mut self, max: usize) -> Stack<T> {
         self.max = max.max(1);
+        self
+    }
+
+    /// The same stack keeping at most `max` things (at least one) in all, the ones leaving
+    /// counted: a push over that many drops the oldest at once, with no exit, so pushes faster
+    /// than the exit do not pile up. Without it only the things shown are counted
+    /// ([`with_max`](Self::with_max)).
+    pub fn with_max_drawn(mut self, max: usize) -> Stack<T> {
+        self.max_drawn = Some(max.max(1));
         self
     }
 
@@ -98,7 +110,58 @@ impl<T> Stack<T> {
             e.shown = false;
             over -= 1;
         }
+        if let Some(max) = self.max_drawn {
+            let over = self.items.len().saturating_sub(max);
+            self.items.drain(..over);
+        }
         key
+    }
+
+    /// Puts `item` in the place of the thing `key`, with a new time to leave, at once and with
+    /// no exit or entrance: a status that replaces itself (a zoom step, progress turning into a
+    /// result). A thing that is leaving comes back. False when there is no such thing.
+    pub fn replace(&mut self, key: u64, item: T, until: Option<Instant>) -> bool {
+        match self.items.iter_mut().find(|e| e.key == key) {
+            Some(e) => {
+                (e.item, e.until, e.shown) = (item, until, true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Brings the thing `key` back if it is leaving, with a new time to leave; it turns round
+    /// where it is in its exit and stays in its place. True when there is such a thing, shown
+    /// or leaving.
+    pub fn revive(&mut self, key: u64, until: Option<Instant>) -> bool {
+        match self.items.iter_mut().find(|e| e.key == key) {
+            Some(e) => {
+                (e.shown, e.until) = (true, until);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Takes the thing `key` away at once, with no exit; the ones above move down into its
+    /// place.
+    pub fn remove(&mut self, key: u64) {
+        self.items.retain(|e| e.key != key);
+    }
+
+    /// Takes everything away at once, with no exit.
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// The newest thing, shown or leaving, for which `is` holds: its key and whether it is
+    /// still shown.
+    pub fn find(&self, mut is: impl FnMut(&T) -> bool) -> Option<(u64, bool)> {
+        self.items
+            .iter()
+            .rev()
+            .find(|e| is(&e.item))
+            .map(|e| (e.key, e.shown))
     }
 
     /// Sends the thing `key` away; it plays its exit in [`frame`](Self::frame).
@@ -201,6 +264,21 @@ impl<T> Stack<T> {
     }
 }
 
+impl<T: PartialEq> Stack<T> {
+    /// [`push`](Self::push), unless an equal thing is there or leaving: then that one is kept
+    /// (brought back if it was leaving, [`revive`](Self::revive)) with the new time to leave,
+    /// so a confirmation said again does not stand twice. Returns the key.
+    pub fn show(&mut self, item: T, until: Option<Instant>) -> u64 {
+        match self.find(|t| *t == item) {
+            Some((key, _)) => {
+                self.revive(key, until);
+                key
+            }
+            None => self.push(item, until),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +337,78 @@ mod tests {
         let gone = after(600, &mut stack, &mut anim, &clock);
         assert_eq!(gone, vec![("copied", 1.0, 0.0)]);
         assert_eq!(stack.current().count(), 1);
+    }
+
+    #[test]
+    fn replace_remove_and_clear_act_at_once() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new();
+        let zoom = stack.push("110%", None);
+        after(400, &mut stack, &mut anim, &clock);
+        assert!(stack.replace(zoom, "120%", None));
+        // In place, at once: no exit, no entrance, same key.
+        assert_eq!(run(&mut stack, &mut anim, &clock), vec![("120%", 1.0, 0.0)]);
+        assert!(!stack.replace(99, "x", None));
+        let saved = stack.push("saved", None);
+        after(600, &mut stack, &mut anim, &clock);
+        stack.remove(saved);
+        // Gone at once; the one above moves down into its place.
+        let now = run(&mut stack, &mut anim, &clock);
+        assert_eq!(now.len(), 1);
+        assert_eq!(
+            after(600, &mut stack, &mut anim, &clock),
+            vec![("120%", 1.0, 0.0)]
+        );
+        stack.push("copied", None);
+        stack.clear();
+        assert!(stack.is_empty());
+        assert!(run(&mut stack, &mut anim, &clock).is_empty());
+    }
+
+    #[test]
+    fn show_brings_back_an_equal_one_that_is_leaving_instead_of_a_second() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new();
+        let a = stack.show("copied", None);
+        after(400, &mut stack, &mut anim, &clock);
+        stack.hide(a);
+        let leaving = after(48, &mut stack, &mut anim, &clock);
+        assert!(leaving[0].1 < 1.0);
+        assert_eq!(stack.find(|s| *s == "copied"), Some((a, false)));
+        assert_eq!(stack.show("copied", None), a, "the same one, not a second");
+        let back = after(600, &mut stack, &mut anim, &clock);
+        assert_eq!(back, vec![("copied", 1.0, 0.0)]);
+        // A different one is pushed as before.
+        assert_ne!(stack.show("saved", None), a);
+        assert_eq!(stack.current().count(), 2);
+    }
+
+    #[test]
+    fn with_max_drawn_counts_the_leaving_ones_too() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new().with_max(2).with_max_drawn(3);
+        for s in ["a", "b", "c", "d", "e"] {
+            stack.push(s, None);
+            run(&mut stack, &mut anim, &clock);
+            clock.advance_ms(16);
+        }
+        let drawn = run(&mut stack, &mut anim, &clock);
+        let names: Vec<_> = drawn.iter().map(|d| d.0).collect();
+        assert_eq!(names, ["e", "d", "c"], "at most three kept, newest first");
+        let shown: Vec<_> = stack.current().map(|(_, s)| *s).collect();
+        assert_eq!(shown, ["d", "e"]);
+        // Without it, the leaving ones are not counted.
+        let mut loose = Stack::new().with_max(2);
+        let mut anim = Animator::new();
+        for s in ["a", "b", "c", "d", "e"] {
+            loose.push(s, None);
+            run(&mut loose, &mut anim, &clock);
+            clock.advance_ms(16);
+        }
+        assert!(run(&mut loose, &mut anim, &clock).len() > 3);
     }
 
     #[test]
