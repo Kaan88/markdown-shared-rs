@@ -4,7 +4,7 @@
 //! own thread, a pool is many short ones on a fixed number of threads.
 //!
 //! The caller submits work under a key, a priority and a generation, and is woken when results
-//! wait; on its own thread it takes them with [`Pool::drain`]. Three things keep a pool from
+//! wait; on its own thread it takes them with [`Pool::drain`]. Four things keep a pool from
 //! doing work nobody wants any more:
 //!
 //! - **The key.** Work queued under a key that is queued already takes that entry's place, so
@@ -14,6 +14,11 @@
 //! - **The generation.** A number the caller raises when everything asked for so far is of no
 //!   use (another folder was opened). Raising it empties the queue of older work, tells older
 //!   work that is running to stop, and throws its result away if it finishes all the same.
+//! - **Cancelling a key.** [`Pool::cancel`] does the same for the work under one key only (a row
+//!   scrolled out of sight, a file deleted), leaving the rest.
+//!
+//! Results come in the order the work finished ([`Pool::drain`]), or in the order it was asked
+//! for, the highest priority first and then the order of submission ([`Pool::drain_ordered`]).
 //!
 //! The wake is a plain closure, as a job's is, so nothing here knows of winit, of a window or of
 //! an event loop.
@@ -23,7 +28,8 @@
 //! - no progress: a piece of work here is short, and the caller counts the results it has;
 //! - no result for work that was dropped, replaced, made stale or lost to a panic: the caller is
 //!   not told key by key, it asks [`Pool::pending`], [`Pool::running`] and [`Pool::lost`];
-//! - no order of results: they come in the order the work finished;
+//! - no holding a result back until the ones asked for before it are done: `drain_ordered`
+//!   orders what waits, and a later drain may give an earlier piece;
 //! - no reprioritising of queued work, other than by submitting it again under its key;
 //! - no waiting: nothing here blocks the caller, not [`Pool::drain`] and not dropping the pool.
 
@@ -44,15 +50,19 @@ struct Flags {
 pub struct Token {
     flags: Arc<Flags>,
     generation: u64,
+    /// Set by [`Pool::cancel`] for this piece alone.
+    own: Arc<AtomicBool>,
 }
 
 impl Token {
-    /// True once the pool's generation has passed this work's, or the pool was dropped: the
+    /// True once the pool's generation has passed this work's, this piece was cancelled by its
+    /// key ([`Pool::cancel`]), or the pool was dropped: the
     /// result will be thrown away, so the work should return soon. What it returns then does
     /// not matter.
     pub fn cancelled(&self) -> bool {
         self.flags.closed.load(Ordering::Relaxed)
             || self.flags.generation.load(Ordering::Relaxed) > self.generation
+            || self.own.load(Ordering::Relaxed)
     }
 
     /// The generation the work was submitted under.
@@ -72,9 +82,26 @@ struct Queued<K, T> {
     work: Work<T>,
 }
 
+/// A result that waits to be drained, with what [`Pool::drain_ordered`] orders it by.
+struct Done<K, T> {
+    priority: i32,
+    seq: u64,
+    key: K,
+    value: T,
+}
+
+/// A piece of work that runs: its key, kept here while it runs so [`Pool::cancel`] finds it, and
+/// its own flag.
+struct Running<K> {
+    seq: u64,
+    key: K,
+    cancelled: Arc<AtomicBool>,
+}
+
 struct State<K, T> {
     queue: Vec<Queued<K, T>>,
-    done: Vec<(K, T)>,
+    done: Vec<Done<K, T>>,
+    active: Vec<Running<K>>,
     seq: u64,
     running: usize,
     /// Worker threads that exist, and those of them waiting for work.
@@ -129,6 +156,7 @@ where
                 state: Mutex::new(State {
                     queue: Vec::new(),
                     done: Vec::new(),
+                    active: Vec::new(),
                     seq: 0,
                     running: 0,
                     threads: 0,
@@ -209,7 +237,7 @@ where
     /// pool's changes nothing: it only goes up. A pool starts at zero.
     pub fn set_generation(&self, generation: u64) -> usize {
         let dropped: Vec<Queued<K, T>>;
-        let stale: Vec<(K, T)>;
+        let stale: Vec<Done<K, T>>;
         {
             let mut state = self.shared.lock();
             let flags = &self.shared.flags;
@@ -241,9 +269,63 @@ where
     /// work finished. Empty when none wait. It never blocks on the work. After it, the next
     /// result wakes the caller again.
     pub fn drain(&self) -> Vec<(K, T)> {
-        let mut state = self.shared.lock();
-        state.woken = false;
-        std::mem::take(&mut state.done)
+        let done = {
+            let mut state = self.shared.lock();
+            state.woken = false;
+            std::mem::take(&mut state.done)
+        };
+        done.into_iter().map(|d| (d.key, d.value)).collect()
+    }
+
+    /// [`drain`](Self::drain), the results in the order the work was asked for: the highest
+    /// priority first, and equal priorities in the order they were submitted (a piece submitted
+    /// again under its key counts from then), whatever order they finished in. Only what waits
+    /// now is ordered: a result still running is not waited for, and comes in a later drain.
+    pub fn drain_ordered(&self) -> Vec<(K, T)> {
+        let mut done = {
+            let mut state = self.shared.lock();
+            state.woken = false;
+            std::mem::take(&mut state.done)
+        };
+        done.sort_by_key(|d| (std::cmp::Reverse(d.priority), d.seq));
+        done.into_iter().map(|d| (d.key, d.value)).collect()
+    }
+
+    /// Says that the work under `key` is of no use any more, as
+    /// [`set_generation`](Self::set_generation) does for a whole generation: if it is queued it
+    /// is dropped unrun; if it runs it sees [`Token::cancelled`] and its result is thrown away
+    /// when it ends; a result of it that waits to be drained is thrown away. Work under other
+    /// keys is left alone, and work submitted under `key` after this runs as usual. True when
+    /// there was anything under `key`.
+    pub fn cancel(&self, key: &K) -> bool {
+        let dropped: Vec<Queued<K, T>>;
+        let stale: Vec<Done<K, T>>;
+        let mut running = false;
+        {
+            let mut state = self.shared.lock();
+            let (gone, keep) = std::mem::take(&mut state.queue)
+                .into_iter()
+                .partition(|q| &q.key == key);
+            state.queue = keep;
+            dropped = gone;
+            let (gone, keep) = std::mem::take(&mut state.done)
+                .into_iter()
+                .partition(|d| &d.key == key);
+            state.done = keep;
+            stale = gone;
+            if state.done.is_empty() {
+                // Nothing waits now, so the next result has to wake the caller afresh.
+                state.woken = false;
+            }
+            for r in state.active.iter().filter(|r| &r.key == key) {
+                r.cancelled.store(true, Ordering::Relaxed);
+                running = true;
+            }
+        }
+        let any = running || !dropped.is_empty() || !stale.is_empty();
+        drop(dropped);
+        drop(stale);
+        any
     }
 
     /// How many pieces of work wait in the queue.
@@ -317,29 +399,49 @@ fn worker<K, T>(shared: Arc<Shared<K, T>>) {
         };
         let Queued {
             key,
+            priority,
             generation,
+            seq,
             work,
-            ..
         } = state.queue.remove(best);
         state.running += 1;
+        let own = Arc::new(AtomicBool::new(false));
+        state.active.push(Running {
+            seq,
+            key,
+            cancelled: own.clone(),
+        });
         drop(state);
 
         let token = Token {
             flags: shared.flags.clone(),
             generation,
+            own: own.clone(),
         };
         // A panic in the work is the work's own: it loses its result and the thread goes on.
         let out = catch_unwind(AssertUnwindSafe(|| work(&token)));
 
         state = shared.lock();
         state.running -= 1;
+        let at = state.active.iter().position(|r| r.seq == seq);
+        let key = state
+            .active
+            .swap_remove(at.expect("a running piece is in the list"))
+            .key;
         let closed = shared.flags.closed.load(Ordering::Relaxed);
-        let wanted = !closed && generation >= shared.flags.generation.load(Ordering::Relaxed);
+        let wanted = !closed
+            && generation >= shared.flags.generation.load(Ordering::Relaxed)
+            && !own.load(Ordering::Relaxed);
         let mut unwanted = None;
         let mut has_result = false;
         match out {
             Ok(value) if wanted => {
-                state.done.push((key, value));
+                state.done.push(Done {
+                    priority,
+                    seq,
+                    key,
+                    value,
+                });
                 has_result = true;
             }
             Ok(value) => unwanted = Some((key, value)),
@@ -460,6 +562,130 @@ mod tests {
         // The results come in the order the work finished.
         let keys: Vec<&str> = pool.drain().into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["first", "high", "mid-1", "mid-2", "low", "neg"]);
+    }
+
+    /// `drain_ordered` gives what waits by priority and then submission, whatever order it
+    /// finished in; `drain` by finishing.
+    #[test]
+    fn drain_ordered_gives_the_results_in_the_order_asked_for() {
+        let (pool, _) = pool::<&str, u32>(3);
+        let (started, starts) = channel();
+        let mut gates = Vec::new();
+        for (key, priority) in [("a", 0), ("b", 5), ("c", 0)] {
+            let (open, wait) = gate();
+            pool.submit(
+                key,
+                priority,
+                0,
+                held(started.clone(), wait, priority as u32),
+            )
+            .unwrap();
+            gates.push(open);
+        }
+        for _ in 0..3 {
+            starts.recv_timeout(LONG).unwrap();
+        }
+        // They finish c, a, b.
+        for i in [2, 0, 1] {
+            gates[i].send(()).unwrap();
+            wait_for(|| {
+                pool.shared
+                    .lock()
+                    .done
+                    .iter()
+                    .any(|d| d.seq == i as u64 + 1)
+            });
+        }
+        wait_for(|| pool.is_idle());
+        let keys: Vec<&str> = pool.drain_ordered().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["b", "a", "c"]);
+        assert!(pool.drain_ordered().is_empty(), "handed over once");
+        // The same finishing order through `drain`.
+        drop(pool);
+        let (pool, _) = self::pool::<&str, u32>(3);
+        let (started, starts) = channel();
+        let mut gates = Vec::new();
+        for (key, priority) in [("a", 0), ("b", 5), ("c", 0)] {
+            let (open, wait) = gate();
+            pool.submit(key, priority, 0, held(started.clone(), wait, 1))
+                .unwrap();
+            gates.push(open);
+        }
+        for _ in 0..3 {
+            starts.recv_timeout(LONG).unwrap();
+        }
+        for i in [2, 0, 1] {
+            gates[i].send(()).unwrap();
+            wait_for(|| {
+                pool.shared
+                    .lock()
+                    .done
+                    .iter()
+                    .any(|d| d.seq == i as u64 + 1)
+            });
+        }
+        let keys: Vec<&str> = pool.drain().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["c", "a", "b"]);
+    }
+
+    /// `cancel` drops the key's queued work unrun, throws away its waiting result, tells its
+    /// running work and throws that result away, and leaves the other keys alone.
+    #[test]
+    fn cancel_takes_one_key_away_queued_running_or_done() {
+        let (pool, _) = pool::<&str, u32>(1);
+        let (started, starts) = channel();
+        let (open, wait) = gate();
+        let seen = Arc::new(AtomicBool::new(false));
+        let saw = seen.clone();
+        pool.submit("run", 0, 0, move |t| {
+            started.send(0).unwrap();
+            wait.recv_timeout(LONG).unwrap();
+            saw.store(t.cancelled(), Ordering::SeqCst);
+            1
+        })
+        .unwrap();
+        starts.recv_timeout(LONG).unwrap();
+        pool.submit("queued", 0, 0, |_| 2).unwrap();
+        pool.submit("other", 0, 0, |_| 3).unwrap();
+        assert!(pool.cancel(&"queued"));
+        assert!(!pool.queued(&"queued") && pool.queued(&"other"));
+        assert!(pool.cancel(&"run"));
+        assert!(!pool.cancel(&"nothing"), "nothing under it");
+        open.send(()).unwrap();
+        wait_for(|| pool.is_idle());
+        assert!(seen.load(Ordering::SeqCst), "the running one saw it");
+        assert_eq!(
+            pool.drain(),
+            vec![("other", 3)],
+            "only the other key's result"
+        );
+        // A waiting result is thrown away; the key runs again when submitted again.
+        pool.submit("again", 0, 0, |_| 4).unwrap();
+        wait_for(|| pool.is_idle());
+        assert!(pool.cancel(&"again"));
+        assert!(pool.drain().is_empty());
+        pool.submit("again", 0, 0, |_| 5).unwrap();
+        wait_for(|| pool.is_idle());
+        assert_eq!(pool.drain(), vec![("again", 5)]);
+        assert_eq!(pool.lost(), 0);
+    }
+
+    /// The cancel is the running piece's own: work submitted under the same key while the
+    /// cancelled piece still runs gives its result.
+    #[test]
+    fn a_cancel_belongs_to_the_piece_that_runs_not_to_the_key() {
+        let (pool, _) = pool::<&str, u32>(1);
+        let (started, starts) = channel();
+        let (open, wait) = gate();
+        pool.submit("k", 0, 0, held(started, wait, 1)).unwrap();
+        starts.recv_timeout(LONG).unwrap();
+        assert!(pool.cancel(&"k"));
+        // Queued behind the cancelled one, under the same key.
+        pool.submit("k", 0, 0, |t| if t.cancelled() { 0 } else { 2 })
+            .unwrap();
+        open.send(()).unwrap();
+        wait_for(|| pool.is_idle());
+        assert_eq!(pool.drain(), vec![("k", 2)], "the new piece's result alone");
     }
 
     #[test]
