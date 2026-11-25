@@ -398,6 +398,27 @@ impl Users {
         users
     }
 
+    /// Whether a file other than those in `notes` links to `target`.
+    pub fn others_than(&self, target: &Path, notes: &[PathBuf]) -> bool {
+        let name = lower_name(target);
+        let stem = target
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let not_note = |i: usize| {
+            self.files
+                .get(i)
+                .is_some_and(|f| !notes.iter().any(|n| same_file(f, n)))
+        };
+        self.names
+            .iter()
+            .any(|(n, i)| (*n == name || *n == stem) && not_note(*i))
+            || self
+                .links
+                .iter()
+                .any(|(n, p, i)| *n == name && not_note(*i) && same_file(p, target))
+    }
+
     /// Whether a file other than `note` links to `target`.
     pub fn others(&self, target: &Path, note: &Path) -> bool {
         let name = lower_name(target);

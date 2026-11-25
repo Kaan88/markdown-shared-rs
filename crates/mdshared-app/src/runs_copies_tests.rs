@@ -196,8 +196,14 @@ fn undo_keeps_a_picture_copy_whose_original_is_gone() {
     std::fs::remove_file(&r.original_picture).expect("the owner removed it");
     let plan = prepare(&r.record, &r.library);
     assert!(
-        plan.pictures_kept.iter().any(|p| same_path(p, &r.picture)),
+        plan.copies_kept.iter().any(|p| same_path(p, &r.picture)),
         "{plan:?}"
+    );
+    assert!(
+        plan.sentence("Trips")
+            .contains("its original is gone or changed"),
+        "{}",
+        plan.sentence("Trips")
     );
     let mut gate = TestGate::new();
     let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
@@ -274,7 +280,7 @@ fn undo_keeps_a_copy_whose_original_is_gone() {
     std::fs::remove_file(&original).expect("the owner removed it");
     let plan = prepare(&loaded, &r.library);
     assert!(
-        plan.notes_kept.iter().any(|p| same_path(p, &r.copy)),
+        plan.copies_kept.iter().any(|p| same_path(p, &r.copy)),
         "{plan:?}"
     );
     let mut gate = TestGate::new();
@@ -297,4 +303,180 @@ fn undo_keeps_a_copy_the_record_names_no_original_for() {
     let mut gate = TestGate::new();
     let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
     assert!(r.copy.exists(), "{report:?}");
+}
+
+// ---- Move them in (C2, D-210) --------------------------------------------------------------
+
+struct Moved1 {
+    dir: PathBuf,
+    library: PathBuf,
+    record_path: PathBuf,
+    record: Record,
+    md: PathBuf,
+    md_bytes: Vec<u8>,
+    picture: PathBuf,
+    copy: PathBuf,
+    note: PathBuf,
+    note_text: String,
+}
+
+impl Drop for Moved1 {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A run that moves `trip.md` in with the picture it shows; its link to a logo outside its
+/// folder is rewritten in the copy, and a note of the library that links to it is rewritten to
+/// lead to the copy.
+fn move_run(tag: &str) -> Moved1 {
+    let dir = crate::paths::canonical_or_absolute(&scratch(tag));
+    let library = dir.join("library");
+    let group = library.join("trips.md");
+    let desk = dir.join("desk");
+    let md = desk.join("trips").join("trip.md");
+    let md_text = "# Trip\n\n![Beach](img/beach.png)\n\n![Logo](../logo.png)\n";
+    write_file(&md, md_text);
+    let picture = desk.join("trips").join("img").join("beach.png");
+    write_file(&picture, "PNG beach");
+    write_file(&desk.join("logo.png"), "PNG logo");
+    let note = library.join("Refs").join("ref.md");
+    let note_text = "# Ref\n\n[Trip](../../desk/trips/trip.md)\n".to_string();
+    write_file(&note, &note_text);
+    write_file(
+        &library.join("refs.md"),
+        &format!(
+            "# Refs\n\n{}\n",
+            library::link_line("Ref", Path::new("Refs/ref.md"))
+        ),
+    );
+    write_file(&group, "# Trips\n");
+    let home = library.join("Trips");
+    let wanted = [Wanted {
+        from: md.clone(),
+        dir: home.clone(),
+    }];
+    let plan = copy_in::plan(&wanted, std::slice::from_ref(&library));
+    let written = copy_in::write(&plan, &library, &home).expect("written");
+    let copy = home.join("trip.md");
+    let links = vec![Link {
+        path: copy.clone(),
+        title: "Trip".to_string(),
+        sections: Vec::new(),
+        line: library::link_line("Trip", &copy),
+    }];
+    let before = read(&group);
+    std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
+    let mp = copy_in::move_plan(&plan, &written, &library, &home);
+    assert_eq!(mp.removes.len(), 2, "{mp:?}");
+    assert_eq!(mp.relinks.len(), 1, "{mp:?}");
+    let g = Group {
+        name: "Trips".to_string(),
+        file: group.clone(),
+        created: false,
+        home,
+    };
+    let (record_path, record) =
+        move_in_record(&library, "", g, &links, &before, &written, &mp).expect("made");
+    let out = copy_in::move_out(&mp, &mut Delete);
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert!(!md.exists() && !picture.exists(), "moved");
+    assert_ne!(
+        read(&copy),
+        md_text,
+        "the copy's link to the logo was rewritten"
+    );
+    Moved1 {
+        dir,
+        library,
+        record_path,
+        record,
+        md,
+        md_bytes: md_text.as_bytes().to_vec(),
+        picture,
+        copy,
+        note,
+        note_text,
+    }
+}
+
+/// Undo of a move puts each original back where it was with its own bytes (the text it had
+/// before its copy's links were rewritten), gives the library's note its link back, and then
+/// takes the copies away, since their originals are there again.
+#[test]
+fn undo_puts_the_moved_originals_back_and_takes_the_copies_away() {
+    let r = move_run("move-undo");
+    let loaded = load(&r.record_path, &r.library).expect("it reads back");
+    assert_eq!(loaded.removed.len(), 2);
+    let plan = prepare(&loaded, &r.library);
+    assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+    assert_eq!(
+        plan.put_back.len(),
+        3,
+        "two originals and the note: {plan:?}"
+    );
+    assert_eq!(plan.notes.len(), 1, "the copy goes: {plan:?}");
+    assert!(
+        plan.sentence("Trips").starts_with("Puts back 3 files"),
+        "{}",
+        plan.sentence("Trips")
+    );
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &loaded, &r.library, &mut gate);
+    assert_eq!(
+        std::fs::read(&r.md).unwrap_or_default(),
+        r.md_bytes,
+        "{report:?}"
+    );
+    assert_eq!(read(&r.picture), "PNG beach");
+    assert_eq!(
+        read(&r.note),
+        r.note_text,
+        "the note leads to the original again"
+    );
+    assert!(!r.copy.exists(), "the copy goes: {report:?}");
+}
+
+/// A file put where a moved original was is never replaced: the original stays in the library,
+/// as its copy, and is listed as kept.
+#[test]
+fn undo_never_writes_over_a_file_where_an_original_was() {
+    let r = move_run("move-undo-taken");
+    write_file(&r.md, "someone else's\n");
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
+    assert_eq!(read(&r.md), "someone else's\n");
+    assert!(r.copy.exists(), "the copy is the only one: {report:?}");
+    assert!(
+        report.restore_kept.iter().any(|p| same_path(p, &r.md)),
+        "{report:?}"
+    );
+}
+
+/// A note the owner changed since the move keeps their text, and the copy it leads to stays.
+#[test]
+fn undo_keeps_a_rewritten_note_the_owner_changed_since() {
+    let r = move_run("move-undo-note");
+    write_file(&r.note, "# Ref\n\nmine now\n");
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
+    assert_eq!(read(&r.note), "# Ref\n\nmine now\n");
+    assert!(
+        report.restore_kept.iter().any(|p| same_path(p, &r.note)),
+        "{report:?}"
+    );
+}
+
+/// A record whose taken original has a `..` in its path is one this program did not write:
+/// nothing of it is acted on.
+#[test]
+fn a_move_record_with_a_strange_original_is_not_acted_on() {
+    let mut r = move_run("move-strange");
+    r.record.removed[0].path = r.dir.join("desk").join("..").join("x.md");
+    let plan = prepare(&r.record, &r.library);
+    assert!(
+        plan.refusal.as_deref().is_some_and(|w| w.contains("x.md")),
+        "{:?}",
+        plan.refusal
+    );
 }

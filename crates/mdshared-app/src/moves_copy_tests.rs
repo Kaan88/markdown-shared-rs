@@ -428,3 +428,174 @@ fn folders_made_outside_the_reach_are_kept_apart() {
     take_back(&done);
     assert!(!above.exists(), "taken back, both");
 }
+
+// ---- Move them in (C2) ---------------------------------------------------------------------
+
+/// A group file in the library that lists `note` (a library note) by `link`.
+fn list_note(w: &World, note: &Path) {
+    let group = w.library.join("Refs.md");
+    put(
+        &group,
+        format!("# Refs\n\n{}\n", crate::library::link_line("Ref", note)).as_bytes(),
+    );
+}
+
+fn moved(w: &World, wanted: &[Wanted]) -> (Vec<Planned>, Written, MovePlan) {
+    let plan = plan(wanted, &w.inside());
+    let done = write(&plan, &w.library, &w.group).expect("written");
+    let mp = move_plan(&plan, &done, &w.library, &w.group);
+    (plan, done, mp)
+}
+
+/// Move them in takes the file and the picture it alone shows away from where they were, once
+/// the copies are made; the copies hold their bytes.
+#[test]
+fn a_moved_file_goes_with_its_picture_and_the_copies_hold_them() {
+    let w = World::new("move-plain");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n\n![a](img/a.png)\n");
+    let pic = w.outside.join("img").join("a.png");
+    put(&pic, b"PNG a");
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.removes.len(), 2, "{mp:?}");
+    let out = move_out(&mp, &mut crate::runs::Delete);
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert!(!md.exists() && !pic.exists(), "the originals are gone");
+    assert_eq!(
+        text(&w.group.join("trip.md")),
+        "# Trip\n\n![a](img/a.png)\n"
+    );
+    assert_eq!(bytes(&w.group.join("img").join("a.png")), b"PNG a");
+}
+
+/// A picture another file beside the original shows stays, so that file still finds it.
+#[test]
+fn a_picture_another_file_shows_stays() {
+    let w = World::new("move-shared-pic");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n\n![a](img/a.png)\n");
+    let pic = w.outside.join("img").join("a.png");
+    put(&pic, b"PNG a");
+    put(&w.outside.join("other.md"), b"# Other\n\n![a](img/a.png)\n");
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.why_stays(&pic), Some(OTHERS_USE));
+    move_out(&mp, &mut crate::runs::Delete);
+    assert!(!md.exists() && pic.exists());
+}
+
+/// A note of the library, inside its folder, that links to a file that is moved in is made to
+/// lead to the copy.
+#[test]
+fn a_library_note_that_links_to_a_moved_file_leads_to_its_copy() {
+    let w = World::new("move-relink");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n");
+    let note = w.library.join("Refs").join("ref.md");
+    put(&note, b"# Ref\n\nSee [the trip](../../desk/trip.md).\n");
+    list_note(&w, &note);
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.relinks.len(), 1, "{mp:?}");
+    let out = move_out(&mp, &mut crate::runs::Delete);
+    assert!(out.failures.is_empty(), "{out:?}");
+    assert!(!md.exists());
+    assert_eq!(text(&note), "# Ref\n\nSee [the trip](../Shots/trip.md).\n");
+}
+
+/// A note the library lists outside its reach that links to the file keeps the file where it
+/// is: undo could not give the note back, so it is not rewritten and the file is copied only.
+#[test]
+fn a_library_note_outside_the_reach_keeps_the_original() {
+    let w = World::new("move-outside-note");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n");
+    let note = w.dir.join("elsewhere").join("ref.md");
+    put(&note, b"# Ref\n\n[Trip](../desk/trip.md)\n");
+    list_note(&w, &note);
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.why_stays(&md), Some(LINKED_OUTSIDE), "{mp:?}");
+    move_out(&mp, &mut crate::runs::Delete);
+    assert!(md.exists());
+    assert_eq!(text(&note), "# Ref\n\n[Trip](../desk/trip.md)\n");
+}
+
+/// An original changed after it was copied is not taken away: the copy is not what it holds.
+#[test]
+fn an_original_changed_since_it_was_copied_stays() {
+    let w = World::new("move-changed");
+    let md = w.outside.join("a.txt");
+    put(&md, b"one\n");
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.removes.len(), 1);
+    put(&md, b"one, and more\n");
+    let out = move_out(&mp, &mut crate::runs::Delete);
+    assert!(out.removed.is_empty() && md.exists(), "{out:?}");
+    put(&md, b"one\n");
+    let other = w.outside.join("b.txt");
+    put(&other, b"two\n");
+    let plan = plan(&[w.want(&other)], &w.inside());
+    let done = write(&plan, &w.library, &w.group).expect("written");
+    put(&other, b"two, changed\n");
+    let mp = move_plan(&plan, &done, &w.library, &w.group);
+    assert_eq!(mp.why_stays(&other), Some(CHANGED));
+}
+
+/// Fable's second review of C1, nit: a file that cannot be copied after all (every name taken
+/// once its links change) gives up the picture it was to write, and another file of the run
+/// that shows the same picture writes it.
+#[test]
+fn a_file_that_stays_after_all_hands_its_picture_on() {
+    let w = World::new("stays-hands-on");
+    let x = w.outside.join("x.md");
+    let x_text = b"# X\n\n![a](img/a.png)\n\n[N](n.txt)\n";
+    put(&x, x_text);
+    put(&w.outside.join("img").join("a.png"), b"PNG a");
+    let y = w.outside.join("y.md");
+    put(&y, b"# Y\n\n![a](img/a.png)\n");
+    let n = w.outside.join("n.txt");
+    put(&n, b"mine\n");
+    put(&w.group.join("x.md"), x_text);
+    for k in 2..=NAMES_MAX {
+        put(&w.group.join(format!("x-{k}.md")), b"other\n");
+    }
+    put(&w.group.join("n.txt"), b"theirs\n");
+    let plan = plan(&[w.want(&x), w.want(&y), w.want(&n)], &w.inside());
+    assert!(
+        matches!(plan[0].copy, Copy::Stays { .. }),
+        "{:?}",
+        plan[0].copy
+    );
+    write(&plan, &w.library, &w.group).expect("written");
+    assert_eq!(bytes(&w.group.join("img").join("a.png")), b"PNG a");
+}
+
+/// Fable's second review of C1, nit: a chain of files, each linking to the next, all renamed
+/// because the last one's link changes, settles however long it is.
+#[test]
+fn a_long_chain_of_links_settles() {
+    let w = World::new("chain");
+    let mut wanted = Vec::new();
+    for k in 1..=6 {
+        let next = if k == 6 {
+            "n.txt".to_string()
+        } else {
+            format!("f{}.md", k + 1)
+        };
+        let text = format!("# {k}\n\n[next]({next})\n");
+        let f = w.outside.join(format!("f{k}.md"));
+        put(&f, text.as_bytes());
+        put(&w.group.join(format!("f{k}.md")), text.as_bytes());
+        wanted.push(w.want(&f));
+    }
+    let n = w.outside.join("n.txt");
+    put(&n, b"mine\n");
+    put(&w.group.join("n.txt"), b"theirs\n");
+    wanted.push(w.want(&n));
+    let plan = plan(&wanted, &w.inside());
+    for (k, p) in plan.iter().take(6).enumerate() {
+        assert_eq!(
+            p.target(),
+            w.group.join(format!("f{}-2.md", k + 1)),
+            "{plan:?}"
+        );
+    }
+}

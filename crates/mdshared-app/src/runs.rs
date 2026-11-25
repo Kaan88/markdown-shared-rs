@@ -394,6 +394,12 @@ pub struct Record {
     /// a copy of and that file's digest, so undo removes a copy only while its original is where
     /// it was (Fable's review of C1). Empty for every other kind.
     pub copied: Vec<PictureRec>,
+    /// The originals a "Move them in" run took away (phase C2, D-210): `path` is where each
+    /// was and `sha256` its digest; `original` is the copy that holds its bytes now. Undo puts
+    /// one back only at that path, only while nothing is there, only with those bytes (the
+    /// copy's, or its text in `originals` when the copy's links were rewritten). Empty for every
+    /// other run.
+    pub removed: Vec<PictureRec>,
 }
 
 /// A record read from disk.
@@ -855,6 +861,14 @@ impl Record {
                 .collect();
             s.push_str(&format!("  \"copied\": [{}],\n", copied.join(", ")));
         }
+        if !self.removed.is_empty() {
+            let removed: Vec<String> = self
+                .removed
+                .iter()
+                .map(|p| picture_json(p, library))
+                .collect();
+            s.push_str(&format!("  \"removed\": [{}],\n", removed.join(", ")));
+        }
         let added: Vec<String> = self
             .added
             .iter()
@@ -1044,6 +1058,11 @@ impl Record {
             .and_then(Json::arr)
             .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
             .unwrap_or_default();
+        let removed = json
+            .get("removed")
+            .and_then(Json::arr)
+            .map(|a| a.iter().filter_map(|p| picture_of(p, library)).collect())
+            .unwrap_or_default();
         let originals = json
             .get("originals")
             .and_then(Json::arr)
@@ -1104,6 +1123,7 @@ impl Record {
             originals,
             added,
             copied,
+            removed,
         })
     }
 
@@ -1264,6 +1284,7 @@ pub fn start_rewrite(
         originals: Vec::new(),
         added: Vec::new(),
         copied: Vec::new(),
+        removed: Vec::new(),
     };
     let path = record.create(library)?;
     Ok((path, record))
@@ -1345,6 +1366,7 @@ fn links_record_of(
         originals: Vec::new(),
         added: Vec::new(),
         copied: Vec::new(),
+        removed: Vec::new(),
     };
     record.keep_added(&group.file, Some(before.to_string()), links, library);
     record
@@ -1362,6 +1384,67 @@ pub fn copies_record(
     before: &str,
     written: &crate::moves::copy_in::Written,
 ) -> io::Result<(PathBuf, Record)> {
+    let record = copies_record_of(library, instruction, group, links, before, written);
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// The record of a "Move them in" run (phase C2, D-210): [`copies_record`]'s, with the originals
+/// the move will take away and the library notes it will rewrite, written before either is done
+/// so undo can put back whatever was done of it. A rewritten note's text before is kept as a
+/// rewrite's original is; an original whose copy's text differs keeps its own text too.
+pub fn move_in_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+    moving: &crate::moves::copy_in::MovePlan,
+) -> io::Result<(PathBuf, Record)> {
+    let mut record = copies_record_of(library, instruction, group, links, before, written);
+    let sha = |t: &str| crate::update::sha256_hex(t.as_bytes());
+    for r in &moving.removes {
+        record.removed.push(PictureRec {
+            path: r.path.clone(),
+            created: false,
+            sha256: r.sha256.clone(),
+            original: Some(r.copy.clone()),
+            original_sha256: digest_of(&r.copy).unwrap_or_default(),
+        });
+        if let Some(text) = &r.text {
+            record.originals.push(Original {
+                path: r.path.clone(),
+                sha256: r.sha256.clone(),
+                written: String::new(),
+                len: text.len() as u64,
+                bom: false,
+                text: text.clone(),
+            });
+        }
+    }
+    for n in &moving.relinks {
+        record.originals.push(Original {
+            path: n.path.clone(),
+            sha256: sha(&n.before),
+            written: sha(&n.after),
+            len: n.before.len() as u64,
+            bom: false,
+            text: n.before.clone(),
+        });
+    }
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+fn copies_record_of(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+    written: &crate::moves::copy_in::Written,
+) -> Record {
     let mut record = links_record_of(library, instruction, group, links, before);
     record.kind = Kind::Copies;
     for note in &mut record.notes {
@@ -1386,8 +1469,7 @@ pub fn copies_record(
         .collect();
     record.pictures = written.pictures.clone();
     record.folders = written.folders.clone();
-    let path = record.create(library)?;
-    Ok((path, record))
+    record
 }
 
 /// Writes one file of a rewrite run (`file.after`) and keeps `file.before` in the record first
@@ -2147,6 +2229,7 @@ fn planned(req: &Request, kind: Kind, secs: u64, started: &str, source: Source) 
         originals: Vec::new(),
         added: Vec::new(),
         copied: Vec::new(),
+        removed: Vec::new(),
     }
 }
 
@@ -2665,6 +2748,15 @@ pub struct UndoPlan {
     pub restore_kept: Vec<PathBuf>,
     /// A rewrite's originals that are gone already: nothing to put back.
     pub restore_gone: usize,
+    /// What a "Move them in" run took away and will be put back where it was: its originals,
+    /// and the library's notes whose links it changed (D-210).
+    pub put_back: Vec<PathBuf>,
+    /// What of it cannot be put back (a file is where an original was, a note changed since):
+    /// kept, and listed.
+    pub put_back_kept: Vec<PathBuf>,
+    /// Copies "Copy them in" made that stay because their original is gone or changed since, so
+    /// the copy may be the only one (D-217). Also in `kept`.
+    pub copies_kept: Vec<PathBuf>,
     /// Notes and pictures this record marks as its own that a run started later names as its
     /// own too: this run died before it wrote them, and the later run found the names free and
     /// wrote them. They are that run's, and stay with their lines (review of the audit 4 fixes,
@@ -2681,7 +2773,8 @@ impl UndoPlan {
                 || !self.links.is_empty()
                 || self.group_file.is_some()
                 || !self.folders.is_empty()
-                || !self.restore.is_empty())
+                || !self.restore.is_empty()
+                || !self.put_back.is_empty())
     }
 
     /// The question's sentence: what goes, and what stays.
@@ -2729,6 +2822,19 @@ impl UndoPlan {
         if !self.notes.is_empty() {
             goes.push(count(self.notes.len(), "note", "notes"));
         }
+        let back = if self.put_back.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Puts back {} this run moved or changed, where {} were. ",
+                count(self.put_back.len(), "file", "files"),
+                if self.put_back.len() == 1 {
+                    "it"
+                } else {
+                    "they"
+                }
+            )
+        };
         if !self.pictures.is_empty() {
             goes.push(count(self.pictures.len(), "picture", "pictures"));
         }
@@ -2766,7 +2872,36 @@ impl UndoPlan {
             s.push('.');
             s
         };
-        if !self.kept.is_empty() {
+        s = format!("{back}{s}");
+        if !self.put_back_kept.is_empty() {
+            s.push_str(&format!(
+                " {} cannot be put back, {} changed or taken since, and {} kept.",
+                count(self.put_back_kept.len(), "file", "files"),
+                if self.put_back_kept.len() == 1 {
+                    "its place"
+                } else {
+                    "their places"
+                },
+                if self.put_back_kept.len() == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            ));
+        }
+        if !self.copies_kept.is_empty() {
+            s.push_str(&format!(
+                " {} kept: {} gone or changed since, so the copy may be the only one.",
+                count(self.copies_kept.len(), "copy is", "copies are"),
+                if self.copies_kept.len() == 1 {
+                    "its original is"
+                } else {
+                    "their originals are"
+                }
+            ));
+        }
+        let changed = self.notes_kept.len() + self.pictures_kept.len();
+        if changed > 0 {
             let mut said: Vec<String> = Vec::new();
             if !self.notes_kept.is_empty() {
                 said.push(format!(
@@ -2783,7 +2918,7 @@ impl UndoPlan {
             s.push_str(&format!(
                 " {} and {} kept.",
                 said.join(", "),
-                if self.kept.len() == 1 { "is" } else { "are" }
+                if changed == 1 { "is" } else { "are" }
             ));
         }
         if !self.links_kept.is_empty() {
@@ -3028,6 +3163,30 @@ impl Reach {
                 }
                 if copy.original.is_none() {
                     return Err(foreign(&copy.path));
+                }
+            }
+            // An original a move took away is put back only where it was, which is outside the
+            // library (D-210): an absolute path with no `..`, whose bytes are in a copy inside.
+            for r in &record.removed {
+                let Some(copy) = &r.original else {
+                    return Err(foreign(&r.path));
+                };
+                if !reach.allows(copy) {
+                    return Err(outside(copy));
+                }
+                if !r.path.is_absolute() || has_parent_dir(&r.path) {
+                    return Err(foreign(&r.path));
+                }
+            }
+            for o in &record.originals {
+                if was_removed(record, &o.path) {
+                    continue;
+                }
+                if !reach.allows(&o.path) {
+                    return Err(outside(&o.path));
+                }
+                if !has_extension(&o.path, &["md", "markdown"]) {
+                    return Err(foreign(&o.path));
                 }
             }
             for picture in &record.pictures {
@@ -3276,6 +3435,10 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
         );
         return (plan, None);
     }
+    // A move's originals and the notes it rewrote: what undo will put back (D-210).
+    if record.kind == Kind::Copies {
+        put_back_plan(record, &mut plan);
+    }
     // What a later run wrote under the names this one marked: not this run's to take.
     let later =
         if record.notes.iter().any(|n| n.created) || record.pictures.iter().any(|p| p.created) {
@@ -3305,11 +3468,11 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(note.path.clone());
         } else if note.path.symlink_metadata().is_err() {
             plan.gone.push(note.path.clone());
-        } else if !copy_may_go(record, &note.path) {
+        } else if !copy_may_go(record, &note.path, &plan.put_back) {
             // A copy whose original is gone or changed may be the only one left: it stays, and
             // so does its line.
             plan.kept.push(note.path.clone());
-            plan.notes_kept.push(note.path.clone());
+            plan.copies_kept.push(note.path.clone());
             continue;
         } else if digest_of(&note.path).is_some_and(|d| d.eq_ignore_ascii_case(&note.sha256)) {
             file_goes = true;
@@ -3350,10 +3513,15 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.before.push(picture.path.clone());
         } else if picture.path.symlink_metadata().is_err() {
             plan.gone.push(picture.path.clone());
-        } else if !original_there(picture) {
+        } else if !original_there(picture)
+            && !picture
+                .original
+                .as_ref()
+                .is_some_and(|o| plan.put_back.iter().any(|r| same_path(r, o)))
+        {
             // A copy whose original is gone or changed may be the only one left: it stays.
             plan.kept.push(picture.path.clone());
-            plan.pictures_kept.push(picture.path.clone());
+            plan.copies_kept.push(picture.path.clone());
         } else if digest_of(&picture.path).is_some_and(|d| d.eq_ignore_ascii_case(&picture.sha256))
         {
             plan.pictures.push(picture.path.clone());
@@ -3571,6 +3739,11 @@ pub fn undo_with(
         report.plan = Some(plan);
         return report;
     };
+    // 1b. A move's originals back where they were, and the notes it rewrote, before anything of
+    //     the copies goes: a copy goes only while its original is there again (D-210).
+    if record.kind == Kind::Copies {
+        put_back(record, &plan, &mut report);
+    }
     // 2. The links first, so the pane never shows a link to a file that is gone.
     for (file, removals) in &plan.links {
         let headings = if same_path(file, &record.group.file) {
@@ -3609,7 +3782,7 @@ pub fn undo_with(
         let matches = created_note(note).is_some_and(|n| {
             reach.allows(note)
                 && (record.kind == Kind::Copies || has_extension(note, &["md"]))
-                && copy_may_go(record, note)
+                && copy_may_go(record, note, &[])
                 && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
         });
         if !matches {
@@ -3812,13 +3985,118 @@ fn picture_of(p: &Json, library: &Path) -> Option<PictureRec> {
 /// "Copy them in" made, and such a copy only while the record names its original and that file
 /// is where it was with the digest it had, so undo never removes the only copy (Fable's review
 /// of C1).
-fn copy_may_go(record: &Record, note: &Path) -> bool {
+fn copy_may_go(record: &Record, note: &Path, back: &[PathBuf]) -> bool {
     record.kind != Kind::Copies
         || record
             .copied
             .iter()
             .find(|c| same_path(&c.path, note))
-            .is_some_and(|c| c.original.is_some() && original_there(c))
+            .is_some_and(|c| {
+                c.original
+                    .as_ref()
+                    .is_some_and(|o| original_there(c) || back.iter().any(|b| same_path(b, o)))
+            })
+}
+
+/// Whether a "Move them in" record took the file at `path` away.
+fn was_removed(record: &Record, path: &Path) -> bool {
+    record.removed.iter().any(|r| same_path(&r.path, path))
+}
+
+/// The bytes a moved original is put back with: its text the record kept, or its copy's bytes
+/// while they are the original's; `None` when neither is the file that was taken.
+fn removed_bytes(record: &Record, r: &PictureRec) -> Option<Vec<u8>> {
+    let bytes = match record
+        .originals
+        .iter()
+        .find(|o| same_path(&o.path, &r.path))
+    {
+        Some(o) => encoded(&o.text, o.bom),
+        None => read_regular(r.original.as_deref()?, DIGEST_MAX_BYTES, false)?,
+    };
+    crate::update::sha256_hex(&bytes)
+        .eq_ignore_ascii_case(&r.sha256)
+        .then_some(bytes)
+}
+
+/// What undo of a move puts back: each original whose path is free and whose bytes it has, in a
+/// folder that is still there; each note it rewrote while it holds what the run wrote. One that
+/// is there already as it was needs nothing; one changed since is kept, and listed.
+fn put_back_plan(record: &Record, plan: &mut UndoPlan) {
+    for r in &record.removed {
+        match std::fs::symlink_metadata(&r.path) {
+            Ok(_) if digest_of(&r.path).is_some_and(|d| d.eq_ignore_ascii_case(&r.sha256)) => {}
+            Ok(_) => plan.put_back_kept.push(r.path.clone()),
+            Err(_) => {
+                let folder = r.path.parent().is_some_and(Path::is_dir);
+                if folder && removed_bytes(record, r).is_some() {
+                    plan.put_back.push(r.path.clone());
+                } else {
+                    plan.put_back_kept.push(r.path.clone());
+                }
+            }
+        }
+    }
+    for o in &record.originals {
+        if was_removed(record, &o.path) {
+            continue;
+        }
+        match digest_of(&o.path) {
+            Some(d) if d.eq_ignore_ascii_case(&o.written) => plan.put_back.push(o.path.clone()),
+            Some(d) if d.eq_ignore_ascii_case(&o.sha256) => {}
+            None => {}
+            Some(_) => plan.put_back_kept.push(o.path.clone()),
+        }
+    }
+}
+
+/// Puts back what [`put_back_plan`] said, each read again just before: the originals first,
+/// each made new where it was (never over a file), then the notes, each only while it holds what
+/// the run wrote.
+fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport) {
+    let planned = |p: &Path| plan.put_back.iter().any(|r| same_path(r, p));
+    for r in record.removed.iter().filter(|r| planned(&r.path)) {
+        let Some(bytes) = removed_bytes(record, r) else {
+            report.restore_kept.push(r.path.clone());
+            report.kept.push(r.path.clone());
+            continue;
+        };
+        let made = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&r.path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&bytes)?;
+                f.sync_all()
+            });
+        match made {
+            Ok(()) => report.restored.push(r.path.clone()),
+            Err(e) => report.failures.push(Failure::new(&r.path, e.to_string())),
+        }
+    }
+    for o in record
+        .originals
+        .iter()
+        .filter(|o| !was_removed(record, &o.path))
+    {
+        if !planned(&o.path) {
+            continue;
+        }
+        if !digest_of(&o.path).is_some_and(|d| d.eq_ignore_ascii_case(&o.written)) {
+            report.restore_kept.push(o.path.clone());
+            report.kept.push(o.path.clone());
+            continue;
+        }
+        match crate::files::replace(&o.path, &encoded(&o.text, o.bom)) {
+            Ok(()) => report.restored.push(o.path.clone()),
+            Err(e) => report.failures.push(Failure::new(&o.path, e.to_string())),
+        }
+    }
+    report
+        .restore_kept
+        .extend(plan.put_back_kept.iter().cloned());
+    report.kept.extend(plan.put_back_kept.iter().cloned());
 }
 
 /// Whether the file a picture was copied from is where it was, with the digest it had: always
@@ -5245,6 +5523,7 @@ mod tests {
             originals: Vec::new(),
             added: Vec::new(),
             copied: Vec::new(),
+            removed: Vec::new(),
         };
         let text = record.to_json(&library);
         let back = Record::from_json(&text, &library).expect("it reads");
@@ -6811,6 +7090,7 @@ mod tests {
             originals: Vec::new(),
             added: Vec::new(),
             copied: Vec::new(),
+            removed: Vec::new(),
         };
         let t0 = "# Trip\n\nThe owner's line.\n\n";
         let t1 = with_links_added(t0, &[link("One")]);

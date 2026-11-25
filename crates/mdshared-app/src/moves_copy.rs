@@ -115,8 +115,8 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
     // Then each Markdown file's links. A file whose text changes is no longer the bytes it was
     // named by, so its name is chosen again from the text it will hold: a file there may hold
     // exactly that, or the name may be taken by other bytes. That can change where another
-    // file's link must lead, so this is done again until nothing moves (a few times at most).
-    for _ in 0..4 {
+    // file's link must lead, so this is done again until nothing moves.
+    for _ in 0..passes_max(out.len()) {
         let mut moved = false;
         for i in 0..out.len() {
             let (Some(w), Some(text)) = (wanted.get(i), texts.get(i).and_then(Option::as_ref))
@@ -168,6 +168,9 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
                 Ok((to, false)) => Copy::New { to, text: wants },
                 Err(why) => Copy::Stays { why },
             };
+            if matches!(out[i].copy, Copy::Stays { .. }) {
+                give_up_pictures(&mut out, i, &mut taken);
+            }
             if !same_path(out[i].target(), &before) {
                 moved = true;
             }
@@ -177,6 +180,32 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
         }
     }
     out
+}
+
+/// The most link passes: each pass settles at least one more file of a chain of links, so a
+/// run of `n` files needs at most `n + 1` (Fable's review of C1); a run is a few dozen files.
+fn passes_max(files: usize) -> usize {
+    (files + 1).clamp(2, 200)
+}
+
+/// A file that will not be copied after all takes no picture with it: one it was to write is
+/// written by another file of the run that shows it, if any, or its place is free again.
+fn give_up_pictures(out: &mut [Planned], me: usize, taken: &mut Vec<PathBuf>) {
+    let Some(mine) = out.get_mut(me).map(|p| std::mem::take(&mut p.pictures)) else {
+        return;
+    };
+    for c in mine.iter().filter(|c| !c.there) {
+        let heir = out
+            .iter_mut()
+            .enumerate()
+            .filter(|(k, _)| *k != me)
+            .flat_map(|(_, p)| p.pictures.iter_mut())
+            .find(|o| o.there && same_path(&o.to, &c.to) && !exists(&o.to));
+        match heir {
+            Some(o) => o.there = false,
+            None => taken.retain(|t| !same_path(t, &c.to)),
+        }
+    }
 }
 
 /// What is written, for the record.
@@ -291,6 +320,315 @@ pub fn take_back(done: &Written) {
     folders.sort_by_key(|f| std::cmp::Reverse(f.components().count()));
     for folder in folders {
         let _ = std::fs::remove_dir(folder);
+    }
+}
+
+// ---- Move them in (phase C2, D-210) --------------------------------------------------------------
+
+/// Why an original stays where it is although the switch says "Move them in": its row says it.
+pub const OTHER_DRIVE: &str = "on another drive: copied";
+pub const CHANGED: &str = "changed since it was copied: copied";
+pub const LINKED_OUTSIDE: &str = "a note of the library outside its folder links to it: copied";
+pub const LISTED: &str = "a group of the library lists it: copied";
+pub const OTHERS_USE: &str = "another file links to it: copied";
+pub const NOT_READ: &str = "not every file that may link to it could be read: copied";
+pub const TOO_LARGE: &str = "too large for undo to keep: copied";
+
+/// The most text a move keeps for undo (the originals of rewritten files and of the library's
+/// notes whose links it changes), well inside what a record may hold.
+const KEPT_MAX: usize = 3 * 1024 * 1024;
+
+/// An original "Move them in" takes away once its copy is listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remove {
+    pub path: PathBuf,
+    /// Its digest when the plan was made: it goes only while it still has it.
+    pub sha256: String,
+    /// Where its bytes are now: the copy, or the picture's copy.
+    pub copy: PathBuf,
+    /// Its text, when the copy's text differs (its links were rewritten): what undo writes back.
+    pub text: Option<String>,
+}
+
+/// A note of the library whose links lead to an original that goes: they are made to lead to
+/// the copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relink {
+    pub path: PathBuf,
+    pub before: String,
+    pub after: String,
+    /// The originals its links lead to: none of them goes if it cannot be rewritten.
+    pub targets: Vec<PathBuf>,
+}
+
+/// What "Move them in" does after the copies are made and listed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MovePlan {
+    pub removes: Vec<Remove>,
+    pub relinks: Vec<Relink>,
+    /// The originals that stay, and why.
+    pub stays: Vec<(PathBuf, String)>,
+}
+
+impl MovePlan {
+    /// Why `path` stays, when it does.
+    pub fn why_stays(&self, path: &Path) -> Option<&str> {
+        self.stays
+            .iter()
+            .find(|(p, _)| same_path(p, path))
+            .map(|(_, w)| w.as_str())
+    }
+}
+
+/// What a move did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MoveOut {
+    pub removed: Vec<PathBuf>,
+    pub relinked: Vec<PathBuf>,
+    /// What could not be done, and why: the original is then where it was.
+    pub failures: Vec<(PathBuf, String)>,
+}
+
+/// What of a written copy-in goes from where it was. An original goes only when it is on the
+/// copy's drive, still the bytes that were copied, listed by no group, and linked to by no note
+/// of the library outside the library's reach (`library` and `home`: undo may rewrite the notes
+/// inside it only). A picture goes only when no other file that may link to it does (the files
+/// the library lists and the Markdown files beside the originals), as the mover's carry rule
+/// says (D-091). The library's notes inside the reach that link to an original that goes are
+/// rewritten to lead to its copy. Any other file on the disk is not looked for.
+pub fn move_plan(plan: &[Planned], written: &Written, library: &Path, home: &Path) -> MovePlan {
+    let mut out = MovePlan::default();
+    let mut candidates: Vec<Remove> = Vec::new();
+    let mut kept = 0usize;
+    let stay = |out: &mut MovePlan, path: &Path, why: &str| {
+        if out.why_stays(path).is_none() {
+            out.stays.push((path.to_path_buf(), why.to_string()));
+        }
+    };
+    let froms: Vec<PathBuf> = plan
+        .iter()
+        .filter(|p| !matches!(p.copy, Copy::Stays { .. }))
+        .map(|p| p.from.clone())
+        .collect();
+    // The files themselves.
+    for p in plan {
+        if matches!(p.copy, Copy::Stays { .. }) {
+            continue;
+        }
+        let Some(rec) = written
+            .files
+            .iter()
+            .find(|f| same_path(&f.path, p.target()))
+        else {
+            continue;
+        };
+        if !same_volume(&p.from, &rec.path) {
+            stay(&mut out, &p.from, OTHER_DRIVE);
+            continue;
+        }
+        if !digest_of(&p.from).is_some_and(|d| d.eq_ignore_ascii_case(&rec.original_sha256)) {
+            stay(&mut out, &p.from, CHANGED);
+            continue;
+        }
+        let text = if rec.sha256.eq_ignore_ascii_case(&rec.original_sha256) {
+            None
+        } else {
+            match links::note_text(&p.from) {
+                Some(t) if kept + t.len() <= KEPT_MAX => {
+                    kept += t.len();
+                    Some(t)
+                }
+                _ => {
+                    stay(&mut out, &p.from, TOO_LARGE);
+                    continue;
+                }
+            }
+        };
+        candidates.push(Remove {
+            path: p.from.clone(),
+            sha256: rec.original_sha256.clone(),
+            copy: rec.path.clone(),
+            text,
+        });
+    }
+    // Who else may link to the pictures: the files the library lists and the Markdown files
+    // beside the originals, not counting the originals themselves.
+    let lib = crate::library::read(library);
+    let listed: Vec<PathBuf> = lib
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(|e| e.path.clone()))
+        .collect();
+    let mut users: Vec<PathBuf> = listed.clone();
+    let mut dirs: Vec<PathBuf> = froms
+        .iter()
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+    dirs.sort();
+    dirs.dedup_by(|a, b| same_path(a, b));
+    for d in &dirs {
+        users.extend(super::md_files_in(d, links::USERS_MAX));
+    }
+    let index = links::Users::read(&users);
+    for pic in &written.pictures {
+        let Some(o) = &pic.original else { continue };
+        if candidates.iter().any(|c| same_path(&c.path, o)) || out.why_stays(o).is_some() {
+            continue;
+        }
+        let why = if !same_volume(o, &pic.path) {
+            Some(OTHER_DRIVE)
+        } else if !digest_of(o).is_some_and(|d| d.eq_ignore_ascii_case(&pic.original_sha256)) {
+            Some(CHANGED)
+        } else if !index.complete {
+            Some(NOT_READ)
+        } else if index.others_than(o, &froms) {
+            Some(OTHERS_USE)
+        } else {
+            None
+        };
+        match why {
+            Some(w) => stay(&mut out, o, w),
+            None => candidates.push(Remove {
+                path: o.clone(),
+                sha256: pic.original_sha256.clone(),
+                copy: pic.path.clone(),
+                text: None,
+            }),
+        }
+    }
+    // A file a group lists stays: its line would lead to nothing.
+    candidates.retain(|c| {
+        let named = listed.iter().any(|l| links::same_file(l, &c.path));
+        if named {
+            stay(&mut out, &c.path, LISTED);
+        }
+        !named
+    });
+    // The library's notes that link to what goes: outside the reach, the file stays; inside,
+    // the note is rewritten to lead to the copy.
+    let notes: Vec<(PathBuf, String)> = listed
+        .iter()
+        .filter(|l| is_markdown(l) && !froms.iter().any(|f| links::same_file(f, l)))
+        .filter(|l| !written.files.iter().any(|w| same_path(&w.path, l)))
+        .filter_map(|l| links::note_text(l).map(|t| (l.clone(), t)))
+        .collect();
+    let leads_to = |text: &str, note: &Path, c: &Remove| {
+        note.parent().is_some_and(|base| {
+            links::links(text, base)
+                .iter()
+                .any(|l| links::same_file(&l.target, &c.path))
+        })
+    };
+    for (note, text) in &notes {
+        if crate::runs::inside(library, home, note) {
+            continue;
+        }
+        candidates.retain(|c| {
+            let linked = leads_to(text, note, c);
+            if linked {
+                stay(&mut out, &c.path, LINKED_OUTSIDE);
+            }
+            !linked
+        });
+    }
+    for (note, text) in &notes {
+        if !crate::runs::inside(library, home, note) {
+            continue;
+        }
+        let targets: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|c| leads_to(text, note, c))
+            .map(|c| c.path.clone())
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let Some(base) = note.parent() else { continue };
+        let place = |p: &Path| -> PathBuf {
+            match candidates.iter().find(|c| links::same_file(&c.path, p)) {
+                Some(c) => c.copy.clone(),
+                None => p.to_path_buf(),
+            }
+        };
+        let (after, n) = links::rewrite(text, base, base, &place, &[]);
+        if n == 0 || kept + text.len() > KEPT_MAX {
+            for t in &targets {
+                stay(&mut out, t, TOO_LARGE);
+            }
+            candidates.retain(|c| !targets.iter().any(|t| same_path(t, &c.path)));
+            continue;
+        }
+        kept += text.len();
+        out.relinks.push(Relink {
+            path: note.clone(),
+            before: text.clone(),
+            after,
+            targets,
+        });
+    }
+    out.removes = candidates;
+    out
+}
+
+/// Does what `mp` says, after its record is written: each note rewritten (only while it still
+/// says what was read), then each original to `bin`, only while it is the bytes that were copied
+/// and its copy is there, and only when every note that links to it was rewritten.
+pub fn move_out(mp: &MovePlan, bin: &mut dyn crate::runs::Bin) -> MoveOut {
+    let mut done = MoveOut::default();
+    let mut held: Vec<PathBuf> = Vec::new();
+    for r in &mp.relinks {
+        match super::rewrite_note(&r.path, &r.before, &r.after) {
+            Ok(()) => done.relinked.push(r.path.clone()),
+            Err(why) => {
+                held.extend(r.targets.iter().cloned());
+                done.failures.push((r.path.clone(), why));
+            }
+        }
+    }
+    for r in &mp.removes {
+        if held.iter().any(|h| same_path(h, &r.path)) {
+            done.failures.push((
+                r.path.clone(),
+                "a note that links to it could not be rewritten: copied".to_string(),
+            ));
+            continue;
+        }
+        let same = digest_of(&r.path).is_some_and(|d| d.eq_ignore_ascii_case(&r.sha256));
+        if !same || !plain(&r.copy) {
+            done.failures.push((r.path.clone(), CHANGED.to_string()));
+            continue;
+        }
+        match bin.recycle(&r.path) {
+            Ok(()) => done.removed.push(r.path.clone()),
+            Err(why) => done.failures.push((r.path.clone(), why)),
+        }
+    }
+    done
+}
+
+/// Whether two paths are on one volume: a rename between them is a move, not a copy.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        let root = |p: &Path| match crate::paths::canonical_or_absolute(p).components().next() {
+            Some(Component::Prefix(x)) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+            _ => None,
+        };
+        let (ra, rb) = (root(a), root(b));
+        ra.is_some() && ra == rb
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+        let (da, db) = (dev(a), dev(b));
+        da.is_some() && da == db
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (a, b);
+        false
     }
 }
 
