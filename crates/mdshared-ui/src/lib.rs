@@ -34,6 +34,7 @@ pub mod frost;
 pub mod gfx;
 pub mod glyph;
 pub mod grid;
+pub mod handover;
 #[cfg(feature = "host")]
 pub mod host;
 pub mod infobar;
