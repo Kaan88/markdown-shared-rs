@@ -1453,3 +1453,23 @@ both seen failing without the change. Left for later, from Fable's review: an in
 composition sent to the row while its picker is open is not shown; hover stays as it was when the
 picker opened, as under a dropdown; the caret test does not check that the card leaves the field
 uncovered. Not seen by a person.
+
+## The pool: cancel by key, and results in the order asked for (`Pool::cancel`, `Pool::drain_ordered`, 2026-11-25, `feat/pool-cancel`, roadmap X5)
+
+`Pool::cancel(&key)` does for one key what `set_generation` does for a generation: queued work
+under it is dropped unrun, running work under it sees `Token::cancelled` and its result is thrown
+away when it ends, and a result of it waiting to be drained is thrown away; other keys are left
+alone, and work submitted under the key afterwards runs as usual. It says whether there was
+anything under the key. `Pool::drain_ordered()` is `drain` with the results that wait ordered by
+priority, highest first, then by submission (a piece submitted again under its key counts from
+then), whatever order they finished in; it orders only what waits and does not hold a result
+back for one still running. Nothing changes for a caller that uses neither: `drain` still gives
+the order of finishing.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (in `pool.rs`: three
+pieces finishing c, a, b come out b, a, c by `drain_ordered` and c, a, b by `drain`; cancel
+drops a queued key unrun, tells a running one (its token says so) and throws its result away,
+throws away a waiting result, leaves another key's result, answers false for a key with
+nothing, and the key runs again when submitted again; the pool tests ran 30 times in a row
+without a failure); `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.

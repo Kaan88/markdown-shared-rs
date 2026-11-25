@@ -155,7 +155,7 @@ No window system. All of it is usable from a test with a temporary folder.
 | `handover` | A second launch's hand-over (`single_mutex::send`) reaching a winit window: the window procedure replaced once, each hand-over for the app's id queued and answered, a wake; Windows only (false and nothing elsewhere) (provisional) | `handover::listen(&window, app_id, wake)`, `handover::take(&window) -> Vec<Vec<OsString>>` |
 | `watch` | Telling the application that an open file changed on disk | `FileWatcher` |
 | `job` | One worker thread with cancel, progress and a wake closure | `Job::start`, `Cancel`, `Progress` |
-| `pool` | A bounded pool for many small pieces of work (thumbnails, tags, sizes), with keys, priorities and generations that drop stale work | `Pool::new(workers, wake)`, `submit(key, priority, generation, work)`, `set_generation`, `drain`, `Token::cancelled` |
+| `pool` | A bounded pool for many small pieces of work (thumbnails, tags, sizes), with keys, priorities and generations that drop stale work | `Pool::new(workers, wake)`, `submit(key, priority, generation, work)`, `set_generation`, `cancel(&key)` (one key's work dropped, told and thrown away), `drain`, `drain_ordered` (by priority, then submission), `Token::cancelled` |
 | `fuzzy` | Fuzzy subsequence matching with scores and match positions, for pickers | `score`, `rank`, `Match` |
 | `foldersearch` | Searching the text files of a folder on a worker, streaming hits | `Search`, `search_tree`, `Options`, `Hit` |
 | `html_md` | HTML from the clipboard turned into Markdown | `to_markdown` |
