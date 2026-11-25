@@ -170,6 +170,36 @@ Checks for the ready toolkit (Purge's gates):
 | C2 | The UIA script from W8 (`tests/uia/purge_shape.ps1`), run on the host | Every action W8 lists works. Run 2026-11-25: 50 of 50 checks pass |
 | C3 | Size of the `purge_shape` release exe | Under 10 MB; `purge_shape.ps1` fails at 10 MB or more. 2026-11-25: 3,631,616 bytes (3.46 MB) |
 
+## Fast-tracked for the md apps (2026-11-25)
+
+mdedit and mdview take up the toolkit's motion and the pieces below. The work in the apps starts
+once `feat/anim` is merged into `main`; neither app moves its pin before then. Asked for by the
+mdedit session on the owner's word; the new items come from a Claude Fable review of
+`feat/anim` against both apps.
+
+Already on the roadmap, fast-tracked (the rows stay where they are, with their ids):
+
+| Id | For the md apps | Toolkit status |
+|---|---|---|
+| X3, L10 | Motion for the palette, the tab strip, a menu's hover row, notice bars and the Settings form | open |
+| X4 | A stack of toasts, so that messages stop replacing each other | open |
+| L1 | `submenu::Cascade` in place of both apps' hand-made submenus and their dwell timer (mdedit `ui.rs:582-588`, `commands.rs:2544`) | done in the toolkit; the apps adopt it |
+| L3 | A scrollbar for mdedit's plain preview and side-by-side | done in the toolkit; mdedit adopts it |
+| W2 | `focus`: a keyboard for mdedit's Files and Functions panes | done in the toolkit; mdedit adopts it |
+| W3 | `window_state`: restore onto a monitor that still exists | done in the toolkit; the apps adopt it |
+
+New, fast-tracked:
+
+| Id | What | Size | Risk | Builds on | Status |
+|---|---|---|---|---|---|
+| D1 | **Animation damage groups.** A tag set while a region draws, and `end_frame` saying which tags still move. Without it an app that redraws only damaged regions must guess what to redraw or `keep`, and a toast at rest whose track was dropped on a caret-blink frame fades in again | M | medium | `anim::Animator` | open |
+| D2 | **`presence_bounds()`** on `Menu`, `Cascade`, `Bubble` and the dialog card. `draw_in_presence` touches the rectangle grown by 18 px, plus the 6 px drop, plus a device pixel; both apps redraw only `menu.rect().inset(-20.0)` (mdedit `app.rs:1435`, mdview `app.rs:853`) | S | low | `anim::presence`, `menu`, `submenu`, `overlay`, `dialog` | open |
+| D3 | **A fade that keeps frost's alpha mark**, with a test. `Snapshot::crossfade` assumes alpha 255 on both sides (`anim/region.rs:134`); frost marks chrome with 254 (`frost.rs:31`), so a popup over frosted chrome turns opaque halfway through its fade | S | medium | `anim::region`, `frost` | open |
+| D4 | **`chrome::*_animated`**: hover fades for the caption, bar and tab buttons | S | low | `chrome`, `anim` | open |
+| D5 | **One preset set for document apps** (menu, tip, toast, dialog), so both apps tune their durations in one place | S | low | `anim` presets | open |
+| D6 | **A shared tooltip model**: the delay, blocked after a press, the anchor; both apps carry the same `Tip` struct and timer | S | low | `overlay::Bubble` | open |
+| D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | open |
+
 ## Left over from what exists
 
 | Id | What | Size | Risk | Builds on | Status |
