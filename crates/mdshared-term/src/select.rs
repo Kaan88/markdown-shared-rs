@@ -215,14 +215,16 @@ impl Selection {
 
     /// Cuts the selection to the lines the screen still keeps: the part that was in lines the
     /// scrollback has dropped is let go. Returns false when nothing of it is left (the caller
-    /// then drops the selection). What is left is taken as its text now, so the part that
-    /// survived is not later mistaken for a rewrite.
+    /// then drops the selection). An end that was cut takes what is left as its text now, so the
+    /// part that survived is not later mistaken for a rewrite; a call that cuts nothing leaves
+    /// the text it holds alone, so a program's rewrite is still noticed afterwards.
     pub fn clip(&mut self, screen: &Screen) -> bool {
         let (first, end) = (screen.first_line(), screen.end_line());
         let (_, last) = self.range();
         if last.line < first || self.is_empty() {
             return false;
         }
+        let before = (self.anchor, self.head);
         let stream = self.kind == SelectionKind::Stream;
         for p in [
             &mut self.anchor.0,
@@ -242,7 +244,9 @@ impl Selection {
                 }
             }
         }
-        self.held = fingerprint(&self.text(screen));
+        if (self.anchor, self.head) != before {
+            self.held = fingerprint(&self.text(screen));
+        }
         true
     }
 
@@ -255,17 +259,19 @@ impl Selection {
     }
 
     /// Follows the screen after output: whether the selection still covers the text it was made
-    /// on. False when that text was rewritten or erased, or when the scrollback has dropped part
-    /// of it, and the caller then drops the selection. True when it is still there, also when it
-    /// scrolled into the scrollback: the selection is then cut to the lines the screen still
-    /// keeps, and it goes on from there (see [`clip`](Self::clip)). A press that was not dragged
-    /// is followed too, so a caller that follows after every feed keeps it until the drag.
+    /// on, which the caller keeps when it does and drops when it does not. False when that text
+    /// was rewritten or erased. False too once the first line of the selection has left the ring:
+    /// the text it holds is then not all there any more (the top of it is gone), so it is dropped
+    /// whole, even when lines at the bottom survive; [`clip`](Self::clip) is the call that keeps
+    /// that surviving part instead. A selection that reaches past the last line of the screen is
+    /// clamped to it and kept, which a resize does. A press that was not dragged is empty, and
+    /// `follow` answers false for it because there is no text to keep: the caller holds the press
+    /// itself until the drag.
     pub fn follow(&mut self, screen: &Screen) -> bool {
         if !self.is_intact(screen) {
             return false;
         }
-        self.clip(screen);
-        true
+        self.clip(screen)
     }
 
     /// The selected text. Each row gives its selected characters without trailing spaces, and
@@ -621,10 +627,9 @@ mod tests {
         assert!(sel.follow(&s));
         assert_eq!(sel.text(&s), "second");
         assert_eq!(sel.range(), (Point::new(1, 0), Point::new(1, 5)));
-        // A press that was not dragged is followed too: it is not a selection yet.
+        // A press that was not dragged holds no text, so there is nothing for it to keep.
         let mut press = Selection::start(&s, Point::new(2, 0), SelectionKind::Stream, 1);
-        s.feed(b"\r\nsixth");
-        assert!(press.follow(&s));
+        assert!(!press.follow(&s));
         // When the ring drops the line itself there is nothing left to follow.
         let mut ring = Screen::new(12, 3, 2);
         ring.feed(b"zero\r\none\r\ntwo");
@@ -667,5 +672,50 @@ mod tests {
         same.feed(b"\x1b[1;1Hhello");
         assert!(kept.follow(&same));
         assert_eq!(kept.text(&same), "hello");
+    }
+
+    #[test]
+    fn a_selection_whose_first_line_left_the_ring_is_dropped_even_when_its_text_is_empty() {
+        let mut s = Screen::new(12, 3, 2);
+        s.feed(b"\r\n\r\nx");
+        // A line selection of the empty first line: it holds no text at all, so nothing about
+        // the text it holds can change while the line scrolls away.
+        let mut empty = Selection::start(&s, Point::new(0, 1), SelectionKind::Stream, 3);
+        assert_eq!(empty.text(&s), "");
+        assert!(empty.is_intact(&s));
+        s.feed(b"\r\n\r\n\r\n\r\n");
+        assert_eq!(s.first_line(), 2);
+        assert!(empty.is_intact(&s));
+        // The line is gone from the top of the ring, so there is nothing left of the selection;
+        // it must not be kept just because its text is still what it was.
+        assert!(!empty.follow(&s));
+    }
+
+    #[test]
+    fn a_clip_that_cuts_nothing_leaves_a_rewrite_to_be_noticed() {
+        let mut s = screen("hello world");
+        let mut sel = drag(&s, (0, 0), (0, 4), SelectionKind::Stream);
+        s.feed(b"\x1b[1;2HXX");
+        assert_eq!(s.row_text(0), "hXXlo world");
+        // Nothing was cut, so the clip must not take the new text as what the selection holds.
+        assert!(sel.clip(&s));
+        assert!(!sel.is_intact(&s));
+        assert!(!sel.follow(&s));
+    }
+
+    #[test]
+    fn a_full_row_ended_by_a_hard_break_stops_a_word_at_the_row_edge() {
+        let s = screen("abcdefghijkl\r\nmnop");
+        // Row 0 fills all 12 columns but ended with a hard break, so "abcdefghijkl" and "mnop"
+        // are two words even though their cells touch.
+        assert_eq!(s.row_text(0), "abcdefghijkl");
+        assert_eq!(s.row_text(1), "mnop");
+        assert!(!s.line_at(0).is_some_and(Line::wrapped));
+        let one = Selection::start(&s, Point::new(0, 3), SelectionKind::Stream, 2);
+        assert_eq!(one.range(), (Point::new(0, 0), Point::new(0, 11)));
+        assert_eq!(one.text(&s), "abcdefghijkl");
+        let two = Selection::start(&s, Point::new(1, 2), SelectionKind::Stream, 2);
+        assert_eq!(two.range(), (Point::new(1, 0), Point::new(1, 3)));
+        assert_eq!(two.text(&s), "mnop");
     }
 }

@@ -1499,12 +1499,15 @@ selection in the scrollback (its rows are not screen rows) and wrong for a row t
 repainted. It now holds a 64-bit fingerprint (FNV-1a) of its own text, taken when it is made,
 extended or clipped, and `Selection::is_intact(&screen)` says whether the cells still give that
 text. `Selection::follow(&mut self, &screen)` is the one call after each `Screen::feed`: false
-means the text was rewritten, erased or partly dropped from the scrollback, and the caller drops
-the selection, as terminals do; true means it is still there, also when it scrolled into the
-scrollback, and the selection is cut to what the screen keeps and goes on from there. A press
-that has not been dragged is followed too, so a caller that follows after every feed keeps it
-until the drag. `clip` now takes the clipped text as what the selection holds, so the part that
-survived a ring drop is not mistaken for a rewrite.
+means the text was rewritten, erased or its first line is gone from the ring, and the caller
+drops the selection, as terminals do; true means it is still there, also when it scrolled into
+the scrollback, where its line numbers still point at its text and nothing about what it covers
+changed on the way. A selection that reaches past the last line of the screen is clamped to it
+and kept, which a resize does. A press that has not been dragged is empty, and `follow` says
+false for it because it holds no text: the caller holds the press itself until the drag. `clip`
+takes the text of an end it cuts as what the selection holds, so the part that survived a ring
+drop is not mistaken for a rewrite, and a clip that cuts nothing leaves the text it holds alone,
+so a rewrite is still noticed after it.
 
 Two consequences of comparing text rather than cells, both deliberate and in the module doc: a
 program that writes the same characters over them again does not drop the selection (copying
@@ -1519,16 +1522,46 @@ rows and is unchanged; its crossing and its stopping at a hard break are now tes
 Test (`select::tests::a_word_crosses_a_soft_wrap_and_stops_at_a_hard_break`): a word that starts
 on the first of two wrapped rows runs to the last cell of the second, from either row, and the
 word after the hard break stops at it; seen failing without the change, where it stopped at the
-row's last column. `a_line_crosses_a_soft_wrap_and_stops_at_a_hard_break` passed before the
+row's last column. `a_full_row_ended_by_a_hard_break_stops_a_word_at_the_row_edge` is the same
+question with the cells touching: a row filled to all 12 columns and ended by a hard break does
+not join the row below, from either side; seen failing when `!prev.wrapped()` was deleted from
+`word_at` (the word below reached up into the row above) and when `!line.wrapped()` was (the word
+above reached down). `a_line_crosses_a_soft_wrap_and_stops_at_a_hard_break` passed before the
 change as well, since the line unit already joined wrapped rows.
 `a_selection_follows_its_text_into_the_scrollback`: a selection made on a screen row is intact
-and followed after two more lines push it into the scrollback under the same number, an undragged
-press is followed, and a selection whose line the ring has dropped is not. `a_rewrite_or_an_erase_of_the_selected_cells_drops_the_selection`:
+and followed after two more lines push it into the scrollback under the same number, and a
+selection whose line the ring has dropped is not.
+`a_selection_whose_first_line_left_the_ring_is_dropped_even_when_its_text_is_empty`: a line
+selection of an empty line scrolls out of the ring, its text is still empty (`is_intact` says
+so) and `follow` still says no, because the line is gone; seen failing when `follow` ignored
+what `clip` said. `a_clip_that_cuts_nothing_leaves_a_rewrite_to_be_noticed`: a clip that cuts
+nothing leaves the old text in place, so the rewrite after it is still seen; seen failing when
+`clip` re-sealed on every call. `a_rewrite_or_an_erase_of_the_selected_cells_drops_the_selection`:
 erasing the rest of the selected row keeps it, overwriting a selected cell, erasing its line and
-clearing the screen drop it, and writing the same characters again keeps it. Both follow tests
-fail to compile against the old module, which had no `follow` and no `is_intact`. `a_second_click_takes_a_word_and_grows_by_words`
+clearing the screen drop it, and writing the same characters again keeps it. The two `follow`
+tests fail to compile against the module before this branch, which had no `follow` and no
+`is_intact`; the two new ones fail against the branch's own first commit. `a_second_click_takes_a_word_and_grows_by_words`
 was changed to the new expectation: the path it double clicks is one word over the wrap.
 
-Run: `cargo test -p mdshared-term` (48 unit tests and the crate's doctest pass; in `select::`
-eleven tests, the four above among them) and the three commands below, on Windows only. Compiled,
-not run, on Linux and macOS. Not seen by a person: no window draws a selection yet (roadmap T1).
+### Known limits, for later
+
+Not fixed here, and none of them is in the tests above:
+
+- **A block selection of a wrapped word is a rectangle over the wrong text.** A double click with
+  Alt held (a `SelectionKind::Block`) on a word that crosses a soft wrap takes `range()`'s
+  smallest and largest columns, so it covers a rectangle between two rows instead of the word.
+- **A wide character that wrapped early stops a word at the wrap.** When a wide character does
+  not fit in the last column, that column is blanked and the line wraps; a word selection sees
+  that blank cell and does not cross, although the text is continuous there.
+- **`Selection::start` with a column of `END` overflows in a word selection.** `word_at` adds
+  one to the column (`b + 1`) and a column of `usize::MAX` wraps in a debug build; this was there
+  before the branch. No caller makes one today: a press comes from a cell.
+- **A large selection is lost as soon as its first line leaves the ring.** `follow` compares all
+  the text it holds, so a drop from the top of a selection that spans the scrollback takes the
+  whole selection, where xterm keeps the part that is left. `clip` keeps that part, at the price
+  of calling it after every feed and losing rewrite detection across the call.
+
+Run: `cargo test -p mdshared-term` (51 unit tests and the crate's doctest pass; in `select::`
+fourteen tests, the seven above among them) and the three commands below, on Windows only.
+Compiled, not run, on Linux and macOS. Not seen by a person: no window draws a selection yet
+(roadmap T1).
