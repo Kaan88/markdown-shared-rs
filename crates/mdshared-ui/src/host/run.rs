@@ -47,6 +47,9 @@ struct Host<A: App> {
     frost: Frost,
     /// The pointer, logical px.
     pointer: (f32, f32),
+    /// The pointer has been over the window since it last left: until then `pointer` is not
+    /// where it is, and no resize cursor is shown for it.
+    pointer_seen: bool,
     clicks: Clicks,
     double_click: Duration,
     /// The double-click rectangle, device px.
@@ -56,7 +59,21 @@ struct Host<A: App> {
     /// The loop asked the window for a redraw and has not had it yet.
     requested: bool,
     #[cfg(all(feature = "a11y", windows))]
-    latest: std::sync::Arc<std::sync::Mutex<Option<accesskit::TreeUpdate>>>,
+    access: Shared11y,
+}
+
+/// The accessibility tree, shared with the adapter's activation handler, which may ask for it
+/// on another thread.
+#[cfg(all(feature = "a11y", windows))]
+type Shared11y = std::sync::Arc<std::sync::Mutex<Access>>;
+
+#[cfg(all(feature = "a11y", windows))]
+struct Access {
+    tree: crate::a11y::Tree,
+    /// The node with the keyboard, as the application last answered.
+    focus: accesskit::NodeId,
+    /// The application was not asked while nobody listened: the tree may be behind.
+    stale: bool,
 }
 
 /// Opens the window `config` describes and runs `app` in it until it calls [`Cx::exit`]. Call it
@@ -86,6 +103,7 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         pal: LIGHT,
         exit: false,
         touched: false,
+        no_resize: Vec::new(),
     };
     let mut host = Host {
         app,
@@ -98,26 +116,49 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         cursor: CursorState::new(),
         frost: Frost::default(),
         pointer: (0.0, 0.0),
+        pointer_seen: false,
         clicks: Clicks::default(),
         double_click: platform::double_click_time(),
         double_click_size: platform::double_click_size(),
         snap_sent: None,
         requested: false,
         #[cfg(all(feature = "a11y", windows))]
-        latest: Default::default(),
+        access: {
+            let root = crate::a11y::id("mdshared-ui host window");
+            std::sync::Arc::new(std::sync::Mutex::new(Access {
+                tree: crate::a11y::Tree::new(root),
+                focus: root,
+                stale: true,
+            }))
+        },
     };
     event_loop.run_app(&mut host)
 }
 
-/// Serves the latest tree at once when an assistive technology first asks, on whichever thread
-/// asks (the loop's proxy alone would answer with a placeholder first).
+/// Serves the whole tree at once when an assistive technology first asks, on whichever thread
+/// asks (the loop's proxy alone would answer with a placeholder first). A tree not kept up to
+/// date while nobody listened is served as it is, and the loop is woken to ask for the nodes
+/// again.
 #[cfg(all(feature = "a11y", windows))]
-struct Latest(std::sync::Arc<std::sync::Mutex<Option<accesskit::TreeUpdate>>>);
+struct Latest<M: 'static> {
+    access: Shared11y,
+    wake: winit::event_loop::EventLoopProxy<Wake<M>>,
+}
 
 #[cfg(all(feature = "a11y", windows))]
-impl accesskit::ActivationHandler for Latest {
+impl<M: Send + 'static> accesskit::ActivationHandler for Latest<M> {
     fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
-        self.0.lock().ok()?.clone()
+        let access = self.access.lock().ok()?;
+        if access.stale || access.tree.is_empty() {
+            let _ = self.wake.send_event(Wake::Refresh);
+        }
+        // Never built yet (asked while the window is still being made): nothing, so that the
+        // first update the loop gives, which then holds every node and the tree's info, is the
+        // adapter's first tree. A tree served here and the updates after it must agree.
+        if access.tree.is_empty() {
+            return None;
+        }
+        Some(access.tree.full(access.focus))
     }
 }
 
@@ -169,11 +210,13 @@ impl<A: App> Host<A> {
         self.after();
     }
 
-    /// After a call: the cursor, the snap rectangle, the accessibility tree.
+    /// After a call: the cursor, the snap rectangle, the accessibility tree. The tree waits for
+    /// the frame when one is coming, so that it reads the layout that frame draws.
     fn after(&mut self) {
         self.sync_window();
-        if std::mem::take(&mut self.st.touched) {
-            self.refresh_tree();
+        let frame_coming = !self.st.damage.is_empty() && !self.st.vis.hidden();
+        if self.st.touched && !frame_coming {
+            self.refresh_tree(false);
         }
     }
 
@@ -201,40 +244,73 @@ impl<A: App> Host<A> {
         }
     }
 
-    /// The resize direction at `at` (logical px): only for a restored window drawn by us.
+    /// The resize direction at `at` (logical px): only for a restored window drawn by us, with
+    /// the pointer seen, and not over the snap rectangle or a place the application keeps.
     fn edge(&self, at: (f32, f32)) -> Option<ResizeDirection> {
-        if self.st.maximized || chrome::NATIVE_FRAME {
+        if self.st.maximized || chrome::NATIVE_FRAME || !self.pointer_seen {
+            return None;
+        }
+        let kept = |r: &Rect| r.contains(at.0, at.1);
+        if self.st.snap.as_ref().is_some_and(kept) || self.st.no_resize.iter().any(kept) {
             return None;
         }
         window::edge_at(at.0, at.1, self.st.size.0, self.st.size.1)
     }
 
+    /// Asks the application for its nodes and gives the adapter what changed: only while an
+    /// assistive technology listens, unless `always` (once, before the window is shown, so the
+    /// first request is served a real tree). Not asked, the tree is marked stale.
     #[cfg(all(feature = "a11y", windows))]
-    fn refresh_tree(&mut self) {
-        let Some(win) = self.win.as_ref() else {
+    fn refresh_tree(&mut self, always: bool) {
+        self.st.touched = false;
+        let Some(win) = self.win.as_mut() else {
             return;
         };
+        let Ok(mut access) = self.access.lock() else {
+            return;
+        };
+        let access = &mut *access;
+        let Win {
+            window, adapter, ..
+        } = win;
         let mut cx = Cx {
-            window: &win.window,
+            window,
             anim: &mut self.anim,
             proxy: &self.proxy,
             st: &mut self.st,
             now: Instant::now(),
             drawing: None,
         };
-        let tree = self.app.accessibility(&mut cx);
+        let app = &mut self.app;
+        let mut build = || {
+            access.tree.begin();
+            access.focus = app.accessibility(&mut cx, &mut access.tree);
+            access.stale = false;
+            access.tree.end(access.focus)
+        };
+        if always {
+            let update = build();
+            adapter.update_if_active(|| update);
+        } else {
+            let mut built = false;
+            adapter.update_if_active(|| {
+                built = true;
+                build()
+            });
+            if !built {
+                access.stale = true;
+            }
+        }
+        // A redraw asked for while the nodes were built is the application's business; the
+        // tree is not asked again for it.
         self.st.touched = false;
-        if let Ok(mut l) = self.latest.lock() {
-            *l = Some(tree.clone());
-        }
-        if let Some(win) = self.win.as_mut() {
-            win.adapter.update_if_active(|| tree);
-        }
     }
 
     /// No adapter here: the tree is not asked for.
     #[cfg(not(all(feature = "a11y", windows)))]
-    fn refresh_tree(&mut self) {}
+    fn refresh_tree(&mut self, _always: bool) {
+        self.st.touched = false;
+    }
 
     /// The window's size, scale and state as the window says them now.
     fn read_window(&mut self) {
@@ -267,10 +343,11 @@ impl<A: App> Host<A> {
     }
 
     /// Reads high contrast again; on a switch, turns the backdrop by it, redraws everything and
-    /// tells the application.
-    fn read_contrast(&mut self, now: Instant) {
+    /// tells the application. `colours`: the watch woke, which it also does when the contrast
+    /// theme's colours change with the switch still on, so the application is told anyway.
+    fn read_contrast(&mut self, now: Instant, colours: bool) {
         let hc = read_high_contrast();
-        if hc != self.st.high_contrast {
+        if hc != self.st.high_contrast || (colours && hc) {
             self.st.high_contrast = hc;
             self.st.damage.all();
             self.call(now, |app, cx| app.event(cx, Event::Contrast(hc)));
@@ -359,10 +436,12 @@ impl<A: App> Host<A> {
         }
         self.st.deadlines.anim = self.anim.end_frame();
         present(&mut win.surface, &win.bmp, dev, self.frost.key());
-        // A redraw asked for while drawing belongs to the next frame; the tree is not asked
-        // again for it.
-        self.st.touched = false;
         self.sync_window();
+        // Asked for before the frame (and kept for it by `after`), or said during it: the tree
+        // reads the layout just drawn. A redraw asked for while drawing does not count.
+        if self.st.touched {
+            self.refresh_tree(false);
+        }
     }
 
     /// Presents the whole bitmap again, as it is.
@@ -420,7 +499,7 @@ impl<A: App> Host<A> {
                 Event::Scale(self.st.scale)
             }
             WindowEvent::ThemeChanged(t) => {
-                self.read_contrast(now);
+                self.read_contrast(now, false);
                 Event::Theme {
                     dark: t == winit::window::Theme::Dark,
                 }
@@ -438,7 +517,7 @@ impl<A: App> Host<A> {
                     // The places the system's wish for less motion, and the contrast, are read
                     // again.
                     self.anim.set_system_reduced(platform::motion_reduced());
-                    self.read_contrast(now);
+                    self.read_contrast(now, false);
                 }
                 if changed && self.st.backdrop != Backdrop::Off {
                     self.st.damage.all();
@@ -454,10 +533,12 @@ impl<A: App> Host<A> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = logical(position.x, position.y, scale);
+                self.pointer_seen = true;
                 let (x, y) = self.pointer;
                 Event::PointerMove { x, y }
             }
             WindowEvent::CursorLeft { .. } => {
+                self.pointer_seen = false;
                 self.cursor.forget();
                 Event::PointerLeave
             }
@@ -549,7 +630,10 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         let adapter = accesskit_winit::Adapter::with_mixed_handlers(
             el,
             &window,
-            Latest(self.latest.clone()),
+            Latest {
+                access: self.access.clone(),
+                wake: self.proxy.0.clone(),
+            },
             self.proxy.0.clone(),
         );
         let surface = softbuffer::Context::new(window.clone())
@@ -577,10 +661,11 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         self.anim.set_system_reduced(platform::motion_reduced());
         let now = Instant::now();
         self.call(now, |app, cx| app.start(cx));
-        self.refresh_tree();
-        // The first frame, to the hidden window; then shown, and presented again.
+        // The first frame, to the hidden window; then the tree, read from what it laid out;
+        // then shown, and presented again.
         self.st.damage.all();
         self.frame(now);
+        self.refresh_tree(true);
         window.set_visible(true);
         self.present_all();
         // The system decides about the focus; if the window did not get it, the frame drawn
@@ -611,17 +696,20 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         let now = Instant::now();
         match wake {
             Wake::Message(m) => self.call(now, |app, cx| app.message(cx, m)),
-            Wake::Contrast => self.read_contrast(now),
+            Wake::Contrast => self.read_contrast(now, true),
+            #[cfg(all(feature = "a11y", windows))]
+            Wake::Refresh => self.refresh_tree(false),
             #[cfg(all(feature = "a11y", windows))]
             Wake::Access(e) => match e.window_event {
                 accesskit_winit::WindowEvent::ActionRequested(req) => {
                     self.call(now, |app, cx| app.event(cx, Event::Action(req)));
                 }
-                // The adapter is made with a direct activation handler (`Latest`), so the first
-                // tree is never asked for through the loop; and nothing is kept for an
-                // assistive technology that leaves. Named so the match stays exhaustive.
-                accesskit_winit::WindowEvent::InitialTreeRequested
-                | accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
+                // The direct handler (`Latest`) answers the first request, unless the tree was
+                // never built; then the loop builds it, and the first update holds it whole.
+                accesskit_winit::WindowEvent::InitialTreeRequested => self.refresh_tree(false),
+                // Nothing is kept for an assistive technology that leaves: with nobody
+                // listening the tree is no longer built.
+                accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
             },
         }
         if self.st.exit {
@@ -638,6 +726,7 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         #[cfg(not(all(feature = "a11y", windows)))]
         let _ = win;
         let now = Instant::now();
+        self.call(now, |app, cx| app.raw(cx, &event));
         if let Some(ev) = self.reduce(now, event) {
             self.call(now, |app, cx| app.event(cx, ev));
         }
@@ -654,7 +743,13 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         let due = self.st.deadlines.take_due(now, hidden);
         if due.anim {
             let moving = self.st.animated;
-            if moving.is_empty() {
+            let (w, h) = self
+                .win
+                .as_ref()
+                .map_or((1, 1), |win| (win.bmp.width, win.bmp.height));
+            // Motion named wholly outside the window would give a frame with nothing to draw,
+            // and so no new deadline: the animation would stop. The whole window is drawn.
+            if moving.is_empty() || moving.device(self.st.scale, w, h).is_none() {
                 self.st.damage.all();
             } else {
                 self.st.damage.merge(moving);

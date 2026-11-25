@@ -43,10 +43,11 @@ pub(super) fn button(b: MouseButton) -> Option<Button> {
 /// the content right or down (a wheel turned away from the user).
 pub(super) fn wheel(delta: MouseScrollDelta, scale: f32, shift: bool) -> Event {
     let (x, y, precise) = match delta {
+        // A precision touchpad on Windows reports fractions of a line; a wheel, whole notches.
         MouseScrollDelta::LineDelta(x, y) => (
             f64::from(x) * f64::from(WHEEL_LINE),
             f64::from(y) * f64::from(WHEEL_LINE),
-            false,
+            [x, y].iter().any(|v| v.is_finite() && v.fract() != 0.0),
         ),
         MouseScrollDelta::PixelDelta(p) => {
             let (x, y) = logical(p.x, p.y, scale);

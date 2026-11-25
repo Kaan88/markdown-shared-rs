@@ -70,20 +70,27 @@
 //! frame is drawn as focused, since a window winit shows is activated (`with_active`, true by
 //! default); if it turns out not to have the keyboard once shown, it is drawn again unfocused.
 //!
-//! **Accessibility** (features `host` and `a11y`). The application gives its tree by
-//! [`App::accessibility`] on every system. On Windows the AccessKit adapter is made with
-//! `with_mixed_handlers` before the window is shown; the host asks for the tree before the
-//! first frame, after every call that asked for a redraw or said [`Cx::accessibility_changed`],
-//! and after a resize or a change of scale; keeps the latest for the system's first request
-//! (served at once, on the thread that asks); and hands it to the adapter when an assistive
-//! technology is listening. A request from one (Invoke, Toggle, Focus, ScrollIntoView) is
-//! [`Event::Action`]. Elsewhere there is no adapter yet and the tree is not asked for.
+//! **Accessibility** (features `host` and `a11y`). The application adds its nodes to the
+//! host's [`a11y::Tree`](crate::a11y::Tree) in [`App::accessibility`]; the host begins and ends
+//! that tree, so AccessKit gets only what changed, and keeps it whole for the system's first
+//! request (served at once, on the thread that asks). On Windows the AccessKit adapter is made
+//! with `with_mixed_handlers` before the window is shown. The host asks for the nodes once
+//! after the first frame, before the window is shown, and then only while an assistive
+//! technology listens: after a call that asked for a redraw or said
+//! [`Cx::accessibility_changed`], after a resize or a change of scale, and after a frame in
+//! which `draw` said [`Cx::accessibility_changed`] (so bounds laid out in `draw` are read after
+//! it). A call that is followed by a frame is answered after that frame. With nobody
+//! listening nothing is built; when one arrives it is served the last tree at once and the
+//! nodes are asked for again straight after. A request from one (Invoke, Toggle, Focus,
+//! ScrollIntoView) is [`Event::Action`]. Elsewhere there is no adapter yet and the nodes are
+//! not asked for.
 //!
 //! Deliberately not here: tabs and several windows (Purge's scope: one window); the
 //! client-drawn shadow of Linux ([`shadow`](crate::shadow)) and the rounded corners it cuts,
 //! which mdview wires itself; a backdrop off Windows (above); the window's place and size kept
 //! between runs ([`window_state`](crate::window_state) is the application's to call); a menu
-//! bar, a tray, a file drop, touch, pinch and pen; key releases; regions of the window with
+//! bar, a tray, a file drop, touch, pinch and pen, and key releases, none of which is reduced
+//! to an [`Event`] (an application that needs one reads winit's own in [`App::raw`]); regions of the window with
 //! their own damage (the damage is one rectangle); a GPU. Tested: everything pure (the damage,
 //! the deadlines, the covered and minimized window, the click count, the reduction of events) in
 //! `host_tests.rs`; the window parts by the example
@@ -170,13 +177,16 @@ pub enum Event {
     /// The wheel or a touchpad moved the view: `dx` across, `dy` down, logical px, positive when
     /// the content should move right or down (winit's sign: a wheel turned away from the user,
     /// to scroll up, gives a positive `dy`). A vertical wheel with Shift held arrives as `dx`.
-    /// `precise` is true for a touchpad's pixel deltas and false for a wheel's notches
-    /// ([`WHEEL_LINE`] each).
+    /// `precise` is true for a touchpad's movement and false for a wheel's whole notches
+    /// ([`WHEEL_LINE`] each): pixel deltas, and on Windows line deltas that are not a whole
+    /// number of lines (a precision touchpad reports fractions of a line).
     Wheel { dx: f32, dy: f32, precise: bool },
     /// A key went down.
     Key(KeyPress),
     /// Text an input method committed (an accent typed with a dead key, Chinese or Japanese
-    /// input). Input methods are on only on macOS ([`window::created`](crate::window::created)).
+    /// input). Input methods are on only on macOS ([`window::created`](crate::window::created)):
+    /// a window that takes Chinese or Japanese names in a field turns them on with
+    /// `cx.window().set_ime_allowed(true)` while the field has the keyboard.
     Text(String),
     /// What an input method is composing, `None` when it stopped.
     Preedit(Option<Preedit>),
@@ -191,8 +201,9 @@ pub enum Event {
     Resize { w: f32, h: f32 },
     /// The system's light or dark mode changed.
     Theme { dark: bool },
-    /// High contrast was switched on (`true`) or off: the application makes its tokens again
-    /// ([`tokens`](crate::tokens)). The host has already turned the backdrop off or on by it
+    /// High contrast was switched on (`true`) or off, or the contrast theme's colours changed
+    /// with it still on (`true` again: one contrast theme for another, or its colours arriving
+    /// after the switch): the application makes its tokens again ([`tokens`](crate::tokens)). The host has already turned the backdrop off or on by it
     /// and redraws everything. Windows only: there the host watches the contrast itself
     /// ([`platform::watch_contrast`](crate::platform::watch_contrast), whose one wake it takes,
     /// so an application of the host does not call it) and reads it again on a change of theme
@@ -248,22 +259,38 @@ pub trait App: 'static {
         let _ = (cx, message);
     }
 
-    /// The window's accessibility tree, whole (feature `a11y`). Bounds are in device px of the
-    /// client area ([`access_rect`]). By default a window node with the window's title and
-    /// nothing in it. Asked for on Windows only, where the adapter serves it.
+    /// Adds the window's accessibility nodes to `tree` and answers the node that has the
+    /// keyboard ([`a11y::Tree::root`](crate::a11y::Tree::root) when nothing has it). Feature
+    /// `a11y`. The host has begun `tree` and ends it after this call
+    /// ([`a11y::Tree::end`](crate::a11y::Tree::end)): add the root, under
+    /// [`tree.root()`](crate::a11y::Tree::root), and every node it reaches, all of them each time.
+    /// Made with [`a11y::window`](crate::a11y::window) and [`Cx::scale`], the root's transform
+    /// makes the bounds of everything under it logical px; a root without it needs bounds in
+    /// device px ([`access_rect`]). By default the root with the window's title and nothing in
+    /// it. Asked for on Windows only, where the adapter serves it, and only while an assistive
+    /// technology listens (see the module's "Accessibility").
     #[cfg(feature = "a11y")]
-    fn accessibility(&mut self, cx: &mut Cx<'_, Self::Message>) -> accesskit::TreeUpdate {
-        let root = accesskit::NodeId(0);
-        let mut node = accesskit::Node::new(accesskit::Role::Window);
-        node.set_label(cx.title().to_string());
-        let mut info = accesskit::TreeInfo::new(root);
-        info.toolkit_name = Some("mdshared-ui".into());
-        accesskit::TreeUpdate {
-            nodes: vec![(root, node)],
-            tree: Some(info),
-            tree_id: accesskit::TreeId::ROOT,
-            focus: root,
-        }
+    fn accessibility(
+        &mut self,
+        cx: &mut Cx<'_, Self::Message>,
+        tree: &mut crate::a11y::Tree,
+    ) -> accesskit::NodeId {
+        let root = tree.root();
+        tree.add(
+            root,
+            crate::a11y::window(cx.title(), cx.scale(), Vec::new()),
+        );
+        root
+    }
+
+    /// Every winit event of the window, before the host reduces it to an [`Event`], for what
+    /// the host does not reduce: touch and pen, key releases, a file dropped. Nothing by
+    /// default. The host still does its own work with the event afterwards (a press on the
+    /// resize band still resizes), so an application that acts on one here leaves its
+    /// [`Event`] alone. Touch is not mapped to the pointer by the host: whether Windows also
+    /// sends the mouse messages it promotes from touch to a winit window has not been tried.
+    fn raw(&mut self, cx: &mut Cx<'_, Self::Message>, event: &winit::event::WindowEvent) {
+        let _ = (cx, event);
     }
 }
 
@@ -360,8 +387,12 @@ fn positive(v: f32, default: f32) -> f32 {
 /// What reaches the loop from outside it.
 enum Wake<M> {
     Message(M),
-    /// The contrast watch saw high contrast switch (Windows).
+    /// The contrast watch saw high contrast switch, or its colours change (Windows).
     Contrast,
+    /// An assistive technology arrived while the tree was not kept up to date: it was served
+    /// the last one, and the nodes are asked for again.
+    #[cfg(all(feature = "a11y", windows))]
+    Refresh,
     #[cfg(all(feature = "a11y", windows))]
     Access(accesskit_winit::Event),
 }

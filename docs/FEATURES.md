@@ -495,7 +495,10 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   After `Cx::exit` what arrives is dropped.
 - **The window:** undecorated, a minimum size, the system shadow on Windows, the dark title-bar
   mode and corners from the config; the 8 px edge band of a restored window resizes it
-  (`window::edge_at`, `drag_resize_window`) with the resize cursors; the title row is the
+  (`window::edge_at`, `drag_resize_window`) with the resize cursors, except over the snap
+  rectangle and the places the application gives `Cx::set_no_resize` (a scroll bar along the
+  right edge), and not before the pointer has been seen (it starts at 0,0, the corner); the
+  title row is the
   application's (`Cx::drag_window`, `title_double_click`, `toggle_maximize`, `minimize`);
   snap layouts by `Cx::set_maximize_button`, re-sent after a change of scale.
 - **Backdrop, Windows only:** `Cx::set_backdrop(Backdrop::Mica, &pal)` runs `frost::Frost` (so
@@ -503,7 +506,9 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   still refuses it when the system shows none; `Cx::frost(p, rect)` marks chrome for it within
   the damage. The host reads high contrast at start, on `ThemeChanged`, when the window gains
   the keyboard, and when `platform::watch_contrast` wakes it (the host takes that one wake; an
-  application of the host does not call it), and sends `Event::Contrast` on a switch. Off
+  application of the host does not call it), and sends `Event::Contrast` on a switch, and on
+  every wake of the watch while high contrast is on (one contrast theme for another, or the
+  theme's colours arriving after the switch, which the watch reports apart). Off
   Windows there is no backdrop: stock softbuffer presents Xrgb8888, so the keyed-out chrome
   showed black on KDE Wayland; the host reports none (`Cx::frosted` is false) until it presents
   with alpha, and does not read the contrast there (the portal read can wait half a second).
@@ -514,11 +519,31 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   `Focus(false)`.
 - **Accessibility** (`host,a11y`): the tree's types (`accesskit`) are in plain `[dependencies]`
   and build everywhere, so `App::accessibility`, `Event::Action` and `access_rect` exist on every
-  system; the adapter (`accesskit_winit`) is Windows-only. On Windows
-  `Adapter::with_mixed_handlers` is made before the window is shown; the latest tree is kept for
-  the activation handler, as `purge_shape` does; the tree is asked again after every call that
-  asked for a redraw or `accessibility_changed`, and after a resize or a change of scale.
-  Elsewhere the tree is not asked for. The Cargo lines follow `wk/a11y`'s layout (its working
+  system; the adapter (`accesskit_winit`) is Windows-only. The host owns an `a11y::Tree`: the
+  application adds its nodes in `App::accessibility(cx, tree)` and answers the focus, and the
+  host begins and ends the tree, so AccessKit gets only what changed and the activation handler
+  is served the whole tree. On Windows `Adapter::with_mixed_handlers` is made before the window
+  is shown. The nodes are asked for once after the first frame, before the window is shown, then
+  only while an assistive technology listens: after a call that asked for a redraw or said
+  `accessibility_changed`, after a resize or a change of scale, after the frame when the call is
+  followed by one (so a layout made in `draw` is read), and after a frame whose `draw` said
+  `accessibility_changed` (an animation that moved something). A redraw asked for inside `draw`
+  does not count. Nobody listening, nothing is built: one who arrives is served the last tree
+  and the nodes are asked for again at once; asked before the first build, the handler answers
+  nothing and the loop builds the first tree. Elsewhere the tree is not asked for.
+- **What is not reduced** (touch, pen, key releases, a dropped file) reaches `App::raw` as
+  winit's own event before the host's work. Touch is not mapped to the pointer: whether Windows
+  also sends a winit window the mouse messages it promotes from touch was not tried. A wheel's
+  `precise` is true for pixel deltas and for line deltas that are not whole notches (a precision
+  touchpad on Windows). Motion named wholly outside the window redraws the whole window, so the
+  animation's deadline is not lost.
+- **A UIA client** finds two top-level windows of the process: the window, and winit's
+  `Winit Thread Event Target`, a hidden helper with no name. A rig that finds the window by
+  process id leaves that class out, or finds it by name.
+- **Checked by hand after the audit (2026-11-25):** a UIA probe on the example, three runs: the
+  window, the button by AutomationId `Hello` and the field are found with bounds where they are
+  drawn, and Invoke arrives as a Click, also when the probe connects after the tree went stale.
+  At scale 1 only. CI's Windows job runs the example for two seconds. The Cargo lines follow `wk/a11y`'s layout (its working
   copy of 2026-11-25), so the two merge easily; softbuffer 0.4.8, already in the lock, became an
   optional dependency.
 

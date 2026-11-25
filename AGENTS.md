@@ -75,7 +75,9 @@ cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D w
 cargo test --release -p mdshared-ui --features host,a11y host::
 ```
 
-Run all fifteen before you say a change is done. While working, the debug forms are faster
+Run all fifteen before you say a change is done. The Windows job of CI also runs the host's
+example for two seconds (`cargo run --release -p mdshared-ui --features host,a11y --example host
+-- --seconds 2`): run it too after a change to `host`. While working, the debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
 warnings`). Two traps:
 

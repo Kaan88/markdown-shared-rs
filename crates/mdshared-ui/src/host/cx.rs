@@ -40,6 +40,8 @@ pub(super) struct Shared {
     pub(super) exit: bool,
     /// A call asked for a redraw or said the accessibility tree changed.
     pub(super) touched: bool,
+    /// Where the resize band is off ([`Cx::set_no_resize`]).
+    pub(super) no_resize: Vec<Rect>,
 }
 
 /// The host's side of the loop that an [`App`](super::App) may touch during a call: what it asks
@@ -57,16 +59,24 @@ pub struct Cx<'a, M: 'static> {
 
 impl<M: 'static> Cx<'_, M> {
     /// Asks for `r` (logical px) to be drawn again. Rectangles asked for before the frame are
-    /// joined. One that is empty or not made of numbers asks for nothing.
+    /// joined. One that is empty or not made of numbers asks for nothing. Outside
+    /// [`App::draw`](super::App::draw) it also has the accessibility tree asked for again; during
+    /// a draw (the next frame of an animation) it does not: say
+    /// [`accessibility_changed`](Self::accessibility_changed) when a frame moved what the tree
+    /// reports.
     pub fn request_redraw(&mut self, r: Rect) {
         self.st.damage.add(r);
-        self.st.touched = true;
+        if self.drawing.is_none() {
+            self.st.touched = true;
+        }
     }
 
-    /// Asks for the whole window to be drawn again.
+    /// Asks for the whole window to be drawn again, as [`request_redraw`](Self::request_redraw).
     pub fn request_redraw_all(&mut self) {
         self.st.damage.all();
-        self.st.touched = true;
+        if self.drawing.is_none() {
+            self.st.touched = true;
+        }
     }
 
     /// During [`App::draw`](super::App::draw): `r` holds something in motion, so the animator's
@@ -195,9 +205,23 @@ impl<M: 'static> Cx<'_, M> {
 
     /// Where the maximize caption button is drawn (logical px), so Windows 11 shows the snap
     /// layouts over it ([`snap`](crate::snap)); `None` while it is not there to press (a dialog
-    /// over it). Sent to the system only on a change, and again after a change of scale.
+    /// over it). Sent to the system only on a change, and again after a change of scale. The
+    /// resize band is off over it. Set it in [`App::start`](super::App::start) as well as
+    /// where it is drawn: the system is told by a frame change, which a first frame drawn with
+    /// it set in `draw` would then draw again.
     pub fn set_maximize_button(&mut self, rect: Option<Rect>) {
         self.st.snap = rect;
+    }
+
+    /// The places (logical px) where a press is the application's even on the resize band of a
+    /// restored window: a scroll bar along the right edge, a row of buttons along the bottom.
+    /// The band is the outer [`window::EDGE`] px of each side, where a left press otherwise
+    /// resizes the window and is not sent as [`Event::Press`](super::Event::Press). Replaces the
+    /// places given before; an empty list gives the band back everywhere. The snap rectangle
+    /// ([`set_maximize_button`](Self::set_maximize_button)) is left out of the band anyway.
+    pub fn set_no_resize(&mut self, places: &[Rect]) {
+        self.st.no_resize.clear();
+        self.st.no_resize.extend_from_slice(places);
     }
 
     /// The backdrop wanted behind the chrome: Mica, Acrylic or `Off` (the default). `pal` is the
@@ -248,8 +272,10 @@ impl<M: 'static> Cx<'_, M> {
         }
     }
 
-    /// Something in the accessibility tree changed without a redraw: the host asks
-    /// [`App::accessibility`](super::App) again after this call. Nothing without `a11y`.
+    /// Something in the accessibility tree changed: the host asks
+    /// [`App::accessibility`](super::App) again after this call, or after the frame when the
+    /// call is followed by one. During [`App::draw`](super::App::draw), after that frame: so a
+    /// layout made in `draw`, or moved by an animation, reaches the tree. Nothing without `a11y`.
     pub fn accessibility_changed(&mut self) {
         self.st.touched = true;
     }

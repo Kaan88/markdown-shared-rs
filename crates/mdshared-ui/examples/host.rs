@@ -14,6 +14,8 @@
 use std::time::{Duration, Instant};
 
 use mdshared_app::backdrop::Backdrop;
+#[cfg(feature = "a11y")]
+use mdshared_ui::a11y;
 use mdshared_ui::chrome::{self, WinButton};
 use mdshared_ui::cursor::Cursor;
 use mdshared_ui::gfx::{Face, Painter, Rect};
@@ -292,7 +294,7 @@ impl App for Demo {
             #[cfg(feature = "a11y")]
             Event::Action(req) => {
                 println!("a11y action {:?} on {:?}", req.action, req.target_node);
-                if req.action == accesskit::Action::Click && req.target_node == HELLO_NODE {
+                if req.action == accesskit::Action::Click && req.target_node == a11y::id("Hello") {
                     self.hellos += 1;
                     cx.request_redraw(FOOTER);
                 }
@@ -406,43 +408,22 @@ impl App for Demo {
     }
 
     #[cfg(feature = "a11y")]
-    fn accessibility(&mut self, cx: &mut Cx<'_, Msg>) -> accesskit::TreeUpdate {
-        use accesskit::{Action, Node, Role, TreeId, TreeInfo, TreeUpdate};
-        let s = cx.scale();
-        let mut root = Node::new(Role::Window);
-        root.set_label(cx.title().to_string());
-        root.set_children(vec![HELLO_NODE, FIELD_NODE]);
-        let mut b = Node::new(Role::Button);
-        b.set_label("Say hello");
-        b.set_author_id("Hello");
-        b.set_bounds(host::access_rect(HELLO, s));
-        b.add_action(Action::Click);
-        let mut f = Node::new(Role::TextInput);
-        f.set_label("Text");
-        f.set_author_id("Field");
-        f.set_value(self.field.text().to_string());
-        f.set_bounds(host::access_rect(FIELD, s));
-        let mut info = TreeInfo::new(ROOT_NODE);
-        info.toolkit_name = Some("mdshared-ui".into());
-        TreeUpdate {
-            nodes: vec![(ROOT_NODE, root), (HELLO_NODE, b), (FIELD_NODE, f)],
-            tree: Some(info),
-            tree_id: TreeId::ROOT,
-            focus: if self.field_focused {
-                FIELD_NODE
-            } else {
-                ROOT_NODE
-            },
-        }
+    fn accessibility(&mut self, cx: &mut Cx<'_, Msg>, tree: &mut a11y::Tree) -> accesskit::NodeId {
+        // Under `a11y::window` the bounds are logical px: its transform scales them.
+        let root = tree.root();
+        let (hello, field) = (a11y::id("Hello"), a11y::id("Field"));
+        tree.add(
+            root,
+            a11y::window(cx.title(), cx.scale(), vec![hello, field]),
+        );
+        tree.add(hello, a11y::button("Say hello", "Hello", HELLO, false));
+        tree.add(
+            field,
+            a11y::text_input("Text", "Field", FIELD, self.field.text(), false),
+        );
+        if self.field_focused { field } else { root }
     }
 }
-
-#[cfg(feature = "a11y")]
-const ROOT_NODE: accesskit::NodeId = accesskit::NodeId(1);
-#[cfg(feature = "a11y")]
-const HELLO_NODE: accesskit::NodeId = accesskit::NodeId(2);
-#[cfg(feature = "a11y")]
-const FIELD_NODE: accesskit::NodeId = accesskit::NodeId(3);
 
 fn main() {
     let mut args = std::env::args().skip(1);

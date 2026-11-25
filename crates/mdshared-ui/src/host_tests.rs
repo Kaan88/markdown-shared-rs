@@ -562,6 +562,19 @@ fn shift_turns_a_vertical_wheel_sideways_but_not_a_sideways_one() {
 }
 
 #[test]
+fn a_fraction_of_a_line_is_a_touchpad() {
+    // A precision touchpad on Windows: line deltas that are not whole notches.
+    assert_eq!(
+        wheel(MouseScrollDelta::LineDelta(0.0, 0.25), 1.0, false),
+        Event::Wheel {
+            dx: 0.0,
+            dy: 0.25 * WHEEL_LINE,
+            precise: true
+        }
+    );
+}
+
+#[test]
 fn a_wheel_that_is_not_a_number_does_not_move() {
     assert_eq!(
         wheel(
