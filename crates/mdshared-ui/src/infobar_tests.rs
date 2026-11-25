@@ -577,6 +577,7 @@ fn the_focused_control_gets_the_accent_ring_just_outside_it() {
             focused: missing,
             pressed: missing,
             hover: missing,
+            high_contrast: false,
         };
         assert!(
             draw(look).pixels == rest.pixels,
@@ -703,6 +704,74 @@ fn high_contrast_palettes_get_their_own_inks() {
         assert_eq!(hc_light.line, hc_light.ink);
         assert_eq!(hc_dark.line, hc_dark.ink);
     }
+}
+
+#[test]
+fn the_system_contrast_theme_gets_the_high_contrast_colours_when_told() {
+    // Desert-like: white window, black text, a dark blue highlight. Not one of the toolkit's
+    // two high-contrast palettes, so only the flag makes it high contrast.
+    let colors = crate::tokens::SystemColors {
+        window: rgb(0xfffaef),
+        window_text: rgb(0x3d3d3d),
+        highlight: rgb(0x903909),
+        highlight_text: rgb(0xfff5e3),
+        hot_light: rgb(0x1c5e75),
+        gray_text: rgb(0x676767),
+        button_face: rgb(0xfffaef),
+        button_text: rgb(0x3d3d3d),
+    };
+    let pal = crate::tokens::Tokens::from_system_colors(&colors).palette;
+    for severity in ALL {
+        let told = severity_colors_in(severity, &pal, true);
+        assert_eq!(told.fill, pal.page, "{severity:?}");
+        assert_eq!(told.line, told.ink, "{severity:?}");
+        let untold = severity_colors(severity, &pal);
+        assert_ne!(
+            untold.fill, pal.page,
+            "{severity:?}: untold is the old light look"
+        );
+    }
+    // The look's flag reaches the drawing: the card is the page, not the tinted fill.
+    let bar = sample();
+    let rect = Rect::new(0.0, 0.0, 360.0, 120.0);
+    let card = |high_contrast| {
+        let bmp = shot(&pal, 360, 120, |p| {
+            draw_infobar_with(
+                p,
+                &pal,
+                rect,
+                &bar,
+                Look {
+                    high_contrast,
+                    ..Look::default()
+                },
+            )
+        });
+        at(&bmp, 354.0, 60.0)
+    };
+    assert_eq!(card(true), pal.page);
+    assert_eq!(card(false), severity_colors(Severity::Info, &pal).fill);
+}
+
+#[test]
+fn the_dark_error_ink_reads_on_the_dark_surfaces() {
+    use crate::cover::contrast;
+    let ink = severity_colors(Severity::Error, &DARK).ink;
+    assert_eq!(ink, DARK_ERROR_INK);
+    let fill = severity_colors(Severity::Error, &DARK).fill;
+    for ground in [DARK.page, DARK.pane, DARK.bar, DARK.popup, fill] {
+        assert!(
+            contrast(ink, ground) >= 4.5,
+            "{ground:?}: {}",
+            contrast(ink, ground)
+        );
+    }
+    // Light and the high-contrast palettes keep the palette's danger.
+    assert_eq!(severity_colors(Severity::Error, &LIGHT).ink, LIGHT.danger);
+    assert_eq!(
+        severity_colors(Severity::Error, &HIGH_CONTRAST_DARK).ink,
+        HIGH_CONTRAST_DARK.danger
+    );
 }
 
 #[test]

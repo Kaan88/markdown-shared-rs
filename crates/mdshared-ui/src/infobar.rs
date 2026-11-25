@@ -14,17 +14,18 @@
 //!
 //! Deliberately not here: the pointer or keyboard state (the caller keeps it, and decides the
 //! order focus moves in), dismissing a bar or storing a list of bars (the caller owns both),
-//! motion (there is none, so an idle window stays idle), and the accessibility tree. In the
-//! later accessibility layer (W8) a bar is a group or a status whose name is its title and
-//! message, and each action and the close button is a button; the model here carries
-//! everything that tree needs.
+//! motion (there is none, so an idle window stays idle), and the accessibility tree. The `a11y`
+//! module has no info bar builder yet: there a bar is a group or a status whose name is its
+//! title and message, and each action and the close button is a button, and the model here
+//! carries everything that tree needs.
 //!
-//! Also not here: telling a high-contrast palette by anything but identity. A [`Palette`] has
-//! no field that says it is high contrast, so only [`crate::tokens::HIGH_CONTRAST_LIGHT`] and
-//! [`crate::tokens::HIGH_CONTRAST_DARK`] themselves get the high-contrast colours. A palette
-//! made from one of them, such as `Tokens::high_contrast(true).with_accent(c)`, is not equal to
-//! it and is taken as light or dark from its `dark` flag. [`crate::tokens::Tokens::from_system`]
-//! never makes such a palette: a high-contrast look keeps its own accent.
+//! Also not here: telling a high-contrast palette by its colours. A [`Palette`] has no field
+//! that says it is high contrast, so the caller says so in [`Look::high_contrast`] (or to
+//! [`severity_colors_in`]); the system's contrast theme
+//! ([`crate::tokens::Tokens::from_system_colors`], what `Tokens::from_system` gives under
+//! Windows high contrast) needs that flag. Without it only
+//! [`crate::tokens::HIGH_CONTRAST_LIGHT`] and [`crate::tokens::HIGH_CONTRAST_DARK`] themselves,
+//! recognised by identity, get the high-contrast colours.
 //!
 //! The action buttons are drawn by [`crate::notice::bar_button`], the one the bars across the
 //! top of the page use, and the focus ring by [`crate::focus::draw_ring`], as for the other
@@ -52,6 +53,10 @@ pub const ICON: f32 = 16.0;
 pub const CLOSE_SIZE: f32 = 24.0;
 /// The height of an action button, as [`bar_button`] draws it.
 pub const ACTION_H: f32 = 24.0;
+
+/// An error's glyph and frame ink on a dark palette that is not high contrast: WinUI's
+/// critical foreground, about 7:1 on the dark page and 6:1 on the error card.
+pub const DARK_ERROR_INK: Rgb = rgb(0xff99a4);
 
 /// The title's face size, and the line it gets.
 const TITLE_TEXT: f32 = 13.0;
@@ -150,6 +155,12 @@ pub struct Look {
     /// The control the keyboard is on: the accent ring of [`crate::focus::draw_ring`] is drawn
     /// just outside it.
     pub focused: Option<Hit>,
+    /// The palette is a high-contrast one (the host's `Cx::high_contrast`, or
+    /// [`crate::platform::system_high_contrast`]), so the bar takes the high-contrast colours
+    /// of [`severity_colors_in`]: the page as the fill and the ink as the frame. The system's
+    /// own contrast theme ([`crate::tokens::Tokens::from_system_colors`]) needs it; the
+    /// toolkit's two high-contrast palettes get those colours without it.
+    pub high_contrast: bool,
 }
 
 /// An InfoBar's data:its severity, a title, a message, up to [`MAX_ACTIONS`] actions and
@@ -361,11 +372,29 @@ pub struct SeverityColors {
 /// from one of those two, for example with another accent, is not recognised: see the module's
 /// "Also not here".
 pub fn severity_colors(severity: Severity, pal: &Palette) -> SeverityColors {
+    severity_colors_in(severity, pal, false)
+}
+
+/// [`severity_colors`], told by the caller whether `pal` is a high-contrast palette. A
+/// [`Palette`] has no field that says so, and the system's contrast theme
+/// ([`crate::tokens::Tokens::from_system_colors`]) is not one of the toolkit's two, so a window
+/// that follows the system passes its own flag here. `high_contrast` false still recognises
+/// [`HIGH_CONTRAST_LIGHT`] and [`HIGH_CONTRAST_DARK`] by identity.
+///
+/// On a dark palette that is not high contrast, an error's ink is [`DARK_ERROR_INK`], as in
+/// WinUI: the palette's `danger` is the close button's hover fill and reads at less than 3:1 as
+/// a glyph or a frame on the dark surfaces.
+pub fn severity_colors_in(
+    severity: Severity,
+    pal: &Palette,
+    high_contrast: bool,
+) -> SeverityColors {
     use Severity::*;
-    let high_contrast = *pal == HIGH_CONTRAST_LIGHT || *pal == HIGH_CONTRAST_DARK;
+    let high_contrast = high_contrast || *pal == HIGH_CONTRAST_LIGHT || *pal == HIGH_CONTRAST_DARK;
     let ink = match severity {
         Info => pal.accent,
         Warning => pal.warn,
+        Error if pal.dark && !high_contrast => DARK_ERROR_INK,
         Error => pal.danger,
         Success if high_contrast && pal.dark => rgb(0x7ee787),
         Success if high_contrast => rgb(0x006400),
@@ -432,7 +461,7 @@ pub fn draw_infobar(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, h
 /// square), hovered or not. The ring lies in the card's padding, so the clip to `rect` cuts it
 /// only when the bar is squeezed shorter than its content.
 pub fn draw_infobar_with(p: &mut Painter, pal: &Palette, rect: Rect, bar: &InfoBar, look: Look) {
-    let colors = severity_colors(bar.severity, pal);
+    let colors = severity_colors_in(bar.severity, pal, look.high_contrast);
     let l = bar.layout(p, rect);
     let clip = p.clip(rect);
     p.frame(rect, RADIUS, colors.fill, colors.line);
