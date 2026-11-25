@@ -619,6 +619,12 @@ fn the_widget_nodes_have_their_roles_and_states() {
         (s.role(), s.toggled()),
         (Role::Switch, Some(Toggled::False))
     );
+    // AccessKit makes a switch a UIA Button; the role description says what it is.
+    assert_eq!(s.role_description(), Some(SWITCH_ROLE));
+    assert_eq!(s.role_description(), Some("toggle switch"));
+    let h = column_header("Size", "SizeColumn", r);
+    assert_eq!((h.role(), h.label()), (Role::ColumnHeader, Some("Size")));
+    assert!(!h.supports_action(Action::Click));
     let d = combo_box("Theme", "ThemeBox", r, "Dark", true);
     assert_eq!((d.value(), d.is_expanded()), (Some("Dark"), Some(true)));
     let e = expander("Details", "DebugExpander", r, false);
@@ -634,7 +640,7 @@ fn the_widget_nodes_have_their_roles_and_states() {
         Some("fire")
     );
     assert_eq!(text_input("Pin", "p", r, "1234", true).value(), None);
-    assert_eq!(tab("Apps", "TabApps", r, true).is_selected(), Some(true));
+    assert_eq!(tab("Apps", "TabApps", r, true, 0).is_selected(), Some(true));
     let dl = dialog("Uninstall?", "ConfirmDialog", r, true, vec![id("Yes")]);
     assert!(dl.is_modal());
     assert_eq!(dl.children(), &[id("Yes")]);
@@ -645,4 +651,93 @@ fn the_widget_nodes_have_their_roles_and_states() {
 fn the_window_carries_the_scale() {
     let w = window("Purge", 1.5, vec![]);
     assert_eq!(w.transform().map(|t| t.as_coeffs()[0]), Some(1.5));
+}
+
+#[test]
+fn tabs_say_where_they_are_and_the_tab_list_how_many_there_are() {
+    let r = Rect::new(0.0, 0.0, 80.0, 32.0);
+    let names = ["Apps", "Leftovers", "Startup", "Settings"];
+    let mut tree = Tree::new(id("W"));
+    tree.begin();
+    let mut ids = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let tid = id(&format!("Tab{n}"));
+        tree.add(tid, tab(n, &format!("Tab{n}"), r, i == 1, i));
+        ids.push(tid);
+    }
+    let strip = id("Pages");
+    tree.add(strip, tab_list("Pages", "Pages", r, ids.clone()));
+    tree.add(tree.root(), window("W", 1.0, vec![strip]));
+    let u = tree.end(tree.root());
+    assert_eq!(node(&u, strip).size_of_set(), Some(4));
+    for (i, tid) in ids.iter().enumerate() {
+        // AccessKit's 0-based position; UIA says one more ("2 of 4").
+        assert_eq!(node(&u, *tid).position_in_set(), Some(i));
+        assert_eq!(node(&u, *tid).is_selected(), Some(i == 1));
+    }
+    assert_eq!(tab_list("Empty", "e", r, vec![]).size_of_set(), Some(0));
+}
+
+#[test]
+fn clip_keeps_the_part_inside_and_nothing_of_what_is_outside() {
+    let area = Rect::new(100.0, 50.0, 300.0, 200.0);
+    let inside = Rect::new(120.0, 60.0, 40.0, 20.0);
+    assert_eq!(clip(inside, area), Some(inside));
+    // Cut by the top edge and by the right edge.
+    assert_eq!(
+        clip(Rect::new(110.0, 30.0, 40.0, 40.0), area),
+        Some(Rect::new(110.0, 50.0, 40.0, 20.0))
+    );
+    assert_eq!(
+        clip(Rect::new(380.0, 100.0, 40.0, 10.0), area),
+        Some(Rect::new(380.0, 100.0, 20.0, 10.0))
+    );
+    // Wider than the area both ways: the area itself.
+    assert_eq!(clip(Rect::new(0.0, 0.0, 1000.0, 1000.0), area), Some(area));
+    // Wholly above, below, beside, or only touching an edge: nothing.
+    assert_eq!(clip(Rect::new(120.0, 0.0, 40.0, 50.0), area), None);
+    assert_eq!(clip(Rect::new(120.0, 250.0, 40.0, 10.0), area), None);
+    assert_eq!(clip(Rect::new(0.0, 60.0, 100.0, 10.0), area), None);
+    assert_eq!(clip(Rect::new(500.0, 60.0, 10.0, 10.0), area), None);
+    // Empty and negative sizes have nothing inside.
+    assert_eq!(clip(Rect::new(120.0, 60.0, 0.0, 10.0), area), None);
+    assert_eq!(clip(Rect::new(120.0, 60.0, -10.0, 10.0), area), None);
+    assert_eq!(clip(inside, Rect::new(100.0, 50.0, 300.0, -5.0)), None);
+    // Nonsense in, nothing out.
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(clip(Rect::new(bad, 60.0, 40.0, 20.0), area), None);
+        assert_eq!(clip(Rect::new(120.0, 60.0, bad, 20.0), area), None);
+        assert_eq!(clip(inside, Rect::new(100.0, bad, 300.0, 200.0)), None);
+        assert_eq!(clip(inside, Rect::new(100.0, 50.0, 300.0, bad)), None);
+    }
+}
+
+#[test]
+fn clip_agrees_with_cutting_each_axis_on_its_own() {
+    // Against a second way: the overlap of the two intervals on each axis, kept when both are
+    // longer than nothing. Coordinates are whole numbers, so the arithmetic is exact.
+    let mut seed = 0x2545_f491_u32;
+    let mut next = |m: u32| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) % m
+    };
+    for _ in 0..2_000 {
+        let mut v = [0.0f32; 8];
+        for x in v.iter_mut() {
+            *x = next(200) as f32 - 50.0;
+        }
+        let (r, a) = (
+            Rect::new(v[0], v[1], v[2], v[3]),
+            Rect::new(v[4], v[5], v[6], v[7]),
+        );
+        let cut = |p0: f32, l0: f32, p1: f32, l1: f32| {
+            let (s, e) = (p0.max(p1), (p0 + l0).min(p1 + l1));
+            (e > s).then_some((s, e - s))
+        };
+        let want = match (cut(r.x, r.w, a.x, a.w), cut(r.y, r.h, a.y, a.h)) {
+            (Some((x, w)), Some((y, h))) => Some(Rect::new(x, y, w, h)),
+            _ => None,
+        };
+        assert_eq!(clip(r, a), want, "{r:?} in {a:?}");
+    }
 }

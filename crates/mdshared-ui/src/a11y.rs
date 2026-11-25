@@ -34,19 +34,24 @@
 //! scrolled out of the list would otherwise take the clicks and hovers meant for what is drawn
 //! where it would be: the toolbar above the list, or the footer below. Even the row just outside
 //! reaches as far as a row's height, more than a column header is tall. A row without bounds
-//! still takes ScrollIntoView, and UIA reports an empty rectangle for it (IsOffscreen). So a
-//! scroll changes the list node, the rows that come into the viewport or leave it, and the two
+//! still takes ScrollIntoView. UIA reports an empty rectangle for it, and its IsOffscreen is
+//! false all the same: AccessKit 0.25 does not set that property, so a client cannot learn from
+//! it whether a row shows. A rig that needs a row on screen (to click it, or to read where it is)
+//! calls ScrollIntoView and waits until the row's rectangle is not empty. So a scroll changes the list node, the rows that come into the viewport or leave it, and the two
 //! rows cut by its edges; a filter changes the list node and the rows that appear, or whose
 //! position or bounds moved; a change of the list's width changes only the rows in view.
 //! [`plain_list`] is a short list whose items' bounds the caller gives, for the items of a group;
-//! the caller cuts them the same way.
+//! the caller cuts them the same way, with [`clip`].
 //!
 //! **Selection.** AccessKit turns UIA's SelectionItem `Select`, `AddToSelection` and
 //! `RemoveFromSelection` all into the same [`Request::Click`], sent only when the row's selected
 //! state would change. They cannot be told apart, so `AddToSelection` and `RemoveFromSelection`
 //! are not supported. An application treats a click on an unselected row as `Select` (that row
 //! only) and a click on a selected row as nothing, so that `Select` on a selected row keeps it
-//! selected.
+//! selected. A multi-select list is still told as such (UIA Selection's CanSelectMultiple), and
+//! a person selects several rows with the keyboard or Ctrl+click as the application allows; a
+//! test rig does the same, with Ctrl+click or keys typed into the window (SendInput), and gets
+//! one row from each SelectionItem `Select`.
 //!
 //! **Modal dialogs.** While a modal dialog is open, mark the window's other top-level nodes
 //! hidden ([`Node::set_hidden`]) and keep them in the tree: AccessKit then leaves them, and
@@ -387,10 +392,16 @@ pub fn check_box(label: &str, author: &str, r: Rect, on: Option<bool>, disabled:
     n
 }
 
-/// A toggle switch (`toggle`): UIA Toggle.
+/// What a reader calls a [`switch`] (UIA LocalizedControlType).
+pub const SWITCH_ROLE: &str = "toggle switch";
+
+/// A toggle switch (`toggle`): UIA Toggle. AccessKit gives `Role::Switch` UIA's Button control
+/// type, which a reader would call "button", so the node carries the role description
+/// [`SWITCH_ROLE`], which UIA shows as the LocalizedControlType and a reader says instead.
 pub fn switch(label: &str, author: &str, r: Rect, on: bool, disabled: bool) -> Node {
     let mut n = check_box(label, author, r, Some(on), disabled);
     n.set_role(Role::Switch);
+    n.set_role_description(SWITCH_ROLE);
     n
 }
 
@@ -438,7 +449,9 @@ pub fn text(value: &str, author: &str, r: Rect) -> Node {
     n
 }
 
-/// A single-line text field (`textfield`): UIA Value, settable.
+/// A single-line text field (`textfield`): UIA Value, settable. The hint the field draws while it
+/// is empty ("Search (Ctrl+F)") is not here: give it with [`Node::set_placeholder`], which UIA
+/// shows as the HelpText a reader says after the name.
 pub fn text_input(label: &str, author: &str, r: Rect, value: &str, secret: bool) -> Node {
     let mut n = named(
         if secret {
@@ -458,16 +471,21 @@ pub fn text_input(label: &str, author: &str, r: Rect, value: &str, secret: bool)
     n
 }
 
-/// A tab strip or selector bar (`segments::draw_selector`): its tabs are `children`.
+/// A tab strip or selector bar (`segments::draw_selector`): its tabs are `children`, in their
+/// order. It carries the count of its tabs, which each tab's "2 of 4" needs (AccessKit reads the
+/// set's size only from an ancestor).
 pub fn tab_list(label: &str, author: &str, r: Rect, children: Vec<NodeId>) -> Node {
     let mut n = named(Role::TabList, label, author, r);
+    n.set_size_of_set(children.len());
     n.set_children(children);
     n
 }
 
-/// One tab: UIA SelectionItem.
-pub fn tab(label: &str, author: &str, r: Rect, selected: bool) -> Node {
+/// One tab: UIA SelectionItem. `position` is its place among the [`tab_list`]'s children, 0 for
+/// the first; UIA's PositionInSet is one more, and the SizeOfSet comes from the tab list.
+pub fn tab(label: &str, author: &str, r: Rect, selected: bool, position: usize) -> Node {
     let mut n = named(Role::Tab, label, author, r);
+    n.set_position_in_set(position);
     n.set_selected(selected);
     n.add_action(Action::Click);
     n.add_action(Action::Focus);
@@ -476,8 +494,11 @@ pub fn tab(label: &str, author: &str, r: Rect, selected: bool) -> Node {
 
 /// A dialog card (`overlay::dialog_card`): its buttons and content are `children`. `modal` says
 /// the rest of the window cannot be used while it is open; the caller also hides the rest (see
-/// the [module](self)). Give it the body text with [`Node::set_description`], which UIA shows as
-/// the FullDescription, read after the title.
+/// the [module](self)). The body text (the message under the title) belongs in a [`text`] child,
+/// before the buttons: there a reader that walks the dialog finds it, and a client reads it back
+/// as that child's Name. Giving it also with [`Node::set_description`] (UIA FullDescription) lets
+/// a reader say it as the dialog opens, after the title; the description alone is missed by a
+/// reader that reads the dialog's children.
 pub fn dialog(title: &str, author: &str, r: Rect, modal: bool, children: Vec<NodeId>) -> Node {
     let mut n = named(Role::Dialog, title, author, r);
     if modal {
@@ -485,6 +506,30 @@ pub fn dialog(title: &str, author: &str, r: Rect, modal: bool, children: Vec<Nod
     }
     n.set_children(children);
     n
+}
+
+/// A column's header above a list or table (`table`'s header, a list's "Name" and "Size"), with no
+/// requests: a header that sorts is a [`button`]. AccessKit gives it UIA's DataItem control type
+/// with the ARIA role "columnheader". The caller puts the headers in a [`group`] beside the list.
+pub fn column_header(label: &str, author: &str, r: Rect) -> Node {
+    named(Role::ColumnHeader, label, author, r)
+}
+
+/// The part of `r` inside `area`, or `None` when nothing of it is inside: the bounds of a node that
+/// scrolls in a pane, so that one scrolled out cannot take the hits meant for what is drawn where
+/// it would be (see the [module](self) on bounds). Edges that only touch are not inside, and a
+/// rectangle or area with a negative size has nothing inside. One with a coordinate or size that is
+/// NaN or infinite gives `None`.
+pub fn clip(r: Rect, area: Rect) -> Option<Rect> {
+    let finite = [r.x, r.y, r.w, r.h, area.x, area.y, area.w, area.h]
+        .iter()
+        .all(|v| v.is_finite());
+    if !finite {
+        return None;
+    }
+    let (x0, y0) = (r.x.max(area.x), r.y.max(area.y));
+    let (x1, y1) = (r.right().min(area.right()), r.bottom().min(area.bottom()));
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 /// What [`list`] needs of a list.
@@ -501,7 +546,9 @@ pub struct List<'a> {
     pub count: usize,
     /// The scroll offset from the top of the first row. NaN or infinite counts as 0.
     pub scroll: f32,
-    /// Whether several rows can be selected.
+    /// Whether several rows can be selected (UIA Selection's CanSelectMultiple). Through UIA each
+    /// row takes only `Select`; several rows are selected with the keyboard or Ctrl+click (see
+    /// the [module](self) on selection).
     pub multiselect: bool,
 }
 
