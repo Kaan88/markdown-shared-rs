@@ -130,7 +130,7 @@ is linked or run that way; say so when you report it.
 - **Nonsense in, nothing out.** Public functions take NaN, infinities, empty lists, zero sizes
   and hand-edited settings lines without panicking, and the tests feed them these.
 - **`unsafe` only at the system's edge.** It lives in the modules that call the OS: `platform`
-  (and `platform/recycle`), `snap`, `corners`, `place`, `menu_bar`, `open_documents`,
+  (and `platform/recycle`), `snap`, `handover`, `corners`, `place`, `menu_bar`, `open_documents`,
   `desktop_entry`, `blur/wl`, `shadow/wl`, `mdshared-app/crash`, `mdshared-app/single_mutex`, `mdshared-fetch/winhttp` and
   `curl`. Every block has a `// SAFETY:` line. A model, a widget or a parser has none.
 - Logical pixels in every public API; the painter multiplies by the scale and snaps to device

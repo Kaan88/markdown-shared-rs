@@ -1,11 +1,11 @@
 //! The hand-over of a second launch reaching a winit window (roadmap P8b).
 //!
-//! [`mdshared_app::single_mutex::send`] hands the first instance's window a second launch's
+//! `mdshared_app::single_mutex::send` (Windows) hands the first instance's window a second launch's
 //! command line in a `WM_COPYDATA`. That message is sent, not posted, so it reaches only the
 //! window procedure, and winit 0.30's `with_msg_hook` sees posted messages only: a winit window
 //! answers it with the default handling (0), and `send` gives false. [`listen`] replaces the
 //! window procedure once with one that gives each `WM_COPYDATA` to
-//! [`single_mutex::received`](mdshared_app::single_mutex::received): a hand-over for the
+//! `single_mutex::received`: a hand-over for the
 //! application's id is queued, answered with 1 (so `send` gives true), and `wake` is called; any
 //! other message goes on to winit's procedure. The loop takes the queued hand-overs with [`take`]
 //! when it is woken.
@@ -26,6 +26,10 @@
 
 use std::ffi::OsString;
 
+/// At most this many hand-overs wait for [`take`]; a loop that does not take them (stuck in a
+/// modal loop) keeps the newest.
+pub const MAX_QUEUED: usize = 64;
+
 /// Replaces the window procedure of `window` once, so hand-overs for `app_id` are queued for
 /// [`take`] and `wake` is called for each. True when it is in place (also when it already was:
 /// the first `app_id` and `wake` stay). Call it on the window's own thread (the event loop's);
@@ -44,8 +48,8 @@ pub fn listen(_window: &winit::window::Window, _app_id: &str, _wake: impl Fn() +
 }
 
 /// The hand-overs `window` received since the last call, oldest first: each the arguments of
-/// one launch, as [`single_mutex::send`](mdshared_app::single_mutex::send) was given them.
-/// Empty when none came, before [`listen`], and off Windows.
+/// one launch, as `single_mutex::send` was given them. At most [`MAX_QUEUED`] wait: past that the
+/// oldest is dropped. Empty when none came, before [`listen`], and off Windows.
 #[cfg(windows)]
 pub fn take(window: &winit::window::Window) -> Vec<Vec<OsString>> {
     hwnd_of(window).map(imp::take).unwrap_or_default()
@@ -125,15 +129,21 @@ mod imp {
         });
         // The entry is in place before the procedure that looks for it.
         ENTRIES.with(|e| e.borrow_mut().push(entry));
-        // SAFETY: `proc` is an `extern "system"` function with a window procedure's signature
-        // that calls `prev` for everything it does not handle; the window belongs to this thread.
-        unsafe {
+        // SAFETY: `handover_proc` is an `extern "system"` function with a window procedure's
+        // signature that calls `prev` for everything it does not handle; the window belongs to
+        // this thread. It gives the procedure it replaced, `prev`, which is not 0.
+        let replaced = unsafe {
             SetWindowLongPtrW(
                 window,
                 GWLP_WNDPROC,
                 handover_proc as *const () as usize as isize,
             )
         };
+        if replaced == 0 {
+            // Not replaced: the entry would never see the window's end.
+            ENTRIES.with(|e| e.borrow_mut().retain(|x| x.hwnd != hwnd));
+            return false;
+        }
         true
     }
 
@@ -163,7 +173,13 @@ mod imp {
         if let Some(args) =
             unsafe { mdshared_app::single_mutex::received(&state.app_id, msg, lparam) }
         {
-            state.queued.borrow_mut().push(args);
+            {
+                let mut queued = state.queued.borrow_mut();
+                if queued.len() >= super::MAX_QUEUED {
+                    queued.remove(0);
+                }
+                queued.push(args);
+            }
             (state.wake)();
             return 1;
         }
