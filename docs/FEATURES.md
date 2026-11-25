@@ -1050,6 +1050,67 @@ Mica and frost, the drag, resize and snap, the tooltip (no pointer rested on it)
 first-frame rules (no white flash, no flip). Linux (`host` and `host,a11y`) and macOS were only
 type-checked; the KDE Wayland fix (no backdrop off Windows) was not run there.
 
+## The settings form in motion, and a number row as a slider (`settings::Form::draw_animated`, `show_as_slider`, 2026-11-25, `feat/l10-settings-motion`, roadmap L10)
+
+`Form::draw_animated(p, pal, window, caret_on, anim, id)` draws the form `draw` draws, with
+motion from the window's `anim::Animator` (the caller begins and ends the frame; `id` names the
+form in it). A toggle row's knob slides and its fill fades in (`fluent::MOVE`, the motion of
+`toggle::draw_toggle_animated`); the chosen segment of a segmented choice slides to the new
+one, in the classic and the neutral look (held as a place inside the control, so a scroll is
+not a motion; a label reads as chosen while the pill is under its middle); a row's hover fill
+(its hairline fading out under it), a category's hover fill and the open dropdown's hover row
+(`Menu::draw_in_animated`) fade by `document::HOVER`; the scrollbar widens under the pointer
+(`scroll::draw_scrollbar_animated`); a slider row's thumb glides (`slider::draw_animated`).
+Names in the animator are made from `id`, the row's index and the row's id, so a row replaced
+by another starts at rest and two rows with one id cannot ask one name twice.
+`Form::set_high_contrast(on)` makes the highlights (hover fills, scrollbar, menu row, chosen
+segment) change at once in `draw_animated`; a switch's knob and a slider's thumb still move.
+It changes nothing in `draw`.
+
+`draw` and `draw_animated` share one drawing (`draw_with`); with no animator it takes exactly
+the paths it took before, and the existing freezes (`settings::unchanged`, `settings::frozen`,
+the style tests, the toggle's and the dropdown's frozen copies) pass unchanged. Not done: the
+form has no check box, so "ticks" has nothing to animate (the dropdown's menu draws its
+chosen mark as the menu draws it); the stepper's and the Close button's hover change at once.
+
+`Form::show_as_slider(id) -> bool` draws the number row `id` (`Row::number`, with its `step`
+and `unit`) as a slider instead of a stepper: the value and unit, then a 160 px track
+(`Form::slider_rect(i)`) drawn by `slider::draw`. No `Row` variant and no field was added; the
+value stays `Value::Number` and `set_value` clamps it as a number's. The marks are ids kept by
+the form: they outlast `set_rows`, and an id with no number row marks nothing until one comes;
+the call says whether such a row is there now. A form never told of a slider draws and answers
+as on main. Keys: Left and Right a step (Ctrl a page), Page Up and Page Down a page (five steps
+or a tenth of the span), Home and End the ends, `+` and `-` a step, each an `Outcome::Changed`
+landing on a multiple of the step from the low end; Up and Down still move the keyboard, as
+from every row of this form. A press on the track moves the value there at once (`Changed`)
+and takes the thumb; a press on the thumb takes it where it is. `Form::pointer(x, y) ->
+Outcome` is `pointer_move` with a drag's changes reported as they happen; with `pointer_move`
+(a `bool`) the change is reported by `release`. A drag ends at `set_rows` (the row in hand
+may now be another) and when the keys open a dropdown. The wheel scrolls the body over a
+slider, as over a stepper. The paged form (`settings::pages`) draws such a row as its stepper.
+
+The arithmetic is whole numbers in `i64`, so the keys are exact over the whole `i32` range,
+and a row built by hand with `min` over `max` is read with its ends swapped instead of
+panicking. The thumb's place is an `f32` fraction of the track (the slider widget on a track
+from 0 to 1): a press or a drag lands on the nearest whole number on the step's grid, held
+inside the ends, so over a span of more than about 2^24 a pointer cannot reach every number.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y` (23 tests in
+`settings/motion_tests.rs`: the animated form equals `draw` at rest in both themes and under
+`Policy::Never` after each kind of change; it differs in motion for the switch, a row's hover,
+the segment in both looks, the slider's thumb, the scrollbar and the dropdown menu's row, and
+equals `draw` again once settled; under high contrast a hover, the scrollbar and a choice are
+at once while a switch still slides; a form never told of a slider draws as one without the
+call, and a told one otherwise; the marks follow ids through `set_rows`; the slider's keys,
+press, drag and release give the values and outcomes stated; a drag ends when `set_rows` puts
+another slider at its index or a row above it, and when the keys open a dropdown; crossed ends
+do not panic; a range around 16 777 217 (2^24 + 1) steps exactly by the keys and stays inside
+its ends under the pointer, and the whole `i32` range does not overflow; odd windows do not
+panic), `cargo clippy --workspace --all-targets --features mdshared-ui/host,mdshared-ui/a11y
+-- -D warnings`, `cargo fmt --all --check`, on Windows only. `settings_motion_sheet` (ignored)
+writes the slider row and a frame in motion, light and dark, at 1 and 1.5. Not seen by a person
+in a running app; no application uses it yet.
+
 ## The tree's disclosure turns (`Painter::icon_rotated`, `glyph::draw_disclosure`, 2026-11-25, `feat/x3-disclosure`, roadmap X3)
 
 The last open part of X3. The toolkit draws no tree rows: the applications draw them and swap
