@@ -1489,3 +1489,38 @@ at its end on the first frame. Test (`chrome::tests::the_animated_pieces_are_the
 extended): the first frame of a hover is not the full hover, and the caption buttons, the new-tab button and the tab (left of its label) are at rest
 there; the way back starts from the full hover. Seen failing without the change. Not seen by a
 person.
+
+## A page switch that survives a resize (`PageTransition::fits`, `PageTransition::rebase`, 2026-11-26, `feat/x10-page-resize`, roadmap X10)
+
+Until now a switch held a snapshot of the old page taken at one size, and `apply` ended it as
+soon as the bitmap was another size: the frame then showed the new page plainly. An application
+that wants the switch to go on now has two additions, both methods on `PageTransition` and
+nothing else changed:
+
+- `fits(&bmp)` says whether the saved old page is of the bitmap's size, i.e. whether `apply`
+  would blend it. It is true when no switch runs (there is no old page to be wrong) and false
+  after the window was resized either way.
+- `rebase(&mut anim, old, scale)` is `begin_with` for a switch already running: it replaces the
+  old page with one the application drew again at the new size, records this frame's scale, and
+  leaves the animator's progress alone, so the switch goes on from where it was instead of
+  starting its time again. The effect and the timing are kept. With nothing running it answers
+  false and does nothing; an empty snapshot or reduced motion ends the switch; a snapshot of
+  another rectangle than `apply` is given still ends it, as any mismatch does.
+
+The frame that does it draws the old page again, laid out at the new size, takes
+`Painter::snapshot` of the region, calls `rebase`, and then draws the new page and calls `apply`,
+all in that same frame. An application that calls neither is as before.
+
+Run: `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast --
+--skip explorer_tests` (in `anim/page.rs`:
+`a_rebase_keeps_the_progress_and_an_empty_or_idle_one_does_not` checks `fits` idle, on the old
+size and on another, that the animator's progress is the same before and after `rebase`, and the
+empty, idle, reduced-motion and new-scale cases;
+`a_resize_mid_switch_draws_the_old_page_at_the_new_size_and_does_not_stretch_it` grows the
+window from 60 by 30 to 80 by 40 half way, rebases, and compares every pixel with a switch that
+began at 80 by 40 at the same moment, plus three sampled pixels: the old page's fixed-width green
+block against the new right edge, and the background outside the region; both fail with `fits`
+and `rebase` neutered); `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows. Not
+seen in a real window: no application or example drives `PageTransition`, so the resize path is
+exercised by the tests only.

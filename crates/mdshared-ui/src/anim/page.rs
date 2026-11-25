@@ -14,10 +14,16 @@
 //! switch ends there and then and the frame shows the new page plainly. A switch cut short is
 //! never wrong; an old page blended in the wrong place is.
 //!
-//! Deliberately not here: a switch that survives a resize (it would need the old page drawn
-//! again at the new size, which is the application's to do: draw it, take a snapshot, and
-//! [`begin_with`](PageTransition::begin_with) it), and transitions of more than one region at
-//! once (keep one `PageTransition` for each).
+//! A resize in the middle of a switch need not cut it short. An application that wants the
+//! switch to go on draws the old page once more, laid out at the new size, takes a
+//! [`Painter::snapshot`] of the region, and gives it to [`rebase`](PageTransition::rebase) in
+//! that same frame before drawing the new page and calling `apply`: the progress carries on
+//! from where it was. [`fits`](PageTransition::fits) says when that is needed; it is false once
+//! the bitmap is no longer the size the saved old page was taken at.
+//!
+//! Deliberately not here: drawing the old page again (that is the application's, which has the
+//! widgets and the new layout), and transitions of more than one region at once (keep one
+//! `PageTransition` for each).
 
 use super::{Animator, AsId, Easing, Id, Motion, Snapshot, fluent};
 use crate::gfx::{Painter, Rect};
@@ -191,6 +197,42 @@ impl PageTransition {
         anim.set(self.id, 0.0);
     }
 
+    /// Whether the saved old page still fits `bmp`, the bitmap this frame draws into: it is of
+    /// the size the switch began at, so [`apply`](Self::apply) would blend it. False after the
+    /// window was resized, larger or smaller, and true when no switch runs (there is then no
+    /// old page to be wrong).
+    ///
+    /// When it is false under a running switch, the application that wants the switch to go on
+    /// draws the old page again at the new size, takes [`Painter::snapshot`] of the region, and
+    /// gives it to [`rebase`](Self::rebase) before the new page is drawn and `apply` is called.
+    /// An application that does not do that is as before: `apply` ends the switch and the frame
+    /// shows the new page plainly.
+    pub fn fits(&self, bmp: &Bitmap) -> bool {
+        self.old.as_ref().is_none_or(|old| old.fits(bmp))
+    }
+
+    /// As [`begin_with`](Self::begin_with), for a switch already running: replaces its old page
+    /// with one drawn again at this frame's size, and the recorded scale with this frame's, and
+    /// lets the switch go on from where it is rather than starting its time again. Call it when
+    /// [`fits`](Self::fits) says the saved page is of another size, which is after the window
+    /// was resized: draw the old page as it was when the switch began but laid out in this
+    /// frame's bitmap, take a [`Painter::snapshot`] of the region, give it here, then draw the
+    /// new page and call [`apply`](Self::apply), all in that same frame. The effect and the
+    /// timing stay as they were.
+    ///
+    /// It does nothing and answers false when no switch runs, and ends the switch when the
+    /// snapshot is empty or the animator does not animate. A snapshot of another rectangle than
+    /// the one `apply` is given still ends the switch, as any other mismatch does.
+    pub fn rebase(&mut self, anim: &mut Animator, old: Snapshot, scale: f32) -> bool {
+        if self.old.is_none() || old.is_empty() || !anim.animates() {
+            self.cancel(anim);
+            return false;
+        }
+        self.old = Some(old);
+        self.scale = scale;
+        true
+    }
+
     /// Whether a switch is in flight.
     pub fn running(&self) -> bool {
         self.old.is_some()
@@ -210,7 +252,9 @@ impl PageTransition {
     /// and with the new page left as drawn, when the old page would no longer be in its place:
     /// the bitmap has another size than at the start (the window was resized), the painter
     /// another scale (the window moved to another screen), or `r` is another device rectangle
-    /// (the layout changed). Returns whether the switch is still running.
+    /// (the layout changed). A switch that should survive such a change is given the old page
+    /// again at the new size first ([`fits`](Self::fits) and [`rebase`](Self::rebase)).
+    /// Returns whether the switch is still running.
     ///
     /// The blend is of the whole region and does not heed the painter's clip.
     pub fn apply(&mut self, anim: &mut Animator, p: &mut Painter, r: Rect) -> bool {
@@ -285,11 +329,49 @@ mod tests {
 
     const OLD: [u8; 3] = [200, 0, 0];
     const NEW: [u8; 3] = [0, 0, 200];
+    const GREEN: [u8; 3] = [0, 200, 0];
+    const BACK: [u8; 3] = [9, 9, 9];
     const REGION: Rect = Rect::new(10.0, 5.0, 40.0, 20.0);
 
     fn at(bmp: &Bitmap, x: u32, y: u32) -> [u8; 3] {
         let o = ((y * bmp.width + x) * 4) as usize;
         [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]]
+    }
+
+    /// The first pixel at which two bitmaps of one size differ: its place and both colours,
+    /// so a mismatch says where it is rather than printing whole frames.
+    fn first_difference(a: &Bitmap, b: &Bitmap) -> Option<(u32, u32, [u8; 3], [u8; 3])> {
+        (0..a.height).find_map(|y| {
+            (0..a.width)
+                .find(|&x| at(a, x, y) != at(b, x, y))
+                .map(|x| (x, y, at(a, x, y), at(b, x, y)))
+        })
+    }
+
+    /// A frame's background and `page` in the region, its last column in white (to see it
+    /// move).
+    fn draw_page(p: &mut Painter, region: Rect, page: [u8; 3]) {
+        let (w, h) = (p.bmp.width as f32, p.bmp.height as f32);
+        p.fill(Rect::new(0.0, 0.0, w, h), BACK);
+        p.fill(region, page);
+        p.fill(
+            Rect::new(region.right() - 1.0, region.y, 1.0, region.h),
+            [255; 3],
+        );
+    }
+
+    /// The old page laid out at the size of `p`'s bitmap: `BACK` outside the region, `OLD`
+    /// inside it, and a green block of a fixed ten px against the region's right edge. A page
+    /// of forty px stretched to sixty would have that block fifteen wide, which is how a
+    /// stretch is told from a drawing at the new size.
+    fn draw_old(p: &mut Painter, region: Rect) {
+        let (w, h) = (p.bmp.width as f32, p.bmp.height as f32);
+        p.fill(Rect::new(0.0, 0.0, w, h), BACK);
+        p.fill(region, OLD);
+        p.fill(
+            Rect::new(region.right() - 10.0, region.y, 10.0, region.h),
+            GREEN,
+        );
     }
 
     /// A window whose region shows one flat page, and a switch of it under test.
@@ -299,25 +381,37 @@ mod tests {
         clock: ManualClock,
         anim: Animator,
         tr: PageTransition,
+        region: Rect,
     }
 
     impl Rig {
         fn new() -> Rig {
+            let mut rig = Rig::sized(60, 30, REGION);
+            rig.frame(0, OLD);
+            rig
+        }
+
+        /// A window `w` by `h` holding the old page in `region`, and a switch of it under test.
+        fn sized(w: u32, h: u32, region: Rect) -> Rig {
             let mut rig = Rig {
-                bmp: Bitmap::new(60, 30),
+                bmp: Bitmap::new(w, h),
                 gfx: Gfx::new(),
                 clock: ManualClock::new(),
                 anim: Animator::new(),
                 tr: PageTransition::new("page")
                     .with_timing(Duration::from_millis(100), Easing::Linear),
+                region,
             };
-            rig.frame(0, OLD);
+            {
+                let mut p = Painter::new(&mut rig.bmp, &mut rig.gfx, 1.0);
+                draw_old(&mut p, region);
+            }
             rig
         }
 
         fn begin(&mut self, effect: PageEffect) {
             let p = Painter::new(&mut self.bmp, &mut self.gfx, 1.0);
-            self.tr.begin(&mut self.anim, &p, REGION, effect);
+            self.tr.begin(&mut self.anim, &p, self.region, effect);
         }
 
         /// One frame `ms` later: the window cleared, the region filled with `page` (its last
@@ -328,10 +422,25 @@ mod tests {
             self.anim.begin_frame(self.clock.now());
             {
                 let mut p = Painter::new(&mut self.bmp, &mut self.gfx, 1.0);
-                p.fill(Rect::new(0.0, 0.0, 60.0, 30.0), [9, 9, 9]);
-                p.fill(REGION, page);
-                p.fill(Rect::new(49.0, 5.0, 1.0, 20.0), [255, 255, 255]);
-                self.tr.apply(&mut self.anim, &mut p, REGION);
+                draw_page(&mut p, self.region, page);
+                self.tr.apply(&mut self.anim, &mut p, self.region);
+            }
+            self.anim.end_frame().is_some()
+        }
+
+        /// One frame `ms` later after the window was resized: the bitmap already holds the old
+        /// page as the application drew it at the new size; this frame takes the snapshot
+        /// again and hands it over, then draws the new page and applies the switch.
+        fn frame_resized(&mut self, ms: u64, page: [u8; 3]) -> bool {
+            self.clock.advance_ms(ms);
+            self.anim.begin_frame(self.clock.now());
+            {
+                let mut p = Painter::new(&mut self.bmp, &mut self.gfx, 1.0);
+                assert!(!self.tr.fits(p.bmp), "the old page is of the old size");
+                let old = p.snapshot(self.region);
+                assert!(self.tr.rebase(&mut self.anim, old, p.scale));
+                draw_page(&mut p, self.region, page);
+                self.tr.apply(&mut self.anim, &mut p, self.region);
             }
             self.anim.end_frame().is_some()
         }
@@ -340,9 +449,7 @@ mod tests {
         fn plain(&mut self, page: [u8; 3]) -> Vec<u8> {
             let mut bmp = Bitmap::new(self.bmp.width, self.bmp.height);
             let mut p = Painter::new(&mut bmp, &mut self.gfx, 1.0);
-            p.fill(Rect::new(0.0, 0.0, 60.0, 30.0), [9, 9, 9]);
-            p.fill(REGION, page);
-            p.fill(Rect::new(49.0, 5.0, 1.0, 20.0), [255, 255, 255]);
+            draw_page(&mut p, self.region, page);
             bmp.pixels
         }
     }
@@ -568,5 +675,118 @@ mod tests {
         assert!(!r.tr.running(), "an empty snapshot is no switch");
         assert_eq!(Edge::Left.opposite(), Edge::Right);
         assert_eq!(Edge::Bottom.opposite(), Edge::Top);
+    }
+
+    #[test]
+    fn a_rebase_keeps_the_progress_and_an_empty_or_idle_one_does_not() {
+        // Nothing runs: there is no old page to be of another size, and a rebase does nothing.
+        let mut r = Rig::new();
+        assert!(r.tr.fits(&r.bmp));
+        let old = Snapshot::take(&r.bmp, 10, 5, 50, 25);
+        assert!(!r.tr.rebase(&mut r.anim, old, 1.0));
+        assert!(!r.tr.running());
+
+        // A running switch fits the window it began on, and not one of another size.
+        r.begin(PageEffect::Crossfade);
+        r.frame(0, NEW);
+        r.frame(30, NEW);
+        let t: f32 = r.anim.get("page").expect("the progress is the animator's");
+        assert!((0.25..0.35).contains(&t), "about 0.3 of the way: {t}");
+        assert!(r.tr.fits(&r.bmp));
+        r.bmp = Bitmap::new(80, 40);
+        assert!(!r.tr.fits(&r.bmp), "another size");
+
+        // The old page drawn again at the new size, handed over: the same switch, the same
+        // progress, and the new size from now on.
+        let old = Snapshot::take(&r.bmp, 10, 5, 70, 35);
+        assert!(r.tr.rebase(&mut r.anim, old, 1.0));
+        assert!(r.tr.running());
+        assert!(r.tr.fits(&r.bmp));
+        let same: f32 = r.anim.get("page").expect("the progress is still there");
+        assert_eq!(t, same, "the progress carries on");
+
+        // An empty snapshot ends it, and its progress goes with it.
+        assert!(!r.tr.rebase(&mut r.anim, Snapshot::default(), 1.0));
+        assert!(!r.tr.running());
+        assert!(r.anim.is_empty(), "its progress is forgotten");
+
+        // So does reduced motion asked for in the middle.
+        r.begin(PageEffect::Crossfade);
+        r.frame(0, NEW);
+        r.anim.set_system_reduced(true);
+        let old = Snapshot::take(&r.bmp, 10, 5, 70, 35);
+        assert!(!r.tr.rebase(&mut r.anim, old, 1.0));
+        assert!(!r.tr.running());
+        r.anim.set_system_reduced(false);
+
+        // A new scale is taken too: after a move to another screen the snapshot's rectangle
+        // and the frame's are both in the new scale's device pixels.
+        r.bmp = Bitmap::new(80, 40);
+        r.begin(PageEffect::Crossfade);
+        r.clock.advance_ms(10);
+        r.anim.begin_frame(r.clock.now());
+        assert!(r.tr.apply_dev(&mut r.anim, &mut r.bmp, (10, 5, 50, 25), 1.0));
+        let old = Snapshot::take(&r.bmp, 15, 8, 75, 38);
+        assert!(r.tr.rebase(&mut r.anim, old, 1.5));
+        assert!(
+            r.tr.apply_dev(&mut r.anim, &mut r.bmp, (15, 8, 75, 38), 1.5),
+            "the new scale is the one in force"
+        );
+        // And a rectangle that is not the snapshot's still ends it.
+        assert!(
+            !r.tr
+                .apply_dev(&mut r.anim, &mut r.bmp, (10, 5, 70, 35), 1.5)
+        );
+        assert!(!r.tr.running());
+        r.anim.end_frame();
+    }
+
+    #[test]
+    fn a_resize_mid_switch_draws_the_old_page_at_the_new_size_and_does_not_stretch_it() {
+        // The switch runs 40 ms of its 100 on the 60 by 30 window.
+        let mut r = Rig::new();
+        r.begin(PageEffect::Crossfade);
+        r.frame(0, NEW);
+        assert!(r.frame(40, NEW));
+        assert!(r.tr.running());
+
+        // The window grows to 80 by 40: the application draws the old page again, laid out
+        // for the new size, with its green block of ten px against the region's new right
+        // edge.
+        let region = Rect::new(10.0, 5.0, 60.0, 30.0);
+        r.bmp = Bitmap::new(80, 40);
+        r.region = region;
+        {
+            let mut p = Painter::new(&mut r.bmp, &mut r.gfx, 1.0);
+            draw_old(&mut p, region);
+        }
+        assert!(!r.tr.fits(&r.bmp), "the saved old page is of the old size");
+
+        // The next frame is at 50 ms, half way: it hands the old page over and goes on,
+        // rather than being cut short.
+        assert!(r.frame_resized(10, NEW));
+        assert!(r.tr.running(), "the switch was not cut short");
+        assert!(r.tr.fits(&r.bmp), "and it follows the new size now");
+
+        // A switch that had begun on the 80 by 40 window itself, at the same moment.
+        let mut want = Rig::sized(80, 40, region);
+        want.begin(PageEffect::Crossfade);
+        want.frame(0, NEW);
+        assert!(want.frame(50, NEW));
+        assert!(want.tr.running());
+
+        assert_eq!((r.bmp.width, r.bmp.height), (80, 40), "the new size");
+        let differing = first_difference(&r.bmp, &want.bmp);
+        assert!(
+            differing.is_none(),
+            "laid out anew, not stretched: {differing:?}"
+        );
+        // Where the old page is red at its new size too, the mix is half of each page...
+        assert_eq!(at(&r.bmp, 57, 10), [100, 0, 100]);
+        // ...and inside the green block, which a stretched 40 px page would have put at
+        // x = 57 (fifteen wide) but a page drawn at the new size has from x = 60.
+        assert_eq!(at(&r.bmp, 65, 10), [0, 100, 100]);
+        // Nothing of the old page is pasted outside the region.
+        assert_eq!(at(&r.bmp, 75, 35), BACK);
     }
 }
