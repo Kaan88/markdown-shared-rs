@@ -37,18 +37,21 @@
 //! still takes ScrollIntoView. UIA reports an empty rectangle for it, and its IsOffscreen is
 //! false all the same: AccessKit 0.25 does not set that property, so a client cannot learn from
 //! it whether a row shows. A rig that needs a row on screen (to click it, or to read where it is)
-//! calls ScrollIntoView and waits until the row's rectangle is not empty. So a scroll changes the list node, the rows that come into the viewport or leave it, and the two
-//! rows cut by its edges; a filter changes the list node and the rows that appear, or whose
+//! calls ScrollIntoView and waits until the row's rectangle is not empty.
+//!
+//! So a scroll changes the list node, the rows that come into the viewport or leave it, and the
+//! two rows cut by its edges; a filter changes the list node and the rows that appear, or whose
 //! position or bounds moved; a change of the list's width changes only the rows in view.
 //! [`plain_list`] is a short list whose items' bounds the caller gives, for the items of a group;
 //! the caller cuts them the same way, with [`clip`].
 //!
 //! **Selection.** AccessKit turns UIA's SelectionItem `Select`, `AddToSelection` and
 //! `RemoveFromSelection` all into the same [`Request::Click`], sent only when the row's selected
-//! state would change. They cannot be told apart, so `AddToSelection` and `RemoveFromSelection`
-//! are not supported. An application treats a click on an unselected row as `Select` (that row
-//! only) and a click on a selected row as nothing, so that `Select` on a selected row keeps it
-//! selected. A multi-select list is still told as such (UIA Selection's CanSelectMultiple), and
+//! state would change: a click on a selected row can only be `RemoveFromSelection`, and one on
+//! an unselected row is `Select` or `AddToSelection`, which cannot be told apart, so
+//! `AddToSelection` is not supported. An application treats a click on an unselected row as
+//! `Select` (that row only); a click on a selected row may deselect it (`purge_shape` ignores
+//! it). A multi-select list is still told as such (UIA Selection's CanSelectMultiple), and
 //! a person selects several rows with the keyboard or Ctrl+click as the application allows; a
 //! test rig does the same, with Ctrl+click or keys typed into the window (SendInput), and gets
 //! one row from each SelectionItem `Select`.
@@ -451,7 +454,8 @@ pub fn text(value: &str, author: &str, r: Rect) -> Node {
 
 /// A single-line text field (`textfield`): UIA Value, settable. The hint the field draws while it
 /// is empty ("Search (Ctrl+F)") is not here: give it with [`Node::set_placeholder`], which UIA
-/// shows as the HelpText a reader says after the name.
+/// shows as the HelpText a reader says after the name. AccessKit 0.25 reports it whether or not
+/// the field holds text (a field has no text runs, so it counts as empty).
 pub fn text_input(label: &str, author: &str, r: Rect, value: &str, secret: bool) -> Node {
     let mut n = named(
         if secret {

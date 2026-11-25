@@ -359,7 +359,7 @@ try {
         $row5 = ById $list 'Row4'
         $rs = ComSet $hwnd 'Row4'
         Check 'row position of size' ($rs.Position -eq 5 -and $rs.Size -eq 2000) "row 5: $($rs.Position) of $($rs.Size), name '$($row5.Current.Name)'"
-        # The row's name is its two columns: the program and its size (5 * 37 % 900 + 12 for
+        # The row's name is its two columns: the program and its size (4 * 37 % 900 + 12 for
         # program 5, whose index is 4).
         Check 'a row is named with its size' ($row5.Current.Name -eq 'Program 0005, 160 MB') "'$($row5.Current.Name)'"
         $si = Pattern $row5 $P.Select
@@ -429,7 +429,7 @@ try {
         $desc = ComDescription $hwnd 'ConfirmDialog'
         $body = ById $dlg 'ConfirmBody'
         $bodyText = if ($body) { $body.Current.Name } else { '(not found)' }
-        Check 'dialog has its body as text, and as its description' ($bodyText -eq '1 programs will be removed.' -and $desc -eq $bodyText) "ConfirmBody '$bodyText', FullDescription '$desc'"
+        Check 'dialog has its body as text, and as its description' ($bodyText -eq '1 program will be removed.' -and $desc -eq $bodyText) "ConfirmBody '$bodyText', FullDescription '$desc'"
         # The rest of the window is hidden while the dialog is open: AccessKit leaves hidden nodes
         # out of what UIA sees, so they are not found at all.
         $behind = ById $win 'UninstallButton'

@@ -744,11 +744,13 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   host begins and ends the tree, so AccessKit gets only what changed and the activation handler
   is served the whole tree. On Windows `Adapter::with_mixed_handlers` is made before the window
   is shown. The nodes are asked for once after the first frame, before the window is shown, then
-  only while an assistive technology listens: after a call that asked for a redraw or said
+  only once an assistive technology has asked (Windows' adapter stays active after that, for
+  the life of the window, so the cost is paid from then on): after a call that asked for a redraw or said
   `accessibility_changed`, after a resize or a change of scale, after the frame when the call is
   followed by one (so a layout made in `draw` is read), and after a frame whose `draw` said
   `accessibility_changed` (an animation that moved something). A redraw asked for inside `draw`
-  does not count. Nobody listening, nothing is built: one who arrives is served the last tree
+  does not count; a redraw wholly outside the window draws nothing and the nodes are asked for
+  at once. Before anyone has asked, nothing is built: one who arrives is served the last tree
   and the nodes are asked for again at once; asked before the first build, the handler answers
   nothing and the loop builds the first tree. Elsewhere the tree is not asked for.
 - **What is not reduced** (touch, pen, key releases, a dropped file) reaches `App::raw` as
@@ -763,8 +765,8 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
 - **Checked by hand after the audit (2026-11-25):** a UIA probe on the example, three runs: the
   window, the button by AutomationId `Hello` and the field are found with bounds where they are
   drawn, and Invoke arrives as a Click, also when the probe connects after the tree went stale.
-  At scale 1 only. CI's Windows job runs the example for two seconds. The Cargo lines follow `wk/a11y`'s layout (its working
-  copy of 2026-11-25), so the two merge easily; softbuffer 0.4.8, already in the lock, became an
+  At scale 1 only. CI's Windows job runs the example for two seconds. The probe is
+  `tests/uia/host.ps1`; it is not run by CI (it needs a desktop). softbuffer 0.4.8, already in the lock, became an
   optional dependency.
 
 Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and

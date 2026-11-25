@@ -302,7 +302,10 @@ mod shape {
         }
         /// The dialog's text under its title; also its body text and description in the tree.
         fn dialog_body(&self) -> String {
-            format!("{} programs will be removed.", self.sel.len())
+            match self.sel.len() {
+                1 => "1 program will be removed.".to_string(),
+                n => format!("{n} programs will be removed."),
+            }
         }
         fn footer(&self) -> String {
             format!(

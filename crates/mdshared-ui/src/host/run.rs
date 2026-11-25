@@ -62,8 +62,8 @@ struct Host<A: App> {
     access: Shared11y,
 }
 
-/// The accessibility tree, shared with the adapter's activation handler, which may ask for it
-/// on another thread.
+/// The accessibility tree, shared with the adapter's activation handler, which asks for it
+/// inside the window procedure (on Windows, the window's own thread).
 #[cfg(all(feature = "a11y", windows))]
 type Shared11y = std::sync::Arc<std::sync::Mutex<Access>>;
 
@@ -135,8 +135,8 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
     event_loop.run_app(&mut host)
 }
 
-/// Serves the whole tree at once when an assistive technology first asks, on whichever thread
-/// asks (the loop's proxy alone would answer with a placeholder first). A tree not kept up to
+/// Serves the whole tree at once when an assistive technology first asks, inside the window
+/// procedure (the loop's proxy alone would answer with a placeholder first). A tree not kept up to
 /// date while nobody listened is served as it is, and the loop is woken to ask for the nodes
 /// again.
 #[cfg(all(feature = "a11y", windows))]
@@ -406,6 +406,11 @@ impl<A: App> Host<A> {
         let scale = self.st.scale;
         let damage = std::mem::take(&mut self.st.damage);
         let Some(dev) = damage.device(scale, w, h) else {
+            // The damage fell wholly outside the window: no frame, but `after` kept the tree
+            // for one, so it is built now.
+            if self.st.touched {
+                self.refresh_tree(false);
+            }
             return;
         };
         self.st.animated = Damage::default();
@@ -698,14 +703,20 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
             Wake::Message(m) => self.call(now, |app, cx| app.message(cx, m)),
             Wake::Contrast => self.read_contrast(now, true),
             #[cfg(all(feature = "a11y", windows))]
-            Wake::Refresh => self.refresh_tree(false),
+            // Through `after`, so that a frame already asked for is drawn first and the
+            // nodes read its layout.
+            Wake::Refresh => {
+                self.st.touched = true;
+                self.after();
+            }
             #[cfg(all(feature = "a11y", windows))]
             Wake::Access(e) => match e.window_event {
                 accesskit_winit::WindowEvent::ActionRequested(req) => {
                     self.call(now, |app, cx| app.event(cx, Event::Action(req)));
                 }
-                // The direct handler (`Latest`) answers the first request, unless the tree was
-                // never built; then the loop builds it, and the first update holds it whole.
+                // Not sent while the direct handler (`Latest`) is installed: it answers the
+                // first request, or sends `Wake::Refresh` when the tree was never built. Kept
+                // for an adapter that sends it.
                 accesskit_winit::WindowEvent::InitialTreeRequested => self.refresh_tree(false),
                 // Nothing is kept for an assistive technology that leaves: with nobody
                 // listening the tree is no longer built.

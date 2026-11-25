@@ -75,12 +75,14 @@
 //! that tree, so AccessKit gets only what changed, and keeps it whole for the system's first
 //! request (served at once, on the thread that asks). On Windows the AccessKit adapter is made
 //! with `with_mixed_handlers` before the window is shown. The host asks for the nodes once
-//! after the first frame, before the window is shown, and then only while an assistive
-//! technology listens: after a call that asked for a redraw or said
+//! after the first frame, before the window is shown, and then only once an assistive
+//! technology has asked (on Windows the adapter stays active from then on, for the life of
+//! the window): after a call that asked for a redraw or said
 //! [`Cx::accessibility_changed`], after a resize or a change of scale, and after a frame in
 //! which `draw` said [`Cx::accessibility_changed`] (so bounds laid out in `draw` are read after
-//! it). A call that is followed by a frame is answered after that frame. With nobody
-//! listening nothing is built; when one arrives it is served the last tree at once and the
+//! it). A call that is followed by a frame is answered after that frame (a redraw asked for
+//! wholly outside the window draws nothing, and the nodes are asked for at once). Until one
+//! asks nothing is built; when one arrives it is served the last tree at once and the
 //! nodes are asked for again straight after. A request from one (Invoke, Toggle, Focus,
 //! ScrollIntoView) is [`Event::Action`]. Elsewhere there is no adapter yet and the nodes are
 //! not asked for.
@@ -267,8 +269,11 @@ pub trait App: 'static {
     /// Made with [`a11y::window`](crate::a11y::window) and [`Cx::scale`], the root's transform
     /// makes the bounds of everything under it logical px; a root without it needs bounds in
     /// device px ([`access_rect`]). By default the root with the window's title and nothing in
-    /// it. Asked for on Windows only, where the adapter serves it, and only while an assistive
-    /// technology listens (see the module's "Accessibility").
+    /// it. Asked for on Windows only, where the adapter serves it, and only once an assistive
+    /// technology has asked: from then on, for the life of the window, after every call that
+    /// changed something, as Windows' adapter does not go back to idle (see the module's
+    /// "Accessibility"). It is called inside the adapter's update: build nodes only, and do not
+    /// act on the window from here (minimize, drag, focus, close), which would re-enter it.
     #[cfg(feature = "a11y")]
     fn accessibility(
         &mut self,
