@@ -389,7 +389,7 @@ difference: the dialog paints its own with the row's colour inside it; these use
 Added to `menu::Menu`: `min_width(w)` (a drop-down's list is at least as wide as its field;
 off unless asked) and `highlight(i)` (the keyboard highlight set by index and brought into view).
 
-The list never covers its field. It is placed as `Menu::around` places a menu, but where it fits
+The list does not cover its field unless not even one row would fit beside it. It is placed as `Menu::around` places a menu, but where it fits
 neither below nor above the field it goes to the side with more room, cut to that room, and
 scrolls, instead of being pushed over the field (`submenu::around_clear`, crate-private, used
 through a crate-private placement of `Menu`; `Menu::around` itself is unchanged). While the list
@@ -429,7 +429,8 @@ seen any of them.
   `platform::caret_blink_time()` (`GetCaretBlinkTime`; INFINITE gives a steady caret). The blink
   restarts on input and when focus arrives; unfocused, with a selection, or under reduced motion
   it asks for no deadline, so the window sleeps. `focused` includes the window's own focus.
-  Tested on a manual clock; no application calls it yet, so it has not blinked in a window.
+  Tested on a manual clock; `examples/host.rs` blinks its field's caret through it, run
+  headless in CI only, so no person has watched it blink.
 - **P1, a selector bar** (`segments`). `selector_rects`, `selector_at`, `selector_key` (Left,
   Right, Home, End; no wrap), `draw_selector` and its animated form: the two-or-three-option
   switch's look with any count. Purge's tabs are underlined with a count in a second style;

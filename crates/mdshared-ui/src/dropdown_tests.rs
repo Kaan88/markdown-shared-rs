@@ -1120,6 +1120,17 @@ fn an_open_menu_follows_the_field_when_the_page_scrolls() {
     );
     assert_eq!((after.x, after.w), (before.x, before.w));
 
+    // A wider field after a resize: the list is at least as wide again.
+    let wider = Rect::new(scrolled.x, scrolled.y, 300.0, scrolled.h);
+    d.set_field(wider);
+    place(&mut d, AREA);
+    assert!(
+        d.menu().unwrap().rect().w >= 300.0,
+        "the list kept the old width"
+    );
+    d.set_field(scrolled);
+    place(&mut d, AREA);
+
     // A closed drop-down and an unusable field change nothing.
     d.set_field(Rect::new(f32::NAN, 0.0, 10.0, 10.0));
     place(&mut d, AREA);

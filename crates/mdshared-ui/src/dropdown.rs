@@ -26,7 +26,7 @@
 //! The menu is placed as [`Menu::around`](crate::menu::Menu::around) places a menu, round the
 //! field grown by [`MENU_GAP`] above and below: under the field with its left edges level and a
 //! gap of [`MENU_GAP`] px, above it where there is no room below, and leftwards where there is no
-//! room to the right. One rule is added: it never covers the field. Where it fits neither below
+//! room to the right. One rule is added: it does not cover the field. Where it fits neither below
 //! nor above, it goes to the side with more room and is cut to that room, and scrolls, unless
 //! not even one row would show on either side: then it covers the field as a plain menu does.
 //! It is at least as wide as the field up to the menu's widest (420 px), opens with the chosen option ticked and highlighted (brought into
@@ -233,8 +233,8 @@ impl<T> Dropdown<T> {
 
     /// Opens the menu under `field` and returns it: one row per option, the chosen one ticked
     /// and highlighted, placed as [`Menu::around`] places a menu round `field` grown by
-    /// [`MENU_GAP`] above and below, but never over the field (see the module doc), and at least
-    /// as wide as `field`. An open menu is opened again in the new place.
+    /// [`MENU_GAP`] above and below, but not over the field unless no row would show beside it
+    /// (see the module doc), and at least as wide as `field` (up to the menu's widest). An open menu is opened again in the new place.
     /// With no options, or a `field` that is not finite or has no area, nothing opens and the
     /// answer is None.
     pub fn open_menu(&mut self, field: Rect) -> Option<&mut Menu<usize>> {
@@ -267,6 +267,11 @@ impl<T> Dropdown<T> {
         }
         if let Some(menu) = self.menu.as_mut() {
             menu.set_around(Around::Clear(menu_anchor(field)));
+            menu.set_min_width(field.w);
+            // Cut shorter, the list keeps the highlighted row in view.
+            if let Some(row) = menu.hover {
+                menu.highlight(row);
+            }
         }
     }
 

@@ -144,9 +144,10 @@ pub(crate) enum Around {
     Below(Rect),
     /// Beside the rectangle (an item as wide as its menu), on the left first when `true`.
     Beside(Rect, bool),
-    /// Below the rectangle, flipped above or to the left when it does not fit, and never over
-    /// it: where it fits on neither side it is cut to the room on the roomier side and scrolls
-    /// (a drop-down's list, which must not hide its field).
+    /// Below the rectangle, flipped above or to the left when it does not fit, and not over it:
+    /// where it fits on neither side it is cut to the room on the roomier side and scrolls (a
+    /// drop-down's list, which must not hide its field), unless not even one row would show on
+    /// either side, where it is placed as [`Around::Below`] places it.
     Clear(Rect),
 }
 
@@ -181,6 +182,9 @@ pub struct Menu<T> {
     branches: Vec<bool>,
     /// The least width the menu is placed at ([`min_width`](Self::min_width)); zero for none.
     min_w: f32,
+    /// The highlighted row is drawn in the palette's accent with `on_accent`
+    /// ([`set_high_contrast`](Self::set_high_contrast)).
+    high_contrast: bool,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -214,6 +218,7 @@ impl<T: Clone> Menu<T> {
             went_up: false,
             branches: Vec::new(),
             min_w: 0.0,
+            high_contrast: false,
         }
     }
 
@@ -247,8 +252,24 @@ impl<T: Clone> Menu<T> {
     /// is placed in still narrow it, and a width that is not finite or not positive asks for
     /// nothing. A menu not given one is as wide as before.
     pub fn min_width(mut self, w: f32) -> Self {
-        self.min_w = if w.is_finite() { w.max(0.0) } else { 0.0 };
+        self.set_min_width(w);
         self
+    }
+
+    /// [`min_width`](Self::min_width) on a menu already made: the next placement uses it.
+    pub(crate) fn set_min_width(&mut self, w: f32) {
+        self.min_w = if w.is_finite() { w.max(0.0) } else { 0.0 };
+    }
+
+    /// Draws the highlighted row as Windows does under high contrast: filled with the palette's
+    /// `accent` and its label, mark, icon and hint in `on_accent`, which for the system's
+    /// contrast theme ([`crate::tokens::Tokens::from_system_colors`]) are its Highlight and
+    /// HighlightText ([`crate::tokens::selected`]). Off by default: the row is filled with
+    /// `hover` and keeps its colours, which under a contrast theme stays close to the popup.
+    /// Pass the host's `Cx::high_contrast` or
+    /// [`crate::platform::system_high_contrast`].
+    pub fn set_high_contrast(&mut self, on: bool) {
+        self.high_contrast = on;
     }
 
     pub(crate) fn set_around(&mut self, around: Around) {
@@ -461,10 +482,14 @@ impl<T: Clone> Menu<T> {
                 );
                 p.fill(line, pal.popup_line);
             }
-            if self.hover == Some(i) && item.enabled {
-                p.rbox(r, 5.0, pal.hover);
+            let lit = self.hover == Some(i) && item.enabled;
+            let strong = lit && self.high_contrast;
+            if lit {
+                p.rbox(r, 5.0, if strong { pal.accent } else { pal.hover });
             }
-            let color = if item.enabled { pal.text } else { pal.faint };
+            // Under high contrast everything on the highlighted row reads on Highlight.
+            let ink = |c| if strong { pal.on_accent } else { c };
+            let color = ink(if item.enabled { pal.text } else { pal.faint });
             let mut x = r.x + 9.0;
             if marks || icons {
                 // The check mark has a column of its own before the icons, so an item shows both
@@ -472,19 +497,19 @@ impl<T: Clone> Menu<T> {
                 // icons would be.
                 let mut col = r.x + 18.0;
                 if item.checked {
-                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), pal.accent);
+                    p.icon(crate::glyph::CHECK, 14.0, col, r.cy(), ink(pal.accent));
                 }
                 if marks && icons {
                     col += MARK;
                 }
                 if icons && !item.icon.is_empty() {
-                    let c = if item.enabled { pal.muted } else { pal.faint };
+                    let c = ink(if item.enabled { pal.muted } else { pal.faint });
                     p.icon(item.icon, 14.0, col, r.cy(), c);
                 }
                 x = col + 18.0;
             }
             let hint_w = if self.opens_submenu(i) {
-                let c = if item.enabled { pal.muted } else { pal.faint };
+                let c = ink(if item.enabled { pal.muted } else { pal.faint });
                 p.icon(crate::glyph::RIGHT, 12.0, r.right() - 12.0, r.cy(), c);
                 ARROW - 2.0
             } else if item.hint.is_empty() {
@@ -496,7 +521,7 @@ impl<T: Clone> Menu<T> {
                     r.right() - 10.0,
                     r.cy(),
                     &item.hint,
-                    pal.faint,
+                    ink(pal.faint),
                 ) + 18.0
             };
             let (label, key) = self.shown(&item.label);
@@ -692,6 +717,84 @@ mod tests {
         let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
         menu.place_in(&mut p, area);
         menu
+    }
+
+    #[test]
+    fn under_high_contrast_the_highlighted_row_is_highlight_with_highlight_text() {
+        let colors = crate::tokens::SystemColors {
+            window: crate::gfx::rgb(0xfffaef),
+            window_text: crate::gfx::rgb(0x3d3d3d),
+            highlight: crate::gfx::rgb(0x903909),
+            highlight_text: crate::gfx::rgb(0xfff5e3),
+            hot_light: crate::gfx::rgb(0x1c5e75),
+            gray_text: crate::gfx::rgb(0x676767),
+            button_face: crate::gfx::rgb(0xfffaef),
+            button_text: crate::gfx::rgb(0x3d3d3d),
+        };
+        let pal = crate::tokens::Tokens::from_system_colors(&colors).palette;
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        let draw = |hc: Option<bool>| {
+            let mut menu = Menu::new(many(3), 40.0, 40.0, false);
+            menu.highlight(1);
+            if let Some(on) = hc {
+                menu.set_high_contrast(on);
+            }
+            let mut bmp = Bitmap::new(300, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, pal.page);
+            menu.draw_in(&mut p, &pal, area);
+            (bmp, menu.row_rect(0), menu.row_rect(1))
+        };
+        let px = |b: &Bitmap, x: f32, y: f32| {
+            let o = (y as usize * b.width as usize + x as usize) * 4;
+            [b.pixels[o + 2], b.pixels[o + 1], b.pixels[o]]
+        };
+        let count = |b: &Bitmap, r: Rect, c: crate::gfx::Rgb| {
+            let mut n = 0;
+            for y in r.y as usize..r.bottom() as usize {
+                for x in r.x as usize..r.right() as usize {
+                    if px(b, x as f32, y as f32) == c {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let (plain, row0, row1) = draw(None);
+        let (off, _, _) = draw(Some(false));
+        let (on, _, _) = draw(Some(true));
+        assert!(
+            off.pixels == plain.pixels,
+            "off is the default, pixel for pixel"
+        );
+        assert_eq!(px(&plain, row1.x + 4.0, row1.cy()), pal.hover);
+        assert_eq!(px(&on, row1.x + 4.0, row1.cy()), colors.highlight);
+        // The label is drawn in HighlightText (light on Desert's dark Highlight); its
+        // antialiased edges blend, so count the pixels near it.
+        let mut light = 0;
+        for y in row1.y as usize..row1.bottom() as usize {
+            for x in row1.x as usize..row1.right() as usize {
+                let c = px(&on, x as f32, y as f32);
+                if c[0] >= 0xd0 && c[1] >= 0xc0 && c[2] >= 0xb0 {
+                    light += 1;
+                }
+            }
+        }
+        assert!(
+            light > 10,
+            "the label is in HighlightText ({light} light pixels)"
+        );
+        assert_eq!(
+            count(&on, row1, pal.text),
+            0,
+            "no window text left on Highlight"
+        );
+        assert_eq!(
+            count(&on, row0, pal.text),
+            count(&plain, row0, pal.text),
+            "other rows unchanged"
+        );
     }
 
     fn many(n: u8) -> Vec<Item<u8>> {
