@@ -107,6 +107,20 @@ Read on 2026-11-24 from Microsoft Learn, "Timing and easing"
 
 Motions made of them: `FADE` (83 ms linear), `ENTER` and `EXIT` (167 ms), `ENTER_LARGE` (250 ms),
 `MOVE` and `MOVE_LARGE` (point to point, 167 and 250 ms), `PAGE` (250 ms decelerating).
+### For the document apps (`anim::document`)
+
+One set of motions for mdview and mdedit, so the two move alike (roadmap D5). Each `Pair` has an
+`enter` and an `exit`, and `pair.transient()` gives an empty `Transient` that uses them.
+
+| Name | Enter | Exit |
+|---|---|---|
+| `MENU` | `MENU_ENTER`: 117 ms decelerating (chosen by the owner over 167 ms, 2026-11-25) | `fluent::EXIT` |
+| `TIP` | `fluent::FADE` | `fluent::FADE` |
+| `TOAST` | `fluent::ENTER` | `fluent::EXIT` |
+| `DIALOG` | `fluent::ENTER_LARGE` | `fluent::EXIT` |
+| `HOVER` | `fluent::FADE`, for a hover or pressed look | |
+| `TIP_DELAY` | 500 ms of rest before a tooltip shows (`tooltip::Tooltip`) | |
+
 `fluent::web` holds the Fluent 2 tokens of the web library (`microsoft/fluentui`,
 `packages/tokens/src/global/durations.ts` and `curves.ts`): 50 to 500 ms and nine curves. Not
 read: WinUI's own `Common_themeresources_any.xaml` (the paths tried were not found), so the three
@@ -291,6 +305,26 @@ Every call that types, deletes, moves the caret or changes the selection starts 
 on, with no `forget` from the caller. While the field is not focused, and while a selection is
 shown (the caret is hidden over it, as on Windows), the animator is not asked, so `end_frame`
 gives no deadline for the caret and the window sleeps.
+
+### What a motion touches, and frosted chrome
+
+A window that repaints only what changed must repaint everything a popup's entrance or exit
+touches, on each frame of it and on the frame after it has gone. That is wider than the popup:
+its shadow, and the drop or slide it moves by. `presence_bounds()` says it, as last placed:
+`Menu::presence_bounds` (every `Entrance`), `Cascade::presence_bounds` (each submenu's slide
+too), `Bubble::presence_bounds` (a toast's rise), `overlay::dialog_presence_bounds(card)` and
+`Palette::presence_bounds`. For a piece of the application's own, `anim::pop_bounds(bounds,
+shift)` grows what `pop(p, bounds, t, shift, ..)` is given by the shift and a device pixel. Do
+not guess with `rect.inset(-20.0)`: a menu opened above its anchor reaches 23 px.
+
+Frost marks the window's chrome with alpha 254 for the compositor (`frost`). A fade mixes two
+pictures, and a mix of a marked pixel with an unmarked one would be read as chrome and turn
+opaque half-way. `Painter::set_frost_key(Some(key))` gives the painter the frost's key, and
+`Painter::fade` (so `pop` and every presence) then mixes through `Snapshot::crossfade_keyed`:
+where one side is frosted chrome and the other is not, the pixel is mixed premultiplied and
+leaves the mark, so the compositor shows a fade. `host` sets the key itself on each frame; an
+application that presents its own frame calls `p.set_frost_key(frost.key().copied())` before
+it draws. With no key, a fade is the plain `Snapshot::crossfade`.
 
 ## Widgets with motion
 

@@ -1427,6 +1427,11 @@ pub fn motion_reduced() -> bool {
 /// this the setting was read only when the window got the keyboard back. On macOS nothing
 /// changes behind the application's back (the application reads again when its window gains
 /// the focus), so the wake is dropped and never called.
+///
+/// The first call on Windows (of this or [`watch_contrast`]) waits until the hidden window's
+/// thread has made the window: normally a few milliseconds, at most five seconds when that
+/// thread never answers, after which nothing is heard. Call it from a helper thread when the
+/// caller must not wait.
 pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
     imp::watch_motion_reduced(wake)
 }
