@@ -149,6 +149,11 @@ pub enum Kind {
     Rewrite,
 
     Markdown,
+    /// Files linked into a library file and nothing else (the task window's "File them", a
+    /// folder added to the library): no note is written, no file is read or changed but the
+    /// library file. Its notes are all `created: false`, so undo takes out their lines and never
+    /// touches a file; it has no source.
+    Links,
 }
 
 impl Kind {
@@ -159,6 +164,7 @@ impl Kind {
             Kind::Rewrite => "rewrite",
 
             Kind::Markdown => "markdown",
+            Kind::Links => "links",
         }
     }
 
@@ -169,6 +175,7 @@ impl Kind {
             "rewrite" => Some(Kind::Rewrite),
 
             "markdown" => Some(Kind::Markdown),
+            "links" => Some(Kind::Links),
             _ => None,
         }
     }
@@ -1245,6 +1252,74 @@ pub fn start_rewrite(
         originals: Vec::new(),
         added: Vec::new(),
     };
+    let path = record.create(library)?;
+    Ok((path, record))
+}
+
+/// The record of a run that only linked files into `group.file` ([`Kind::Links`]), made after
+/// the links are in: `before` is the library file's text before them (for a file the run made,
+/// which `group.created` then says, the heading it was made with). Each link becomes a note the run did not make, so
+/// undo takes its line out and never the file; the headings `before` did not have are the run's
+/// own; and when the file holds exactly `before` plus the links, that is kept too, so undo can
+/// give the file back byte for byte while nothing else changed it.
+pub fn links_record(
+    library: &Path,
+    instruction: &str,
+    group: Group,
+    links: &[Link],
+    before: &str,
+) -> io::Result<(PathBuf, Record)> {
+    let base = group.file.parent().unwrap_or(Path::new("")).to_path_buf();
+    let old = Some(library::parse(before, &base));
+    let mut sections_added: Vec<Vec<String>> = Vec::new();
+    for link in links {
+        for n in 1..=link.sections.len() {
+            let path: Vec<String> = link.sections[..n].to_vec();
+            let known = old
+                .as_ref()
+                .is_some_and(|p| p.sections.iter().any(|s| sections_eq(s, &path)));
+            if !known && !sections_added.iter().any(|s| sections_eq(s, &path)) {
+                sections_added.push(path);
+            }
+        }
+    }
+    let (secs, started) = now_utc();
+    let mut record = Record {
+        version: RECORD_VERSION,
+        kind: Kind::Links,
+        started,
+        started_secs: secs,
+        state: State::Done,
+        instruction: instruction.to_string(),
+        sent: None,
+        source: Source {
+            path: PathBuf::new(),
+            len: 0,
+            sha256: String::new(),
+            recycled: false,
+        },
+        group: group.clone(),
+        folders: Vec::new(),
+        notes: links
+            .iter()
+            .map(|l| NoteRec {
+                path: link_target(&l.path, &base),
+                created: false,
+                sha256: String::new(),
+                ranges: Vec::new(),
+                heading_shift: 0,
+                title_added: false,
+                sections: l.sections.clone(),
+                line: l.line.clone(),
+            })
+            .collect(),
+        pictures: Vec::new(),
+        sections_added,
+        moved: None,
+        originals: Vec::new(),
+        added: Vec::new(),
+    };
+    record.keep_added(&group.file, Some(before.to_string()), links, library);
     let path = record.create(library)?;
     Ok((path, record))
 }
@@ -2846,6 +2921,21 @@ impl Reach {
         if !reach.is_library_file(file) {
             return Err(outside(file));
         }
+        // A run of links names files anywhere: they are the owner's, linked where they are, and
+        // undo never touches them, only their lines. So a record that says it made a file, a
+        // folder or a picture is not one a run of links writes, and none of it is acted on.
+        if record.kind == Kind::Links {
+            if let Some(note) = record.notes.iter().find(|n| n.created) {
+                return Err(foreign(&note.path));
+            }
+            if let Some(folder) = record.folders.first() {
+                return Err(foreign(folder));
+            }
+            if let Some(picture) = record.pictures.first() {
+                return Err(foreign(&picture.path));
+            }
+            return Ok(reach);
+        }
         for folder in &record.folders {
             if !reach.allows(folder) {
                 return Err(outside(folder));
@@ -3066,7 +3156,12 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     // The original. Undo is the one thing that deletes, so it does not run unless the notes can
     // not be the only copy: the original is where it was, with the length and the digest it had.
     // A source in the Recycle Bin must be back for the same reason.
-    let state = source_state(&record.source);
+    // A run of links has no source: nothing was cut from a file, so nothing can be its only copy.
+    let state = if record.kind == Kind::Links {
+        SourceState::Same
+    } else {
+        source_state(&record.source)
+    };
     if state != SourceState::Same {
         plan.refusal = Some(source_refusal(record, state));
         return (plan, None);
@@ -3447,7 +3542,7 @@ pub fn undo_with(
             report.group_kept = true;
         } else if reach.is_library_file(file)
             && file.symlink_metadata().is_ok_and(|m| m.is_file())
-            && only_heading_and_home(file)
+            && (only_heading_and_home(file) || holds_what_it_was_made_with(record, file))
         {
             if std::fs::remove_file(file).is_ok() {
                 report.group_removed = true;
@@ -3561,6 +3656,19 @@ fn rewrite_chains(record: &Record) -> Vec<(&Original, &Original)> {
 }
 
 /// Whether a library file holds nothing but its group's heading and its `home:` line.
+/// A run of links makes a group from the library's template (heading, `home:` and the lines
+/// that say what the file is), and records that text as the file's text before its links. Its
+/// group goes when the file holds that text exactly again: nothing the owner wrote is in it.
+fn holds_what_it_was_made_with(record: &Record, file: &Path) -> bool {
+    if record.kind != Kind::Links || !record.group.created {
+        return false;
+    }
+    let Some(added) = record.added.iter().find(|a| same_path(&a.file, file)) else {
+        return false;
+    };
+    library_text_of(file).is_some_and(|now| now == added.before)
+}
+
 fn only_heading_and_home(path: &Path) -> bool {
     let Some(bytes) = read_regular(path, library::MAX_FILE_BYTES as u64, false) else {
         return false;
@@ -6603,6 +6711,161 @@ mod tests {
         assert_eq!(done.later.len(), 3, "{done:?}");
         assert!(one.is_file() && two.is_file() && map.is_file());
         assert_eq!(read(&library.join("Trip.md")), group);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn links_of(base: &Path, files: &[(&Path, &str, &[&str])]) -> Vec<Link> {
+        let _ = base;
+        files
+            .iter()
+            .map(|(path, title, sections)| Link {
+                path: path.to_path_buf(),
+                title: title.to_string(),
+                sections: sections.iter().map(|s| s.to_string()).collect(),
+                line: library::link_line(title, path),
+            })
+            .collect()
+    }
+
+    /// The task window's "File them" and a folder added to the library write links only: their
+    /// record is a run of links, and its undo gives the library file back and never touches a
+    /// file it linked (the pictures plan, section 14).
+    #[test]
+    fn a_run_of_links_is_undone_to_the_byte_and_its_files_are_left_alone() {
+        let dir = scratch("links-undo");
+        let library = dir.join("library");
+        let group = library.join("food.md");
+        write_file(
+            &group,
+            "# Food
+
+- [Old](old.md)
+",
+        );
+        write_file(
+            &library.join("old.md"),
+            "# Old
+",
+        );
+        let pasta = dir.join("elsewhere").join("pasta.md");
+        write_file(
+            &pasta, "# Pasta
+",
+        );
+        let menu = dir.join("elsewhere").join("menu.pdf");
+        write_file(
+            &menu,
+            "%PDF-1.4
+",
+        );
+        let links = links_of(
+            &library,
+            &[(&pasta, "Pasta", &["Dinner"]), (&menu, "Menu", &[])],
+        );
+        let before = read(&group);
+        std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
+        let g = Group {
+            name: "Food".to_string(),
+            file: group.clone(),
+            created: false,
+            home: library.clone(),
+        };
+        let (path, record) = links_record(&library, "by dish", g, &links, &before).expect("made");
+        assert_eq!(record.kind, Kind::Links);
+        assert_eq!(record.state, State::Done);
+        assert!(record.notes.iter().all(|n| !n.created));
+        assert_eq!(record.sections_added, vec![vec!["Dinner".to_string()]]);
+        assert_eq!(record.added.len(), 1, "the add is kept to the byte");
+        let loaded = load(&path, &library).expect("it reads back");
+        assert_eq!(loaded.kind, Kind::Links);
+        assert_eq!(loaded.notes.len(), 2);
+
+        let plan = prepare(&loaded, &library);
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        let mut gate = TestGate::new();
+        let report = undo(&path, &loaded, &library, &mut gate);
+        assert_eq!(read(&group), before, "{report:?}");
+        assert_eq!(
+            read(&pasta),
+            "# Pasta
+",
+            "a linked file is never touched"
+        );
+        assert_eq!(
+            read(&menu),
+            "%PDF-1.4
+"
+        );
+        assert_eq!(load(&path, &library).map(|r| r.state), Some(State::Undone));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_of_links_that_says_it_made_a_file_is_not_acted_on() {
+        let dir = scratch("links-foreign");
+        let library = dir.join("library");
+        let group = library.join("food.md");
+        write_file(
+            &group, "# Food
+",
+        );
+        let pasta = dir.join("pasta.md");
+        write_file(
+            &pasta, "# Pasta
+",
+        );
+        let links = links_of(&library, &[(&pasta, "Pasta", &[])]);
+        let before = read(&group);
+        std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
+        let g = Group {
+            name: "Food".to_string(),
+            file: group.clone(),
+            created: false,
+            home: library.clone(),
+        };
+        let (_, mut record) = links_record(&library, "", g, &links, &before).expect("made");
+        record.notes[0].created = true;
+        let plan = prepare(&record, &library);
+        assert!(plan.refusal.is_some(), "a run of links makes no file");
+        assert!(!plan.acts());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_of_links_that_made_its_group_takes_the_group_away() {
+        let dir = scratch("links-group");
+        let library = dir.join("library");
+        let group = library.join("trips.md");
+        let pasta = dir.join("japan.md");
+        write_file(
+            &pasta, "# Japan
+",
+        );
+        let links = links_of(&library, &[(&pasta, "Japan", &["Asia"])]);
+        let made = library::new_group_with_home("Trips", Some(Path::new("trips"))).expect("made");
+        let made = made.as_str();
+        write_file(&group, &with_links_added(made, &links));
+        let g = Group {
+            name: "Trips".to_string(),
+            file: group.clone(),
+            created: true,
+            home: library.clone(),
+        };
+        let (path, record) = links_record(&library, "", g, &links, made).expect("made");
+        let mut gate = TestGate::new();
+        let report = undo(&path, &record, &library, &mut gate);
+        assert!(
+            !group.exists(),
+            "the group the run made goes: {:?} {:?}",
+            std::fs::read_to_string(&group),
+            record.added
+        );
+        let _ = report;
+        assert_eq!(
+            read(&pasta),
+            "# Japan
+"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
