@@ -294,7 +294,15 @@ pub fn button_fill_animated(
 ) -> Option<(Rgb, f32)> {
     let t = anim.toggle(Id::new(id).with("hover"), hovered, document::HOVER);
     if open || (pressed && hovered) || t >= 1.0 || t <= 0.0 {
-        return button_fill(pal, hovered || t >= 1.0, pressed, on, open).map(|c| (c, 1.0));
+        // At the ends the look is the fade's, not the pointer's: on the frame a hover begins
+        // (t = 0) it is still the rest look.
+        let lit = if open || (pressed && hovered) {
+            hovered
+        } else {
+            t > 0.0
+        };
+        // A press shows while the pointer is on the button only.
+        return button_fill(pal, lit, pressed && hovered, on, open).map(|c| (c, 1.0));
     }
     let lit = button_fill(pal, true, false, on, false).unwrap_or(pal.hover);
     match button_fill(pal, false, false, on, false) {
@@ -319,7 +327,8 @@ pub fn draw_win_button_animated(
 ) {
     let t = anim.toggle(Id::new(id).with("hover"), hovered, document::HOVER);
     if (pressed && hovered) || t >= 1.0 || t <= 0.0 {
-        return draw_win_button(p, pal, kind, b, maximized, hovered || t >= 1.0, pressed);
+        let lit = (pressed && hovered) || t > 0.0;
+        return draw_win_button(p, pal, kind, b, maximized, lit, pressed);
     }
     let g = match kind {
         WinButton::Close => glyph::WIN_CLOSE,
@@ -356,7 +365,9 @@ pub fn draw_tab_animated(
 ) -> TabDrawn {
     let quiet = !s.active && !s.dragging;
     let t = anim.toggle(Id::new(id).with("hover"), s.hovered, document::HOVER);
-    if !quiet || t >= 1.0 || t <= 0.0 {
+    // A quiet hovered tab at t = 0 (the frame its hover begins) takes the way below, which then
+    // draws the rest look with the close button, shown at once.
+    if !quiet || t >= 1.0 || (t <= 0.0 && !s.hovered) {
         let s = TabState {
             hovered: s.hovered || (quiet && t >= 1.0),
             ..*s
@@ -438,7 +449,7 @@ pub fn draw_new_tab_button_animated(
             p.icon(glyph::PLUS, 12.0, b.cx(), b.cy() - 0.5, pal.text);
             b
         }
-        _ => draw_new_tab_button(p, pal, x, avail, hovered || fill.is_some(), pressed),
+        _ => draw_new_tab_button(p, pal, x, avail, fill.is_some(), pressed),
     }
 }
 
@@ -506,8 +517,31 @@ mod tests {
             px
         };
         assert!(frame(false) == plain(false), "first seen: at rest");
-        // The motion starts on the frame that asks; one later it is on its way.
-        frame(true);
+        // The motion starts on the frame that asks, from the rest look (no flash of the full
+        // hover); one later it is on its way.
+        let first = frame(true);
+        assert!(
+            first != plain(true),
+            "the first frame of a hover is not the full hover"
+        );
+        let cols = |px: &[u8], x0: usize, x1: usize| {
+            (0..TITLE_H as usize)
+                .flat_map(|y| px[(y * 400 + x0) * 4..(y * 400 + x1) * 4].to_vec())
+                .collect::<Vec<u8>>()
+        };
+        let rest = plain(false);
+        // The caption buttons, the new-tab button and the tab left of its label (its close
+        // button shows at once, so the whole tab is not the rest look).
+        for (x0, x1, what) in [
+            (min.x as usize, 400, "the caption buttons"),
+            (174, 262, "the new-tab button"),
+            (50, 84, "the tab"),
+        ] {
+            assert!(
+                cols(&first, x0, x1) == cols(&rest, x0, x1),
+                "{what} at rest"
+            );
+        }
         clock.advance_ms(40);
         let on_way = frame(true);
         assert!(
@@ -516,7 +550,10 @@ mod tests {
         );
         clock.advance_ms(500);
         assert!(frame(true) == plain(true), "arrived");
-        frame(false);
+        assert!(
+            frame(false) == plain(true),
+            "the way back starts from the full hover"
+        );
         clock.advance_ms(40);
         let back = frame(false);
         assert!(
