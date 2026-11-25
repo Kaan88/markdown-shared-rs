@@ -87,7 +87,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | L7 | **Drag and drop inside a window.** A drag that starts after a threshold, a drag image, drop targets that light up, drop position between rows, auto-scroll at the edges, files dropped from the system (winit's hover and drop of paths) | M | medium | none | `rows`, `grid`, `select`, `anim` | open |
 | L8 | **Dragging files out to other applications**, which winit does not do and needs OLE, XDND/Wayland data devices and NSDraggingSource | L | high | none (three systems' glue, `unsafe`) | L7, `platform` | open |
 | L9 | **Files and images on the clipboard.** Copy and cut of file lists (with the "cut" flag file managers honour), paste of them; an image as pixels, both ways | M | high | decided: hand-written formats | `platform` clipboard, `cf_html` as the pattern for a pure format | open |
-| L10 | **Settings form with motion and the new widgets.** `settings::Form` draws its own switches, ticks and scrollbar; give it an animator and a slider row | M | medium | none | `settings`, `slider`, `anim`; must stay pixel-identical when not opted in | open |
+| L10 | **Settings form with motion and the new widgets.** `settings::Form` draws its own switches, ticks and scrollbar; give it an animator and a slider row | M | medium | none | `settings`, `slider`, `anim`; must stay pixel-identical when not opted in | claimed: Shared toolkit session for the md apps, 2026-11-25 |
 
 ## Files
 
@@ -181,8 +181,8 @@ Already on the roadmap, fast-tracked (the rows stay where they are, with their i
 
 | Id | For the md apps | Toolkit status |
 |---|---|---|
-| X3, L10 | Motion for the palette, the tab strip, a menu's hover row, notice bars and the Settings form | open |
-| X4 | A stack of toasts, so that messages stop replacing each other | open |
+| X3, L10 | Motion for the palette, the tab strip, a menu's hover row, notice bars and the Settings form | claimed |
+| X4 | A stack of toasts, so that messages stop replacing each other | claimed: Shared toolkit session for the md apps, 2026-11-25 |
 | L1 | `submenu::Cascade` in place of both apps' hand-made submenus and their dwell timer (mdedit `ui.rs:582-588`, `commands.rs:2544`) | done in the toolkit; the apps adopt it |
 | L3 | A scrollbar for mdedit's plain preview and side-by-side | done in the toolkit; mdedit adopts it |
 | W2 | `focus`: a keyboard for mdedit's Files and Functions panes | done in the toolkit; mdedit adopts it |
@@ -192,13 +192,13 @@ New, fast-tracked:
 
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
-| D1 | **Animation damage groups.** A tag set while a region draws, and `end_frame` saying which tags still move. Without it an app that redraws only damaged regions must guess what to redraw or `keep`, and a toast at rest whose track was dropped on a caret-blink frame fades in again | M | medium | `anim::Animator` | open |
-| D2 | **`presence_bounds()`** on `Menu`, `Cascade`, `Bubble` and the dialog card. `draw_in_presence` touches the rectangle grown by 18 px, plus the 6 px drop, plus a device pixel; both apps redraw only `menu.rect().inset(-20.0)` (mdedit `app.rs:1435`, mdview `app.rs:853`) | S | low | `anim::presence`, `menu`, `submenu`, `overlay`, `dialog` | open |
-| D3 | **A fade that keeps frost's alpha mark**, with a test. `Snapshot::crossfade` assumes alpha 255 on both sides (`anim/region.rs:134`); frost marks chrome with 254 (`frost.rs:31`), so a popup over frosted chrome turns opaque halfway through its fade | S | medium | `anim::region`, `frost` | open |
-| D4 | **`chrome::*_animated`**: hover fades for the caption, bar and tab buttons | S | low | `chrome`, `anim` | open |
-| D5 | **One preset set for document apps** (menu, tip, toast, dialog), so both apps tune their durations in one place | S | low | `anim` presets | open |
-| D6 | **A shared tooltip model**: the delay, blocked after a press, the anchor; both apps carry the same `Tip` struct and timer | S | low | `overlay::Bubble` | open |
-| D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | open |
+| D1 | **Animation damage groups.** A tag set while a region draws, and `end_frame` saying which tags still move. Without it an app that redraws only damaged regions must guess what to redraw or `keep`, and a toast at rest whose track was dropped on a caret-blink frame fades in again | M | medium | `anim::Animator` | claimed: Shared toolkit session, 2026-11-25 |
+| D2 | **`presence_bounds()`** on `Menu`, `Cascade`, `Bubble` and the dialog card. `draw_in_presence` touches the rectangle grown by 18 px, plus the 6 px drop, plus a device pixel; both apps redraw only `menu.rect().inset(-20.0)` (mdedit `app.rs:1435`, mdview `app.rs:853`) | S | low | `anim::presence`, `menu`, `submenu`, `overlay`, `dialog` | claimed: Shared toolkit session, 2026-11-25 |
+| D3 | **A fade that keeps frost's alpha mark**, with a test. `Snapshot::crossfade` assumes alpha 255 on both sides (`anim/region.rs:134`); frost marks chrome with 254 (`frost.rs:31`), so a popup over frosted chrome turns opaque halfway through its fade | S | medium | `anim::region`, `frost` | claimed: Shared toolkit session, 2026-11-25 |
+| D4 | **`chrome::*_animated`**: hover fades for the caption, bar and tab buttons | S | low | `chrome`, `anim` | claimed: Shared toolkit session, 2026-11-25 |
+| D5 | **One preset set for document apps** (menu, tip, toast, dialog), so both apps tune their durations in one place | S | low | `anim` presets | claimed: Shared toolkit session, 2026-11-25 |
+| D6 | **A shared tooltip model**: the delay, blocked after a press, the anchor; both apps carry the same `Tip` struct and timer | S | low | `overlay::Bubble` | claimed: Shared toolkit session, 2026-11-25 |
+| D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | claimed: Shared toolkit session, 2026-11-25 |
 
 ## Left over from what exists
 
@@ -206,8 +206,8 @@ New, fast-tracked:
 |---|---|---|---|---|---|
 | X1 | **See the animations in a window.** mdmix runs the motion (the owner has seen it and likes it); still unseen: the spinner and bar on `cycle`, a caret on `blink`, a page switch cut short by a resize | S | medium | `docs/ANIMATION.md` | open |
 | X2 | **Check the Linux reduced-motion reading on a real desktop.** KDE Plasma and GNOME: the three portal keys, the `SettingChanged` signal, the wake | S | low | `platform`, LINUX.md | open |
-| X3 | **Motion for the rest.** `notice` bars, the command palette, the tree's disclosure, the tab strip, a menu's hover row | M | medium | `anim`, each widget | open |
-| X4 | **A stack of toasts.** `anim::Transient` is one slot; several toasts each leaving on its own | S | low | `anim::Transient`, `overlay::Bubble` | open |
+| X3 | **Motion for the rest.** `notice` bars, the command palette, the tree's disclosure, the tab strip, a menu's hover row | M | medium | `anim`, each widget | claimed: Shared toolkit session for the md apps, 2026-11-25 |
+| X4 | **A stack of toasts.** `anim::Transient` is one slot; several toasts each leaving on its own | S | low | `anim::Transient`, `overlay::Bubble` | claimed: Shared toolkit session for the md apps, 2026-11-25 |
 | X5 | **`pool`: cancel by key, and results in a chosen order.** | S | low | `mdshared_app::pool` | open |
 | X6 | **`commands`: chord sequences (`Ctrl+K Ctrl+S`) and keymaps per context.** | M | medium | `commands`, `keys` | open |
 | X7 | **Compare `mdshared-term` with a real terminal.** Run a known test suite (vttest, esctest) through `Screen` and note the differences; nothing was compared with xterm | M | low | `mdshared-term` | open |
