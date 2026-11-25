@@ -161,6 +161,15 @@ pub enum Kind {
     /// a Markdown file took along, each with the original it was copied from. It has no source:
     /// nothing of the owner's was changed.
     Copies,
+    /// Write notes (mdedit's `docs/ai-pictures-plan.md` section 10): notes a model wrote from
+    /// pictures and text files, and copies of the pictures beside them. Its notes are `.md` files
+    /// this run made; its pictures are the copies, each with the original it was made from and
+    /// that file's digest, or with none for a picture pasted from the clipboard, whose file was
+    /// in a temp folder that goes with the window. It has no source: no file was cut, and every
+    /// original is read and never changed. Undo removes a copy only while it is what was
+    /// written, its original (when it names one) is where it was with that digest, and no note
+    /// undo keeps shows it ([`UndoPlan::shown`]); it never touches an original.
+    Notes,
 }
 
 impl Kind {
@@ -173,6 +182,7 @@ impl Kind {
             Kind::Markdown => "markdown",
             Kind::Links => "links",
             Kind::Copies => "copies",
+            Kind::Notes => "notes",
         }
     }
 
@@ -185,6 +195,7 @@ impl Kind {
             "markdown" => Some(Kind::Markdown),
             "links" => Some(Kind::Links),
             "copies" => Some(Kind::Copies),
+            "notes" => Some(Kind::Notes),
             _ => None,
         }
     }
@@ -2778,6 +2789,10 @@ pub struct UndoPlan {
     /// wrote them. They are that run's, and stay with their lines (review of the audit 4 fixes,
     /// S2).
     pub later: Vec<PathBuf>,
+    /// Copies a [`Kind::Notes`] run made that stay because a note undo keeps (changed since,
+    /// still listed, there before the run, a later run's) shows them: removing one would break
+    /// that note's picture (plan section 10). Also in `kept`. Empty for every other kind.
+    pub shown: Vec<PathBuf>,
 }
 
 impl UndoPlan {
@@ -2944,6 +2959,16 @@ impl UndoPlan {
                 said.join(", "),
                 if changed == 1 { "is" } else { "are" }
             ));
+        }
+        if !self.shown.is_empty() {
+            s.push_str(&if self.shown.len() == 1 {
+                " 1 picture stays with the note that shows it.".to_string()
+            } else {
+                format!(
+                    " {} pictures stay with the notes that show them.",
+                    self.shown.len()
+                )
+            });
         }
         if !self.links_kept.is_empty() {
             s.push_str(&format!(
@@ -3460,7 +3485,9 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
     // not be the only copy: the original is where it was, with the length and the digest it had.
     // A source in the Recycle Bin must be back for the same reason.
     // A run of links has no source: nothing was cut from a file, so nothing can be its only copy.
-    let state = if matches!(record.kind, Kind::Links | Kind::Copies) {
+    // Nor has a run of Write notes: its originals are read and never changed, and each copy is
+    // checked against its own original below.
+    let state = if matches!(record.kind, Kind::Links | Kind::Copies | Kind::Notes) {
         SourceState::Same
     } else {
         source_state(&record.source)
@@ -3573,6 +3600,16 @@ fn plan_of(record: &Record, library: &Path) -> (UndoPlan, Option<Reach>) {
             plan.pictures_kept.push(picture.path.clone());
         }
     }
+    // A copy a note that stays shows stays with it.
+    if record.kind == Kind::Notes && !plan.pictures.is_empty() {
+        let shows = KeptNotes::of(record, &plan.notes);
+        let (kept, going): (Vec<PathBuf>, Vec<PathBuf>) = std::mem::take(&mut plan.pictures)
+            .into_iter()
+            .partition(|p| shows.show(p));
+        plan.pictures = going;
+        plan.kept.extend(kept.iter().cloned());
+        plan.shown = kept;
+    }
     if !removals.is_empty() {
         plan.links = vec![(record.group.file.clone(), removals)];
     }
@@ -3662,6 +3699,9 @@ pub struct UndoReport {
     /// Copies a move made that stay because a note undo kept as the move left it still leads to
     /// them. Also in `kept`.
     pub led_to: Vec<PathBuf>,
+    /// Copies a [`Kind::Notes`] run made that stay because a note undo kept shows them
+    /// ([`UndoPlan::shown`]), worked out again after the notes went. Also in `kept`.
+    pub shown: Vec<PathBuf>,
     /// The record was marked "undone".
     pub marked: bool,
     pub mark_error: Option<String>,
@@ -3865,7 +3905,14 @@ pub fn undo_with(
             }
         }
     }
+    // The notes that stay, read again now that the others went: a copy one of them shows stays.
+    let shows = (record.kind == Kind::Notes).then(|| KeptNotes::of(record, &report.removed_notes));
     for picture in &plan.pictures {
+        if shows.as_ref().is_some_and(|s| s.show(picture)) {
+            report.shown.push(picture.clone());
+            report.kept.push(picture.clone());
+            continue;
+        }
         if led_to(picture) {
             report.led_to.push(picture.clone());
             report.kept.push(picture.clone());
@@ -3940,6 +3987,9 @@ pub fn undo_with(
     report.links_kept = plan.links_kept.clone();
     report.before = plan.before.clone();
     report.later = plan.later.clone();
+    let mut shown = plan.shown.clone();
+    shown.append(&mut report.shown);
+    report.shown = shown;
     report.plan = Some(plan);
     report
 }
@@ -4182,6 +4232,57 @@ fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport, bin: &mut
     report.kept.extend(plan.put_back_kept.iter().cloned());
 }
 
+/// The notes of a [`Kind::Notes`] run that stay on disk after undo: every note the record names
+/// but those in `going`, as each reads now. A note that is there and cannot be read as text (not a
+/// regular file, too large, not UTF-8) may show any copy, so then every copy stays.
+struct KeptNotes {
+    /// Each note's path, its text, and its text in lower case.
+    texts: Vec<(PathBuf, String, String)>,
+    unreadable: bool,
+}
+
+impl KeptNotes {
+    fn of(record: &Record, going: &[PathBuf]) -> KeptNotes {
+        let mut kept = KeptNotes {
+            texts: Vec::new(),
+            unreadable: false,
+        };
+        for note in &record.notes {
+            if going.iter().any(|g| same_path(g, &note.path))
+                || note.path.symlink_metadata().is_err()
+                || kept.texts.iter().any(|(p, _, _)| same_path(p, &note.path))
+            {
+                continue;
+            }
+            match read_regular(&note.path, DIGEST_MAX_BYTES, false)
+                .and_then(|b| String::from_utf8(b).ok())
+            {
+                Some(text) => {
+                    let lower = text.to_lowercase();
+                    kept.texts.push((note.path.clone(), text, lower));
+                }
+                None => kept.unreadable = true,
+            }
+        }
+        kept
+    }
+
+    /// Whether a note that stays shows `copy`: a Markdown link or picture that leads to it, or,
+    /// so that a link written another way (HTML, a reference the reader does not take) never
+    /// breaks, its file name anywhere in the note's text, as it is or with its spaces as `%20`.
+    fn show(&self, copy: &Path) -> bool {
+        if self.unreadable {
+            return true;
+        }
+        let name = lower_name(copy);
+        let encoded = name.replace(' ', "%20");
+        self.texts.iter().any(|(note, text, lower)| {
+            crate::moves::links_to(text, note.parent().unwrap_or(Path::new("")), copy)
+                || (!name.is_empty() && (lower.contains(&name) || lower.contains(&encoded)))
+        })
+    }
+}
+
 /// Whether the file a picture was copied from is where it was, with the digest it had: always
 /// for a picture that names no original.
 fn original_there(picture: &PictureRec) -> bool {
@@ -4361,6 +4462,8 @@ mod tests {
 
     #[path = "../../runs_copies_tests.rs"]
     mod copies;
+    #[path = "../../runs_notes_tests.rs"]
+    mod notes;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
