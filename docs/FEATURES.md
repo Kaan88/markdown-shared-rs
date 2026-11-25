@@ -404,6 +404,62 @@ wheel changing a closed drop-down. For a screen reader the caller builds `a11y::
 Not verified: both were only drawn into bitmaps by tests; neither has run in a window, and the
 specimen sheets (`toggle_sheet`, `dropdown_sheet`) have not been seen by a person.
 
+## The Purge fast track's smaller pieces (W5b, X8, P1, P2, P3, P5, P6; 2026-11-25)
+
+Roadmap rows of Purge's readiness checklist; each was written by an agent, reviewed, and then
+audited with the rest of the fast track by Claude Fable (the audit's fixes are listed last). All
+provisional; none is on `main` yet. Run on Windows only, headless, unless said; no person has
+seen any of them.
+
+- **W5b, the system's high-contrast colours** (`tokens`, `platform`). `SystemColors` holds the
+  eight `GetSysColor` colours a contrast theme sets; `Tokens::from_system_colors` maps them as
+  WinUI does (window, window text, Highlight and HighlightText as accent and on_accent, grey
+  text as faint and the lines, button face as the bars when the text reads on it).
+  `Tokens::from_system` uses them under Windows high contrast; Linux keeps the toolkit's own
+  high-contrast palettes. `hover` and `on` are kept at 4.5:1 for `text`, `faint` and `accent`
+  (`legible_fill`), which keeps them close to the window, so a selected row is drawn with
+  `tokens::selected(pal, high_contrast)`: Highlight with HighlightText. `allowed_backdrop` turns
+  Mica, Acrylic and frost off under high contrast; `platform::watch_contrast(wake)` wakes on a
+  switch or a change of the theme's colours (a hidden top-level window on its own thread); the
+  host takes that wake. HotLight reaches links through `link::Look::ink`; ButtonText reaches
+  nothing (the palette has no field for it). Tested over five Windows themes (Aquatic, Desert,
+  Dusk, Night sky, High Contrast Black) by their colours; no contrast theme was switched on.
+- **X8, the caret blink** (`textfield`). `TextField::blink_caret(anim, id, blink, focused)`
+  gives `caret_on` from `Animator::blink`, with the half-period from
+  `platform::caret_blink_time()` (`GetCaretBlinkTime`; INFINITE gives a steady caret). The blink
+  restarts on input and when focus arrives; unfocused, with a selection, or under reduced motion
+  it asks for no deadline, so the window sleeps. `focused` includes the window's own focus.
+  Tested on a manual clock; no application calls it yet, so it has not blinked in a window.
+- **P1, a selector bar** (`segments`). `selector_rects`, `selector_at`, `selector_key` (Left,
+  Right, Home, End; no wrap), `draw_selector` and its animated form: the two-or-three-option
+  switch's look with any count. Purge's tabs are underlined with a count in a second style;
+  the selector is a filled pill, so Purge may draw its own over `selector_rects`.
+- **P2, the InfoBar** (`infobar`). Four severities with their glyphs, a semibold title, a
+  wrapped message, up to two actions and a close button; `InfoBar::parts` for keyboard focus;
+  `draw_infobar_with(Look { hover, pressed, focused, high_contrast })`; `stack_layout`. The
+  dark error ink is `DARK_ERROR_INK` (WinUI's `#ff99a4`, 4.5:1 or more on every dark surface);
+  the palette's `danger` read at 2.6:1. Under the system's contrast theme the caller sets
+  `Look::high_contrast` (a palette has no flag), and the card takes the page with the ink as its
+  frame.
+- **P3, the expander** (`expander`). `Expander` (toggle, `header_hit`, `key`), `draw_header`,
+  and `draw_expander_animated`, whose body grows through the animator and snaps under reduced
+  motion. Its header takes one string at 32 px; Purge's Settings headers hold a title, a hint and
+  a status, so Purge draws those and keeps the model.
+- **P5, the hyperlink button** (`link`). Accent text (or `Look::ink`), underlined on hover, the
+  hand cursor, Enter and Space without Ctrl or Alt, elided and clipped to its rectangle.
+- **P6, the anchored flyout** (`flyout`). A card placed by the menu's geometry round an anchor,
+  any content in `content_rect()`, `pointer_down` (a press on the anchor closes and is kept
+  from it), Escape, its own focus scope that gives the focus back to what had it (as WinUI),
+  `set_anchor` after a scroll. No a11y builder: report it as a non-modal `a11y::dialog`. Purge's
+  use is a TeachingTip (centred, with buttons): the content and the centring are Purge's.
+- **The audit's fixes** (Claude Fable read all of the above; fixed by Claude Opus 5.5):
+  `tokens::selected`; the InfoBar's high-contrast flag and dark error ink; `link::Look::ink`;
+  `Dropdown::set_field`, which moves an open list after a scroll or a resize (it stayed where it
+  opened); a drop-down list that would show less than one row beside its field covers the field
+  instead of a sliver that still takes every key; `Expander::key`, `link::key` and
+  `SelectableText::key` take `&KeyName` as the others do; the module docs that said W8 was not
+  built now name the `a11y` builders.
+
 ## Read-only selectable text (`mdshared_ui::seltext`, P7)
 A paragraph that cannot be edited but can be selected, for Purge's log output and the paths in
 its details pane. `SelectableText` holds the text, an anchor and a caret as byte offsets on char
