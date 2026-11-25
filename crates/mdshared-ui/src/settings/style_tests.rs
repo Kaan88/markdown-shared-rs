@@ -40,6 +40,30 @@ fn pixel(b: &Bitmap, x: f32, y: f32, scale: f32) -> Rgb {
     [b.pixels[i + 2], b.pixels[i + 1], b.pixels[i]]
 }
 
+/// The same rows in the frozen copy of the form as it stood before styles
+/// ([`super::frozen`]), drawn as [`drawn`] draws: the pixels the classic style must keep.
+fn drawn_frozen(pal: &Palette, ground: u8, scale: f32) -> Bitmap {
+    use super::frozen::{Form as OldForm, Row as OldRow};
+    let rows = vec![
+        OldRow::header("Colour"),
+        OldRow::choice(1, "Theme", &["Dark", "Light", "Warm", "Cool"], 0),
+        OldRow::toggle(2, "Joined", true),
+        OldRow::header("Shape"),
+        OldRow::number(3, "Corners", 6, 0, 10).unit("px"),
+        OldRow::choice(4, "Rows", &["Tint", "Bar"], 1),
+    ];
+    let (w, h) = ((900.0 * scale) as u32, (700.0 * scale) as u32);
+    let mut bmp = Bitmap::new(w, h);
+    bmp.clear([ground; 3]);
+    let mut gfx = Gfx::new();
+    let mut f = OldForm::new("Look", rows).single_page();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+        f.draw(&mut p, pal, Rect::new(0.0, 0.0, 900.0, 700.0), false);
+    }
+    bmp
+}
+
 #[test]
 fn the_classic_style_is_what_a_form_given_none_draws() {
     assert_eq!(Style::default(), Style::CLASSIC);
@@ -48,15 +72,19 @@ fn the_classic_style_is_what_a_form_given_none_draws() {
         (c.radius, c.soft_shadow, c.neutral_segments, c.caps_headings),
         (10.0, None, false, false)
     );
+    // Its headings, segmented choices, card and shadow are the form's before styles, pixel for
+    // pixel, given no style or CLASSIC, light and dark, at 1 and 1.5.
     for pal in [&LIGHT, &DARK] {
         for scale in [1.0, 1.5] {
-            let (none, _) = drawn(pal, None, 120, scale);
-            let (classic, _) = drawn(pal, Some(Style::CLASSIC), 120, scale);
-            assert!(
-                none.pixels == classic.pixels,
-                "dark {} at {scale}",
-                pal.dark
-            );
+            let was = drawn_frozen(pal, 120, scale);
+            for style in [None, Some(Style::CLASSIC)] {
+                let (now, _) = drawn(pal, style, 120, scale);
+                assert!(
+                    now.pixels == was.pixels,
+                    "{style:?}, dark {} at {scale}",
+                    pal.dark
+                );
+            }
         }
     }
 }
