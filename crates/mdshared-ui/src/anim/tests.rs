@@ -867,6 +867,51 @@ fn groups_say_which_regions_still_move_and_when() {
     assert_eq!(names, vec![Id::new("caret")]);
 }
 
+/// A fade that arrives during a frame that only keeps its group was not drawn where it
+/// arrived: the group is due once more, and then at rest.
+#[test]
+fn a_group_whose_motion_arrives_while_kept_is_due_once_more() {
+    let clock = ManualClock::new();
+    let mut anim = Animator::new();
+    let toast = |anim: &mut Animator| {
+        anim.group("toast");
+        anim.presence("toast-in", false, LINEAR_100, LINEAR_100)
+    };
+    for _ in 0..10 {
+        anim.begin_frame(clock.now());
+        anim.group("toast");
+        anim.presence("toast-in", true, LINEAR_100, LINEAR_100);
+        anim.end_frame();
+        clock.advance(FRAME);
+    }
+    // Leaving: drawn part of the way.
+    for _ in 0..3 {
+        clock.advance(FRAME);
+        anim.begin_frame(clock.now());
+        toast(&mut anim);
+        anim.end_frame();
+    }
+    // A frame for the caret alone, after the fade's end: the toast is only kept.
+    // (Frames for the caret alone, after the fade's end: the toast is only kept. A frame steps
+    // at most 50 ms, so two of them.)
+    clock.advance(Duration::from_millis(40));
+    anim.begin_frame(clock.now());
+    anim.keep_group("toast");
+    anim.end_frame();
+    clock.advance(Duration::from_millis(40));
+    anim.begin_frame(clock.now());
+    anim.keep_group("toast");
+    let deadline = anim
+        .end_frame()
+        .expect("the toast's last state is still to be drawn");
+    assert!(anim.group_due("toast", deadline));
+    clock.advance(FRAME);
+    anim.begin_frame(clock.now());
+    assert_eq!(toast(&mut anim), 0.0);
+    assert_eq!(anim.end_frame(), None);
+    assert!(anim.group_deadlines().is_empty());
+}
+
 #[test]
 fn a_kept_group_is_not_taken_for_new_after_a_frame_that_skipped_it() {
     let clock = ManualClock::new();

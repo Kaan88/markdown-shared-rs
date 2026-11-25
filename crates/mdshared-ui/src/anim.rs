@@ -643,6 +643,9 @@ pub struct Animator {
     /// needs drawing; and the same for what was asked outside every group.
     groups: Vec<(Id, Instant)>,
     loose: Option<Instant>,
+    /// The groups a [`keep_group`](Self::keep_group) of this frame let arrive without drawing
+    /// them: their last state is still to be drawn, so each needs one more frame.
+    arrived: Vec<u64>,
 }
 
 impl Default for Animator {
@@ -673,6 +676,7 @@ impl Animator {
             group: None,
             groups: Vec::new(),
             loose: None,
+            arrived: Vec::new(),
         }
     }
 
@@ -762,12 +766,19 @@ impl Animator {
     pub fn keep_group(&mut self, tag: impl AsId) {
         let tag = tag.as_id().0;
         let (now, frame, animates) = (self.time, self.frame, self.animates());
+        let mut arrived = false;
         for t in self.tracks.values_mut().filter(|t| t.group == Some(tag)) {
             t.seen = frame;
             if !animates {
                 t.motion.kind = Kind::Snap;
             }
+            let was = t.settled;
             t.advance(now);
+            arrived |= !was && t.settled;
+        }
+        // A value that arrived here was not drawn where it arrived: the group is due once more.
+        if arrived && !self.arrived.contains(&tag) {
+            self.arrived.push(tag);
         }
         for r in self.runs.values_mut().filter(|r| r.group == Some(tag)) {
             r.seen = frame;
@@ -775,8 +786,10 @@ impl Animator {
     }
 
     /// The groups that had something in flight, or a cycle or blink, at the end of the last
-    /// frame, each with when it next needs drawing (at most the deadline
-    /// [`end_frame`](Self::end_frame) gave). A group not listed is at rest: its region need not
+    /// frame, each with when it next needs drawing (no sooner than the deadline
+    /// [`end_frame`](Self::end_frame) gave). A group whose motion arrived during a
+    /// [`keep_group`](Self::keep_group) is listed once more, a frame on, for its last state to be
+    /// drawn. A group not listed is at rest: its region need not
     /// be drawn for its motion. At a deadline, draw the groups whose time has come
     /// ([`group_due`](Self::group_due)).
     pub fn group_deadlines(&self) -> &[(Id, Instant)] {
@@ -825,9 +838,14 @@ impl Animator {
             let w = r.next.saturating_sub(time);
             wait = Some(wait.map_or(w, |old| old.min(w)));
         }
+        if !self.arrived.is_empty() {
+            let w = self.frame_interval;
+            wait = Some(wait.map_or(w, |old| old.min(w)));
+        }
         self.animating = wait.is_some();
         let at = self.frame_at.unwrap_or_else(Instant::now);
         self.note_groups(at);
+        self.arrived.clear();
         // A wait too long for the clock to hold (a blink of centuries) is no deadline.
         let mut deadline = wait.and_then(|w| at.checked_add(w));
         if let Some(wake) = self.wake.take() {
@@ -855,6 +873,9 @@ impl Animator {
         }
         for r in self.runs.values() {
             note(r.group, r.next.saturating_sub(time));
+        }
+        for &g in &self.arrived {
+            note(Some(g), interval);
         }
         self.groups = groups
             .into_iter()
