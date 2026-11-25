@@ -58,9 +58,9 @@ jobs:
       - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-ui --features a11y a11y
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host host::
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host,a11y host::
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
 
   windows:
     runs-on: windows-latest
@@ -87,9 +87,9 @@ jobs:
       - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-ui --features a11y a11y
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host host::
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host,a11y host::
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
       # A smoke run of the host: a real window, a few frames, closed on its timer.
       - run: cargo run --release -p mdshared-ui --features host,a11y --example host -- --seconds 2
 
@@ -125,6 +125,6 @@ jobs:
       - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-ui --features a11y a11y
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host host::
+      - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features host,a11y host::
+      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
