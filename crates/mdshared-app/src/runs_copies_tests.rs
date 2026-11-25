@@ -620,4 +620,8 @@ fn a_copy_a_kept_note_leads_to_stays() {
     );
     assert!(r.md.exists(), "{report:?}");
     assert!(r.copy.exists(), "the kept note leads to it: {report:?}");
+    assert!(
+        report.led_to.iter().any(|p| same_path(p, &r.copy)),
+        "{report:?}"
+    );
 }

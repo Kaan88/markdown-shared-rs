@@ -3659,6 +3659,9 @@ pub struct UndoReport {
     pub restored: Vec<PathBuf>,
     /// A rewrite's originals changed since the run: kept.
     pub restore_kept: Vec<PathBuf>,
+    /// Copies a move made that stay because a note undo kept as the move left it still leads to
+    /// them. Also in `kept`.
+    pub led_to: Vec<PathBuf>,
     /// The record was marked "undone".
     pub marked: bool,
     pub mark_error: Option<String>,
@@ -3839,13 +3842,17 @@ pub fn undo_with(
             report.held_back.push(note.clone());
             continue;
         }
-        let matches = !led_to(note)
-            && created_note(note).is_some_and(|n| {
-                reach.allows(note)
-                    && (record.kind == Kind::Copies || has_extension(note, &["md"]))
-                    && copy_may_go(record, note, &[])
-                    && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
-            });
+        if led_to(note) {
+            report.led_to.push(note.clone());
+            report.kept.push(note.clone());
+            continue;
+        }
+        let matches = created_note(note).is_some_and(|n| {
+            reach.allows(note)
+                && (record.kind == Kind::Copies || has_extension(note, &["md"]))
+                && copy_may_go(record, note, &[])
+                && digest_of(note).is_some_and(|d| d.eq_ignore_ascii_case(&n.sha256))
+        });
         if !matches {
             report.kept.push(note.clone());
             continue;
@@ -3859,17 +3866,21 @@ pub fn undo_with(
         }
     }
     for picture in &plan.pictures {
-        let matches = !led_to(picture)
-            && record
-                .pictures
-                .iter()
-                .find(|p| p.created && same_path(&p.path, picture))
-                .is_some_and(|p| {
-                    reach.allows(picture)
-                        && has_extension(picture, &PICTURE_EXTENSIONS)
-                        && original_there(p)
-                        && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
-                });
+        if led_to(picture) {
+            report.led_to.push(picture.clone());
+            report.kept.push(picture.clone());
+            continue;
+        }
+        let matches = record
+            .pictures
+            .iter()
+            .find(|p| p.created && same_path(&p.path, picture))
+            .is_some_and(|p| {
+                reach.allows(picture)
+                    && has_extension(picture, &PICTURE_EXTENSIONS)
+                    && original_there(p)
+                    && digest_of(picture).is_some_and(|d| d.eq_ignore_ascii_case(&p.sha256))
+            });
         if !matches {
             report.kept.push(picture.clone());
             continue;
