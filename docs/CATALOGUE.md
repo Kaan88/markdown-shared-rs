@@ -120,6 +120,7 @@ Full account: [ANIMATION.md](ANIMATION.md).
 | `anim::Clock` | Where time comes from; a clock moved by hand for tests | `SystemClock`, `ManualClock` |
 | `anim::Snapshot`, `PageTransition` | A saved piece of the bitmap; cross-fade, slide or push between an old page and a new one; a cross-fade over frosted chrome as the compositor shows it (`crossfade_keyed`, `Painter::set_frost_key`); ends when the bitmap size, scale or region changes (provisional) | `Painter::snapshot`, `PageTransition::begin` / `apply(anim, p, region)` / `apply_dev`, `PageEffect` |
 | `anim::Transient`, `pop`, `pop_bounds` | Things that appear and disappear, kept alive while they leave; any drawing faded and moved as one | `Transient::show` / `hide` / `frame`, `pop(p, bounds, t, shift, draw)` |
+| `anim::Stack` | Several things that enter and leave each on its own, newest at the bottom, the ones above gliding into a gap: a stack of toasts (provisional) | `Stack::new()`, `push(item, until)`, `hide`, `keep`, `tick(now)`, `deadline`, `frame(anim, id, height, gap)` -> `Shown { item, t, lift }` |
 | `anim::document` | One set of motions and timings for the document applications: `MENU`, `TIP`, `TOAST`, `DIALOG` (`Pair { enter, exit }`, `Pair::transient`), `HOVER`, `TIP_DELAY` (provisional) | `document::MENU.transient()`, `document::TIP_DELAY` |
 
 ## Platform (`mdshared-ui`)

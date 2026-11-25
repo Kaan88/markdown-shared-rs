@@ -42,6 +42,7 @@ pub mod page;
 pub mod presence;
 pub mod region;
 pub mod spring;
+pub mod stack;
 
 pub use cycle::Periodic;
 pub use ease::{Bezier, Easing, cubic_bezier};
@@ -49,6 +50,7 @@ pub use page::{Edge, PageEffect, PageTransition};
 pub use presence::{Transient, pop, pop_bounds};
 pub use region::Snapshot;
 pub use spring::Spring;
+pub use stack::Stack;
 
 use crate::gfx::{Rect, Rgb};
 use std::cell::Cell;
