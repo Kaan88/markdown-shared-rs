@@ -527,10 +527,11 @@ mod tests {
         assert!(frame(false) == plain(false), "back at rest");
         let mut still = Animator::new();
         still.set_policy(Policy::Never);
-        still.begin_frame(clock.now());
-        assert!(moving(&mut still, false) == plain(false));
-        assert!(moving(&mut still, true) == plain(true));
-        still.end_frame();
+        for hovered in [false, true] {
+            still.begin_frame(clock.now());
+            assert!(moving(&mut still, hovered) == plain(hovered));
+            still.end_frame();
+        }
     }
 
     #[test]

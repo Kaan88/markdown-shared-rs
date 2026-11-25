@@ -185,6 +185,8 @@ pub struct Menu<T> {
     /// The highlighted row is drawn in the palette's accent with `on_accent`
     /// ([`set_high_contrast`](Self::set_high_contrast)).
     high_contrast: bool,
+    /// Each row's hover fill, while [`draw_in_animated`](Self::draw_in_animated) draws.
+    fade: Option<Vec<f32>>,
 }
 
 /// The width of the check-mark column in a menu that also has icons.
@@ -219,6 +221,7 @@ impl<T: Clone> Menu<T> {
             branches: Vec::new(),
             min_w: 0.0,
             high_contrast: false,
+            fade: None,
         }
     }
 
@@ -484,8 +487,18 @@ impl<T: Clone> Menu<T> {
             }
             let lit = self.hover == Some(i) && item.enabled;
             let strong = lit && self.high_contrast;
-            if lit {
-                p.rbox(r, 5.0, if strong { pal.accent } else { pal.hover });
+            match self.fade.as_ref().and_then(|f| f.get(i).copied()) {
+                // Under high contrast the highlight is at once, as the system's.
+                Some(a) if !self.high_contrast => {
+                    if a > 0.0 {
+                        p.rbox_a(r, 5.0, pal.hover, a.min(1.0));
+                    }
+                }
+                _ => {
+                    if lit {
+                        p.rbox(r, 5.0, if strong { pal.accent } else { pal.hover });
+                    }
+                }
             }
             // Under high contrast everything on the highlighted row reads on Highlight.
             let ink = |c| if strong { pal.on_accent } else { c };
@@ -573,6 +586,31 @@ impl<T: Clone> Menu<T> {
             -MENU_DROP
         };
         crate::anim::pop_bounds(self.rect.inset(-18.0), (0.0, drop))
+    }
+
+    /// [`draw_in`](Self::draw_in) with the hover row's fill fading in on the row the pointer or
+    /// the keys reach and out on the one they left (roadmap X3), by
+    /// [`crate::anim::document::HOVER`]. `id` names the menu in `anim`. At rest, and when the
+    /// animator does not animate, this is `draw_in`, pixel for pixel; under high contrast the
+    /// highlight is at once.
+    pub fn draw_in_animated(
+        &mut self,
+        p: &mut Painter,
+        pal: &Palette,
+        area: Rect,
+        anim: &mut crate::anim::Animator,
+        id: impl crate::anim::AsId,
+    ) {
+        let id = crate::anim::Id::new(id);
+        let fade = (0..self.items.len())
+            .map(|i| {
+                let on = self.hover == Some(i) && self.items[i].enabled;
+                anim.toggle(id.with(("row", i)), on, crate::anim::document::HOVER)
+            })
+            .collect();
+        self.fade = Some(fade);
+        self.draw_in(p, pal, area);
+        self.fade = None;
     }
 
     /// Where the menu was last placed.
@@ -887,6 +925,72 @@ mod tests {
                 assert_eq!(changed_outside(scale, out, &draw), 0, "dialog, t {t}");
             }
         }
+    }
+
+    /// The hover row's fade: at rest the plain draw, on its way something else, and under high
+    /// contrast or with an animator that does not animate the plain draw at once.
+    #[test]
+    fn the_hover_row_fades_and_is_the_plain_draw_at_rest() {
+        use crate::anim::{Animator, Clock, ManualClock, Policy};
+        use crate::theme::LIGHT;
+        let area = Rect::new(0.0, 0.0, 300.0, 300.0);
+        let shot = |menu: &mut Menu<u8>, anim: Option<&mut Animator>| {
+            let mut bmp = Bitmap::new(300, 300);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, LIGHT.page);
+            match anim {
+                Some(a) => menu.draw_in_animated(&mut p, &LIGHT, area, a, "menu"),
+                None => menu.draw_in(&mut p, &LIGHT, area),
+            }
+            bmp.pixels
+        };
+        let mut menu = Menu::new(many(4), 40.0, 40.0, false);
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut frame = |menu: &mut Menu<u8>, ms: u64| {
+            clock.advance_ms(ms);
+            anim.begin_frame(clock.now());
+            let px = shot(menu, Some(&mut anim));
+            anim.end_frame();
+            px
+        };
+        menu.highlight(1);
+        assert!(
+            frame(&mut menu, 0) == shot(&mut menu, None),
+            "first seen: at rest"
+        );
+        menu.highlight(2);
+        frame(&mut menu, 16);
+        let moving = frame(&mut menu, 40);
+        assert!(
+            moving != shot(&mut menu, None),
+            "row 2 fading in, row 1 out"
+        );
+        for _ in 0..20 {
+            frame(&mut menu, 16);
+        }
+        assert!(frame(&mut menu, 16) == shot(&mut menu, None), "arrived");
+        let mut still = Animator::new();
+        still.set_policy(Policy::Never);
+        still.begin_frame(clock.now());
+        menu.highlight(3);
+        assert!(shot(&mut menu, Some(&mut still)) == shot(&mut menu, None));
+        still.end_frame();
+        menu.set_high_contrast(true);
+        menu.highlight(0);
+        let mut anim = Animator::new();
+        anim.begin_frame(clock.now());
+        shot(&mut menu, Some(&mut anim));
+        anim.end_frame();
+        menu.highlight(1);
+        clock.advance_ms(40);
+        anim.begin_frame(clock.now());
+        assert!(
+            shot(&mut menu, Some(&mut anim)) == shot(&mut menu, None),
+            "high contrast: at once"
+        );
+        anim.end_frame();
     }
 
     fn many(n: u8) -> Vec<Item<u8>> {

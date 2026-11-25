@@ -71,6 +71,39 @@ pub struct UpdateBarHits {
     pub close: Option<Rect>,
 }
 
+/// How much of a bar at `bar` shows while it slides in or out, `t` from 0 (gone) to 1 (there),
+/// from [`Animator::presence`](crate::anim::Animator::presence) with
+/// [`crate::anim::document::MENU`] (roadmap X3): the bar's own height times `t`, rounded to whole
+/// logical px, for the caller to lay the page out under it.
+pub fn bar_height(bar: Rect, t: f32) -> f32 {
+    (bar.h * t.clamp(0.0, 1.0)).round()
+}
+
+/// Draws a bar (any of this module's, through `draw`) sliding down into place from the top of
+/// its rectangle as `t` goes from 0 to 1, and back up as it goes: `draw` is given the bar's
+/// rectangle moved up by what is hidden, and the drawing is cut to the part that shows
+/// ([`bar_height`]). At 1 it is `draw(bar)`, pixel for pixel; at 0 nothing is drawn. Returns
+/// what `draw` returns (the hits, in their drawn places), or `None` at 0.
+pub fn draw_sliding<R>(
+    p: &mut Painter,
+    bar: Rect,
+    t: f32,
+    draw: impl FnOnce(&mut Painter, Rect) -> R,
+) -> Option<R> {
+    if t.is_nan() || t >= 1.0 {
+        return Some(draw(p, bar));
+    }
+    let shown = bar_height(bar, t);
+    if shown <= 0.0 {
+        return None;
+    }
+    let old = p.clip(Rect::new(bar.x, bar.y, bar.w, shown));
+    let moved = Rect::new(bar.x, bar.y - (bar.h - shown), bar.w, bar.h);
+    let out = draw(p, moved);
+    p.restore(old);
+    Some(out)
+}
+
 /// The bar that offers a newer version, shows its download, and says when it is in place.
 pub fn draw_update_bar(
     p: &mut Painter,
@@ -304,4 +337,56 @@ pub fn draw_offer_bar(
         (right - (bar.x + 38.0)).max(0.0),
     );
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::Gfx;
+    use mdshared_text::Bitmap;
+
+    fn offer(p: &mut Painter, pal: &Palette, r: Rect) -> OfferBarHits {
+        let state = OfferBarState::default();
+        draw_offer_bar(p, pal, r, glyph::INFO, "A note", "Yes", "No", state)
+    }
+
+    /// A bar slides down: at 1 it is the plain bar, at 0 nothing, half-way only its lower half
+    /// shows, in the top half of its place.
+    #[test]
+    fn a_bar_slides_down_into_its_place() {
+        let pal = crate::theme::LIGHT;
+        let bar = Rect::new(0.0, 40.0, 400.0, 44.0);
+        let shot = |t: Option<f32>| {
+            let mut bmp = Bitmap::new(400, 120);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(Rect::new(0.0, 0.0, 400.0, 120.0), pal.page);
+            match t {
+                Some(t) => {
+                    draw_sliding(&mut p, bar, t, |p, r| offer(p, &pal, r));
+                }
+                None => {
+                    offer(&mut p, &pal, bar);
+                }
+            }
+            bmp.pixels
+        };
+        let blank = shot(Some(0.0));
+        assert!(shot(Some(1.0)) == shot(None));
+        assert!(blank == shot(Some(-1.0)));
+        assert_eq!(bar_height(bar, 0.5), 22.0);
+        let half = shot(Some(0.5));
+        for y in 0..120u32 {
+            for x in 0..400u32 {
+                let o = ((y * 400 + x) * 4) as usize;
+                if half[o..o + 4] != blank[o..o + 4] {
+                    assert!(
+                        (40..62).contains(&y),
+                        "{x},{y} drawn outside the part that shows"
+                    );
+                }
+            }
+        }
+        assert!(half != blank);
+    }
 }
