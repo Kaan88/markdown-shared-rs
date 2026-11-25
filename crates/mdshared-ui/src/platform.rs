@@ -2072,6 +2072,7 @@ mod contrast_tests {
             SendMessageW, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        let tx2 = tx.clone();
         watch_motion_reduced(move || {
             _ = tx.send(());
         });
@@ -2084,13 +2085,27 @@ mod contrast_tests {
         // Nothing changed: no wake.
         send(WM_SETTINGCHANGE);
         assert!(rx.try_recv().is_err());
-        // As just after a switch: what was seen differs from the system now.
-        *imp::MOTION_SEEN.lock().unwrap() = Some(!motion_reduced());
-        // A colour change is not a setting change.
-        send(WM_SYSCOLORCHANGE);
-        assert!(rx.try_recv().is_err());
-        send(WM_SETTINGCHANGE);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(()));
+        // As just after a switch: what was seen differs from the system now. The wake and what
+        // was seen are one slot for the process, and a host test running beside this one may
+        // register its own wake (and so the current value) at any moment: set both again
+        // before each try, and allow a few.
+        let mut woke = false;
+        for _ in 0..5 {
+            let tx = tx2.clone();
+            watch_motion_reduced(move || {
+                _ = tx.send(());
+            });
+            *imp::MOTION_SEEN.lock().unwrap() = Some(!motion_reduced());
+            // A colour change is not a setting change.
+            send(WM_SYSCOLORCHANGE);
+            assert!(rx.try_recv().is_err());
+            send(WM_SETTINGCHANGE);
+            if rx.recv_timeout(Duration::from_millis(500)) == Ok(()) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "a setting change with a differing value wakes");
         // Seen now.
         send(WM_SETTINGCHANGE);
         assert!(rx.try_recv().is_err());
