@@ -227,3 +227,39 @@ fn disclosure_sheet() {
         bmp.write_png(&out.join(file)).unwrap();
     }
 }
+
+/// The turn by another motion takes that motion's time, and with `DISCLOSURE_MOTION` is the
+/// plain `disclosure_turn`.
+#[test]
+fn a_disclosure_turns_by_the_motion_it_is_given() {
+    use crate::anim::{Animator, Clock, ManualClock, Motion};
+    let run = |motion: Option<Motion>| {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut frames = 0;
+        for k in 0..40 {
+            anim.begin_frame(clock.now());
+            let t = match motion {
+                Some(m) => disclosure_turn_with(&mut anim, "row", k > 0, m),
+                None => disclosure_turn(&mut anim, "row", k > 0),
+            };
+            anim.end_frame();
+            if t >= 1.0 {
+                return (frames, t);
+            }
+            frames += 1;
+            clock.advance_ms(16);
+        }
+        (frames, 0.0)
+    };
+    let plain = run(None);
+    assert_eq!(run(Some(DISCLOSURE_MOTION)), plain);
+    let quick = run(Some(Motion::tween_ms(83, crate::anim::fluent::DECELERATE)));
+    let slow = run(Some(Motion::tween_ms(333, crate::anim::fluent::DECELERATE)));
+    assert_eq!(quick.1, 1.0);
+    assert_eq!(slow.1, 1.0);
+    assert!(
+        quick.0 < plain.0 && plain.0 < slow.0,
+        "{quick:?} {plain:?} {slow:?}"
+    );
+}
