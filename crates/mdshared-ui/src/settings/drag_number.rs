@@ -178,14 +178,14 @@ impl Form {
             Row::Number { value, .. } => value,
             _ => return false,
         };
+        // Carry on from here at the new pace, with no jump; a place that is not a number cannot
+        // anchor it, so the pace waits for one that is.
         if let Some(fine) = fine
             && fine != h.fine
+            && x.is_finite()
         {
-            // Carry on from here at the new pace, with no jump.
-            if x.is_finite() {
-                h.anchor_x = x;
-                h.anchor = i64::from(now);
-            }
+            h.anchor_x = x;
+            h.anchor = i64::from(now);
             h.fine = fine;
         }
         self.drag = Drag::Number(h);

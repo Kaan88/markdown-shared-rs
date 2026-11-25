@@ -120,11 +120,11 @@ fn a_drag_right_or_left_changes_the_value_by_the_step_for_every_four_px() {
     assert_eq!(f.pointer(x - 8.0, y), changed(SIZE, 12));
     assert_eq!(f.release(x - 8.0, y), Outcome::Redraw, "already reported");
     assert_eq!(number(&f, SIZE), 12);
-    assert_ne!(
-        f.pointer(x + 40.0, y),
-        changed(SIZE, 25),
+    assert!(
+        !matches!(f.pointer(x + 40.0, y), Outcome::Changed { .. }),
         "the release ended it"
     );
+    assert_eq!(number(&f, SIZE), 12);
 
     // A step of 25: 25 for every 4 px.
     let (x, y) = value_at(&f, STEPPED);
@@ -177,6 +177,14 @@ fn with_shift_the_drag_is_one_step_for_every_sixteen_px_and_changing_shift_does_
     assert_eq!(f.pointer_with(x + 28.0, y, NONE), changed(SIZE, 18));
     assert_eq!(f.pointer_with(x + 20.0, y, NONE), changed(SIZE, 16));
     assert_eq!(f.release(x + 20.0, y), Outcome::Redraw);
+    // Shift first seen at a place that is no number: the pace waits for a real place.
+    let mut f = form(&[SIZE]);
+    f.press(x, y, NONE, 1);
+    assert_eq!(f.pointer_with(x + 40.0, y, NONE), changed(SIZE, 24));
+    assert_eq!(f.pointer_with(f32::NAN, y, SHIFT), Outcome::None);
+    assert_eq!(f.pointer_with(x + 40.0, y, SHIFT), Outcome::None, "no jump");
+    assert_eq!(f.pointer_with(x + 56.0, y, SHIFT), changed(SIZE, 25));
+    f.release(x + 56.0, y);
     // Without a drag, pointer_with is pointer.
     let mut a = form(&[SIZE]);
     let mut b = form(&[SIZE]);

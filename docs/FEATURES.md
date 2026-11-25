@@ -1259,3 +1259,22 @@ warnings`; `cargo fmt --all --check`; on Windows only. Found, not changed: the s
 buttons and keys (`number_by` in settings.rs, on main) panic on a hand-built row with `min`
 over `max`, as `i32::clamp` does. Not seen by a person in a running app; mdplay does not call
 it yet.
+
+Claude Fable's review (2026-11-25) found nothing blocking. Fixed: a Shift change seen at a
+pointer place that is no number no longer switches the pace without a new anchor (it jumped
+back); the test that a release ends the drag now checks the value. Noted for later:
+- With `pointer_move` (changes reported on release), a key during a drag and a drag back to
+  the reported value can leave the app holding a value the form no longer shows; a new press
+  or a key-opened dropdown mid-drag drops an unreported value. Hosts on `pointer` or
+  `pointer_with` are not affected; the slider's drag has the same hole on main.
+- With `pointer`, a key during a drag and a release without a move report the same value
+  twice.
+- A drag does not check again that its row is still draggable (`show_as_slider` mid-drag),
+  and there is no call to cancel a drag whose release never comes.
+- `cursor_at` answers `ResizeEw` over a draggable value during other drags (the scrollbar, a
+  text selection, a slider).
+- A hand-built row whose value is outside its ends snaps to the end on the first move.
+- Untested: a new press and a key-opened dropdown ending the drag, other keys during a drag;
+  no fixed-seed run over press, move, key and release. The `///` of `key`, `press`, `release`
+  and `pointer` do not mention the drag. The release and feature runs of AGENTS.md were not
+  run.
