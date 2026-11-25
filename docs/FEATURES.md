@@ -1225,7 +1225,7 @@ with the pace following Shift; with `pointer_move` (a `bool`) the change is repo
 new press, `set_rows` (no report: the row in hand may be another) and a dropdown opened by the
 keys end it too. Other keys act as without a drag. `Form::cursor_at(x, y) -> Option<Cursor>`
 answers `Cursor::ResizeEw` over a draggable value and all through its drag, `None` elsewhere,
-with a dropdown open, before a layout and in a form never told; the host lists it first in
+with a dropdown or a colour picker open (its card may cover the rows), before a layout and in a form never told; the host lists it first in
 `cursor::pick` and passes the result to `CursorState::set`. `ResizeEw` is winit's
 `CursorIcon::EwResize`, which winit shows on Windows as `IDC_SIZEWE`; a host setting the
 cursor itself loads `IDC_SIZEWE`. The marks are ids kept through `set_rows`, as the slider
@@ -1416,6 +1416,26 @@ settles, the same key under another backdrop is no change, `None` goes back, no 
 focus, the system asked nothing more); `cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
 Not seen on a frosted window.
+
+## While a colour picker is open (`settings::Form`, 2026-11-26, `fix/colour-open`, asked by mdplay)
+
+Two follow-ups to the colour row, from mdplay's Look dialog, whose picker card covers three rows:
+
+- `Form::cursor_at` answers `None` while a colour picker is open, as it does with a dropdown
+  open: the card may cover a draggable value, and a press there cancels the picker rather than
+  starting a drag. It answers as before once the picker closes.
+- While a picker is open the keys go to it, so a focused text field draws no caret and no
+  selection; it keeps its accent underline. The selection stays in the field and shows again
+  when the picker closes.
+
+A form never given `show_as_colour` draws and answers as before. Tests (`settings::colour_tests`):
+`the_rows_field_shows_no_caret_while_its_picker_is_open` (the row's pixels are the same in both
+blink phases while open, and differ again after Escape) and `no_drag_cursor_while_a_picker_is_open`
+(the arrow over a draggable value goes while the picker is open and comes back after Escape),
+both seen failing without the change. Left for later, from Fable's review: an input-method
+composition sent to the row while its picker is open is not shown; hover stays as it was when the
+picker opened, as under a dropdown; the caret test does not check that the card leaves the field
+uncovered. Not seen by a person.
 
 ## The pool: cancel by key, and results in the order asked for (`Pool::cancel`, `Pool::drain_ordered`, 2026-11-25, `feat/pool-cancel`, roadmap X5)
 
