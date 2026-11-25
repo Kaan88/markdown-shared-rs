@@ -40,7 +40,7 @@ the row says the widget holds state.
 
 | Module | For | Start at |
 |---|---|---|
-| `chrome` | The title row: caption buttons, the tab strip's widths, one tab | `TITLE_H`, `draw_win_button`, `tab_widths`, `draw_tab`, `draw_new_tab_button`, `button_fill` |
+| `chrome` | The title row: caption buttons, the tab strip's widths, one tab; their hover fades (`_animated`, the plain pixels at rest) | `TITLE_H`, `draw_win_button`, `tab_widths`, `draw_tab`, `draw_new_tab_button`, `button_fill`; `draw_win_button_animated`, `draw_tab_animated`, `draw_new_tab_button_animated`, `button_fill_animated` |
 | `window` | Frameless-window helpers: resize edges, title double click, identity, pinch zoom | `edge_at`, `title_double_click`, `identify`, `set_edited`, `PinchZoom` |
 | `window_state` | A window's place saved as one settings value and put back on the monitors there are now: its own, else the nearest; at that monitor's scale; shrunk and moved onto the work area (provisional) | `WindowState::{to_setting, from_setting}`, `restore(&state, &monitors) -> Option<Placement>`, `Monitor`, `MonitorId`; `capture(&window)`, `monitors(&window)` (winit) |
 | `focus` | Which widget has the keyboard: Tab order declared each frame, rings on keyboard use only, scopes for a dialog or a menu that give the focus back when they close (provisional) | `Focus::new()`, `begin_frame`, `add` / `add_with(id, Options::no_tab_stop())` / `add_in(scope, id)`, `end_frame`, `tab(shift)`, `focus(id)`, `blur`, `key_used`, `pointer_used`, `is_focused`, `ring_visible`, `push_scope`, `pop_scope`; `draw_ring` |
