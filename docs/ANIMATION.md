@@ -60,6 +60,7 @@ stall or a minute minimised, what was in flight goes on from where it was and do
 | `PageTransition` | A page or tab switch of a region, driven by a `Snapshot` of the old page. It ends at once if the bitmap's size, the scale or the region changes under it |
 | `Transient<T>` | A slot for a thing that comes and goes, which keeps it while its exit plays |
 | `pop` | Draws anything faded as a whole and moved into place: the entrance and exit of a popup |
+| `unfold` | Draws anything cut off below a line that runs down it, from `UNFOLD_FROM` (0.6) opaque to whole: a menu hanging from its control |
 | `Policy`, `set_system_reduced` | Reduced motion (below) |
 
 The painter gained what these need: `Painter::offset` / `restore_offset` (move everything drawn
@@ -286,6 +287,7 @@ and on every frame under reduced motion, each draws exactly the pixels of the pl
 | `overlay::draw_backdrop` | `draw_backdrop_presence(p, pal, w, h, t)` | The dimming follows the dialog's presence |
 | `overlay::draw_dialog_card` | `pop(p, dialog_bounds(card), t, (0.0, DIALOG_RISE), …)` | A dialog fades and rises as one thing |
 | `menu::Menu::draw_in` | `Menu::draw_in_presence(p, pal, area, t)` | The menu fades and drops 6 px into place |
+| `menu::Menu::draw_in` | `Menu::draw_in_entering(p, pal, area, t, Entrance)` | `Drop` as above; `Unfold` opens from its top edge, starting 60% opaque (`anim::unfold`), and rises when above its anchor; `Side` slides 6 px in from beside its row (a submenu); `Fade` only fades (a menu closing) |
 
 Not done, and how each would be: the settings form (`settings::Form`) draws its own switches,
 ticks and scrollbar and has no animator passed in, so it is unchanged; an application can still

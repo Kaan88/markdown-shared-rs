@@ -138,6 +138,21 @@ const MAX_WIDTH: f32 = 420.0;
 /// [`Menu::draw_in_presence`], in logical px.
 pub const MENU_DROP: f32 = 6.0;
 
+/// How a menu comes in ([`Menu::draw_in_entering`]); every one is a fade as well.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Entrance {
+    /// [`MENU_DROP`] px down into place (up, for a menu above its anchor).
+    Drop,
+    /// From its top edge down ([`crate::anim::unfold`]), as a menu hanging from its control;
+    /// a menu above its anchor rises instead.
+    Unfold,
+    /// [`MENU_DROP`] px sideways into place, as a submenu beside its row: from the left, or from
+    /// the right for one `leftward` of its parent.
+    Side { leftward: bool },
+    /// A fade in place, and nothing else: what a closing menu does.
+    Fade,
+}
+
 /// The room the arrow of a row that opens a submenu takes at the row's right, in place of a
 /// hint.
 const ARROW: f32 = 28.0;
@@ -755,6 +770,61 @@ impl<T: Clone> Menu<T> {
         } else {
             self.rect.inset(-18.0)
         }
+    }
+
+    /// Places the menu inside `area` and draws it at presence `t` with the entrance `how`: the
+    /// same as [`draw_in_presence`](Self::draw_in_presence) for [`Entrance::Drop`], and at 1
+    /// [`draw_in`](Self::draw_in) pixel for pixel whatever `how` is.
+    pub fn draw_in_entering(
+        &mut self,
+        p: &mut Painter,
+        pal: &Palette,
+        area: Rect,
+        t: f32,
+        how: Entrance,
+    ) {
+        self.draw_entering_with(p, area, t, how, |p, m| m.draw_in(p, pal, area));
+    }
+
+    /// As [`draw_in_entering`](Self::draw_in_entering), with the drawing given: `draw` draws
+    /// the menu and anything that belongs to it (a submenu's arrow, a badge), all of it moving
+    /// and fading as one thing. It is called with the menu placed, and not at all at 0.
+    pub fn draw_entering_with(
+        &mut self,
+        p: &mut Painter,
+        area: Rect,
+        t: f32,
+        how: Entrance,
+        draw: impl FnOnce(&mut Painter, &mut Self),
+    ) {
+        self.place_in(p, area);
+        let drop = if self.opened_above() {
+            MENU_DROP
+        } else {
+            -MENU_DROP
+        };
+        let shift = match how {
+            Entrance::Drop => (0.0, drop),
+            // A menu above its control cannot unfold downward from it: it rises, as a dropped
+            // one above does.
+            Entrance::Unfold if self.opened_above() => (0.0, drop),
+            Entrance::Unfold => {
+                let (rect, bounds) = (self.rect, self.presence_bounds());
+                crate::anim::unfold(p, rect, bounds, t, |p| draw(p, self));
+                return;
+            }
+            Entrance::Side { leftward: false } => (-MENU_DROP, 0.0),
+            Entrance::Side { leftward: true } => (MENU_DROP, 0.0),
+            Entrance::Fade => (0.0, 0.0),
+        };
+        let bounds = self.presence_bounds();
+        crate::anim::pop(p, bounds, t, shift, |p| draw(p, self));
+    }
+
+    /// Everything the menu draws where it was last placed, its shadow included: what a fade of
+    /// it must take whole.
+    pub fn drawn_bounds(&self) -> Rect {
+        self.presence_bounds()
     }
 
     /// Where the menu was last placed.

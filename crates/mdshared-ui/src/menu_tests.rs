@@ -1009,3 +1009,123 @@ fn a_looks_text_size_sizes_the_labels_and_the_menu() {
     };
     assert!(ink(10.0) < ink(13.5), "{} {}", ink(10.0), ink(13.5));
 }
+
+#[test]
+fn a_menu_entering_any_way_is_drawn_as_before_once_there_and_each_way_differs_on_the_way() {
+    use crate::theme::LIGHT;
+    let area = Rect::new(0.0, 0.0, 300.0, 400.0);
+    let draw = |t: Option<f32>, how: Entrance, above: bool| {
+        let mut menu = Menu::new(many(4), 60.0, 150.0, false);
+        if above {
+            menu = menu.above();
+        }
+        let mut bmp = Bitmap::new(300, 400);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(area, LIGHT.page);
+        match t {
+            Some(t) => menu.draw_in_entering(&mut p, &LIGHT, area, t, how),
+            None => menu.draw_in(&mut p, &LIGHT, area),
+        }
+        (bmp, menu.rect())
+    };
+    let ways = [
+        Entrance::Drop,
+        Entrance::Unfold,
+        Entrance::Side { leftward: false },
+        Entrance::Side { leftward: true },
+        Entrance::Fade,
+    ];
+    for above in [false, true] {
+        let (plain, rect) = draw(None, Entrance::Fade, above);
+        for how in ways {
+            let (there, _) = draw(Some(1.0), how, above);
+            assert!(there.pixels == plain.pixels, "{how:?} above {above}: at 1");
+        }
+        let (drop, _) = draw(Some(0.5), Entrance::Drop, above);
+        let (presence, _) = {
+            let mut menu = Menu::new(many(4), 60.0, 150.0, false);
+            if above {
+                menu = menu.above();
+            }
+            let mut bmp = Bitmap::new(300, 400);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(area, LIGHT.page);
+            menu.draw_in_presence(&mut p, &LIGHT, area, 0.5);
+            (bmp, ())
+        };
+        assert!(drop.pixels == presence.pixels, "Drop is draw_in_presence");
+        let mut seen = vec![drop.pixels.clone()];
+        for how in ways {
+            let (half, _) = draw(Some(0.5), how, above);
+            if how == Entrance::Unfold && above {
+                // Above its anchor it rises: the same as a drop there.
+                assert!(half.pixels == drop.pixels, "unfold above rises");
+                continue;
+            }
+            if how != Entrance::Drop {
+                assert!(
+                    !seen.contains(&half.pixels),
+                    "{how:?} differs from the others"
+                );
+                seen.push(half.pixels.clone());
+            }
+            if how == Entrance::Unfold {
+                // The lower half is not there yet: the page shows below the unfolded line.
+                let y = (rect.y + rect.h * 0.75) as u32;
+                let x = (rect.x + rect.w / 2.0) as u32;
+                let o = ((y * half.width + x) * 4) as usize;
+                let px = [half.pixels[o + 2], half.pixels[o + 1], half.pixels[o]];
+                assert_eq!(px, LIGHT.page, "below the line at half way");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_menu_entering_with_its_own_drawing_moves_that_drawing_with_it() {
+    use crate::theme::LIGHT;
+    let area = Rect::new(0.0, 0.0, 300.0, 400.0);
+    // A mark drawn beside the menu's top-left corner, inside its bounds, as a cascade's arrow is.
+    let draw = |t: f32| {
+        let mut menu = Menu::new(many(4), 60.0, 150.0, false);
+        let mut bmp = Bitmap::new(300, 400);
+        let mut gfx = Gfx::new();
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(area, LIGHT.page);
+        let mut ran = false;
+        menu.draw_entering_with(
+            &mut p,
+            area,
+            t,
+            Entrance::Side { leftward: false },
+            |p, m| {
+                ran = true;
+                m.draw_in(p, &LIGHT, area);
+                let r = m.rect();
+                p.fill(Rect::new(r.x + 4.0, r.y + 4.0, 2.0, 2.0), [255, 0, 0]);
+            },
+        );
+        let r = menu.rect();
+        let o = (((r.y + 4.0) as u32 * 300 + (r.x + 4.0) as u32) * 4) as usize;
+        (
+            ran,
+            [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o]],
+            menu.drawn_bounds(),
+            r,
+        )
+    };
+    let (ran, there, bounds, rect) = draw(1.0);
+    assert!(ran && there == [255, 0, 0]);
+    assert!(
+        bounds.x < rect.x && bounds.right() > rect.right(),
+        "the shadow's reach"
+    );
+    let (ran, _, _, _) = draw(0.0);
+    assert!(!ran, "not drawn at 0");
+    // Half way it is 3 px to the left and half there: the mark's place shows neither the mark
+    // whole nor the page.
+    let (_, half, _, _) = draw(0.5);
+    assert!(half != [255, 0, 0] && half != LIGHT.page, "{half:?}");
+}
