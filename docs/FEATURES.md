@@ -1489,3 +1489,46 @@ at its end on the first frame. Test (`chrome::tests::the_animated_pieces_are_the
 extended): the first frame of a hover is not the full hover, and the caption buttons, the new-tab button and the tab (left of its label) are at rest
 there; the way back starts from the full hover. Seen failing without the change. Not seen by a
 person.
+
+## A selection that follows its text, and words across a soft wrap (`mdshared_term::select`, 2026-11-26, `feat/t6-select-rewrap`, roadmap T6)
+
+A selection already held absolute line numbers, so it stayed on its text while the screen
+scrolled. It had no way to notice a program writing over the cells under it: the module doc left
+that to the caller, comparing `Screen::take_dirty` with `Selection::range`, which is wrong for a
+selection in the scrollback (its rows are not screen rows) and wrong for a row that was only
+repainted. It now holds a 64-bit fingerprint (FNV-1a) of its own text, taken when it is made,
+extended or clipped, and `Selection::is_intact(&screen)` says whether the cells still give that
+text. `Selection::follow(&mut self, &screen)` is the one call after each `Screen::feed`: false
+means the text was rewritten, erased or partly dropped from the scrollback, and the caller drops
+the selection, as terminals do; true means it is still there, also when it scrolled into the
+scrollback, and the selection is cut to what the screen keeps and goes on from there. A press
+that has not been dragged is followed too, so a caller that follows after every feed keeps it
+until the drag. `clip` now takes the clipped text as what the selection holds, so the part that
+survived a ring drop is not mistaken for a rewrite.
+
+Two consequences of comparing text rather than cells, both deliberate and in the module doc: a
+program that writes the same characters over them again does not drop the selection (copying
+would give the same text), and a rewrite that happens to fingerprint to the same 64 bits is not
+noticed (no real output does).
+
+Words now cross a soft wrap: a double click on `~/src/a-b` on one row of a wrapped path selects
+the whole path through `.rs` on the next, because the two rows are one line of text. A hard line
+break still stops a word, and so does a cell of another class. `Unit::Line` already joined wrapped
+rows and is unchanged; its crossing and its stopping at a hard break are now tested by name.
+
+Test (`select::tests::a_word_crosses_a_soft_wrap_and_stops_at_a_hard_break`): a word that starts
+on the first of two wrapped rows runs to the last cell of the second, from either row, and the
+word after the hard break stops at it; seen failing without the change, where it stopped at the
+row's last column. `a_line_crosses_a_soft_wrap_and_stops_at_a_hard_break` passed before the
+change as well, since the line unit already joined wrapped rows.
+`a_selection_follows_its_text_into_the_scrollback`: a selection made on a screen row is intact
+and followed after two more lines push it into the scrollback under the same number, an undragged
+press is followed, and a selection whose line the ring has dropped is not. `a_rewrite_or_an_erase_of_the_selected_cells_drops_the_selection`:
+erasing the rest of the selected row keeps it, overwriting a selected cell, erasing its line and
+clearing the screen drop it, and writing the same characters again keeps it. Both follow tests
+fail to compile against the old module, which had no `follow` and no `is_intact`. `a_second_click_takes_a_word_and_grows_by_words`
+was changed to the new expectation: the path it double clicks is one word over the wrap.
+
+Run: `cargo test -p mdshared-term` (48 unit tests and the crate's doctest pass; in `select::`
+eleven tests, the four above among them) and the three commands below, on Windows only. Compiled,
+not run, on Linux and macOS. Not seen by a person: no window draws a selection yet (roadmap T1).
