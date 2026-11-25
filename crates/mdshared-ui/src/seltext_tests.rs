@@ -5,7 +5,7 @@
 //! `target/specimen/seltext.png` and `seltext-150.png`.
 
 use super::*;
-use crate::gfx::{Gfx, Painter, Rect, Rgb};
+use crate::gfx::{Gfx, Painter, Rect, Rgb, Wrap};
 use crate::theme::{DARK, LIGHT};
 use mdshared_text::Bitmap;
 
@@ -701,40 +701,64 @@ fn lines_of_another_text_are_ignored_and_nothing_panics() {
     assert_eq!(m.caret().0, lines[0].range.end);
 }
 
+/// The least of five timings of `f`, which is steadier than one.
+fn least_of_five(mut f: impl FnMut()) -> std::time::Duration {
+    (0..5)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            f();
+            started.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
 #[test]
 fn paragraph_lines_is_linear_on_a_long_line_of_one_token() {
-    // 20,000 chars is the size asked for; 100,000 makes a quadratic pass (about 300 ms in
-    // release) stand far from a linear one (about 2 ms), so the bound below catches it.
+    // 20,000 chars is the size asked for. Five times as many chars take about five times as
+    // long when the work is linear and about 25 times when it is quadratic (a quadratic pass took
+    // 300 ms at 100,000 chars in release, a linear one 2 ms), so the ratio of the two is the
+    // check, which a slow machine does not change. The absolute bound is only for a hang.
+    let mut lines_took = Vec::new();
+    let mut model_took = Vec::new();
     for len in [20_000, 100_000] {
         let text = "a".repeat(len);
         let mut bmp = Bitmap::new(8, 8);
         let mut gfx = Gfx::new();
         let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
-        // The first call shapes the text; the second only reads the cached layout.
+        // The first call shapes the text; the timed ones only read the cached layout.
         let lines = p.paragraph_lines(Face::Ui, 13.0, 300.0, &text, [0, 0, 0]);
-        let started = std::time::Instant::now();
-        let again = p.paragraph_lines(Face::Ui, 13.0, 300.0, &text, [0, 0, 0]);
-        let took = started.elapsed();
-        assert_eq!(lines, again);
+        let took = least_of_five(|| {
+            let again = p.paragraph_lines(Face::Ui, 13.0, 300.0, &text, [0, 0, 0]);
+            assert_eq!(lines, again);
+        });
         let stops: usize = lines.iter().map(|l| l.stops.len()).sum();
         assert_eq!(stops, text.len() + lines.len());
         // The model's double click and keys on it are linear too.
-        let mut m = model(&text);
-        let started = std::time::Instant::now();
-        m.press(&lines, 5000.0, middle(&lines[0]), Mods::default(), 2);
-        m.key(&KeyName::End, shift());
-        m.key(&KeyName::Left, shift());
-        let model_took = started.elapsed();
-        assert_eq!(m.selection().start, 0);
-        println!("{len} chars: paragraph_lines {took:?}, model {model_took:?}");
-        if !cfg!(debug_assertions) {
+        let took_model = least_of_five(|| {
+            let mut m = model(&text);
+            m.press(&lines, 5000.0, middle(&lines[0]), Mods::default(), 2);
+            m.key(&KeyName::End, shift());
+            m.key(&KeyName::Left, shift());
+            assert_eq!(m.selection().start, 0);
+        });
+        println!("{len} chars: paragraph_lines {took:?}, model {took_model:?}");
+        lines_took.push(took);
+        model_took.push(took_model);
+    }
+    if !cfg!(debug_assertions) {
+        let slack = std::time::Duration::from_millis(5);
+        for (what, took) in [("paragraph_lines", &lines_took), ("the model", &model_took)] {
             assert!(
-                took.as_millis() < 100,
-                "{len}: paragraph_lines took {took:?}"
+                took[1] <= took[0] * 12 + slack,
+                "{what} is not linear: {:?} for 20,000 chars, {:?} for 100,000",
+                took[0],
+                took[1]
             );
             assert!(
-                model_took.as_millis() < 100,
-                "{len}: the model took {model_took:?}"
+                took[1].as_secs() < 2,
+                "{what} took {:?} for 100,000 chars",
+                took[1]
             );
         }
     }
@@ -815,6 +839,247 @@ fn a_lone_carriage_return_and_the_unicode_separators_end_a_line() {
     assert_eq!(m.caret().0, text.find('\u{2028}').unwrap());
     m.key(&KeyName::Home, none);
     assert_eq!(m.caret().0, 4);
+}
+
+#[test]
+fn right_end_and_a_triple_click_treat_a_crlf_as_one_line_break() {
+    let text = "one\r\ntwo\r\n\r\nthree";
+    let none = Mods::default();
+    let lines = lines_of(text);
+    assert_eq!(lines.len(), 4, "parley breaks at each CRLF: {lines:?}");
+    // The caret never stands between the \r and the \n, with lines and without.
+    for with_lines in [true, false] {
+        let mut m = model(text);
+        if with_lines {
+            m.set_lines(&lines);
+        }
+        let mut stood = vec![0];
+        for _ in 0..text.chars().count() {
+            m.key(&KeyName::Right, none);
+            stood.push(m.caret().0);
+        }
+        assert!(
+            !stood.contains(&4) && !stood.contains(&9) && !stood.contains(&11),
+            "with lines {with_lines}: Right stood inside a CRLF: {stood:?}"
+        );
+        assert_eq!(*stood.last().unwrap(), text.len(), "Right reaches the end");
+        // Left comes back the same way.
+        let mut back = vec![m.caret().0];
+        for _ in 0..text.chars().count() {
+            m.key(&KeyName::Left, none);
+            back.push(m.caret().0);
+        }
+        assert!(
+            !back.contains(&4) && !back.contains(&9) && !back.contains(&11),
+            "with lines {with_lines}: Left stood inside a CRLF: {back:?}"
+        );
+        assert_eq!(*back.last().unwrap(), 0);
+        // Shift+Right at the end of "one" selects the whole line break.
+        m.key(&KeyName::End, none);
+        assert_eq!(
+            m.caret().0,
+            3,
+            "with lines {with_lines}: End stops before the CRLF"
+        );
+        m.key(&KeyName::Right, shift());
+        assert_eq!(m.selected_text(), "\r\n", "with lines {with_lines}");
+        m.key(&KeyName::Right, none);
+        m.key(&KeyName::End, shift());
+        assert_eq!(
+            m.selected_text(),
+            "two",
+            "with lines {with_lines}: End on the second line"
+        );
+        // The empty line between two CRLFs: End stays at its start.
+        m.key(&KeyName::Right, none);
+        m.key(&KeyName::Right, none);
+        assert_eq!(
+            m.caret().0,
+            10,
+            "with lines {with_lines}: on the empty line"
+        );
+        m.key(&KeyName::End, none);
+        assert_eq!(
+            m.caret().0,
+            10,
+            "with lines {with_lines}: End on the empty line"
+        );
+    }
+    let mut m = model(text);
+    for (i, want) in ["one", "two", "", "three"].into_iter().enumerate() {
+        let line = &lines[i];
+        m.press(&lines, 1.0, middle(line), none, 3);
+        assert_eq!(m.selected_text(), want, "triple click on line {i}");
+        m.press(&lines, 1000.0, middle(line), none, 1);
+        assert_eq!(
+            m.caret().0,
+            line.range.start + want.len(),
+            "a click past line {i} lands before its CRLF"
+        );
+    }
+}
+
+/// A registry key with a stretch of 90 chars and no space: wider than the area in any face.
+const KEY: &str = "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\\
+                   {ec8030f7-c20a-464f-9b0e-13a3a9e97384}";
+
+/// Whether the device px column `x` of `bmp` holds anything but `page` in rows `y0..y1`.
+fn inked(bmp: &Bitmap, x: usize, y0: usize, y1: usize, page: Rgb) -> bool {
+    (y0..y1.min(bmp.height as usize)).any(|y| {
+        let at = (y * bmp.width as usize + x) * 4;
+        [bmp.pixels[at + 2], bmp.pixels[at + 1], bmp.pixels[at]] != page
+    })
+}
+
+#[test]
+fn a_long_path_wraps_anywhere_inside_a_narrow_area_and_copies_as_it_was() {
+    for scale in [1.0, 1.5] {
+        for pal in [&LIGHT, &DARK] {
+            let (w, h) = (320.0, 260.0);
+            let area = Rect::new(10.0, 10.0, 130.0, 240.0);
+            let fresh = || {
+                let mut bmp = Bitmap::new((w * scale) as u32, (h * scale) as u32);
+                let mut gfx = Gfx::new();
+                Painter::new(&mut bmp, &mut gfx, scale).fill(Rect::new(0.0, 0.0, w, h), pal.page);
+                (bmp, gfx)
+            };
+            let mut m = model(KEY).with_wrap(Wrap::Anywhere);
+            assert_eq!(m.wrap(), Wrap::Anywhere);
+
+            // The lines break inside the words and every char boundary is inside the area.
+            let (mut bmp, mut gfx) = fresh();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            let lines = lines(&mut p, pal, area.w, Face::Mono, 12.0, &m);
+            assert!(lines.len() >= 4, "scale {scale}: {} lines", lines.len());
+            let mut at = 0;
+            for l in &lines {
+                assert_eq!(l.range.start, at, "the lines are contiguous");
+                at = l.range.end;
+                let right = l.stops.iter().copied().fold(0.0, f32::max);
+                assert!(
+                    right <= area.w + 0.01,
+                    "scale {scale}: line {:?} ends at {right}, past {}",
+                    l.range,
+                    area.w
+                );
+            }
+            assert_eq!(at, KEY.len(), "every byte is on a line, none added");
+
+            // Drawn, the clip cuts nothing: the paragraph unclipped is the same pixels, and it
+            // has no ink right of the area. Every line has ink.
+            draw(&mut p, pal, area, Face::Mono, 12.0, &m, false);
+            let (mut free, mut gfx) = fresh();
+            let mut q = Painter::new(&mut free, &mut gfx, scale);
+            q.paragraph_wrapped(
+                Face::Mono,
+                12.0,
+                area.x,
+                area.y,
+                area.w,
+                KEY,
+                pal.text,
+                Wrap::Anywhere,
+            );
+            assert!(
+                bmp.pixels == free.pixels,
+                "scale {scale}, dark {}: the clip cut a char off",
+                pal.dark
+            );
+            let edge = (area.right() * scale).ceil() as usize;
+            let rows = (0, (h * scale) as usize);
+            assert!(
+                (edge..free.width as usize).all(|x| !inked(&free, x, rows.0, rows.1, pal.page)),
+                "scale {scale}: ink right of the area"
+            );
+            for l in &lines {
+                let y0 = ((area.y + l.y) * scale) as usize;
+                let y1 = ((area.y + l.y + l.height) * scale) as usize;
+                let x0 = (area.x * scale) as usize;
+                assert!(
+                    (x0..edge).any(|x| inked(&bmp, x, y0, y1, pal.page)),
+                    "scale {scale}: line {:?} has no ink",
+                    l.range
+                );
+            }
+            // Words alone would have run past the area: the test asks something.
+            let (mut words, mut gfx) = fresh();
+            Painter::new(&mut words, &mut gfx, scale).paragraph(
+                Face::Mono,
+                12.0,
+                area.x,
+                area.y,
+                area.w,
+                KEY,
+                pal.text,
+            );
+            assert!(
+                (edge..words.width as usize).any(|x| inked(&words, x, rows.0, rows.1, pal.page)),
+                "scale {scale}: breaking between words kept the key inside the area"
+            );
+
+            // A selection across the first break copies the text as it was, with no line break.
+            let (l0, l1) = (&lines[0], &lines[1]);
+            m.press(&lines, middle_x(l0), middle(l0), Mods::default(), 1);
+            m.drag(&lines, middle_x(l1), middle(l1));
+            let selection = m.selection();
+            assert!(selection.start < l0.range.end && l0.range.end < selection.end);
+            let copied = m.key(&KeyName::Char('c'), ctrl());
+            assert_eq!(copied, Some(Action::Copy(KEY[selection].to_string())));
+            m.select_all();
+            assert_eq!(
+                m.key(&KeyName::Char('c'), ctrl()),
+                Some(Action::Copy(KEY.to_string()))
+            );
+            // And the highlight is on both sides of the break.
+            m.press(&lines, middle_x(l0), middle(l0), Mods::default(), 1);
+            m.drag(&lines, middle_x(l1), middle(l1));
+            let (mut bmp, mut gfx) = fresh();
+            let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+            draw(&mut p, pal, area, Face::Mono, 12.0, &m, true);
+            let lit = blended(pal.page, pal.selection);
+            for (l, x) in [
+                (l0, last_char_x(l0)),
+                (l1, (l1.stops[0] + l1.stops[1]) / 2.0),
+            ] {
+                let y = area.y + l.y + l.height * 0.08;
+                assert!(
+                    close(pixel(&bmp, area.x + x, y, scale), lit),
+                    "scale {scale}, dark {}: no highlight on line {:?}",
+                    pal.dark,
+                    l.range
+                );
+            }
+        }
+    }
+}
+
+/// The x of the middle of the last char of `line`, in its own coordinates.
+fn last_char_x(line: &Line) -> f32 {
+    let n = line.stops.len();
+    (line.stops[n - 2] + line.stops[n - 1]) / 2.0
+}
+
+/// The x of the middle of `line`, in its own coordinates.
+fn middle_x(line: &Line) -> f32 {
+    (line.stops[0] + line.stops[line.stops.len() - 1]) / 2.0
+}
+
+#[test]
+fn by_default_the_lines_are_those_paragraph_draws() {
+    let text = "a few words that wrap, and C:\\Program Files\\Mozilla Firefox\\uninstall";
+    let mut bmp = Bitmap::new(8, 8);
+    let mut gfx = Gfx::new();
+    let mut p = Painter::new(&mut bmp, &mut gfx, 1.5);
+    let m = model(text);
+    assert_eq!(m.wrap(), Wrap::Words);
+    assert_eq!(
+        lines(&mut p, &LIGHT, 90.0, Face::Ui, 13.0, &m),
+        p.paragraph_lines(Face::Ui, 13.0, 90.0, text, LIGHT.text)
+    );
+    let mut m = m.with_wrap(Wrap::Anywhere);
+    m.set_wrap(Wrap::Words);
+    assert_eq!(m.wrap(), Wrap::Words);
+    assert!(lines(&mut p, &LIGHT, 90.0, Face::Ui, 13.0, &model("")).is_empty());
 }
 
 #[test]

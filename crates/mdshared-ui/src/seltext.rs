@@ -1,16 +1,28 @@
-//! Selectable text that cannot be edited: log output, a path, a message in a details pane. It
-//! holds the text, a selection as byte offsets, and the pointer drag in progress; the caller
-//! gives it the wrapped lines of the paragraph it draws, passes in the pointer and key events,
-//! and acts on what they return. Nothing here reads the clipboard, a clock or a window.
+//! Selectable text that cannot be edited: a path, a command line, a registry key, a message in a
+//! details pane. It holds the text, a selection as byte offsets, and the pointer drag in
+//! progress; the caller gives it the wrapped lines of the paragraph it draws, passes in the
+//! pointer and key events, and acts on what they return. Nothing here reads the clipboard, a
+//! clock or a window.
+//!
+//! # How much text
+//!
+//! One paragraph, of the size a details pane shows: a few lines, a few hundred at most. It is
+//! not a log view. Every press and drag is given the lines of the whole paragraph, which the
+//! caller gets from [`lines`] (a cached layout is read again, but the stops of every line are
+//! built each time: linear in the text, about 2 ms for 100,000 chars in release on the machine
+//! that wrote this), and [`draw`] does the same on every frame that shows a selection. There is
+//! no scrolling and no virtualisation: the whole paragraph is laid out and drawn into its
+//! rectangle, clipped. Output that grows without end belongs in a list of rows, one line each.
 //!
 //! # The lines
 //!
-//! The text wraps as [`Painter::paragraph`] draws it, and only that layout knows where a byte
-//! sits on screen. [`Painter::paragraph_lines`](crate::gfx::Painter::paragraph_lines), given the
-//! face, size, width, text and colour `paragraph` is given, reports the lines of the very layout
-//! `paragraph` draws, each with the x of every character boundary, so hit testing and the
-//! selection highlight agree with the drawn glyphs. The caller asks for those lines and hands
-//! them to [`SelectableText::press`] and [`SelectableText::drag`]. The model keeps the last lines
+//! The text wraps as [`Painter::paragraph_wrapped`](crate::gfx::Painter::paragraph_wrapped)
+//! draws it with the model's [`Wrap`], and only that layout knows where a byte sits on screen.
+//! [`lines`] reports the lines of the very layout [`draw`] draws, from
+//! [`Painter::paragraph_lines_wrapped`](crate::gfx::Painter::paragraph_lines_wrapped), each with
+//! the x of every character boundary, so hit testing and the selection highlight agree with the
+//! drawn glyphs. The caller asks for those lines and hands them to [`SelectableText::press`] and
+//! [`SelectableText::drag`]. The model keeps the last lines
 //! it was given for the keys (Left and Right step over clusters, Home and End find the wrapped
 //! line, Up and Down move between lines), and the next press, drag or
 //! [`SelectableText::set_lines`] replaces them. **After a resize or a font change the caller
@@ -21,6 +33,16 @@
 //! Lines that do not fit the text (a range past its end or off a char boundary, a stop count
 //! that is not the range's char count plus one) are dropped where they come in, so lines of
 //! another text are ignored rather than trusted.
+//!
+//! # Wrapping a path
+//!
+//! By default ([`Wrap::Words`]) the paragraph breaks its lines between words, as
+//! [`Painter::paragraph`] does, and a word wider than the rectangle (`C:\Program Files\Mozilla
+//! Firefox\uninstall\helper.exe`, a registry key) runs past its right edge, where the clip cuts
+//! it off and no click can reach it. [`SelectableText::with_wrap`] with [`Wrap::Anywhere`] breaks
+//! such a word between two clusters instead, so every char stays inside the rectangle: what a
+//! pane of paths in the monospace face wants. The breaks are only where the lines end: the text
+//! is not changed, so a copy across a break gives the text as it was, with no line break added.
 //!
 //! # Where the caret is
 //!
@@ -56,10 +78,18 @@
 //! selection from [`SelectableText::text`] and [`SelectableText::selected_text`] to its own
 //! accessibility tree.
 //!
-//! Deliberately not tested: right-to-left paragraphs. The stops follow parley's runs and carry
-//! its direction, but no test exercises an RTL paragraph.
+//! # Right-to-left text
+//!
+//! Not supported beyond what falls out of the layout, and not tested. The stops follow parley's
+//! runs and carry their direction, so a click lands on the right char of a right-to-left run.
+//! But the keys move in logical order, the order of the bytes: Left steps to the previous char
+//! and Right to the next, which in a right-to-left run moves the caret the other way on screen.
+//! And the highlight is one rectangle per line, from the x of the first selected byte on that
+//! line to the x of the last: right on a line of one direction, wrong on a line that mixes
+//! directions, where the selected chars are not one span on screen and the rectangle covers some
+//! that are not selected and misses some that are.
 
-use crate::gfx::{Face, Line, Painter, Rect};
+use crate::gfx::{Face, Line, Painter, Rect, Wrap};
 use crate::keys::{KeyName, Mods};
 use crate::menu::Item;
 use crate::textfield::{Class, class};
@@ -102,12 +132,35 @@ pub struct SelectableText {
     goal_x: Option<f32>,
     /// A press started a drag that has not been released.
     dragging: bool,
+    /// Where the paragraph may break its lines, for [`lines`] and [`draw`].
+    wrap: Wrap,
 }
 
 impl SelectableText {
     /// An empty paragraph; [`set_text`](Self::set_text) gives it words.
     pub fn new() -> SelectableText {
         SelectableText::default()
+    }
+
+    /// The paragraph, breaking its lines by `wrap` (see the module's "Wrapping a path"):
+    /// [`Wrap::Words`], the default, breaks between words only, as [`Painter::paragraph`] does;
+    /// [`Wrap::Anywhere`] also breaks a word too wide for the rectangle, which a path needs.
+    /// [`lines`] and [`draw`] lay the paragraph out this way.
+    pub fn with_wrap(mut self, wrap: Wrap) -> SelectableText {
+        self.wrap = wrap;
+        self
+    }
+
+    /// Changes where the paragraph breaks its lines, as [`with_wrap`](Self::with_wrap) sets it.
+    /// The selection stays. The lines the model has are of the old wrapping, as after a resize:
+    /// give it the new ones with [`set_lines`](Self::set_lines) before passing keys again.
+    pub fn set_wrap(&mut self, wrap: Wrap) {
+        self.wrap = wrap;
+    }
+
+    /// Where the paragraph breaks its lines.
+    pub fn wrap(&self) -> Wrap {
+        self.wrap
     }
 
     /// The text as it is, newlines included.
@@ -130,8 +183,10 @@ impl SelectableText {
     }
 
     /// Gives the model the lines of the paragraph as it is drawn now, from the top of the
-    /// paragraph: [`Painter::paragraph_lines`](crate::gfx::Painter::paragraph_lines) for the same
-    /// text, face, size, width and colour.
+    /// paragraph: [`lines`] for the same painter, palette, width, face and size [`draw`] is
+    /// given. Those are the layout's lines in `pal.text` with the model's [`Wrap`]; with
+    /// [`Wrap::Words`] they are [`Painter::paragraph_lines`](crate::gfx::Painter::paragraph_lines)
+    /// for the same text, face, size, width and colour.
     ///
     /// The keys need them: Left and Right step over clusters by them, Home and End find the
     /// wrapped line, and Up and Down move between lines. [`press`](Self::press) and
@@ -195,9 +250,8 @@ impl SelectableText {
     }
 
     /// A pointer press at `(x, y)`, in logical px from the top left of the paragraph: the
-    /// `lines` must be [`Painter::paragraph_lines`](crate::gfx::Painter::paragraph_lines) for the
-    /// same text, face, size, width and colour, and replace the ones the model has (see
-    /// [`set_lines`](Self::set_lines); lines that do not fit the text are ignored). `clicks`
+    /// `lines` must be [`lines`] for what [`draw`] is given, and replace the ones the model has
+    /// (see [`set_lines`](Self::set_lines); lines that do not fit the text are ignored). `clicks`
     /// counts the presses of a multiple click: one puts the caret at the nearest cluster edge
     /// and starts a drag, two select the word under the pointer, and three or more select its
     /// line. With `mods.shift` a single click moves only the caret, extending the selection from
@@ -475,6 +529,8 @@ impl SelectableText {
     }
 
     /// The next cluster edge after `at`, by the lines; one char on with no line holding `at`.
+    /// Never the middle of a `\r\n`, which parley marks as an edge on a line that is only the
+    /// line break.
     fn next_edge(&self, at: usize) -> usize {
         let Some(line) = self
             .lines
@@ -484,11 +540,12 @@ impl SelectableText {
             return next_char(&self.text, at);
         };
         bounds(line, &self.text)
-            .find(|&(i, b)| b > at && line.edges[i])
+            .find(|&(i, b)| b > at && line.edges[i] && !inside_crlf(&self.text, b))
             .map_or(line.range.end, |(_, b)| b)
     }
 
-    /// The cluster edge before `at`, by the lines; one char back with no line holding it.
+    /// The cluster edge before `at`, by the lines; one char back with no line holding it. Never
+    /// the middle of a `\r\n`.
     fn prev_edge(&self, at: usize) -> usize {
         let Some(line) = self
             .lines
@@ -498,7 +555,7 @@ impl SelectableText {
             return prev_char(&self.text, at);
         };
         bounds(line, &self.text)
-            .filter(|&(i, b)| b < at && line.edges[i])
+            .filter(|&(i, b)| b < at && line.edges[i] && !inside_crlf(&self.text, b))
             .last()
             .map_or(line.range.start, |(_, b)| b)
     }
@@ -538,15 +595,32 @@ impl SelectableText {
     }
 }
 
+/// The wrapped lines of `model`'s paragraph as [`draw`] lays it out in a rectangle `width` wide
+/// with the same `pal`, `face` and `size`, from the top of the paragraph: what
+/// [`SelectableText::press`], [`SelectableText::drag`] and [`SelectableText::set_lines`] are
+/// given. It reads the layout `draw` draws (the colour is `pal.text`, the wrap the model's
+/// [`Wrap`]), from the painter's cache once either has laid it out. Empty text gives no lines.
+pub fn lines(
+    p: &mut Painter,
+    pal: &Palette,
+    width: f32,
+    face: Face,
+    size: f32,
+    model: &SelectableText,
+) -> Vec<Line> {
+    p.paragraph_lines_wrapped(face, size, width, &model.text, pal.text, model.wrap)
+}
+
 /// Draws the paragraph in `area` and, when `model` has a selection and `focused` is set, the
 /// selection behind the text: `pal.selection` at the same 0.35 alpha the text field uses, over
 /// each wrapped line the selection touches. A selected empty line gets a highlight as wide as a
 /// space, so it shows. The text is drawn by
-/// [`Painter::paragraph`](crate::gfx::Painter::paragraph) with `pal.text`, in `face` and `size`,
-/// clipped to `area`.
+/// [`Painter::paragraph_wrapped`](crate::gfx::Painter::paragraph_wrapped) with `pal.text` and the
+/// model's [`Wrap`], in `face` and `size`, clipped to `area`; with [`Wrap::Words`] that is
+/// [`Painter::paragraph`].
 ///
-/// The lines are laid out for `area.w` on every call, with `pal.text`, so they come from the
-/// same cached layout `paragraph` draws and the highlight follows a resize without the model
+/// The lines are laid out for `area.w` on every call ([`lines`]), so they come from the same
+/// cached layout the text is drawn from and the highlight follows a resize without the model
 /// being told. The highlight is placed in device px as the glyphs are, from the rounded corner
 /// of `area`, so the two agree at a fractional `area.x`. The model's own lines are not touched;
 /// the caller gives them to it with [`SelectableText::set_lines`].
@@ -561,7 +635,7 @@ pub fn draw(
 ) {
     let old = p.clip(area);
     if focused && model.has_selection() {
-        let lines = p.paragraph_lines(face, size, area.w, &model.text, pal.text);
+        let lines = lines(p, pal, area.w, face, size, model);
         let selection = model.selection();
         let s = p.scale;
         // The device px corner the paragraph's glyphs are placed from.
@@ -598,7 +672,16 @@ pub fn draw(
             );
         }
     }
-    p.paragraph(face, size, area.x, area.y, area.w, &model.text, pal.text);
+    p.paragraph_wrapped(
+        face,
+        size,
+        area.x,
+        area.y,
+        area.w,
+        &model.text,
+        pal.text,
+        model.wrap,
+    );
     p.restore(old);
 }
 
@@ -659,6 +742,12 @@ fn x_of(line: &Line, text: &str, at: usize) -> f32 {
         .or_else(|| line.stops.last())
         .copied()
         .unwrap_or(0.0)
+}
+
+/// Whether byte `b` of `text` is between the `\r` and the `\n` of a `\r\n`, one line break
+/// where no caret stands.
+fn inside_crlf(text: &str, b: usize) -> bool {
+    b > 0 && text.as_bytes().get(b - 1) == Some(&b'\r') && text.as_bytes().get(b) == Some(&b'\n')
 }
 
 /// Whether `c` ends a line: the chars parley breaks a line at.
@@ -749,18 +838,27 @@ fn logical_line(text: &str, at: usize) -> Range<usize> {
     start..end
 }
 
+/// The char boundary before `i`, for the keys when no line holds `i`. A `\r\n` is one step, as
+/// it is one line break, so the caret never stands between its two chars.
 fn prev_char(text: &str, i: usize) -> usize {
     let mut i = i.min(text.len());
     while !text.is_char_boundary(i) {
         i -= 1;
     }
+    if text[..i].ends_with("\r\n") {
+        return i - 2;
+    }
     text[..i].char_indices().next_back().map_or(0, |(p, _)| p)
 }
 
+/// The char boundary after `i`, for the keys when no line holds `i`; a `\r\n` is one step.
 fn next_char(text: &str, i: usize) -> usize {
     let mut i = i.min(text.len());
     while !text.is_char_boundary(i) {
         i -= 1;
+    }
+    if text[i..].starts_with("\r\n") {
+        return i + 2;
     }
     text[i..].chars().next().map_or(i, |c| i + c.len_utf8())
 }
