@@ -3,6 +3,14 @@
 //! Each icon is SVG path data on a 16 by 16 grid, drawn as strokes [`STROKE`] wide with round
 //! ends and corners; nothing is filled. A dot is a circle small enough that its stroke closes
 //! over the middle. Lines sit on half units, so at 16 px they land on whole pixels.
+//!
+//! One drawing lives here as well, because it is a glyph and nothing more: a tree row's
+//! disclosure, the chevron that turns from [`RIGHT`] to [`DOWN`] as a folder opens
+//! ([`draw_disclosure`], [`draw_disclosure_animated`]). The tree itself (`tree`) draws no rows;
+//! the applications draw them and call this for the chevron.
+
+use crate::anim::{Animator, AsId, Id, Motion, fluent};
+use crate::gfx::{Painter, Rgb};
 
 /// The side of the grid the icons are drawn on.
 pub const GRID: f32 = 16.0;
@@ -233,3 +241,74 @@ pub const ALL: &[(&str, &str)] = &[
     ("HEADING", HEADING),
     ("TABLE", TABLE),
 ];
+
+// ---- the tree's disclosure ---------------------------------------------------------------------
+
+/// How long the disclosure takes to turn, and how: [`fluent::MOVE`], 167 ms on the point to
+/// point curve, the same both ways. The chevron stays on screen and moves from one place to
+/// another, which is what `MOVE` is for; `ENTER` and `EXIT` are for things that appear and go
+/// away, and `anim::document` has no motion for a part of a control. 167 ms is also the
+/// expander's body (`ENTER` and `EXIT` are 167 ms), so a chevron beside a body that opens ends
+/// its turn as the body ends.
+pub const DISCLOSURE_MOTION: Motion = fluent::MOVE;
+
+/// Draws a tree row's disclosure: the [`RIGHT`] chevron turned clockwise by `open` times 90
+/// degrees, `size` logical px across, centred on `cx, cy`, in colour `c`. `open` is 0 for a
+/// closed folder and 1 for an open one, and anything between is part of the way through a turn.
+///
+/// At rest it is what the applications draw today, pixel for pixel: at 0 (or less) it is
+/// `p.icon(RIGHT, size, cx, cy, c)` and at 1 (or more) it is `p.icon(DOWN, size, cx, cy, c)`.
+/// In between, the right chevron's path is turned and stroked
+/// ([`Painter::icon_rotated`]), so it stays crisp. An `open` that is not a number is drawn
+/// closed. The caller owns the row, its hits and whether it is expanded; this draws the chevron
+/// and nothing else.
+pub fn draw_disclosure(p: &mut Painter, cx: f32, cy: f32, size: f32, open: f32, c: Rgb) {
+    if open.is_nan() || open <= 0.0 {
+        p.icon(RIGHT, size, cx, cy, c);
+    } else if open >= 1.0 {
+        p.icon(DOWN, size, cx, cy, c);
+    } else {
+        p.icon_rotated(RIGHT, size, cx, cy, open * 90.0, c);
+    }
+}
+
+/// How far the disclosure named `id` is through its turn now: 0 closed, 1 open, moving by
+/// [`DISCLOSURE_MOTION`] when `expanded` changes. The value lives under a part of `id`
+/// (`Id::new(id).with("disclosure")`), so the row's own id can carry its other values. A
+/// disclosure first seen is at rest where it is (an open folder is drawn open, with no turn).
+/// Under reduced motion, or with [`Policy::Never`](crate::anim::Policy::Never), it is 0 or 1 at
+/// once, as the animator makes every value its target. A motion starts on the frame that asks
+/// for the new state and moves from the next one, as every value of the animator does.
+pub fn disclosure_turn(anim: &mut Animator, id: impl AsId, expanded: bool) -> f32 {
+    let t = anim.toggle(Id::new(id).with("disclosure"), expanded, DISCLOSURE_MOTION);
+    if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else if expanded {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// [`draw_disclosure`] at [`disclosure_turn`]: the chevron of the row named `id` turns as the
+/// row opens or closes, and is the plain right or down chevron at rest. The animator asks for
+/// frames until the turn ends; the caller runs its frame as it does for every `_animated` draw
+/// (`begin_frame`, draw, `end_frame`).
+#[allow(clippy::too_many_arguments)] // drawing call: a point, a size, the state and a colour
+pub fn draw_disclosure_animated(
+    p: &mut Painter,
+    anim: &mut Animator,
+    id: impl AsId,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    expanded: bool,
+    c: Rgb,
+) {
+    let open = disclosure_turn(anim, id, expanded);
+    draw_disclosure(p, cx, cy, size, open, c);
+}
+
+#[cfg(test)]
+#[path = "glyph_tests.rs"]
+mod tests;

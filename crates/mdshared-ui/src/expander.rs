@@ -14,9 +14,14 @@
 //! its hits and its keys as well, because [`Expander::header_hit`] and [`Expander::key`] know
 //! nothing of the `Look`.
 //!
+//! The chevron points right while closed and down while open. [`draw_header`] and
+//! [`draw_expander_animated`] swap the two glyphs; [`draw_expander_turning`], the opt-in
+//! animated draw, turns the chevron between them as the body opens and closes (the tree's
+//! disclosure, `glyph::draw_disclosure`), and at rest is the same pixels as the swap.
+//!
 //! Deliberately not here: the body's content (the caller draws it); the header's icons besides
-//! the chevron; a chevron that turns through the animation (the plain drawing swaps the right
-//! and down chevrons, which is what the tree's disclosure does); and the accessibility layer.
+//! the chevron; a turning chevron in `draw_header` and `draw_expander_animated` (they keep the
+//! swap, so what they draw does not change); and the accessibility layer.
 //! For a screen reader the caller builds the header with `a11y::expander` (feature `a11y`), a
 //! button that expands or collapses; [`Expander::expanded`] is what maps to UIA's
 //! ExpandCollapse state.
@@ -185,6 +190,13 @@ pub fn draw_header(
     expanded: bool,
     look: Look,
 ) {
+    header_turned(p, pal, rect, title, if expanded { 1.0 } else { 0.0 }, look);
+}
+
+/// [`draw_header`] with its chevron `open` of the way through its turn (0 right, 1 down; see
+/// [`glyph::draw_disclosure`]). At 0 and 1 the chevron is the plain right and down glyph, so
+/// `draw_header` is this at 0 or 1.
+fn header_turned(p: &mut Painter, pal: &Palette, rect: Rect, title: &str, open: f32, look: Look) {
     if [rect.x, rect.y, rect.w, rect.h]
         .iter()
         .any(|v| !v.is_finite())
@@ -217,9 +229,8 @@ pub fn draw_header(
         // inside the header: a ring that is cut off by the header's own edge would look broken.
         draw_ring(p, pal, rect.inset(2.0), RADIUS - 2.0);
     }
-    let chevron = if expanded { glyph::DOWN } else { glyph::RIGHT };
     let cx = rect.x + PAD + CHEVRON / 2.0;
-    p.icon(chevron, CHEVRON, cx, rect.cy(), ink);
+    glyph::draw_disclosure(p, cx, rect.cy(), CHEVRON, open, ink);
     let x = rect.x + PAD + CHEVRON + GAP;
     let max = rect.right() - PAD - x;
     if max > 0.0 {
@@ -245,10 +256,50 @@ pub fn draw_expander_animated(
     look: Look,
     full_h: f32,
 ) -> Rect {
+    let open = if expanded { 1.0 } else { 0.0 };
+    expander_turned(p, pal, anim, id, area, title, expanded, open, look, full_h)
+}
+
+/// [`draw_expander_animated`] whose chevron also turns, from right to down as the body opens
+/// and back as it closes, by [`glyph::disclosure_turn`] under the expander's `id`. At rest it
+/// is `draw_expander_animated` pixel for pixel (the plain right or down chevron), and it
+/// answers the same rectangle for the body. The turn takes as long as the body's height (167
+/// ms each way); under reduced motion both are at their end at once. Opt in by calling this
+/// instead of `draw_expander_animated`.
+#[allow(clippy::too_many_arguments)] // a widget call: area, label, state and the body's height
+pub fn draw_expander_turning(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl AsId,
+    area: Rect,
+    title: &str,
+    expanded: bool,
+    look: Look,
+    full_h: f32,
+) -> Rect {
+    let id = Id::new(id);
+    let open = glyph::disclosure_turn(anim, id, expanded);
+    expander_turned(p, pal, anim, id, area, title, expanded, open, look, full_h)
+}
+
+#[allow(clippy::too_many_arguments)] // the two public draws above, with the chevron's turn
+fn expander_turned(
+    p: &mut Painter,
+    pal: &Palette,
+    anim: &mut Animator,
+    id: impl AsId,
+    area: Rect,
+    title: &str,
+    expanded: bool,
+    open: f32,
+    look: Look,
+    full_h: f32,
+) -> Rect {
     let id = Id::new(id);
     let shown = shown_height(anim, body_id(id), expanded, full_h);
     let head = header_rect(area);
-    draw_header(p, pal, head, title, expanded, look);
+    header_turned(p, pal, head, title, open, look);
     // Under the header that was actually drawn, which is shorter than HEADER_H when the area is.
     let room = if area.h.is_finite() {
         (area.bottom() - head.bottom()).max(0.0)

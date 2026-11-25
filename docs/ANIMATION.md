@@ -310,13 +310,16 @@ and on every frame under reduced motion, each draws exactly the pixels of the pl
 | `overlay::draw_backdrop` | `draw_backdrop_presence(p, pal, w, h, t)` | The dimming follows the dialog's presence |
 | `overlay::draw_dialog_card` | `pop(p, dialog_bounds(card), t, (0.0, DIALOG_RISE), …)` | A dialog fades and rises as one thing |
 | `menu::Menu::draw_in` | `Menu::draw_in_presence(p, pal, area, t)` | The menu fades and drops 6 px into place |
+| `p.icon(glyph::RIGHT or DOWN, …)` in a tree row | `glyph::draw_disclosure_animated(p, anim, id, cx, cy, size, expanded, c)` | The chevron turns a quarter clockwise as the folder opens and back as it closes (`fluent::MOVE`, 167 ms) |
+| `expander::draw_expander_animated` | `draw_expander_turning(…)`, the same arguments | The body grows as before, and the chevron turns with it |
 | `menu::Menu::draw_in` | `Menu::draw_in_entering(p, pal, area, t, Entrance)` | `Drop` as above; `Unfold` opens from its top edge, starting 60% opaque (`anim::unfold`), and rises when above its anchor; `Side` slides 6 px in from beside its row (a submenu); `Fade` only fades (a menu closing) |
 
 Not done, and how each would be: the settings form (`settings::Form`) draws its own switches,
 ticks and scrollbar and has no animator passed in, so it is unchanged; an application can still
 wrap the whole form in `pop` for its entrance. The bars of `notice` (update, crash, offer) take
 their height from the application's layout, which can animate that height with `anim.value`. The
-command palette, the tree's disclosure and the tab strip have no motion. The text field's caret
+tree's disclosure turns through `glyph::draw_disclosure_animated` (above); the plain icons it
+swapped are unchanged. The text field's caret
 blinks through `TextField::draw_blinking` (above); the plain `TextField::draw` is unchanged.
 
 ## Reduced motion
