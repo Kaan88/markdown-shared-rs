@@ -336,9 +336,10 @@ pub const TOO_LARGE: &str = "too large for undo to keep: copied";
 pub const UNSAVED: &str = "open with changes not saved: copied";
 pub const UNSAVED_NOTE: &str = "a note open with changes not saved links to it: copied";
 pub const SHOWN_BY_STAYING: &str = "a file that stays shows it: copied";
-/// A file whose very bytes the library already holds and lists: the run writes no copy of it, so
-/// its record could not put it back (Fable's re-review of C2).
-pub const ALREADY_LISTED: &str = "the library lists the same file already: left where it is";
+/// A file whose very bytes the library already holds and lists, before this run or by its own
+/// line: the run writes no copy of it, so its record could not put it back (Fable's re-review of
+/// C2). Such an original is never moved.
+pub const ALREADY_LISTED: &str = "the same file is in the library already: left where it is";
 /// A move whose record would be too large to read back is a copy (Fable's review of C2, 2).
 pub const RECORD_FULL: &str = "the run's record has no room to keep it for undo: copied";
 
