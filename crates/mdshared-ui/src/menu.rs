@@ -707,13 +707,19 @@ impl<T: Clone> Menu<T> {
         } else {
             -MENU_DROP
         };
-        // The frame and the shadow round it.
-        let bounds = if self.look.shadow && self.look.soft_shadow {
+        let bounds = self.presence_bounds();
+        crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
+    }
+
+    /// What the menu draws where it was last placed, its shadow included: the rectangle a
+    /// fade or a slide of it must take whole. 18 px round it for the toolkit's shadow; the
+    /// soft shadow's reach ([`soft_bounds`]) in a look with [`Look::soft_shadow`].
+    pub(crate) fn presence_bounds(&self) -> Rect {
+        if self.look.shadow && self.look.soft_shadow {
             soft_bounds(self.rect, &Shade::POPUP)
         } else {
             self.rect.inset(-18.0)
-        };
-        crate::anim::pop(p, bounds, t, (0.0, drop), |p| self.draw_in(p, pal, area));
+        }
     }
 
     /// Where the menu was last placed.

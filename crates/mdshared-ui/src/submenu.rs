@@ -768,20 +768,20 @@ impl<T: Clone> Cascade<T> {
         }
     }
 
-    /// Everything the open menus draw, their shadows included.
+    /// Everything the open menus draw, their shadows included: 18 px round them all for the
+    /// toolkit's shadow, and as far as each soft shadow reaches ([`Menu::presence_bounds`]).
     fn bounds(&self) -> Rect {
         let mut r = self.menus[0].rect();
         for m in &self.menus[1..] {
-            let s = m.rect();
-            let (x, y) = (r.x.min(s.x), r.y.min(s.y));
-            r = Rect::new(
-                x,
-                y,
-                r.right().max(s.right()) - x,
-                r.bottom().max(s.bottom()) - y,
-            );
+            r = union(r, m.rect());
         }
-        r.inset(-18.0)
+        let mut r = r.inset(-18.0);
+        for m in &self.menus {
+            if m.look().shadow && m.look().soft_shadow {
+                r = union(r, m.presence_bounds());
+            }
+        }
+        r
     }
 
     fn drop(&self) -> f32 {
@@ -846,13 +846,24 @@ impl<T: Clone> Cascade<T> {
                 } else {
                     -MENU_DROP
                 };
-                let b = menu.rect().inset(-18.0);
+                let b = menu.presence_bounds();
                 pop(p, b, shown[k - 1], (dx, 0.0), |p| {
                     menu.draw_in(p, pal, area)
                 });
             }
         });
     }
+}
+
+/// The smallest rectangle holding `a` and `b`.
+fn union(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    Rect::new(
+        x,
+        y,
+        a.right().max(b.right()) - x,
+        a.bottom().max(b.bottom()) - y,
+    )
 }
 
 #[cfg(test)]
