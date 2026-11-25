@@ -443,7 +443,7 @@ fn list_note(w: &World, note: &Path) {
 fn moved(w: &World, wanted: &[Wanted]) -> (Vec<Planned>, Written, MovePlan) {
     let plan = plan(wanted, &w.inside());
     let done = write(&plan, &w.library, &w.group).expect("written");
-    let mp = move_plan(&plan, &done, &w.library, &w.group);
+    let mp = move_plan(&plan, &done, &w.library, &w.group, &[]);
     (plan, done, mp)
 }
 
@@ -535,7 +535,7 @@ fn an_original_changed_since_it_was_copied_stays() {
     let plan = plan(&[w.want(&other)], &w.inside());
     let done = write(&plan, &w.library, &w.group).expect("written");
     put(&other, b"two, changed\n");
-    let mp = move_plan(&plan, &done, &w.library, &w.group);
+    let mp = move_plan(&plan, &done, &w.library, &w.group, &[]);
     assert_eq!(mp.why_stays(&other), Some(CHANGED));
 }
 
@@ -598,4 +598,103 @@ fn a_long_chain_of_links_settles() {
             "{plan:?}"
         );
     }
+}
+
+/// Fable's review of C2, 1: a file that stays keeps the picture it shows where it is, though no
+/// other file shows it.
+#[test]
+fn a_picture_shown_by_a_file_that_stays_stays_with_it() {
+    let w = World::new("move-pic-of-staying");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n\n![b](img/beach.png)\n");
+    let pic = w.outside.join("img").join("beach.png");
+    put(&pic, b"PNG b");
+    let note = w.dir.join("elsewhere").join("ref.md");
+    put(&note, b"# Ref\n\n[Trip](../desk/trip.md)\n");
+    list_note(&w, &note);
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.why_stays(&md), Some(LINKED_OUTSIDE), "{mp:?}");
+    assert_eq!(mp.why_stays(&pic), Some(SHOWN_BY_STAYING), "{mp:?}");
+    move_out(&mp, &mut crate::runs::Delete);
+    assert!(md.exists() && pic.exists());
+}
+
+/// The bin that refuses one file.
+struct Refusing(PathBuf);
+
+impl crate::runs::Bin for Refusing {
+    fn recycle(&mut self, path: &Path) -> Result<(), String> {
+        if path == self.0 {
+            return Err("in use".to_string());
+        }
+        std::fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
+
+/// Fable's review of C2, 1: a picture goes only once the file that shows it has gone; a file the
+/// bin would not take keeps its picture.
+#[test]
+fn a_picture_stays_when_the_file_that_shows_it_could_not_go() {
+    let w = World::new("move-pic-held");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n\n![b](img/beach.png)\n");
+    let pic = w.outside.join("img").join("beach.png");
+    put(&pic, b"PNG b");
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.removes.len(), 2, "{mp:?}");
+    let out = move_out(&mp, &mut Refusing(md.clone()));
+    assert!(md.exists() && pic.exists(), "{out:?}");
+    assert!(
+        out.failures
+            .iter()
+            .any(|(p, w)| p == &pic && w == SHOWN_BY_STAYING),
+        "{out:?}"
+    );
+}
+
+/// Fable's review of C2, 3: a file a tab holds with changes not saved stays (with the picture it
+/// shows), and so does a file a library note open that way links to: neither is changed from
+/// under its tab.
+#[test]
+fn a_file_or_a_note_open_with_changes_not_saved_keeps_its_original() {
+    let w = World::new("move-unsaved");
+    let md = w.outside.join("trip.md");
+    put(&md, b"# Trip\n\n![b](img/beach.png)\n");
+    let pic = w.outside.join("img").join("beach.png");
+    put(&pic, b"PNG b");
+    let other = w.outside.join("b.txt");
+    put(&other, b"two\n");
+    let note = w.library.join("Refs").join("ref.md");
+    put(&note, b"# Ref\n\nSee [b](../../desk/b.txt).\n");
+    list_note(&w, &note);
+    let plan = plan(&[w.want(&md), w.want(&other)], &w.inside());
+    let done = write(&plan, &w.library, &w.group).expect("written");
+    let mp = move_plan(
+        &plan,
+        &done,
+        &w.library,
+        &w.group,
+        &[md.clone(), note.clone()],
+    );
+    assert_eq!(mp.why_stays(&md), Some(UNSAVED), "{mp:?}");
+    assert_eq!(mp.why_stays(&pic), Some(SHOWN_BY_STAYING), "{mp:?}");
+    assert_eq!(mp.why_stays(&other), Some(UNSAVED_NOTE), "{mp:?}");
+    assert!(mp.relinks.is_empty() && mp.removes.is_empty(), "{mp:?}");
+    // Without the tabs, both go and the note is rewritten.
+    let mp = move_plan(&plan, &done, &w.library, &w.group, &[]);
+    assert_eq!(mp.removes.len(), 3, "{mp:?}");
+    assert_eq!(mp.relinks.len(), 1, "{mp:?}");
+}
+
+/// Fable's review of C2, 5: an original goes only while its copy is the bytes that were written.
+#[test]
+fn an_original_goes_only_while_its_copy_holds_what_was_written() {
+    let w = World::new("move-copy-changed");
+    let md = w.outside.join("a.txt");
+    put(&md, b"one\n");
+    let (_, _, mp) = moved(&w, &[w.want(&md)]);
+    assert_eq!(mp.removes.len(), 1, "{mp:?}");
+    put(&w.group.join("a.txt"), b"not the copy\n");
+    let out = move_out(&mp, &mut crate::runs::Delete);
+    assert!(md.exists() && out.removed.is_empty(), "{out:?}");
 }

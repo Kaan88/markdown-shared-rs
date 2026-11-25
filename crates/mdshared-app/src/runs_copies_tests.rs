@@ -367,7 +367,7 @@ fn move_run(tag: &str) -> Moved1 {
     }];
     let before = read(&group);
     std::fs::write(&group, with_links_added(&before, &links)).expect("the add");
-    let mp = copy_in::move_plan(&plan, &written, &library, &home);
+    let mp = copy_in::move_plan(&plan, &written, &library, &home, &[]);
     assert_eq!(mp.removes.len(), 2, "{mp:?}");
     assert_eq!(mp.relinks.len(), 1, "{mp:?}");
     let g = Group {
@@ -479,4 +479,128 @@ fn a_move_record_with_a_strange_original_is_not_acted_on() {
         "{:?}",
         plan.refusal
     );
+}
+
+/// Fable's review of C2, 4: the question names each file undo puts back where it was.
+#[test]
+fn undo_s_question_names_each_file_it_puts_back() {
+    let r = move_run("move-named");
+    let plan = prepare(&r.record, &r.library);
+    let s = plan.sentence("Trips");
+    for p in [&r.md, &r.picture, &r.note] {
+        assert!(s.contains(&p.display().to_string()), "{s}");
+    }
+}
+
+/// Fable's review of C2, 4: a record that would put back a file of another kind than its copy,
+/// or one whose copy is not a file the run says it made, is not acted on.
+#[test]
+fn a_move_record_that_puts_back_another_kind_of_file_is_not_acted_on() {
+    let mut r = move_run("move-kind");
+    r.record.removed[0].path = r.dir.join("desk").join("trips").join("trip.bat");
+    let plan = prepare(&r.record, &r.library);
+    assert!(
+        plan.refusal
+            .as_deref()
+            .is_some_and(|w| w.contains("trip.bat")),
+        "{:?}",
+        plan.refusal
+    );
+    let mut r = move_run("move-not-own");
+    let stray = r.library.join("Trips").join("stray.md");
+    write_file(&stray, "# Trip\n");
+    r.record.removed[0].original = Some(stray);
+    let plan = prepare(&r.record, &r.library);
+    assert!(plan.refusal.is_some(), "{plan:?}");
+}
+
+/// Fable's review of C2, nit: a note the move made lead to a copy keeps leading to it while the
+/// original is not back.
+#[test]
+fn undo_keeps_a_relinked_note_while_its_original_is_not_back() {
+    let r = move_run("move-note-held");
+    write_file(&r.md, "someone else's\n");
+    let mut gate = TestGate::new();
+    let report = undo(&r.record_path, &r.record, &r.library, &mut gate);
+    assert_ne!(read(&r.note), r.note_text, "{report:?}");
+    assert!(r.copy.exists(), "{report:?}");
+    assert!(
+        report.restore_kept.iter().any(|p| same_path(p, &r.note)),
+        "{report:?}"
+    );
+}
+
+/// A bin whose window holds one file open with changes not saved.
+struct Unsaved(PathBuf);
+
+impl Bin for Unsaved {
+    fn recycle(&mut self, path: &Path) -> Result<(), String> {
+        std::fs::remove_file(path).map_err(|e| e.to_string())
+    }
+    fn may_write(&mut self, path: &Path) -> Result<(), String> {
+        if same_path(path, &self.0) {
+            Err("open with changes not saved".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Fable's review of C2, 3: undo does not write a note a tab holds with changes not saved.
+#[test]
+fn undo_keeps_a_relinked_note_a_tab_holds_unsaved() {
+    let r = move_run("move-note-unsaved");
+    let relinked = read(&r.note);
+    let mut gate = TestGate::new();
+    let report = undo_with(
+        &r.record_path,
+        &r.record,
+        &r.library,
+        &mut gate,
+        &mut Unsaved(r.note.clone()),
+    );
+    assert_eq!(read(&r.note), relinked, "{report:?}");
+    assert_eq!(
+        std::fs::read(&r.md).unwrap_or_default(),
+        r.md_bytes,
+        "{report:?}"
+    );
+}
+
+/// Fable's review of C2, 2: a move whose record could not be read back is not written, so the
+/// caller moves nothing.
+#[test]
+fn a_move_whose_record_would_be_too_large_writes_none() {
+    let dir = crate::paths::canonical_or_absolute(&scratch("move-full"));
+    let library = dir.join("library");
+    let group = library.join("trips.md");
+    write_file(&group, "# Trips\n");
+    let mp = copy_in::MovePlan {
+        relinks: vec![copy_in::Relink {
+            path: library.join("Refs").join("n.md"),
+            before: "\"\n".repeat(1_200_000),
+            after: String::new(),
+            targets: Vec::new(),
+        }],
+        ..copy_in::MovePlan::default()
+    };
+    let g = Group {
+        name: "Trips".to_string(),
+        file: group,
+        created: false,
+        home: library.join("Trips"),
+    };
+    let err = move_in_record(
+        &library,
+        "",
+        g,
+        &[],
+        "# Trips\n",
+        &copy_in::Written::default(),
+        &mp,
+    )
+    .expect_err("too large");
+    assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+    assert!(!library.join(RUNS_DIR).exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

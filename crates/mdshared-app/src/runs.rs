@@ -1410,7 +1410,7 @@ pub fn move_in_record(
             created: false,
             sha256: r.sha256.clone(),
             original: Some(r.copy.clone()),
-            original_sha256: digest_of(&r.copy).unwrap_or_default(),
+            original_sha256: r.copy_sha256.clone(),
         });
         if let Some(text) = &r.text {
             record.originals.push(Original {
@@ -1432,6 +1432,14 @@ pub fn move_in_record(
             bom: false,
             text: n.before.clone(),
         });
+    }
+    // A record this program could not read back would leave the move with no undo: then nothing
+    // is moved, and the caller writes the copies' record instead (Fable's review of C2, 2).
+    if !reads_back(&mut record.clone(), library) {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            crate::moves::copy_in::RECORD_FULL,
+        ));
     }
     let path = record.create(library)?;
     Ok((path, record))
@@ -2620,6 +2628,14 @@ pub trait Bin {
     /// Puts the file at `path` in the bin; `Err` says why it did not go, and it is then where it
     /// was.
     fn recycle(&mut self, path: &Path) -> Result<(), String>;
+
+    /// Whether undo may write the file at `path` again (a note a move rewrote): `Err` says why
+    /// not, and it is then kept as it is. The default lets every file be written; the
+    /// application's refuses one a tab holds with changes not saved (Fable's review of C2, 3).
+    fn may_write(&mut self, path: &Path) -> Result<(), String> {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// The "bin" that removes the file: what undo did before the Recycle Bin was built (D-071), and
@@ -2825,14 +2841,22 @@ impl UndoPlan {
         let back = if self.put_back.is_empty() {
             String::new()
         } else {
+            // Each file is named: the record says where, and a record can be carried to another
+            // computer (Fable's review of C2, 4; audit 4, A F8).
+            let named: Vec<String> = self
+                .put_back
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
             format!(
-                "Puts back {} this run moved or changed, where {} were. ",
+                "Puts back {} this run moved or changed, where {} were: {}. ",
                 count(self.put_back.len(), "file", "files"),
                 if self.put_back.len() == 1 {
                     "it"
                 } else {
                     "they"
-                }
+                },
+                named.join(", ")
             )
         };
         if !self.pictures.is_empty() {
@@ -3177,6 +3201,19 @@ impl Reach {
                 if !r.path.is_absolute() || has_parent_dir(&r.path) {
                     return Err(foreign(&r.path));
                 }
+                // Only a file of the kind its copy is, and only while that copy is one the
+                // record says the run made (Fable's review of C2, 4).
+                let ext = |p: &Path| {
+                    p.extension()
+                        .map(|e| e.to_string_lossy().to_lowercase())
+                        .unwrap_or_default()
+                };
+                let own = record.copied.iter().any(|c| same_path(&c.path, copy))
+                    || record.pictures.iter().any(|c| same_path(&c.path, copy))
+                    || record.notes.iter().any(|n| same_path(&n.path, copy));
+                if ext(&r.path) != ext(copy) || !own {
+                    return Err(foreign(&r.path));
+                }
             }
             for o in &record.originals {
                 if was_removed(record, &o.path) {
@@ -3242,6 +3279,12 @@ impl Reach {
                 )
             })
     }
+}
+
+/// The group's folder as undo will see it ([`declared_home`]), empty when it names none: the
+/// reach a run must stay inside for its undo to act on what it wrote (Fable's review of C2, nit).
+pub fn undo_home(group_file: &Path, library: &Path) -> PathBuf {
+    declared_home(group_file, library).unwrap_or_default()
 }
 
 /// The folder the group's library file names with `home:` as it reads now; `None` when the file
@@ -3742,7 +3785,7 @@ pub fn undo_with(
     // 1b. A move's originals back where they were, and the notes it rewrote, before anything of
     //     the copies goes: a copy goes only while its original is there again (D-210).
     if record.kind == Kind::Copies {
-        put_back(record, &plan, &mut report);
+        put_back(record, &plan, &mut report, bin);
     }
     // 2. The links first, so the pane never shows a link to a file that is gone.
     for (file, removals) in &plan.links {
@@ -4053,7 +4096,7 @@ fn put_back_plan(record: &Record, plan: &mut UndoPlan) {
 /// Puts back what [`put_back_plan`] said, each read again just before: the originals first,
 /// each made new where it was (never over a file), then the notes, each only while it holds what
 /// the run wrote.
-fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport) {
+fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport, bin: &mut dyn Bin) {
     let planned = |p: &Path| plan.put_back.iter().any(|r| same_path(r, p));
     for r in record.removed.iter().filter(|r| planned(&r.path)) {
         let Some(bytes) = removed_bytes(record, r) else {
@@ -4083,7 +4126,17 @@ fn put_back(record: &Record, plan: &UndoPlan, report: &mut UndoReport) {
         if !planned(&o.path) {
             continue;
         }
-        if !digest_of(&o.path).is_some_and(|d| d.eq_ignore_ascii_case(&o.written)) {
+        // A note goes back to leading to an original only once that original is there again:
+        // else it keeps leading to the copy, which is kept (Fable's review of C2, nit).
+        let base = o.path.parent().unwrap_or(Path::new(""));
+        let leads_to_one_not_back = record.removed.iter().any(|r| {
+            !digest_of(&r.path).is_some_and(|d| d.eq_ignore_ascii_case(&r.sha256))
+                && crate::moves::links_to(&o.text, base, &r.path)
+        });
+        if leads_to_one_not_back
+            || bin.may_write(&o.path).is_err()
+            || !digest_of(&o.path).is_some_and(|d| d.eq_ignore_ascii_case(&o.written))
+        {
             report.restore_kept.push(o.path.clone());
             report.kept.push(o.path.clone());
             continue;

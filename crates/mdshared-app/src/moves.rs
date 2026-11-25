@@ -1332,6 +1332,13 @@ pub trait MoveGate {
 }
 
 /// A note's text made `after` in one atomic write, only while it says `before`.
+/// Whether `text`, a note in `base`, has a link that leads to `path`.
+pub(crate) fn links_to(text: &str, base: &Path, path: &Path) -> bool {
+    links::links(text, base)
+        .iter()
+        .any(|l| links::same_file(&l.target, path))
+}
+
 pub fn rewrite_note(file: &Path, before: &str, after: &str) -> Result<(), String> {
     match links::note_text(file) {
         Some(now) if now == before => {
