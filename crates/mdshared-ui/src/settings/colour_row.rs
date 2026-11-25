@@ -302,6 +302,8 @@ impl Form {
         self.colours.pressed = None;
         if let Some(o) = &mut self.colours.open {
             o.ring = false;
+            // A selection whose release was lost does not outlive the press.
+            o.text_drag = false;
             if !o.flyout.contains(x, y) {
                 return Some(self.close_colour_picker(false));
             }
@@ -323,7 +325,13 @@ impl Form {
                 done => done,
             });
         }
-        if self.colours.ids.is_empty() || !self.card.contains(x, y) || !self.body.contains(x, y) {
+        // An open dropdown takes the press first, as it does over any row: its menu may cover a
+        // swatch, and a press anywhere else closes it.
+        if self.colours.ids.is_empty()
+            || self.menu.is_some()
+            || !self.card.contains(x, y)
+            || !self.body.contains(x, y)
+        {
             return None;
         }
         let i = (0..self.rows.len())

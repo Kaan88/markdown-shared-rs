@@ -655,3 +655,23 @@ fn colour_sheet() {
         }
     }
 }
+
+/// An open dropdown takes a press on a swatch as it does any press: the menu closes (or picks
+/// the item it shows there), and no picker opens.
+#[test]
+fn an_open_dropdown_takes_a_press_on_a_swatch() {
+    let mut v = rows();
+    v.insert(1, Row::choice(99, "Theme", &["System", "Light", "Dark"], 0));
+    let mut f = Form::new("Look", v).single_page();
+    assert!(f.show_as_colour(ACCENT));
+    shot(&mut f, &LIGHT);
+    f.open_menu(index(&f, 99));
+    assert!(f.menu.is_some());
+    let s = f.swatch_rect(index(&f, ACCENT));
+    click(&mut f, s.cx(), s.cy());
+    assert_eq!(f.colour_open(), None, "no picker opened under the menu");
+    assert!(f.menu.is_none(), "the press closed the menu");
+    // With the menu closed, the swatch opens its picker as before.
+    click(&mut f, s.cx(), s.cy());
+    assert_eq!(f.colour_open(), Some(ACCENT));
+}

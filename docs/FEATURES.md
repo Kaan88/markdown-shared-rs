@@ -1303,3 +1303,24 @@ runs white to the hue to black, the ring marker and the strip's handle read on t
 old and new swatches and the hex in mono; in high contrast the card's edge and the ring are
 clear. That is not the owner's approval: **not seen by a person**, not in mdplay, not on Linux
 or macOS, not under Wine.
+
+Claude Fable's review (2026-11-25): one blocking finding, fixed. A swatch took a press before
+an open dropdown did, so a menu item lying over a swatch opened the picker instead of being
+picked, and a press on a swatch did not close the menu; the open dropdown now takes the press
+first (tested). Also fixed: a press in the picker clears a hex-field selection whose release
+was lost. Noted for later:
+- Escape after the app's `set_value` on the open row puts back the text from before the
+  picker opened, and reports it.
+- The old swatch in the popover gives back the colour, not the text: a row that held no colour
+  is left at the fallback grey, and `#AaBbCc` comes back in small letters.
+- A digits-only hex picked to digits only forgets its capitals for the next opening.
+- The row's own field still draws as focused (underline and caret) under an open picker, and
+  IME composition still goes to it. A person should look.
+- A double click on the swatch opens the picker and cancels it at once.
+- No public call closes the picker except `set_rows` (the dropdown has the same gap).
+- `draw_picker` trusts a hand-built `Layout` (its fields are public); a huge one overflows or
+  allocates.
+- Tests: black keeping its saturation is not proved (saturation is already 0 there); no test
+  has a told form with Tab order or `Form::pointer`; `Picker::form`, `Layout::hue_marker` and
+  `Cache::hex_stops` have no direct test. The release and feature runs of AGENTS.md were not
+  run.
