@@ -144,6 +144,9 @@ pub const TOAST_RISE: f32 = 8.0;
 /// Padding inside a dialog card, and the height of its button footer.
 pub const DIALOG_PAD: f32 = 24.0;
 pub const DIALOG_FOOTER: f32 = 72.0;
+/// The roundest a dialog card's corners go: the footer's fill (the footer and 12 px above it,
+/// inset by 1) can round no further, so beyond this its corners would poke out of the card's.
+pub const MAX_CARD_RADIUS: f32 = (DIALOG_FOOTER - 1.0 + 12.0) / 2.0 + 1.0;
 /// A `cw` x `ch` card centred in a `w` x `h` window, shrunk to fit small windows.
 pub fn dialog_card(cw: f32, ch: f32, w: f32, h: f32) -> Rect {
     let cw = cw.min(w - 32.0).max(200.0);
@@ -213,7 +216,8 @@ pub fn draw_dialog_card(p: &mut Painter, pal: &Palette, r: Rect) -> Rect {
 /// [`LIGHT_SHADOW`] on a light palette; 0 draws none. `draw_dialog_card` is this with 10 and
 /// `None`, pixel for pixel. The soft shadow reaches further than [`dialog_bounds`]; its
 /// bounds are [`soft_bounds`](crate::gfx::soft_bounds)`(card, &Shade::POPUP)`. A radius that
-/// is not finite or is negative is the classic 10, for the shadow, the card and the footer alike.
+/// is not finite or is negative is the classic 10, for the shadow, the card and the footer alike;
+/// one larger than [`MAX_CARD_RADIUS`] is that, so the footer's corners can follow the card's.
 pub fn draw_dialog_card_with(
     p: &mut Painter,
     pal: &Palette,
@@ -222,7 +226,7 @@ pub fn draw_dialog_card_with(
     soft: Option<f32>,
 ) -> Rect {
     let radius = if radius.is_finite() && radius >= 0.0 {
-        radius
+        radius.min(MAX_CARD_RADIUS)
     } else {
         10.0
     };
@@ -756,6 +760,37 @@ mod tests {
                     assert!(
                         got.pixels == ten.pixels,
                         "{bad}, {soft:?}, dark {}",
+                        pal.dark
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_rounder_than_its_footer_can_follow_draws_at_the_roundest_it_can() {
+        // Past MAX_CARD_RADIUS the footer's fill cannot round with the card, so its bottom
+        // corners would stand out square beyond the card's curve: the card stops there instead.
+        let r = Rect::new(20.0, 18.0, 320.0, 260.0);
+        for pal in [&LIGHT, &DARK] {
+            for soft in [None, Some(0.6)] {
+                let most = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, MAX_CARD_RADIUS, soft);
+                });
+                let less = window(pal, 1.0, |p| {
+                    draw_dialog_card_with(p, pal, r, MAX_CARD_RADIUS - 8.0, soft);
+                });
+                assert!(
+                    less.pixels != most.pixels,
+                    "the radius still shows below the cap"
+                );
+                for big in [MAX_CARD_RADIUS + 0.5, 60.0, 500.0, f32::MAX] {
+                    let got = window(pal, 1.0, |p| {
+                        draw_dialog_card_with(p, pal, r, big, soft);
+                    });
+                    assert!(
+                        got.pixels == most.pixels,
+                        "{big}, {soft:?}, dark {}",
                         pal.dark
                     );
                 }

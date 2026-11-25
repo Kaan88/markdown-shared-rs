@@ -1076,13 +1076,14 @@ fn a_soft_cascade_that_fades_fades_its_whole_shadow() {
 
 #[test]
 fn a_soft_submenu_that_enters_fades_its_whole_shadow_in() {
-    // 20 px right of the submenu, at its middle: a submenu entering slides across, so this is
-    // measured against the shadow at rest, and must be well under it while it enters.
+    // 20 px below the submenu's foot, at its middle: past the old 18 px, and out of the way of
+    // its sideways slide, so only the fade can lighten it while it enters.
     let clock = ManualClock::new();
     let mut c = recent_open_in(soft_look(), clock.now());
     let rest = drawn(&mut c, |c, p| c.draw_in(p, &LIGHT, AREA));
     let sub = c.menu(1).unwrap().rect();
-    let (x, y) = (sub.right() + 20.0, sub.cy());
+    let (x, y) = (sub.cx(), sub.bottom() + 20.0);
+    assert!(AREA.contains(x, y), "the probe is in the area");
     let full = dark_at(&rest, x, y);
     assert!(full > 0.015, "the shadow reaches there: {full}");
     let mut anim = Animator::new();
@@ -1091,7 +1092,7 @@ fn a_soft_submenu_that_enters_fades_its_whole_shadow_in() {
         c.draw_animated(p, &LIGHT, AREA, 1.0, &mut anim, "m")
     });
     anim.end_frame();
-    clock.advance_ms(40);
+    clock.advance_ms(10);
     anim.begin_frame(clock.now());
     let mid = drawn(&mut c, |c, p| {
         c.draw_animated(p, &LIGHT, AREA, 1.0, &mut anim, "m")
