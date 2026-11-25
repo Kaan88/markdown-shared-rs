@@ -71,6 +71,7 @@ pub mod theme;
 pub mod thumbs;
 pub mod toggle;
 pub mod tokens;
+pub mod tooltip;
 pub mod tray;
 pub mod tree;
 pub mod viewport;

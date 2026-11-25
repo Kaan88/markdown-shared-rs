@@ -458,6 +458,57 @@ pub mod fluent {
     }
 }
 
+/// One set of motions and timings for the document applications (mdedit, mdview), so both tune
+/// them in one place (roadmap D5). Each is a [`fluent`] preset; this says which goes where.
+/// The toolkit's own animated draws (`Cascade::draw_animated`, `draw_dropdown_menu_animated`,
+/// the expander) use [`fluent::ENTER`] and [`fluent::EXIT`], which are [`MENU`](document::MENU)'s:
+/// a change here does not reach them.
+pub mod document {
+    use super::{Motion, Transient, fluent};
+    use std::time::Duration;
+
+    /// An entrance and an exit.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Pair {
+        pub enter: Motion,
+        pub exit: Motion,
+    }
+
+    impl Pair {
+        /// An empty [`Transient`] that enters and leaves by these.
+        pub fn transient<T>(self) -> Transient<T> {
+            Transient::new().with_motion(self.enter, self.exit)
+        }
+    }
+
+    /// A menu, context menu, drop-down list or submenu: in by `ENTER`, out by `EXIT`.
+    pub const MENU: Pair = Pair {
+        enter: fluent::ENTER,
+        exit: fluent::EXIT,
+    };
+    /// A tooltip: a plain short fade both ways, where the eye already is.
+    pub const TIP: Pair = Pair {
+        enter: fluent::FADE,
+        exit: fluent::FADE,
+    };
+    /// A toast: it rises in and sinks out ([`crate::overlay::Bubble::draw_presence`]).
+    pub const TOAST: Pair = Pair {
+        enter: fluent::ENTER,
+        exit: fluent::EXIT,
+    };
+    /// A dialog and its backdrop: a larger thing, a longer entrance.
+    pub const DIALOG: Pair = Pair {
+        enter: fluent::ENTER_LARGE,
+        exit: fluent::EXIT,
+    };
+    /// A hover or pressed look fading in and out.
+    pub const HOVER: Motion = fluent::FADE;
+    /// How long the pointer rests on a control before its tooltip shows
+    /// ([`crate::tooltip::Tooltip`]): mdedit's, and near Windows' default (`SPI_GETMOUSEHOVERTIME`
+    /// is 400 ms; Windows' own tooltips wait about 500).
+    pub const TIP_DELAY: Duration = Duration::from_millis(500);
+}
+
 // ---- the animator ------------------------------------------------------------------------------
 
 /// Whether an [`Animator`] moves anything.
