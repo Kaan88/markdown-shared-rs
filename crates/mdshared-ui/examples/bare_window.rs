@@ -1,7 +1,10 @@
 //! The reference for check C1 (launch time): a bare winit window filled through softbuffer, with
 //! nothing of the toolkit in it. `examples/purge_shape.rs` is measured against it:
 //! `cargo run --release -p mdshared-ui --example bare_window -- --first-frame` prints the time
-//! from the start of `main` to the first frame presented and exits.
+//! from the start of `main` to the first frame drawn and presented into the window while it is
+//! still hidden and the window asked to show, then exits. That leaves out the process's start
+//! before `main` and the moment the compositor puts the window on screen. `tests/uia/first_frame.ps1`
+//! runs both examples many times and prints the medians.
 
 #[cfg(not(windows))]
 fn main() {
@@ -70,6 +73,8 @@ mod bare {
             self.window = Some((window.clone(), surface));
             self.draw();
             window.set_visible(true);
+            // Check C1: from the start of main to the first frame presented, hidden, and the
+            // window asked to show (as purge_shape).
             println!(
                 "first frame after {:.1} ms",
                 self.started.elapsed().as_secs_f64() * 1000.0

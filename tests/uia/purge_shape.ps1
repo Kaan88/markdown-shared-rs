@@ -1,15 +1,27 @@
-# A UI Automation client run against examples/purge_shape (roadmap W8 and checks C1 and C2): it
+# A UI Automation client run against examples/purge_shape (roadmap W8 and checks C1 to C3): it
 # finds the window's elements by AutomationId and drives them (Invoke, Toggle, SelectionItem,
 # ScrollItem, ExpandCollapse, Value, RangeValue) the way Purge's VM rig drives WinUI
-# (vm/guest/m3-e2e-ui.ps1 in Purge). Build both examples, then run it with Windows PowerShell on
-# the host:
+# (vm/guest/m3-e2e-ui.ps1 in Purge). Build both examples, then run it on the host:
 #
 #   cargo build --release -p mdshared-ui --features a11y --example purge_shape --example bare_window
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\uia\purge_shape.ps1 -Exe <path to purge_shape.exe>
+#   powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\uia\purge_shape.ps1 -Exe <path to purge_shape.exe>
 #
-# bare_window.exe is looked for beside purge_shape.exe (or give -BareExe). For check C1 it prints
-# the time from Start-Process to the bare window found by its title, and to purge_shape's names
-# visible (the first time UninstallButton is found by its AutomationId).
+# It needs Windows PowerShell 5.1 (powershell.exe, on .NET Framework), not PowerShell 7 (pwsh):
+# it makes the COM interop assembly for the UIA client with TypeLibConverter and saves it with
+# AssemblyBuilder.Save, which .NET Framework has and .NET does not. It writes that assembly once
+# to %TEMP%\mdshared-uia\Interop.UIAutomationClient.dll and reuses it in later runs (delete the
+# folder to have it made again).
+#
+# Arguments: -Exe, the path to purge_shape.exe (needed); -BareExe, the path to bare_window.exe
+# (looked for beside purge_shape.exe when not given); -FarRow, the 1-based number of the program
+# the ScrollItem and Value sections use, which must lie beyond the first screenful (default
+# 1500, from 40 to 2000). The Value section searches for that program's name less its last two
+# digits ("Program 15" for 1500) and works out how many programs that shows.
+#
+# For check C1 it prints the time from Start-Process to the bare window found by its title, and
+# to purge_shape's names visible (the first time UninstallButton is found by its AutomationId),
+# one run each; tests\uia\first_frame.ps1 runs both examples many times for the medians. For
+# check C3 it prints purge_shape.exe's size and fails when it is 10 MB or more.
 #
 # It also listens for UIA's focus-changed events (Purge's B1), moves the focus with SetFocus and
 # then with a Tab typed into the window, and checks that each move raised one. The Tab needs the
@@ -25,7 +37,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Exe,
     [string]$BareExe = '',
-    [int]$FarRow = 1500
+    [ValidateRange(40, 2000)][int]$FarRow = 1500
 )
 
 Add-Type -AssemblyName UIAutomationClient
@@ -45,7 +57,7 @@ $P = @{
     Value     = [System.Windows.Automation.ValuePattern]::Pattern
 }
 # Every check below, counted by hand; the script says so when fewer ran.
-$Expected = 44
+$Expected = 50
 $script:checks = 0
 $script:failures = 0
 
@@ -88,12 +100,25 @@ function Pattern($el, $pattern) {
     if ($null -ne $el -and $el.TryGetCurrentPattern($pattern, [ref]$p)) { $p } else { $null }
 }
 
-# A top-level window of process $procId with this title.
+# A top-level window of process $procId with this title. A winit process has a second top-level
+# window, the hidden helper of class 'Winit Thread Event Target' with no name; the title already
+# leaves it out, and the class is left out as well, so that a rig that drops the title (or a
+# window whose title is empty) still never takes the helper for the window.
+$HelperClass = 'Winit Thread Event Target'
 function FindWindow([int]$procId, [string]$title) {
     $cond = New-Object System.Windows.Automation.AndCondition(
         (New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $procId)),
-        (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $title)))
+        (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $title)),
+        (New-Object System.Windows.Automation.NotCondition(
+            (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, $HelperClass)))))
     $AE::RootElement.FindFirst($TS::Children, $cond)
+}
+
+# Every top-level window of process $procId, the helper included: for the check that the helper
+# is there and is not what FindWindow gives.
+function ProcessWindows([int]$procId) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition($AE::ProcessIdProperty, $procId)
+    @($AE::RootElement.FindAll($TS::Children, $cond))
 }
 
 # The footer is a Text element (AccessKit's Label): its text is its Name, with no Value pattern.
@@ -241,6 +266,15 @@ public static class UiaFocus {
 '@
 
 $ErrorActionPreference = 'Stop'
+
+# --- C3: the size of the release exe, under 10 MB.
+try {
+    $bytes = (Get-Item $Exe).Length
+    $mb = $bytes / 1MB
+    Check 'C3 purge_shape.exe under 10 MB' ($bytes -lt 10MB) ("{0:N0} bytes ({1:N2} MB)" -f $bytes, $mb)
+}
+catch { SectionFailed 'C3 size' $_ }
+
 # The first UIA call of a process loads and starts the client; done here so the timings below
 # measure the window, not the client.
 $null = $AE::RootElement.FindFirst($TS::Children, [System.Windows.Automation.Condition]::FalseCondition)
@@ -280,9 +314,18 @@ try {
         $win = FindWindow $proc.Id 'Purge shape'
         if ($win) { $hwnd = [IntPtr]$win.Current.NativeWindowHandle }
         Check 'window' ($null -ne $win) "pid $($proc.Id)"
+        $all = ProcessWindows $proc.Id
+        $classes = @($all | ForEach-Object { "'$($_.Current.ClassName)' named '$($_.Current.Name)'" })
+        $helper = @($all | Where-Object { $_.Current.ClassName -eq $HelperClass })
+        Check 'the window, not the helper' ($null -ne $win -and $win.Current.ClassName -ne $HelperClass) "top-level windows of the process: $($classes -join '; '); helpers: $($helper.Count)"
         Check 'find by AutomationId' ($null -ne $button) 'UninstallButton'
         if ($button) { Write-Output "names visible after $ms ms" }
         Check 'find by name' ($null -ne (ByName $win 'Show components')) 'Show components'
+        $hint = (ById $win 'SearchBox').Current.HelpText
+        Check 'search field says its hint' ($hint -eq 'Search (Ctrl+F)') "HelpText '$hint'"
+        $cols = ById $win 'ProgramColumns'
+        $names = @('NameColumn', 'SizeColumn') | ForEach-Object { (ById $cols $_).Current.Name }
+        Check 'column headers' (($names -join ',') -eq 'Name,Size') "'$($names -join "', '")'"
     }
     catch { SectionFailed 'launch' $_ }
     if ($null -eq $win) {
@@ -316,6 +359,9 @@ try {
         $row5 = ById $list 'Row4'
         $rs = ComSet $hwnd 'Row4'
         Check 'row position of size' ($rs.Position -eq 5 -and $rs.Size -eq 2000) "row 5: $($rs.Position) of $($rs.Size), name '$($row5.Current.Name)'"
+        # The row's name is its two columns: the program and its size (5 * 37 % 900 + 12 for
+        # program 5, whose index is 4).
+        Check 'a row is named with its size' ($row5.Current.Name -eq 'Program 0005, 160 MB') "'$($row5.Current.Name)'"
         $si = Pattern $row5 $P.Select
         Check 'SelectionItem pattern' ($null -ne $si)
         $si.Select()
@@ -381,7 +427,9 @@ try {
         $modal = if ($wp) { $wp.Current.IsModal } else { 'no Window pattern' }
         Check 'dialog is a modal window' ($modal -eq $true) "$($dlg.Current.ControlType.ProgrammaticName), modal: $modal"
         $desc = ComDescription $hwnd 'ConfirmDialog'
-        Check 'dialog describes its body' ($desc -eq '1 programs will be removed.') "FullDescription '$desc'"
+        $body = ById $dlg 'ConfirmBody'
+        $bodyText = if ($body) { $body.Current.Name } else { '(not found)' }
+        Check 'dialog has its body as text, and as its description' ($bodyText -eq '1 programs will be removed.' -and $desc -eq $bodyText) "ConfirmBody '$bodyText', FullDescription '$desc'"
         # The rest of the window is hidden while the dialog is open: AccessKit leaves hidden nodes
         # out of what UIA sees, so they are not found at all.
         $behind = ById $win 'UninstallButton'
@@ -428,20 +476,29 @@ try {
     # stays on its program.
     try {
         $farName = (ById $list "Row$($FarRow - 1)").Current.Name
+        # The far program's name less its last two digits ("Program 15" for program 1500) shows
+        # the programs numbered from $lo to $hi, the far one at $lo's distance from the first.
+        $prefix = [int][math]::Floor($FarRow / 100)
+        $query = 'Program {0:D2}' -f $prefix
+        $lo = [math]::Max(1, $prefix * 100)
+        $hi = [math]::Min(2000, $prefix * 100 + 99)
+        $count = $hi - $lo + 1
+        $farAt = $FarRow - $lo + 1
+        # A program the search hides: program 5, or program 2000 when the search shows 5.
+        $hidden = if ($prefix -eq 0) { 'Row1999' } else { 'Row4' }
         $val = Pattern (ById $win 'SearchBox') $P.Value
         Check 'Value pattern' ($null -ne $val)
-        $val.SetValue('Program 15')
-        $f = WaitFor { $t = Footer $win; if ($t -match ' 100 shown') { $t } }
+        $val.SetValue($query)
+        $f = WaitFor { $t = Footer $win; if ($t -match " $count shown") { $t } }
         $got = (Pattern (ById $win 'SearchBox') $P.Value).Current.Value
-        # "Program 1500" to "Program 1599".
-        Check 'search filtered' ($got -eq 'Program 15' -and $f -match ' 100 shown') "value '$got', footer: $(Footer $win)"
+        Check 'search filtered' ($got -eq $query -and $f -match " $count shown") "'$query' should show $lo to $hi; value '$got', footer: $(Footer $win)"
         $kids = (ById $win 'ProgramList').FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
-        Check 'list has the filtered rows' ($kids.Count -eq 100) "$($kids.Count)"
+        Check 'list has the filtered rows' ($kids.Count -eq $count) "$($kids.Count) of $count"
         $row = ById $win "Row$($FarRow - 1)"
         $rs = ComSet $hwnd "Row$($FarRow - 1)"
-        Check 'a row keeps its program through the filter' ($null -ne $row -and $row.Current.Name -eq $farName -and $rs.Position -eq 1 -and $rs.Size -eq 100) "'$($row.Current.Name)' (was '$farName'), $($rs.Position) of $($rs.Size)"
+        Check 'a row keeps its program through the filter' ($null -ne $row -and $row.Current.Name -eq $farName -and $rs.Position -eq $farAt -and $rs.Size -eq $count) "'$($row.Current.Name)' (was '$farName'), $($rs.Position) of $($rs.Size), want $farAt of $count"
         Check 'the selection stays on its program' ((IsSelected $win "Row$($FarRow - 1)") -and (Footer $win) -match '^1 selected') "footer: $(Footer $win)"
-        Check 'a hidden program is not in the tree' ($null -eq (ById $win 'Row4'))
+        Check 'a hidden program is not in the tree' ($null -eq (ById $win $hidden)) $hidden
         $val.SetValue('')
         $f = WaitFor { $t = Footer $win; if ($t -match ' 2000 shown') { $t } }
         Check 'search cleared' ($f -match ' 2000 shown') "footer: $(Footer $win)"
@@ -453,10 +510,18 @@ try {
     try {
         $mine = { @([UiaFocus]::Seen() | Where-Object { $_ -like "$($proc.Id):*" } | ForEach-Object { $_.Substring($_.IndexOf(':') + 1) }) }
         [UiaFocus]::Start()
+        # Row4 is out of view now (the list shows the far row); SetFocus on it must scroll it
+        # into view, as the keyboard would, and its rectangle stop being empty.
+        $list = ById $win 'ProgramList'
+        $rowWasOut = -not (InView (ById $list 'Row4') $list)
         $want = @('Row4', 'SearchBox', 'GroupHeader2')
         foreach ($id in $want) {
             (ById $win $id).SetFocus()
             $null = WaitFor { (& $mine) -contains $id }
+            if ($id -eq 'Row4') {
+                $rowIn = WaitFor { InView (ById $list 'Row4') $list }
+                Check 'focus scrolls an off-view row into view' ($rowWasOut -and $rowIn) "out before: $rowWasOut; row $((ById $list 'Row4').Current.BoundingRectangle), list $($list.Current.BoundingRectangle)"
+            }
         }
         # Each wanted id in order, whatever else came between (the window itself, say).
         $got = & $mine

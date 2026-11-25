@@ -4,22 +4,27 @@
 //!
 //! It holds what Purge's main window holds, drawn with the toolkit and exposed to UI Automation
 //! through [`mdshared_ui::a11y`]:
-//! - a 2,000-row multi-select list with a column header (`ProgramList`, rows `Row0`..`Row1999`),
-//!   only its visible rows drawn, every row in the accessibility tree, each keyed by its program
-//!   so that its id and AutomationId stay with the program whatever the search shows;
-//! - a search field (`SearchBox`, Ctrl+F) that filters the list. The selection is kept by
+//! - a 2,000-row multi-select list (`ProgramList`, rows `Row0`..`Row1999`, each named with its
+//!   program and size, "Program 0001, 12 MB") under a column header (`ProgramColumns`, headers
+//!   `NameColumn` and `SizeColumn`), only its visible rows drawn, every row in the accessibility
+//!   tree, each keyed by its program so that its id and AutomationId stay with the program
+//!   whatever the search shows;
+//! - a search field (`SearchBox`, Ctrl+F, its hint "Search (Ctrl+F)" as the UIA HelpText) that
+//!   filters the list by program name. The selection is kept by
 //!   program: a program the search hides leaves the selection, the others stay selected (so
 //!   Uninstall never acts on a program the list does not show);
 //! - a grouped list whose groups open and close (`LeftoverPane`, headers `GroupHeader0`.., each
 //!   group's items in a list `LeftoverList0`.., items `Leftover0_0`..);
-//! - a modal dialog (`ConfirmDialog`, buttons `ConfirmYes` and `ConfirmNo`) that Uninstall opens;
-//!   while it is open the rest of the window is hidden from UIA;
+//! - a modal dialog (`ConfirmDialog`, its body a text `ConfirmBody`, buttons `ConfirmYes` and
+//!   `ConfirmNo`) that Uninstall opens; while it is open the rest of the window is hidden from UIA;
 //! - a progress bar (`SelectedProgress`), a check box (`ShowComponents`) and a footer
 //!   (`FooterCount`, read back as its Name) a test reads back.
 //!
 //! A row takes UIA's SelectionItem `Select` as "this row only"; `Select` on a selected row keeps
 //! it. `AddToSelection` and `RemoveFromSelection` reach the window as the same click and are not
-//! supported ([`mdshared_ui::a11y`]).
+//! supported ([`mdshared_ui::a11y`]): several rows are selected with Ctrl+click, Shift+click or
+//! Shift and the arrows, as by a person. A Focus request on a row moves the cursor to it and
+//! scrolls it into view, as the keyboard does.
 //!
 //! `tests/uia/purge_shape.ps1` drives it with UIA, the way Purge's VM rig drives its WinUI
 //! window. Each request the window receives from UIA is printed on stdout, and so is the time to
@@ -44,7 +49,7 @@ mod shape {
 
     use mdshared_text::bitmap::Bitmap;
     use mdshared_ui::a11y::accesskit::{ActivationHandler, NodeId, TreeUpdate};
-    use mdshared_ui::a11y::{self, Item, List, Request, Row, RowIndex, Tree};
+    use mdshared_ui::a11y::{self, Item, List, Request, Row, RowIndex, Tree, clip};
     use mdshared_ui::check::{Tick, draw_tick};
     use mdshared_ui::expander::{self, Look};
     use mdshared_ui::gfx::{Face, Gfx, Painter, Rect};
@@ -92,11 +97,13 @@ mod shape {
         button: NodeId,
         check: NodeId,
         search: NodeId,
+        columns: NodeId,
         progress: NodeId,
         list: NodeId,
         footer: NodeId,
         pane: NodeId,
         dialog: NodeId,
+        body: NodeId,
         yes: NodeId,
         no: NodeId,
         rows: RowIndex,
@@ -109,11 +116,13 @@ mod shape {
                 button: a11y::id("UninstallButton"),
                 check: a11y::id("ShowComponents"),
                 search: a11y::id("SearchBox"),
+                columns: a11y::id("ProgramColumns"),
                 progress: a11y::id("SelectedProgress"),
                 list: a11y::id("ProgramList"),
                 footer: a11y::id("FooterCount"),
                 pane: a11y::id("LeftoverPane"),
                 dialog: a11y::id("ConfirmDialog"),
+                body: a11y::id("ConfirmBody"),
                 yes: a11y::id("ConfirmYes"),
                 no: a11y::id("ConfirmNo"),
                 rows: RowIndex::new("ProgramList", 0..COUNT),
@@ -133,26 +142,18 @@ mod shape {
         }
 
         /// The window's children other than the dialog, hidden while it is open.
-        fn main(&self) -> [NodeId; 7] {
+        fn main(&self) -> [NodeId; 8] {
             [
                 self.button,
                 self.check,
                 self.search,
+                self.columns,
                 self.progress,
                 self.list,
                 self.pane,
                 self.footer,
             ]
         }
-    }
-
-    /// The part of `r` inside `area`, if any: the bounds of a pane's entry, so that one scrolled
-    /// out of the pane cannot take the hits meant for what is drawn where it would be (see
-    /// `a11y` on bounds).
-    fn clip(r: Rect, area: Rect) -> Option<Rect> {
-        let (x0, y0) = (r.x.max(area.x), r.y.max(area.y));
-        let (x1, y1) = (r.right().min(area.right()), r.bottom().min(area.bottom()));
-        (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
     }
 
     /// The window's model: everything drawn and everything in the accessibility tree comes
@@ -180,6 +181,19 @@ mod shape {
     fn name(program: usize) -> String {
         format!("Program {:04}", program + 1)
     }
+
+    /// The program's size, as its row shows it in the Size column.
+    fn size(program: usize) -> String {
+        format!("{} MB", (program * 37) % 900 + 12)
+    }
+
+    /// What a reader says of a program's row: its name and its size, the two columns.
+    fn row_name(program: usize) -> String {
+        format!("{}, {}", name(program), size(program))
+    }
+
+    /// The search field's hint, drawn while it is empty and given to UIA as its HelpText.
+    const SEARCH_HINT: &str = "Search (Ctrl+F)";
 
     impl Model {
         fn new(size: (f32, f32), scale: f32) -> Model {
@@ -225,6 +239,20 @@ mod shape {
         fn progress_rect(&self) -> Rect {
             Rect::new(self.size.0 - 216.0, 26.0, 200.0, 4.0)
         }
+        /// The column header's band above the list.
+        fn head_rect(&self) -> Rect {
+            Rect::new(0.0, TOP, (self.size.0 - PANE_W).max(0.0), HEAD_H)
+        }
+        /// The "Name" and "Size" headers: the Size column is the last 136 px of the band, where
+        /// the sizes are drawn from 120 px before its right edge.
+        fn column_rects(&self) -> (Rect, Rect) {
+            let h = self.head_rect();
+            let split = (h.right() - 136.0).max(h.x);
+            (
+                Rect::new(h.x, h.y, split - h.x, h.h),
+                Rect::new(split, h.y, h.right() - split, h.h),
+            )
+        }
         fn list_area(&self) -> Rect {
             let y = TOP + HEAD_H;
             Rect::new(
@@ -262,7 +290,17 @@ mod shape {
         fn fraction(&self) -> f32 {
             (self.sel.len() as f32 / COUNT as f32).clamp(0.0, 1.0)
         }
-        /// The dialog's text under its title; also its description in the tree.
+        /// Where the dialog's body is drawn: one line under the title.
+        fn dialog_body_rect(&self) -> Rect {
+            let d = self.dialog_rect();
+            Rect::new(
+                d.x + overlay::DIALOG_PAD,
+                d.y + overlay::DIALOG_PAD + 30.0,
+                d.w - 2.0 * overlay::DIALOG_PAD,
+                20.0,
+            )
+        }
+        /// The dialog's text under its title; also its body text and description in the tree.
         fn dialog_body(&self) -> String {
             format!("{} programs will be removed.", self.sel.len())
         }
@@ -361,14 +399,28 @@ mod shape {
                     false,
                 ),
             );
+            let mut search = a11y::text_input(
+                "Search",
+                "SearchBox",
+                self.search_rect(),
+                self.search.text(),
+                false,
+            );
+            search.set_placeholder(SEARCH_HINT);
+            tree.add(ids.search, search);
+            // The column header: a group of the two headers, above the list. It names nothing
+            // itself; each header says its column.
+            let (name_col, size_col) = self.column_rects();
+            let (name_id, size_id) = (a11y::id("NameColumn"), a11y::id("SizeColumn"));
+            tree.add(name_id, a11y::column_header("Name", "NameColumn", name_col));
+            tree.add(size_id, a11y::column_header("Size", "SizeColumn", size_col));
             tree.add(
-                ids.search,
-                a11y::text_input(
-                    "Search",
-                    "SearchBox",
-                    self.search_rect(),
-                    self.search.text(),
-                    false,
+                ids.columns,
+                a11y::group(
+                    "",
+                    "ProgramColumns",
+                    self.head_rect(),
+                    vec![name_id, size_id],
                 ),
             );
             tree.add(
@@ -393,7 +445,7 @@ mod shape {
                 let p = self.shown[i];
                 Row {
                     key: p,
-                    label: name(p),
+                    label: row_name(p),
                     author: format!("Row{p}"),
                     selected: self.sel.contains(i),
                 }
@@ -481,6 +533,7 @@ mod shape {
                 ids.button,
                 ids.check,
                 ids.search,
+                ids.columns,
                 ids.progress,
                 list,
                 ids.pane,
@@ -490,18 +543,24 @@ mod shape {
                 let (yes, no) = self.dialog_buttons();
                 tree.add(ids.yes, a11y::button("Uninstall", "ConfirmYes", yes, false));
                 tree.add(ids.no, a11y::button("Cancel", "ConfirmNo", no, false));
+                // The body, as drawn under the title: a text child that a reader walking the
+                // dialog finds, and also the description a reader says as the dialog opens.
+                tree.add(
+                    ids.body,
+                    a11y::text(&self.dialog_body(), "ConfirmBody", self.dialog_body_rect()),
+                );
                 let mut d = a11y::dialog(
                     "Uninstall the selected programs?",
                     "ConfirmDialog",
                     self.dialog_rect(),
                     true,
-                    vec![ids.yes, ids.no],
+                    vec![ids.body, ids.yes, ids.no],
                 );
                 d.set_description(self.dialog_body());
                 tree.add(ids.dialog, d);
                 children.push(ids.dialog);
                 // Modal: the rest stays in the tree, hidden, so that a reader and a UIA client
-                // see only the dialog, and nothing is sent again but these seven when it closes.
+                // see only the dialog, and nothing is sent again but these eight when it closes.
                 for n in ids.main() {
                     if let Some(node) = tree.get_mut(n) {
                         node.set_hidden();
@@ -572,8 +631,12 @@ mod shape {
                     self.sel.select_only(i);
                     self.focus = Focus::List;
                 }
+                // The cursor moves to the row and the row is scrolled into view, as when the
+                // keyboard moves it, so that the focused row is the one on screen.
                 Request::Focus(n) if row(n).is_some() => {
-                    self.sel.set_cursor(row(n).unwrap_or(0));
+                    let i = row(n).unwrap_or(0);
+                    self.sel.set_cursor(i);
+                    self.reveal(i);
                     self.focus = Focus::List;
                 }
                 Request::ScrollIntoView(n) if row(n).is_some() => {
@@ -787,14 +850,14 @@ mod shape {
                 Face::Ui,
                 14.0,
                 &colors,
-                "Search (Ctrl+F)",
+                SEARCH_HINT,
                 focused,
                 true,
             );
             draw_progress(p, pal, self.progress_rect(), self.fraction());
 
             let area = self.list_area();
-            let head = Rect::new(area.x, TOP, area.w, HEAD_H);
+            let head = self.head_rect();
             p.fill(head, pal.bar);
             p.text(
                 Face::Semibold,
@@ -834,7 +897,7 @@ mod shape {
                     pal.text,
                     r.w - 160.0,
                 );
-                let size = format!("{} MB", (prog * 37) % 900 + 12);
+                let size = size(prog);
                 p.text(
                     Face::Ui,
                     13.0,
@@ -1052,7 +1115,9 @@ mod shape {
             };
             state.draw();
             window.set_visible(true);
-            // Check C1: from the start of main to the first frame presented.
+            // Check C1: from the start of main to the first frame drawn and presented into the
+            // hidden window, and the window asked to show; not the compositor putting it on
+            // screen, and not the process's start before main.
             println!(
                 "first frame after {:.1} ms",
                 self.started.elapsed().as_secs_f64() * 1000.0
