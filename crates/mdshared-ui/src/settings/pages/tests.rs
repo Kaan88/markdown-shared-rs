@@ -895,6 +895,13 @@ fn controls_answer_clicks_and_disabled_ones_do_not() {
     assert_eq!(t.click(t.f.control_rect(MODEL)), Outcome::Redraw);
     t.draw(false);
     let menu = t.f.menu.as_ref().unwrap().1.row_rect(0);
+    let (frame, bounds) = (t.f.menu_rect().unwrap(), t.f.menu_bounds().unwrap());
+    assert!(frame.w > 0.0 && frame.contains(menu.cx(), menu.cy()));
+    assert!(
+        bounds.x < frame.x && bounds.right() > frame.right() && bounds.bottom() > frame.bottom(),
+        "the bounds hold the frame and its shadow"
+    );
+    assert_eq!(CARD_RADIUS, 10.0);
     assert_eq!(
         t.click(menu),
         Outcome::Changed {
@@ -904,6 +911,7 @@ fn controls_answer_clicks_and_disabled_ones_do_not() {
     );
     assert_eq!(t.click(t.f.control_rect(EFFORT)), Outcome::None, "disabled");
     assert!(t.f.menu.is_none());
+    assert_eq!((t.f.menu_rect(), t.f.menu_bounds()), (None, None));
 }
 
 #[test]
