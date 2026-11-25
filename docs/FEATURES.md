@@ -462,8 +462,12 @@ seen any of them.
   built now name the `a11y` builders.
 
 ## Read-only selectable text (`mdshared_ui::seltext`, P7)
-A paragraph that cannot be edited but can be selected, for Purge's log output and the paths in
-its details pane. `SelectableText` holds the text, an anchor and a caret as byte offsets on char
+A paragraph that cannot be edited but can be selected, for the paths, command lines and registry
+keys in Purge's details pane. It is one paragraph of the size such a pane shows, a few lines to a
+few hundred: every press and drag is given the lines of the whole paragraph (`paragraph_lines`,
+linear in the text, about 2 ms for 100,000 chars in release), `draw` builds them on every frame
+that shows a selection, and nothing scrolls or is virtualised. It is not a log view; output that
+grows without end belongs in a list of rows. `SelectableText` holds the text, an anchor and a caret as byte offsets on char
 boundaries, and the drag in progress; `draw` paints the selection behind a `Painter::paragraph`.
 No editing, no caret, no clipboard and no clock: Ctrl+C answers `Action::Copy(text)` and the
 caller puts it on the clipboard, and the context menu's items carry the same `Action`s.
@@ -477,13 +481,15 @@ Two clicks select a word with the classes `textfield` uses; three select the who
 between its newlines, not one wrapped piece, which is what a log line needs. Shift with the
 arrows, Home, End and Up/Down extends the selection, and Up and Down keep the x they started
 from. Alt is refused.
-Run on Windows: `cargo test --release -p mdshared-ui` (seltext's 13 tests and its ignored sheet,
-the new gfx test and the rest of the crate), `cargo fmt --all --check` and the workspace's clippy
+Run on Windows: `cargo test --release -p mdshared-ui` (seltext's tests, 28 then and 31 after the
+audit's fixes below, its ignored sheet, the new gfx test and the rest of the crate), `cargo fmt --all --check` and the workspace's clippy
 with warnings as errors. The pixel test draws a selection in both palettes at scale 1 and 1.5 and checks the
 highlight under the selected space and the page under an unselected character.
 Not verified: a real pointer and keyboard in a window; a person looking at
 `target/specimen/seltext.png`; right-to-left paragraphs (their stops follow parley's runs but no
-test exercises them); Linux and macOS (not run here). The UI Automation Text pattern is not done.
+test exercises them; the keys move in logical order, and the one highlight rectangle per line is
+wrong on a line that mixes directions); Linux and macOS (not run here). The UI Automation Text
+pattern is not done.
 
 A review against parley 0.12.0 found faults, fixed in a second commit (`paragraph_lines` and
 `seltext` were not pinned by any application yet, so both changed):
@@ -508,6 +514,79 @@ A review against parley 0.12.0 found faults, fixed in a second commit (`paragrap
 - `draw` gives a selected empty line a highlight as wide as a space, and places the highlight
   from the rounded corner of the area as the glyphs are, so they agree at a fractional x.
   Select all is disabled on empty text.
+
+The audit of the Purge fast track (2026-11-25) found more, fixed in a later commit:
+- A path could not wrap. `Painter::paragraph` breaks between words only, so
+  `C:\Program Files\Mozilla Firefox\...` or a registry key in a narrow card ran past the edge,
+  where the clip cut it off out of reach of the pointer; that is P7's main use. `gfx` gained
+  `Wrap::{Words, Anywhere}` and `Painter::paragraph_wrapped`, `paragraph_height_wrapped` and
+  `paragraph_lines_wrapped` beside the old three, which now call them with `Wrap::Words` (a test
+  checks their pixels, height, lines and cache entry against a copy of the old code; the layouts
+  of the two modes are cached apart). `Anywhere` sets parley's `OverflowWrap::Anywhere`: a word
+  that does not fit a line of its own breaks between two clusters. `SelectableText::with_wrap`,
+  `set_wrap` and `wrap` choose it (the default is `Words`, as before), and the new
+  `seltext::lines(p, pal, width, face, size, &model)` gives the lines `draw` draws, so a caller no
+  longer has to repeat the colour and the wrap. Copy gives the text as it is, with no line break
+  where it wrapped. A pixel test draws a registry key in a 130 px area, light and dark at scale 1
+  and 1.5: it breaks into lines inside the area, the clip cuts nothing (the drawing equals the
+  unclipped one, which has no ink right of the area, where breaking by words has), and a
+  selection across the break copies the original text.
+- On a line that is only a `\r\n`, Right and Left stood between the `\r` and the `\n` (parley
+  marks both as edges there), and without lines the keys stepped into every `\r\n`. Both now
+  step over it whole; a test walks Right and Left across three CRLFs, with lines and without,
+  and checks End and triple clicks on them.
+- The test of `paragraph_lines`' speed asserted 100 ms in release, which a slow runner may miss.
+  It now takes the least of five timings at 20,000 and 100,000 chars and checks that five times
+  the text takes at most twelve times as long (a quadratic pass takes 25 times), with 2 s as the
+  bound for a hang.
+- The module doc says what size of text it is for, and what right-to-left text does.
+
+## One instance per session with no socket (`mdshared_app::single_mutex`, P8, Windows)
+`mdshared_app::single` keeps one instance through a loopback TCP port, which Purge, an
+uninstaller that runs elevated, must not open. `single_mutex` does it with kernel objects only,
+which go away with the last process that holds them however it ended. The first instance creates
+the mutex `Local\mdshared-single.<app id>.mutex` and keeps the `Guard`; it writes its process id,
+and later its main window, into a 16-byte named file mapping beside it (the record). A second
+launch finds the mutex there, reads the record, finds the window, hands it its command line in a
+`WM_COPYDATA` and brings it forward. `Local\` keeps each session (console, Remote Desktop, fast
+user switching) to its own instance.
+
+API: `acquire(app_id) -> Instance::{First(Guard), Running(Running)}`; `Guard::publish_window(hwnd)`
+(0 takes it back) and `held()`; `Running::pid()`, `window()` (the published window while it is
+still one of that process, else the first visible, unowned, non-tool top-level window of the
+process) and `wait_window(timeout)` (waits for the published one only, every 20 ms, and looks
+through the process once at the deadline; `None` at once if the instance went);
+`bring_forward(hwnd)` (`AllowSetForegroundWindow`, `ShowWindowAsync(SW_RESTORE)`,
+`SetForegroundWindow`); `send(app_id, hwnd, &args)` with a 2 s limit (`SEND_TIMEOUT`); the unsafe
+`received(app_id, msg, lparam)` for the window procedure; `windows_of(pid)`, `main_window_of(pid)`;
+`MAX_BYTES` (1 MiB). The module is compiled on Windows only.
+
+What an application does with it is in the module doc, "When nothing is handed over": when
+`wait_window` gives `None` or `send` gives false, call `acquire` again (the instance may have
+gone) and otherwise tell the user in a window of its own, or run anyway; never exit without a
+word. `send` false after its 2 s does not mean the message was lost (Windows still delivers a sent
+message to a thread that was busy), so a launch sends once: a retry can hand the same command line
+over twice. No application uses the module yet, and a winit window does not receive the message
+until its procedure is replaced (roadmap P8b), so for a winit application `send` gives false
+today.
+
+Not prevented, only not made worse: a process of the same user that creates the mutex or the
+record first (a squatter). A first instance that finds the record's name taken tries again every
+5 ms for 100 ms, since an honest mapping can be open for a moment (the instance before it closes
+its mutex before its mapping; a second launch reading the record holds it open); a name still
+taken after that is left alone, so the instance runs with no record, and a later launch learns
+that the application runs and gets no process id and no window.
+
+Run on Windows: `cargo test --release -p mdshared-app` with the module's 16 tests: two guards in
+one process, the record, a record name held open for a moment (and the retry failing it when the
+patience is zero, tried by hand) and one held by a squatter, the waits (gated by channels with
+time limits, not sleeps), hidden windows of the test's own and one that counts as visible but is
+layered, off screen and without a taskbar button, a `WM_COPYDATA` to the test's window, and a
+second process (the test program started again) that finds the first, its window, and hands it
+its arguments. Not verified: a real window brought forward by a launch from Explorer (it needs a
+person at the desktop; the tests bring nothing forward), a winit window receiving the message
+(P8b), an elevated first instance with a plain second launch, and `send` timing out against a
+hung window. Not seen by a person.
 
 ## Accessibility for UI Automation (`mdshared_ui::a11y`, feature `a11y`, roadmap W8 at Purge's scope)
 
