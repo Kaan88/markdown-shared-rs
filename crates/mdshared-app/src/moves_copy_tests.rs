@@ -698,3 +698,32 @@ fn an_original_goes_only_while_its_copy_holds_what_was_written() {
     let out = move_out(&mp, &mut crate::runs::Delete);
     assert!(md.exists() && out.removed.is_empty(), "{out:?}");
 }
+
+/// Fable's re-review of C2: a file whose very bytes the library already holds and lists gets no
+/// copy from the run, so its original stays, and so does the picture it shows; the rest of the
+/// run still moves.
+#[test]
+fn a_file_the_library_lists_already_is_left_where_it_is() {
+    let w = World::new("move-listed-there");
+    let a = w.outside.join("a.md");
+    let a_text = b"# A\n\n![p](img/p.png)\n";
+    put(&a, a_text);
+    let pic = w.outside.join("img").join("p.png");
+    put(&pic, b"PNG p");
+    let b = w.outside.join("b.md");
+    put(&b, b"# B\n");
+    let there = w.group.join("a.md");
+    put(&there, a_text);
+    put(&w.group.join("img").join("p.png"), b"PNG p");
+    list_note(&w, &there);
+    let (plan, _, mp) = moved(&w, &[w.want(&a), w.want(&b)]);
+    assert!(
+        matches!(plan[0].copy, Copy::There { .. }),
+        "{:?}",
+        plan[0].copy
+    );
+    assert_eq!(mp.why_stays(&a), Some(ALREADY_LISTED), "{mp:?}");
+    assert_eq!(mp.why_stays(&pic), Some(SHOWN_BY_STAYING), "{mp:?}");
+    assert!(mp.removes.iter().any(|r| r.path == b), "{mp:?}");
+    assert!(!mp.removes.iter().any(|r| r.path == a || r.path == pic));
+}

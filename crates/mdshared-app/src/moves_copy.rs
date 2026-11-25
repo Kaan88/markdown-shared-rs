@@ -336,6 +336,9 @@ pub const TOO_LARGE: &str = "too large for undo to keep: copied";
 pub const UNSAVED: &str = "open with changes not saved: copied";
 pub const UNSAVED_NOTE: &str = "a note open with changes not saved links to it: copied";
 pub const SHOWN_BY_STAYING: &str = "a file that stays shows it: copied";
+/// A file whose very bytes the library already holds and lists: the run writes no copy of it, so
+/// its record could not put it back (Fable's re-review of C2).
+pub const ALREADY_LISTED: &str = "the library lists the same file already: left where it is";
 /// A move whose record would be too large to read back is a copy (Fable's review of C2, 2).
 pub const RECORD_FULL: &str = "the run's record has no room to keep it for undo: copied";
 
@@ -441,11 +444,23 @@ pub fn move_plan(
         .filter(|p| !matches!(p.copy, Copy::Stays { .. }))
         .map(|p| p.from.clone())
         .collect();
+    let lib = crate::library::read(library);
+    let listed: Vec<PathBuf> = lib
+        .groups
+        .iter()
+        .flat_map(|g| g.entries.iter().map(|e| e.path.clone()))
+        .collect();
     // The files themselves.
     let mut files: Vec<Remove> = Vec::new();
     let mut kept_files = 0usize;
     for p in plan {
         if matches!(p.copy, Copy::Stays { .. }) {
+            continue;
+        }
+        if matches!(p.copy, Copy::There { .. })
+            && listed.iter().any(|l| links::same_file(l, p.target()))
+        {
+            stay(&mut out, &p.from, ALREADY_LISTED);
             continue;
         }
         let Some(rec) = written
@@ -492,12 +507,6 @@ pub fn move_plan(
     }
     // Who else may link to the pictures: the files the library lists, every file of the run,
     // and the Markdown files beside them.
-    let lib = crate::library::read(library);
-    let listed: Vec<PathBuf> = lib
-        .groups
-        .iter()
-        .flat_map(|g| g.entries.iter().map(|e| e.path.clone()))
-        .collect();
     let mut users: Vec<PathBuf> = listed.clone();
     users.extend(plan.iter().map(|p| p.from.clone()));
     let mut dirs: Vec<PathBuf> = plan
