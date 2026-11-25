@@ -2,7 +2,8 @@
 //! after them: a software painter, palettes, menu, text field, file tree, key parsing and a
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
 //! scrollbar, tooltips, toasts, dialog frames), info bars, sliders, knobs and faders, drop-down
-//! lists and toggle switches ([`dropdown`], [`toggle`]), expanders, anchored flyouts, table
+//! lists and toggle switches ([`dropdown`], [`toggle`]), a colour picker ([`colour_picker`]),
+//! expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), and with the
@@ -19,6 +20,7 @@ pub mod blur;
 pub mod cf_html;
 pub mod check;
 pub mod chrome;
+pub mod colour_picker;
 pub mod commands;
 pub mod corners;
 pub mod cover;
