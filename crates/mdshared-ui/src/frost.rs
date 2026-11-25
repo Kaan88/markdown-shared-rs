@@ -672,6 +672,9 @@ mod tests {
         f.set_veil(Some(200));
         f.sync(Backdrop::Mica, false, &DARK, &mut sys);
         assert!(f.key().is_none());
+        // The veil outlives the focus: back with it, the key is the app's veil.
+        assert!(f.sync(Backdrop::Mica, true, &DARK, &mut sys));
+        assert_eq!(*f.key().unwrap(), Key::new(key_colour(&DARK), 200));
         // The window system is asked nothing new for a veil.
         assert_eq!(sys.sets, [Backdrop::Acrylic, Backdrop::Mica]);
     }
