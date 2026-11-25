@@ -207,8 +207,8 @@ mod tests {
     use crate::anim::{Clock, ManualClock};
     use std::time::Duration;
 
-    fn run<'a>(
-        stack: &'a mut Stack<&'static str>,
+    fn run(
+        stack: &mut Stack<&'static str>,
         anim: &mut Animator,
         clock: &ManualClock,
     ) -> Vec<(&'static str, f32, f32)> {
