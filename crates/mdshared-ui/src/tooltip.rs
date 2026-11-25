@@ -6,7 +6,9 @@
 //! [`crate::anim::document::TIP`]); what text a control's tip has is the application's.
 //!
 //! The rules, as Windows' tooltips keep them:
-//! - resting on a control shows its tip after [`TIP_DELAY`](crate::anim::document::TIP_DELAY);
+//! - resting on a control shows its tip after [`TIP_DELAY`](crate::anim::document::TIP_DELAY):
+//!   counted from entering it with [`hover`](Tooltip::hover), or from the pointer's last move
+//!   with [`hover_at`](Tooltip::hover_at), which is given where the pointer is;
 //! - moving to a neighbour while a tip shows shows the neighbour's at once;
 //! - a press hides the tip, and the pressed control shows none again until the pointer has
 //!   left it;
@@ -46,6 +48,8 @@ pub struct Tooltip<K> {
     /// The control pressed last, which shows no tip until the pointer has left it.
     blocked: Option<K>,
     delay: Duration,
+    /// Where [`hover_at`](Self::hover_at) last saw the pointer.
+    at: Option<(f32, f32)>,
 }
 
 impl<K> Default for Tooltip<K> {
@@ -61,6 +65,7 @@ impl<K> Tooltip<K> {
             tip: None,
             blocked: None,
             delay: crate::anim::document::TIP_DELAY,
+            at: None,
         }
     }
 
@@ -128,6 +133,29 @@ impl<K: PartialEq> Tooltip<K> {
         was != self.shown().map(|o| (o.anchor, o.text.clone()))
     }
 
+    /// [`hover`](Self::hover) with the delay counted from the pointer coming to rest: `at` is
+    /// where the pointer is now (any units, the same each call). While a tip waits, the pointer
+    /// moving on the same control starts the wait again; a tip that shows stays while it moves
+    /// within the control, and a neighbour's still shows at once while one shows. Leaving hides
+    /// the tip, as with `hover`. Call it on each pointer move in place of `hover`. True when
+    /// what shows changed.
+    pub fn hover_at(&mut self, now: Instant, over: Option<Over<K>>, at: (f32, f32)) -> bool {
+        let moved = self.at.is_some_and(|a| a != at);
+        self.at = Some(at);
+        let same = matches!(
+            (over.as_ref(), self.tip.as_ref()),
+            (Some(o), Some(t)) if t.over.key == o.key && !t.shown
+        );
+        let changed = self.hover(now, over);
+        if same
+            && moved
+            && let Some(t) = self.tip.as_mut()
+        {
+            t.due = now + self.delay;
+        }
+        changed
+    }
+
     /// A press: the tip goes, and the control under the pointer (`key`, `None` for none) shows
     /// none again until the pointer has left it.
     pub fn press(&mut self, key: Option<K>) {
@@ -171,6 +199,51 @@ mod tests {
         tip.hover(t0 + D * 3, over(3));
         assert!(tip.shown().is_none());
         assert_eq!(tip.deadline(), Some(t0 + D * 4));
+    }
+
+    /// With `hover_at` the wait counts from the pointer's last move on the control; a tip that
+    /// shows stays while the pointer moves within it, and a neighbour's shows at once.
+    #[test]
+    fn hover_at_counts_the_delay_from_the_pointer_coming_to_rest() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut tip = Tooltip::new();
+        assert!(!tip.hover_at(t0, over(1), (5.0, 5.0)));
+        assert_eq!(tip.deadline(), Some(t0 + D));
+        // Still at the same place: the wait goes on from entering.
+        tip.hover_at(t0 + ms(100), over(1), (5.0, 5.0));
+        assert_eq!(tip.deadline(), Some(t0 + D));
+        // A move on the control starts it again.
+        tip.hover_at(t0 + ms(300), over(1), (9.0, 5.0));
+        assert_eq!(tip.deadline(), Some(t0 + ms(300) + D));
+        assert!(!tip.tick(t0 + D));
+        assert!(tip.tick(t0 + ms(300) + D));
+        // Shown: moving within the control keeps it, and asks for no wake.
+        assert!(!tip.hover_at(t0 + ms(900), over(1), (20.0, 9.0)));
+        assert_eq!(tip.shown().unwrap().key, 1);
+        assert_eq!(tip.deadline(), None);
+        // A neighbour while one shows: at once.
+        assert!(tip.hover_at(t0 + ms(950), over(2), (50.0, 9.0)));
+        assert_eq!(tip.shown().unwrap().key, 2);
+        // Leaving hides; the next control waits from its own rest.
+        assert!(tip.hover_at(t0 + ms(1000), None, (200.0, 200.0)));
+        tip.hover_at(t0 + ms(1000), over(3), (125.0, 9.0));
+        tip.hover_at(t0 + ms(1200), over(3), (126.0, 9.0));
+        assert_eq!(tip.deadline(), Some(t0 + ms(1200) + D));
+        // A pressed control still shows none until the pointer has left it.
+        tip.press(Some(3));
+        tip.hover_at(t0 + ms(1300), over(3), (127.0, 9.0));
+        assert_eq!(tip.deadline(), None);
+    }
+
+    /// `hover` is unchanged: moving on the same control keeps the time counted from entering.
+    #[test]
+    fn hover_counts_from_entering_whatever_hover_at_did_before() {
+        let t0 = Instant::now();
+        let mut tip = Tooltip::new();
+        tip.hover_at(t0, over(1), (5.0, 5.0));
+        tip.hover(t0 + Duration::from_millis(300), over(1));
+        assert_eq!(tip.deadline(), Some(t0 + D));
     }
 
     #[test]
