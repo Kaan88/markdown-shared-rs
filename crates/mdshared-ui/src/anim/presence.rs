@@ -162,6 +162,36 @@ pub fn pop(
     p.fade(&under, t);
 }
 
+/// How opaque an unfolding thing is when it starts: it opens from its top edge already mostly
+/// there, as the owner's prototype has it (`opacity: .6` with the clip), so it reads as unfolding
+/// rather than fading in.
+pub const UNFOLD_FROM: f32 = 0.6;
+
+/// Draws something unfolding from its top edge: what `draw` draws, cut off below a line that
+/// runs down `rect` as `t` goes from 0 to 1, at an opacity from [`UNFOLD_FROM`] up to 1. A menu
+/// hanging from the control that opens it enters this way. `rect` is the thing itself; `bounds`
+/// is everything `draw` touches, its shadow included (saved and blended, as in [`pop`]), and the
+/// shadow beside the thing shows as it unfolds, the shadow below it only at the end. At 1 `draw`
+/// runs as if called directly; at 0 (or below) it does not run.
+///
+/// For what opens upward (a menu above its control), [`pop`] with a rise is the entrance; this
+/// opens downward only.
+pub fn unfold(p: &mut Painter, rect: Rect, bounds: Rect, t: f32, draw: impl FnOnce(&mut Painter)) {
+    if t.is_nan() || t >= 1.0 {
+        return draw(p);
+    }
+    if t <= 0.0 {
+        return;
+    }
+    let under = p.snapshot(bounds.inset(-p.px()));
+    let bottom = rect.y + rect.h * t;
+    let shown = Rect::new(bounds.x, bounds.y, bounds.w, (bottom - bounds.y).max(0.0));
+    let clip = p.clip(shown);
+    draw(p);
+    p.restore(clip);
+    p.fade(&under, UNFOLD_FROM + (1.0 - UNFOLD_FROM) * t);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +359,56 @@ mod tests {
         let (left, _) = popped(0.5, (-6.0, 0.0));
         assert_eq!(at(&left, 7, 15), [128, 128, 128]);
         assert_eq!(at(&left, 17, 15), [255, 255, 255]);
+    }
+
+    /// A white window with a black 10x20 box (its "shadow" a grey frame 4 px round it) drawn
+    /// through `unfold` at `t`.
+    fn unfolded(t: f32) -> (Bitmap, bool) {
+        let mut bmp = Bitmap::new(40, 40);
+        let mut gfx = Gfx::new();
+        let mut ran = false;
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.fill(Rect::new(0.0, 0.0, 40.0, 40.0), [255, 255, 255]);
+            let r = Rect::new(10.0, 10.0, 10.0, 20.0);
+            let bounds = r.inset(-4.0);
+            unfold(&mut p, r, bounds, t, |p| {
+                ran = true;
+                p.fill(bounds, [200, 200, 200]);
+                p.fill(r, [0, 0, 0]);
+            });
+            // The clip is given back.
+            p.fill(Rect::new(36.0, 36.0, 2.0, 2.0), [1, 2, 3]);
+        }
+        assert_eq!(at(&bmp, 36, 36), [1, 2, 3]);
+        (bmp, ran)
+    }
+
+    #[test]
+    fn unfold_opens_from_the_top_edge_already_mostly_there() {
+        let (full, ran) = unfolded(1.0);
+        assert!(ran);
+        assert_eq!(at(&full, 15, 29), [0, 0, 0]);
+        assert_eq!(
+            at(&full, 15, 32),
+            [200, 200, 200],
+            "the shadow below, at the end"
+        );
+        let (none, ran) = unfolded(0.0);
+        assert!(!ran);
+        assert_eq!(at(&none, 15, 15), [255, 255, 255]);
+        // Half way: the top half shown at 0.8, the rest not yet, nor the shadow below it.
+        let (half, _) = unfolded(0.5);
+        let k = |c: u8| (255.0 - (255.0 - c as f32) * 0.8).round() as u8;
+        assert_eq!(at(&half, 15, 10), [k(0); 3]);
+        assert_eq!(at(&half, 15, 19), [k(0); 3]);
+        assert_eq!(at(&half, 15, 20), [255, 255, 255]);
+        assert_eq!(at(&half, 15, 32), [255, 255, 255]);
+        assert_eq!(
+            at(&half, 7, 15),
+            [k(200); 3],
+            "the shadow beside the shown part"
+        );
+        assert_eq!(at(&half, 7, 25), [255, 255, 255]);
     }
 }

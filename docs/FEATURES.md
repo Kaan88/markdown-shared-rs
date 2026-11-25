@@ -331,6 +331,264 @@ Not verified:
 - the tray's menu and the toasts' buttons pressed by a person;
 - `focus` and `submenu` under a real keyboard and pointer in an application.
 
+## A menu's look (`menu::Look`, 2026-11-24, `wk/menulook`, roadmap L11)
+
+mdplay's toolbar is flat, and the rounded, shadowed drop-down clashed with it. The look of a menu
+was eight numbers written into `menu.rs` and `submenu.rs`; they are now the fields of
+`menu::Look`, which a menu takes by `Menu::with_look` (or `set_look`, for a menu an application's
+own code made) and a cascade by `Cascade::with_look`, for every menu it opens:
+
+| Field | `ROUNDED` (the default) | `FLAT` |
+|---|---|---|
+| `radius`, the menu's corners | 8 | 0 |
+| `shadow` | yes | no |
+| `row` | 32 | 26 |
+| `pad`, above the first row and below the last | 5 | 4 |
+| `inset`, from the menu's side to a row's and its highlight's | 5 | 1 (inside the line) |
+| `hover_radius` | 5 | 0 |
+| `separator` | 9 | 9 |
+| `gap`, from a menu to its submenu | 2 (`submenu::GAP`) | 0 |
+
+The struct is `non_exhaustive`, so an application starts from either and changes fields, and a
+field added later breaks none. `Look::sane` puts back the rounded look's own value for any size
+that is not finite, is negative or is out of reason, so a look read from settings cannot break a
+menu. `row_span` and `submenu::beside` keep their signatures and meaning (the rounded look);
+`row_span_with` and `beside_with` take a look. The colours stay the palette's.
+
+Compatibility: a menu given no look is drawn with `Look::ROUNDED`, whose values are the old
+constants; the existing menu and submenu tests, which pin the rows, the placement and the
+pixels, pass unchanged. A test draws a menu with no look and with `ROUNDED` and finds the same
+pixels. The menu tests moved to `menu_tests.rs` (the file would have passed a thousand lines).
+
+What was run, on Windows: the nine commands of AGENTS.md, and after the last change (set_look) fmt, the workspace's clippy and mdshared-ui's tests again; two mutants (the shadow drawn whatever
+the look, the submenu's gap ignored) each failed a new test. The sheet
+`menu_look_sheet` (target/specimen/menu-look.png, -150) shows the rounded, a soft and the flat look,
+light and dark. mdplay's mockup draws its menu bar, toolbar menus and right-click menu in three
+looks built on it.
+
+Not verified: seen by a person (the owner has not looked yet); Linux and macOS (CI not run);
+mdview and mdedit were not rebuilt against the branch (they name no look, so nothing of theirs is
+drawn differently).
+
+## The look as a user setting (`appearance`, joined menus, 2026-11-24, `wk/menulook`, roadmap L12)
+
+mdplay makes its whole look a setting (its D-024): a colour scheme, where the accent comes from,
+the corners, the shadows, the menus' rows, menus joined to their control, the speed of motion.
+The parts any application can use are here, so mdview, mdedit, Hub and mdmix can offer the same
+choices with a few lines. Three pieces, each opt-in:
+
+- **`appearance`**, the look as plain data. `Appearance` has the fields `scheme`
+  (`Scheme::{Dark, Light, Warm, Cool}`), `accent` (`AccentFrom::{Theme, System, Cover,
+  Custom(rgb)}`), `radius`, `shadow` (1 is the toolkit's strength, 0 none), `menu_row`,
+  `joined`, `motion` (`Speed::{Off, Snappy, Fluent, Soft}`, factors 0, 0.66, 1, 1.5) and
+  `submenu_delay_ms`. `Appearance::DEFAULT` is the toolkit's own look (DARK, its accent,
+  `Look::ROUNDED`, Fluent, `submenu::DELAY`), so opting in changes nothing until the user does.
+  `WARM` and `COOL` are two new light palettes taken from mdplay's prototype.
+- **`Painter::shadow_with`** and **`menu::Look::shadow_strength`**: the popup shadow at a
+  strength; `shadow` is `shadow_with` at 1, pixel for pixel.
+- **`menu::joins`, `join_under`, `join_over`**: a menu drawn joined to the control that opens it,
+  the control a tab of the menu (the popup's colour, its line round the tab's top and sides, the
+  seam opened, the menu's corner squared under a tab at its edge, and a concave curve of up to
+  `menu::FILLET` px where the tab's side meets the menu's top inside its width).
+
+### Adopting it
+
+```rust
+use mdshared_ui::anim::{Motion, fluent};
+use mdshared_ui::appearance::{self, Appearance};
+use mdshared_ui::{menu, platform, submenu};
+
+const NAME: &str = "myapp-look"; // one word: whose text it is
+const VERSION: u32 = 1;
+
+// At start: the text is one value of the settings file (unescape it if it was escaped).
+let mut look = Appearance::DEFAULT;
+let mut own_keys = Vec::new();
+if let Some((_version, pairs)) = appearance::parse(&text, NAME) {
+    own_keys = look.read_all(pairs); // the pairs that are not the look's: the app's own
+}
+
+// The palette: the scheme's (or the app's own for a scheme it draws itself), with the accent.
+let system = platform::system_accent(); // ask again on ThemeChanged or when focus returns
+let cover = cover_colors.map(|c| c.accent); // cover::colors, once per picture
+let pal = look.palette(&look.scheme.palette(), system, cover);
+
+// Menus and cascades take the look; the cascade also takes the delay.
+let mlook = look.menu_look();
+let mut m = menu::Menu::new(items, 0.0, 0.0, false).around(control).with_look(mlook);
+let cascade = submenu::Cascade::new(nodes, control)
+    .with_look(mlook)
+    .with_delay(look.submenu_delay());
+
+// A joined menu, each frame it is open.
+m.place_in(&mut p, area);
+let joined = look.joined && menu::joins(control, m.rect());
+if joined {
+    menu::join_under(&mut p, &pal, &mlook, control);
+}
+m.draw_in(&mut p, &pal, area);
+if joined {
+    menu::join_over(&mut p, &pal, &mlook, control, m.rect());
+}
+// ...then the control's label over it, in pal.text.
+
+// Motion: the animator's policy, and the Fluent durations at the user's speed.
+anim.set_policy(look.motion.policy());
+let enter = Motion::tween(look.motion.scale(fluent::FAST), fluent::DECELERATE);
+
+// On a change: apply it as above, then save the look and the app's own keys in one text.
+let mut pairs = look.write();
+pairs.extend(own_keys.iter().cloned());
+let text = appearance::to_text(NAME, VERSION, &pairs);
+```
+
+The text is a header line `name version` and a `key value` line per pair; values are escaped as
+the settings file escapes them (`%`, line breaks), so any text fits. `appearance::KEYS` lists
+the look's keys and values. `parse` never panics: it refuses a text over 64 KiB or with another
+header, skips lines it could not have written, reads at most 256 pairs, and takes CRLF, a
+byte-order mark and blank lines; `read` leaves a field when its value does not read and holds a
+number to its range.
+
+What stays the application's own:
+
+- **Its palettes.** `Scheme::palette` is the toolkit's; an application with a dark of its own
+  (mdplay) passes that as `base` for `Scheme::Dark`. `palette` only puts the accent in.
+- **Its keys.** Anything else it wants in the same text (columns, a layout) goes into the pairs;
+  `read_all` hands them back.
+- **When to ask again.** The system's accent (`platform::system_accent`) when the system says
+  its colours changed or the window regains the focus; the cover's accent once per picture.
+- **The preferences page.** `Scheme::ALL`, `AccentFrom::SOURCES`, `Speed::ALL` and their
+  `label`s fill a `settings::Form`; the ranges are `MAX_RADIUS`, `MAX_SHADOW`,
+  `MIN_MENU_ROW`/`MAX_MENU_ROW`, `MAX_SUBMENU_DELAY_MS`.
+- **Where its menus open.** `Menu::around(control)` opens flush under the control, which a joined
+  menu needs; an application that wants a gap when menus are apart anchors to a rectangle a few
+  px taller.
+
+Not there: dark warm or cool schemes; fonts and text sizes (`tokens::Sizes`); high contrast
+(`tokens::Tokens::from_system`, which an application in high contrast uses instead); acrylic
+menus and the prototype's "unfold" entrance; a joined submenu or a menu joined above its
+control (a flipped menu does not join, and `join_over` answers false); the tab fading with its
+menu (the caller draws both inside one `anim::pop`).
+
+`menu_look` maps the numbers onto `Look::ROUNDED`: this radius, row and shadow strength (no
+shadow at 0), the highlight's corners two px less than the menu's and at most 5 (the prototype's
+rule, and `DEFAULT` gives `ROUNDED` itself), the flat look's full-row highlight at radius 0; the
+padding and gaps stay the rounded look's. The join differs from mdplay's mockup in two places: the
+squared corner paints only the pixels the rounded fill did not cover, so a lit first row is kept,
+and the curve takes the tab's own side line into it instead of standing beside it.
+
+Compatibility: nothing existing changes. `Painter::shadow` draws what it drew (a test against a
+copy of the old loop, light and dark, at scale 1 and 1.5); `Look::ROUNDED` and `FLAT` gain
+`shadow_strength: 1.0` (the struct is `non_exhaustive`); everything else is new.
+
+What was run, on Windows, on 86afe1b with these docs: the nine commands of AGENTS.md, all
+passing (the workspace's tests 1248 passed, 0 failed, 22 ignored; the feature runs recycle 11,
+media_session 7, notify 11, none failed);
+mutants that drew the menu's shadow at strength 1 whatever the look, filled the squared corner
+whole, left out the curve, dropped the width test of `joins`, let a cover source fall back to
+black, dropped the text's size limit and left `read` unclamped each failed a test. The sheet
+`appearance_sheet` (target/specimen/appearance.png, -150) draws the four schemes with a menu
+joined to its title, in the toolkit's look and in mdplay's prototype's; the agent looked at it.
+
+Not verified: seen by the owner; Linux and macOS (CI not run); used by an application (mdplay's
+port is its own work); mdview and mdedit not rebuilt against the branch (they name none of it).
+
+## Soft shadows and the settings form's style (`Painter::soft_shadow`, `settings::Style`, 2026-11-25, `wk/menulook`, roadmap L12)
+
+mdplay's look is drawn after its HTML prototype, whose shadows are CSS `box-shadow`s. The
+toolkit's shadow (`shadow_with`) is ten faint boxes, each blended and rounded down, so on a dark
+page the stack sinks to black next to the box (the Look dialog on mdplay's dimmed page had 9 px
+of pure black under it), and it reaches up about as far as down. These pieces draw what the
+prototype draws; each is opt-in.
+
+- **`Painter::soft_shadow(r, radius, &layers, k)`**, a CSS `box-shadow` in software. Each
+  `Shade { dx, dy, blur, alpha }` is the box with its rounded corners blurred by a Gaussian of
+  sigma `blur / 2` (as browsers draw it), computed exactly (the normal distribution across and
+  down, less each corner's notch in strips), offset, its alpha times `k`; the layers stack as CSS
+  stacks them, and each pixel is blended once and rounded, so a tail too faint to show leaves a
+  dark page as it was. Outside the box only, as CSS; the box is drawn over it next. Recipes:
+  `Shade::POPUP` (`0 8px 24px 55%, 0 2px 6px 35%`, the prototype's menus) and `Shade::TAB`
+  (`0 2px 10px 45%`, a joined menu's control); `LIGHT_SHADOW` (0.45) is the prototype's factor
+  on a light page; `soft_bounds` says how far it reaches (three sigmas). It honours the clip and
+  the offset, the shadow at 150% is the one at 100% made larger, and nonsense (a number that is
+  not finite, `k` of 0 or less) draws nothing.
+- **`menu::Look::soft_shadow`**: the menu casts `Shade::POPUP` at its `shadow_strength` (times
+  `LIGHT_SHADOW` on a light palette) instead of `shadow_with`, its joined control `Shade::TAB`,
+  and `draw_in_presence` fades the whole shadow with the menu. Off in `ROUNDED` and `FLAT`.
+- **`overlay::draw_dialog_card_with(p, pal, r, radius, soft)`**: the dialog card with other
+  corners and, given `Some(k)`, the soft popup shadow at `k`; `draw_dialog_card` is it with 10
+  and `None`.
+- **`settings::Style`**, given by `Form::style` (or `set_style` while the form is open, for a
+  look changed under it): the card's `radius` (out of 0..=32 it is 10), its `soft_shadow`,
+  `neutral_segments` (the chosen segment of a segmented choice a grey pill, white on a light
+  palette, on a track a shade off the card, instead of the accent) and `caps_headings` (11 px
+  small capitals in the muted colour). `Style::CLASSIC` is the form as it was, and what a form
+  given none draws. The struct is `non_exhaustive`: start from `CLASSIC` and change fields.
+
+Against the browser: Edge's own `box-shadow`, rendered headless at 100% and 150% and read pixel
+by pixel, is within 3 to 4 / 255 of the formula these follow (`soft_tests` holds the formula
+against a brute-force 6 x 6 supersampled blur, within 2 / 255).
+
+Cost: two numbers per layer for every column and row in reach, worked out once a call, a product
+per pixel, and a few strips at the corners. mdplay's frames on the release profile, three runs
+each: its Look dialog at 1650 x 1050 (150%) 5.7 to 6.1 ms against 5.55 with the old shadow, at
+100% 2.55 to 2.80 against 2.57; its menus 1.15 to 1.25 against 1.22 to 1.28.
+
+Compatibility: nothing existing changes. `ROUNDED` and `FLAT` gain `soft_shadow: false` (the
+struct is `non_exhaustive`); `draw_dialog_card` is `draw_dialog_card_with(.., 10.0, None)`, and the
+test that pins its pixels to a copy of the old loop passes unchanged; a form given no style draws
+the same pixels as one given `CLASSIC` (a test, light and dark, at 1 and 1.5); every other
+existing test passes unchanged.
+
+What was run, on Windows, on 9bebfcd..b1211de with these docs: the nine commands of AGENTS.md,
+all passing (the workspace's tests 1282 passed, 0 failed, 23 ignored; the feature runs recycle
+11, media_session 7, notify 11, none failed); the new tests also in a debug build. Mutants that
+drew the menu's or the tab's soft shadow as the old one, kept the old snapshot reach, turned the
+soft shadow on in `ROUNDED`, dropped the light factor, rounded the blend down, took sigma as a
+third of the blur, shadowed the corners' partial pixels whole, or ignored the style's radius,
+its limits, its soft shadow, its capitals, its neutral segments or `set_style`'s answer each
+failed a test. mdplay's shots show all of it (its own commit).
+
+The review's fixes (2026-11-25): a cascade (`submenu::Cascade::draw_in_presence`,
+`draw_animated`) fades and slides each soft-shadowed menu's whole shadow, as `Menu` does
+(`Menu::presence_bounds`), where it took 18 px round them; a cascade without the soft shadow
+takes what it took. A corner is cut into one strip per half deviation of its curve, the strips
+spaced round the curve and each taking off exactly the area the curve leaves in it, where it
+took a strip per pixel of radius whatever the blur: the shadow is within half a level of 255 of
+a corner cut finely (strips a pixel high were up to 1.8 levels off at the dialog's corners), and
+the Look dialog at 150% with its largest corners paints in 5.44 to 5.54 ms against 5.86 to 5.96
+(mdplay's shots, opt-level 3 without LTO). `draw_dialog_card_with` takes a radius that is not
+finite or is negative as the classic 10 for the shadow, the card and its footer alike. A form
+in the classic style is held to the frozen copy of the form before styles, pixel for pixel.
+
+Not verified: seen by the owner; Linux and macOS (CI not run); Wine; mdview and mdedit not
+rebuilt against the branch (they name none of it).
+
+## A menu's text size and one lead column, a lighter backdrop (`menu::Look`, `settings::Style`, 2026-11-25, `wk/menulook`, roadmap L12)
+
+Measured against mdplay's HTML prototype, a web page's menus put the check mark and the icon in
+one 30 px column with the label after it, at 13 px, where the toolkit's have a column for each at
+13.5 px; and the prototype's settings panel does not dim the window as much as a modal dialog.
+Each piece is opt-in.
+
+- **`menu::Look::text`**: the labels' size in logical px; the menu is measured at it, so its width
+  follows. `TEXT` (13.5) in `ROUNDED` and `FLAT`; out of 6..=48, or not a number, `sane` gives the
+  default's.
+- **`menu::Look::one_lead`**: the check mark and the icon share one `ONE_LEAD` (30 px) column from
+  the row's left side, a checked item showing its mark there and any other its icon (muted); the
+  label starts after it. A menu with neither marks nor icons starts its labels `NO_LEAD` (14 px)
+  in. Off in both looks.
+- **`settings::Style::backdrop`**: how much of the classic backdrop dims the window behind the
+  card, 1 the classic `draw_backdrop`, 0 none, between them `draw_backdrop_presence` at that
+  part. 1 in `CLASSIC`; not a number is 1.
+
+Compatibility: nothing existing changes. `ROUNDED` and `FLAT` keep 13.5 and separate columns, and
+`CLASSIC` the full backdrop; every existing test passes unchanged. The new tests fail with each
+piece reverted (the lead's position, the text drawn and measured at the look's size, the
+backdrop's part).
+
+Not verified: seen by the owner; Linux and macOS (CI not run); Wine.
+
 ## Rich text pasted as Markdown (`mdshared_app::html_md`, `mdshared_ui::platform::clipboard_html`)
 
 `html_md::to_markdown(html)` turns the HTML a browser, a word processor or mdview put on the
