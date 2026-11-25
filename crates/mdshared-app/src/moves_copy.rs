@@ -230,9 +230,10 @@ fn write_all(plan: &[Planned], done: &mut Written) -> Result<(), String> {
     Ok(())
 }
 
-/// Takes away what a failed write made: its files while they are the bytes it wrote, then its
-/// folders while they are empty, deepest first.
-fn take_back(done: &Written) {
+/// Takes away what a write made: its files while they are the bytes it wrote, then its
+/// folders while they are empty, deepest first. [`write`] calls it when it fails; a caller calls
+/// it when what comes after the copies (the library's lines) cannot be written.
+pub fn take_back(done: &Written) {
     for (path, created, sha) in &done.files {
         if *created && digest_of(path).is_some_and(|d| d.eq_ignore_ascii_case(sha)) {
             let _ = std::fs::remove_file(path);
