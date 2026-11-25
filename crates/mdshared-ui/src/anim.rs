@@ -483,11 +483,16 @@ pub mod document {
         }
     }
 
-    /// A menu, context menu, drop-down list or submenu: in by `ENTER`, out by `EXIT`.
+    /// A menu, context menu, drop-down list or submenu: in by [`MENU_ENTER`], out by
+    /// `fluent::EXIT`.
     pub const MENU: Pair = Pair {
-        enter: fluent::ENTER,
+        enter: MENU_ENTER,
         exit: fluent::EXIT,
     };
+    /// A menu's entrance: 117 ms decelerating, quicker than `fluent::ENTER`'s 167. The owner
+    /// tried both in mdedit and mdview on 2026-11-25 and chose 117 ("this is better");
+    /// `fluent::ENTER` stays Microsoft's timing.
+    pub const MENU_ENTER: Motion = Motion::tween_ms(117, fluent::DECELERATE);
     /// A tooltip: a plain short fade both ways, where the eye already is.
     pub const TIP: Pair = Pair {
         enter: fluent::FADE,

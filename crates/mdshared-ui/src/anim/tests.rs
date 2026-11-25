@@ -953,3 +953,18 @@ fn a_kept_group_is_not_taken_for_new_after_a_frame_that_skipped_it() {
         "not kept: forgotten, and it enters again"
     );
 }
+
+#[test]
+fn a_document_menu_enters_in_117_ms_and_fluent_enter_is_untouched() {
+    use super::document;
+    assert_eq!(
+        document::MENU.enter.length(),
+        Some(Duration::from_millis(117))
+    );
+    assert_eq!(
+        document::MENU.enter,
+        Motion::tween_ms(117, fluent::DECELERATE)
+    );
+    assert_eq!(document::MENU.exit, fluent::EXIT);
+    assert_eq!(fluent::ENTER.length(), Some(fluent::FAST));
+}
