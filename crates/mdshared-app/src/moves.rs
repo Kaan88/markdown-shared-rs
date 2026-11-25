@@ -33,6 +33,10 @@ use std::path::{Path, PathBuf};
 #[path = "moves_links.rs"]
 mod links;
 
+/// "Copy them in" (D-209): files copied into a group's folder, with the pictures they show.
+#[path = "moves_copy.rs"]
+pub mod copy_in;
+
 /// The longest a note's whole path may be after it moves (the plan's 240).
 pub const PATH_MAX_CHARS: usize = 240;
 
@@ -1328,6 +1332,13 @@ pub trait MoveGate {
 }
 
 /// A note's text made `after` in one atomic write, only while it says `before`.
+/// Whether `text`, a note in `base`, has a link that leads to `path`.
+pub(crate) fn links_to(text: &str, base: &Path, path: &Path) -> bool {
+    links::links(text, base)
+        .iter()
+        .any(|l| links::same_file(&l.target, path))
+}
+
 pub fn rewrite_note(file: &Path, before: &str, after: &str) -> Result<(), String> {
     match links::note_text(file) {
         Some(now) if now == before => {
@@ -1652,6 +1663,8 @@ pub(crate) fn record_from_json(
         }),
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
+        removed: Vec::new(),
     })
 }
 
@@ -2620,6 +2633,8 @@ pub fn write_at(
         }),
         originals: Vec::new(),
         added: Vec::new(),
+        copied: Vec::new(),
+        removed: Vec::new(),
     };
     let record_path = match record.create(&req.library) {
         Ok(path) => path,
