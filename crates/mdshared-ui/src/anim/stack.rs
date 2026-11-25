@@ -83,9 +83,11 @@ impl<T> Stack<T> {
     }
 
     /// The same stack keeping at most `max` things (at least one) in all, the ones leaving
-    /// counted: a push over that many drops the oldest at once, with no exit, so pushes faster
-    /// than the exit do not pile up. Without it only the things shown are counted
-    /// ([`with_max`](Self::with_max)).
+    /// counted: over that many, the oldest leaving ones are dropped at once, with no rest of
+    /// their exit, so pushes faster than the exit do not pile up. A shown thing is dropped (with
+    /// no exit) only when nothing is leaving, which happens only with `max` under
+    /// [`with_max`](Self::with_max)'s: keep it at least that. Without it only the things shown
+    /// are counted.
     pub fn with_max_drawn(mut self, max: usize) -> Stack<T> {
         self.max_drawn = Some(max.max(1));
         self
@@ -102,41 +104,61 @@ impl<T> Stack<T> {
             shown: true,
             until,
         });
+        self.cap(key);
+        key
+    }
+
+    /// Sends away the oldest shown things beyond the most shown, sparing `keep` (the one just
+    /// pushed or brought back), then drops what is beyond the most kept: the oldest leaving
+    /// ones first.
+    fn cap(&mut self, keep: u64) {
         let mut over = self.shown().count().saturating_sub(self.max);
-        for e in self.items.iter_mut().filter(|e| e.shown) {
+        for e in self.items.iter_mut().filter(|e| e.shown && e.key != keep) {
             if over == 0 {
                 break;
             }
             e.shown = false;
             over -= 1;
         }
-        if let Some(max) = self.max_drawn {
-            let over = self.items.len().saturating_sub(max);
-            self.items.drain(..over);
+        let Some(max) = self.max_drawn else {
+            return;
+        };
+        while self.items.len() > max {
+            let at = self
+                .items
+                .iter()
+                .position(|e| !e.shown)
+                .or_else(|| self.items.iter().position(|e| e.key != keep))
+                .unwrap_or(0);
+            self.items.remove(at);
         }
-        key
     }
 
-    /// Puts `item` in the place of the thing `key`, with a new time to leave, at once and with
-    /// no exit or entrance: a status that replaces itself (a zoom step, progress turning into a
-    /// result). A thing that is leaving comes back. False when there is no such thing.
+    /// Puts `item` in the place of the thing `key`, with a new time to leave, at once: a status
+    /// that replaces itself (a zoom step, progress turning into a result) plays no exit and no
+    /// entrance. A thing that is leaving comes back, turning round where it is in its exit, and
+    /// the oldest others are sent away if that makes more than the most shown. False when there
+    /// is no such thing.
     pub fn replace(&mut self, key: u64, item: T, until: Option<Instant>) -> bool {
         match self.items.iter_mut().find(|e| e.key == key) {
             Some(e) => {
                 (e.item, e.until, e.shown) = (item, until, true);
+                self.cap(key);
                 true
             }
             None => false,
         }
     }
 
-    /// Brings the thing `key` back if it is leaving, with a new time to leave; it turns round
-    /// where it is in its exit and stays in its place. True when there is such a thing, shown
-    /// or leaving.
+    /// Gives the thing `key` a new time to leave (`None`: not until hidden), and brings it back
+    /// if it is leaving: it turns round where it is in its exit and stays in its place, and the
+    /// oldest others are sent away if that makes more than the most shown. True when there is
+    /// such a thing, shown or leaving.
     pub fn revive(&mut self, key: u64, until: Option<Instant>) -> bool {
         match self.items.iter_mut().find(|e| e.key == key) {
             Some(e) => {
                 (e.shown, e.until) = (true, until);
+                self.cap(key);
                 true
             }
             None => false,
@@ -154,14 +176,19 @@ impl<T> Stack<T> {
         self.items.clear();
     }
 
-    /// The newest thing, shown or leaving, for which `is` holds: its key and whether it is
-    /// still shown.
+    /// The thing for which `is` holds, the newest shown one first, else the newest leaving one:
+    /// its key and whether it is still shown.
     pub fn find(&self, mut is: impl FnMut(&T) -> bool) -> Option<(u64, bool)> {
-        self.items
-            .iter()
-            .rev()
-            .find(|e| is(&e.item))
-            .map(|e| (e.key, e.shown))
+        let mut leaving = None;
+        for e in self.items.iter().rev() {
+            if is(&e.item) {
+                if e.shown {
+                    return Some((e.key, true));
+                }
+                leaving = leaving.or(Some((e.key, false)));
+            }
+        }
+        leaving
     }
 
     /// Sends the thing `key` away; it plays its exit in [`frame`](Self::frame).
@@ -383,6 +410,47 @@ mod tests {
         // A different one is pushed as before.
         assert_ne!(stack.show("saved", None), a);
         assert_eq!(stack.current().count(), 2);
+    }
+
+    /// Bringing one back keeps to the most shown: the oldest other is sent away.
+    #[test]
+    fn a_toast_brought_back_keeps_to_the_most_shown() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new().with_max(1);
+        let copied = stack.show("copied", None);
+        after(400, &mut stack, &mut anim, &clock);
+        stack.show("saved", None);
+        after(32, &mut stack, &mut anim, &clock);
+        assert_eq!(stack.show("copied", None), copied);
+        let shown: Vec<_> = stack.current().map(|(_, s)| *s).collect();
+        assert_eq!(shown, ["copied"], "\"saved\" is sent away");
+        // The same through replace.
+        let saved = stack.find(|s| *s == "saved").unwrap().0;
+        assert!(stack.replace(saved, "saved!", None));
+        let shown: Vec<_> = stack.current().map(|(_, s)| *s).collect();
+        assert_eq!(shown, ["saved!"]);
+    }
+
+    /// Over the most kept, the leaving ones go first: a shown progress toast older than them
+    /// stays, and can still be replaced by its result.
+    #[test]
+    fn with_max_drawn_drops_the_leaving_ones_first() {
+        let clock = ManualClock::new();
+        let mut anim = Animator::new();
+        let mut stack = Stack::new().with_max(3).with_max_drawn(4);
+        let progress = stack.push("exporting", None);
+        let b = stack.push("b", None);
+        let c = stack.push("c", None);
+        run(&mut stack, &mut anim, &clock);
+        stack.hide(b);
+        stack.hide(c);
+        stack.push("d", None);
+        stack.push("e", None);
+        let kept: Vec<_> = stack.find(|s| *s == "exporting").into_iter().collect();
+        assert_eq!(kept, [(progress, true)]);
+        assert!(stack.replace(progress, "exported", None));
+        assert!(stack.items.len() <= 4);
     }
 
     #[test]
