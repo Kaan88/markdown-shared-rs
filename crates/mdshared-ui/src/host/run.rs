@@ -428,6 +428,7 @@ impl<A: App> Host<A> {
         {
             let Win { window, bmp, .. } = win;
             let mut p = Painter::new(bmp, &mut self.gfx, scale);
+            p.set_frost_key(self.frost.key().copied());
             p.clip(damage);
             let mut cx = Cx {
                 window,

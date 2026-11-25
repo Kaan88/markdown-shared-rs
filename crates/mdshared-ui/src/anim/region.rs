@@ -139,6 +139,66 @@ impl Snapshot {
         }
     }
 
+    /// [`crossfade`](Self::crossfade) for a bitmap whose chrome is frosted with `key`: where
+    /// either side is a chrome pixel ([`crate::frost::MARK`]) and the other is not, the two are
+    /// mixed as the compositor will show them, the chrome taken off the key
+    /// ([`crate::frost::Key::apply`]) and both premultiplied, and the result is written with its
+    /// own alpha, which [`crate::frost::key_out`] leaves alone. So a popup fading in over frosted
+    /// chrome lets the backdrop through less and less, rather than counting as chrome (keyed
+    /// out) until halfway and then as an opaque pixel. Where both sides are chrome the colours
+    /// mix and the mark stays; where neither is, this is `crossfade`. With no key it is
+    /// `crossfade`. A pixel written with its own alpha is premultiplied: draw nothing over it
+    /// before the frame is presented (the next frame draws the region again from the back).
+    pub fn crossfade_keyed(&self, bmp: &mut Bitmap, t: f32, key: Option<&crate::frost::Key>) {
+        let Some(key) = key else {
+            return self.crossfade(bmp, t);
+        };
+        let a = parts(t);
+        if a == 256 || a == 0 || !self.fits(bmp) {
+            return self.crossfade(bmp, t);
+        }
+        let mark = crate::frost::MARK;
+        // A pixel as the compositor takes it: alpha, red, green, blue, premultiplied.
+        let shown = |px: &[u8]| -> [u32; 4] {
+            if px[3] == mark {
+                let v = key.apply(u32::from_le_bytes([px[0], px[1], px[2], px[3]]));
+                [v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
+            } else {
+                [px[3] as u32, px[2] as u32, px[1] as u32, px[0] as u32]
+            }
+        };
+        let mixed = |o: u32, n: u32| (o * (256 - a) + n * a + 128) >> 8;
+        let n = self.w as usize * 4;
+        for row in 0..self.h {
+            let o = self.at(bmp, row);
+            let dst = &mut bmp.pixels[o..o + n];
+            let old = self.row(row);
+            for (d, s) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(old.as_chunks::<4>().0)
+            {
+                let (was, now) = (s[3] == mark, d[3] == mark);
+                if was == now {
+                    for i in 0..3 {
+                        d[i] = mix(s[i], d[i], a);
+                    }
+                    d[3] = if was { mark } else { mix(s[3], d[3], a) };
+                    continue;
+                }
+                let (os, ns) = (shown(&s[..]), shown(&d[..]));
+                let out: [u32; 4] = std::array::from_fn(|i| mixed(os[i], ns[i]));
+                // 254 would be taken for chrome and keyed again; one step more is opaque enough.
+                let alpha = if out[0] == mark as u32 { 255 } else { out[0] };
+                d[0] = out[3].min(alpha) as u8;
+                d[1] = out[2].min(alpha) as u8;
+                d[2] = out[1].min(alpha) as u8;
+                d[3] = alpha as u8;
+            }
+        }
+    }
+
     /// The present content of the rectangle moved by `dx, dy` device px and mixed over the
     /// snapshot at opacity `t`, in place: a new page that slides in while it fades in. Where
     /// the moved content has not reached (a band `dx` wide or `dy` high at the edge it comes
@@ -213,6 +273,73 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A popup fading in over frosted chrome shows as the compositor will draw it: its alpha
+    /// rises with `t`, where a plain crossfade turned it opaque at halfway. Where neither side is chrome the keyed fade is the plain one, byte for byte.
+    #[test]
+    fn a_fade_over_frosted_chrome_rises_through_the_backdrop() {
+        use crate::frost::{Key, MARK, key_out, mark};
+        let chrome = [0xf3, 0xf3, 0xf3];
+        let key = Key::new(chrome, 0);
+        // Alpha and red after the present: the bitmap's 32-bit pixels taken off the key.
+        let present = |bmp: &Bitmap, x: u32| {
+            let mut px: Vec<u32> = bmp
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            key_out(&key, &mut px, bmp.width as usize, (0, 0, 20, 10));
+            let v = px[(5 * bmp.width + x) as usize];
+            (v >> 24, (v >> 16) & 0xff)
+        };
+        let fade = |t: f32, keyed: bool| {
+            let mut bmp = painted(20, 10, |_, _| chrome);
+            mark(&mut bmp, (0, 0, 20, 10));
+            let under = Snapshot::take(&bmp, 0, 0, 20, 10);
+            // The popup: opaque white over the left half.
+            for y in 0..10 {
+                for x in 0..10 {
+                    let o = ((y * 20 + x) * 4) as usize;
+                    bmp.pixels[o..o + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+            under.crossfade_keyed(&mut bmp, t, keyed.then_some(&key));
+            bmp
+        };
+        let mut last = 0;
+        for t in [0.2, 0.4, 0.6, 0.8] {
+            let (a, r) = present(&fade(t, true), 2);
+            let want = (t * 255.0).round() as u32;
+            assert!(a.abs_diff(want) <= 2, "t {t}: alpha {a}, want {want}");
+            assert!(
+                r <= a && r.abs_diff(want) <= 2,
+                "t {t}: premultiplied white {r}"
+            );
+            assert!(a > last, "alpha rises with t");
+            last = a;
+            // The chrome beside the popup is still chrome, keyed out.
+            assert_eq!(present(&fade(t, true), 15).0, 0);
+        }
+        // The plain crossfade: the mix stays marked until halfway and is keyed as chrome, then
+        // it is opaque, a jump from about 40 % to all of it.
+        assert!(present(&fade(0.4, false), 2).0 < 160);
+        assert_eq!(present(&fade(0.6, false), 2).0, 255);
+        assert_ne!(MARK, 255);
+
+        // Nothing marked: the keyed fade is the crossfade.
+        let draw = |keyed: bool| {
+            let mut bmp = painted(20, 10, |x, y| [x as u8 * 9, y as u8 * 20, 77]);
+            let under = Snapshot::take(&bmp, 2, 2, 15, 6);
+            for p in bmp.pixels.as_chunks_mut::<4>().0 {
+                p[..3].copy_from_slice(&[10, 200, 90]);
+            }
+            under.crossfade_keyed(&mut bmp, 0.37, keyed.then_some(&key));
+            bmp.pixels
+        };
+        assert_eq!(draw(true), draw(false));
+    }
 
     /// A bitmap whose every pixel is a colour made from its place by `f`.
     fn painted(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 3]) -> Bitmap {

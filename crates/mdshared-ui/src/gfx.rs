@@ -302,6 +302,9 @@ pub struct Painter<'a> {
     clip: (i32, i32, i32, i32),
     /// Device px added to everything drawn in logical px: see [`offset`](Painter::offset).
     origin: (i32, i32),
+    /// The frosted chrome's key, for [`fade`](Painter::fade): see
+    /// [`set_frost_key`](Painter::set_frost_key).
+    frost: Option<crate::frost::Key>,
 }
 
 impl<'a> Painter<'a> {
@@ -313,7 +316,22 @@ impl<'a> Painter<'a> {
             scale,
             clip,
             origin: (0, 0),
+            frost: None,
         }
+    }
+
+    /// The key the chrome is frosted with this frame (`Frost::key`), or `None`: then
+    /// [`fade`](Self::fade), and so [`crate::anim::pop`], mixes a popup over frosted chrome as the
+    /// compositor will show it ([`crate::anim::Snapshot::crossfade_keyed`]). Without it a popup
+    /// that fades over frosted chrome is keyed out with the chrome until halfway, then opaque.
+    /// The window host sets it; an application with its own loop sets it after making the
+    /// `Painter`.
+    pub fn set_frost_key(&mut self, key: Option<crate::frost::Key>) {
+        self.frost = key;
+    }
+
+    pub fn frost_key(&self) -> Option<&crate::frost::Key> {
+        self.frost.as_ref()
     }
 
     /// One device pixel, in logical px: the width of a hairline.
@@ -373,7 +391,7 @@ impl<'a> Painter<'a> {
     /// how a group of drawing calls gets an opacity in a painter that has no layers; the cost
     /// is a copy and a blend of the rectangle. See [`crate::anim::pop`] for the usual wrapper.
     pub fn fade(&mut self, under: &crate::anim::Snapshot, opacity: f32) {
-        under.crossfade(self.bmp, opacity);
+        under.crossfade_keyed(self.bmp, opacity, self.frost.as_ref());
     }
 
     /// Restricts drawing to `r` (intersected with the bitmap) and returns the previous clip, to be

@@ -117,7 +117,7 @@ Full account: [ANIMATION.md](ANIMATION.md).
 | `anim::Animatable` | What can move: `f32`, `f64`, a point, `Rect`, `Rgb`, `[f32; 4]`; kept as `f64`, with a settle precision per type (provisional) | `parts`, `from_parts`, `precision()`, `lerp` |
 | `anim::cycle` | What repeats while shown: a running phase, and a blink that wakes the window only when it changes (provisional) | `Animator::cycle(id, period) -> f32`, `Animator::blink(id, on, off) -> bool`, `Periodic::new(period).ping_pong().still_at(phase)`, `.phase(anim, id)`, `.at(elapsed)` |
 | `anim::Clock` | Where time comes from; a clock moved by hand for tests | `SystemClock`, `ManualClock` |
-| `anim::Snapshot`, `PageTransition` | A saved piece of the bitmap; cross-fade, slide or push between an old page and a new one; ends when the bitmap size, scale or region changes (provisional) | `Painter::snapshot`, `PageTransition::begin` / `apply(anim, p, region)` / `apply_dev`, `PageEffect` |
+| `anim::Snapshot`, `PageTransition` | A saved piece of the bitmap; cross-fade, slide or push between an old page and a new one; a cross-fade over frosted chrome as the compositor shows it (`crossfade_keyed`, `Painter::set_frost_key`); ends when the bitmap size, scale or region changes (provisional) | `Painter::snapshot`, `PageTransition::begin` / `apply(anim, p, region)` / `apply_dev`, `PageEffect` |
 | `anim::Transient`, `pop`, `pop_bounds` | Things that appear and disappear, kept alive while they leave; any drawing faded and moved as one | `Transient::show` / `hide` / `frame`, `pop(p, bounds, t, shift, draw)` |
 
 ## Platform (`mdshared-ui`)
