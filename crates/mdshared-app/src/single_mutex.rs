@@ -19,14 +19,38 @@
 //! match single_mutex::acquire("purge") {
 //!     Instance::First(guard) => { /* make the window */ guard.publish_window(hwnd); /* run, keeping guard */ }
 //!     Instance::Running(first) => {
-//!         if let Some(window) = first.wait_window(Duration::from_secs(2)) {
-//!             single_mutex::send("purge", window, &args);
-//!             single_mutex::bring_forward(window);
+//!         match first.wait_window(Duration::from_secs(2)) {
+//!             Some(window) if single_mutex::send("purge", window, &args) => {
+//!                 single_mutex::bring_forward(window);
+//!             }
+//!             // Not handed over: see "When nothing is handed over". Send once, never again.
+//!             _ => { /* tell the user, or run anyway */ }
 //!         }
 //!         return; // the caller's choice
 //!     }
 //! }
 //! ```
+//!
+//! # When nothing is handed over
+//!
+//! A second launch that exits without a word when the hand-over failed leaves the user who
+//! started it looking at nothing. [`Running::wait_window`] gives `None` when the first instance
+//! publishes no window in time and has no visible main window either (one that is still starting,
+//! or hung), when its record cannot be read (an elevated first instance seen from a plain launch,
+//! or a squatter's record: see "Deliberately not here"), and when it went away while this waited.
+//! [`send`] gives false for a window that does not take the message, which is every winit
+//! window until its procedure is replaced to call [`received`] (roadmap P8b), and for one that
+//! did not answer within [`SEND_TIMEOUT`]. In each case the application decides, and should do
+//! one of two things: call [`acquire`] again, which gives [`Instance::First`] when the instance
+//! has gone (this launch is then the first after all), and otherwise either tell the user in a
+//! window of its own that the application runs but could not be reached, or open its own window
+//! anyway, as a second instance.
+//!
+//! A false from [`send`] after the time limit does not mean the message was lost: Windows keeps
+//! a sent message for the receiving thread, which may still handle it once it is no longer busy.
+//! A launch that sends again after a false may hand the same command line over twice (two files
+//! opened, two uninstalls asked for), so send once; an application that must retry makes its
+//! hand-over safe to receive twice.
 //!
 //! # The names
 //!
@@ -119,9 +143,14 @@
 //!   every launch think the application runs. Private namespaces with a boundary descriptor would
 //!   prevent it; an application that needs that is beyond this module. The same goes for the
 //!   record: a process that makes the mapping of that name first is found by the next launch, and
-//!   a first instance that finds a mapping already there does not write into it (see
-//!   `create_record`): it keeps its mutex, publishes no window, and every launch finds the windows
-//!   of the process instead. Neither is prevented, only not made worse.
+//!   a first instance that finds a mapping already there, and still there after a tenth of a
+//!   second of trying again (see `create_record`), does not write into it: it keeps its mutex and
+//!   has no record, so [`Guard::publish_window`] does nothing. A later launch then reads the
+//!   squatter's mapping. One that holds no whole record gives no process id, so [`Running::pid`]
+//!   and [`Running::window`] give `None`, and [`Running::wait_window`] gives `None` at its
+//!   deadline (the mutex is still there, so it waits it out): the launch knows the application
+//!   runs and can reach nothing (see "When nothing is handed over"). One that holds a record the
+//!   squatter wrote is believed. Neither is prevented, only not made worse.
 //! - Waiting for the first instance to answer anything beyond the message: [`send`] says whether
 //!   the window procedure took the hand-over, not what the application did with it.
 //! - A listener thread or a message-only window of its own. The first instance's own window
@@ -129,8 +158,9 @@
 //! - Callbacks. The window procedure is the application's; it calls [`received`].
 //!
 //! Verified: the tests (`single_mutex_tests.rs`), run on Windows: two guards in one process, the
-//! record, a hidden window of the test's own, a `WM_COPYDATA` sent to it, and a second process
-//! (the test program started again) that finds the first, its window, and hands it its arguments.
+//! record, a record name held open for a moment and one held by a squatter, a hidden window of
+//! the test's own, a `WM_COPYDATA` sent to it, and a second process (the test program started
+//! again) that finds the first, its window, and hands it its arguments.
 //! Not verified: a real window brought forward by a launch from Explorer (it needs a person at
 //! the desktop; the tests bring nothing forward), a winit window receiving the message through a
 //! replaced procedure, and an elevated first instance with a plain second launch.
@@ -174,6 +204,14 @@ const MAGIC: u32 = 0x4D44_5352;
 
 /// The size of the record: the magic, the process id and the window, 4 + 4 + 8 bytes.
 const RECORD: usize = 16;
+
+/// How long a first instance that finds the record's name taken tries again before it takes the
+/// mapping for a squatter's: 100 ms. A mapping of that name may be open for a moment for honest
+/// reasons (see `create_record`), each a matter of microseconds.
+const RECORD_PATIENCE: Duration = Duration::from_millis(100);
+
+/// The pause between two tries within [`RECORD_PATIENCE`]: 5 ms.
+const RECORD_RETRY: Duration = Duration::from_millis(5);
 
 /// The most UTF-16 units of the application id that go into an object name. A name may be at most
 /// 260 units long; the prefix and the suffix take 29.
@@ -222,6 +260,10 @@ pub struct Running {
 /// "access denied" (an elevated instance's mutex seen from a plain launch). Any other failure of
 /// the system gives a [`Guard`] that holds nothing, so the application runs as it would without
 /// this module rather than not at all; [`Guard::held`] tells the two apart.
+///
+/// Returns at once, except for a first instance that finds the record's name taken: it tries
+/// again for up to a tenth of a second before it goes on without a record (see the module's
+/// "Deliberately not here").
 pub fn acquire(app_id: &str) -> Instance {
     let name = object_name(app_id, "mutex");
     // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call; no security
@@ -254,40 +296,57 @@ pub fn acquire(app_id: &str) -> Instance {
 }
 
 /// Makes the record of this process and maps it: (mapping, address of the view), each 0 or null
-/// when it could not be made, and also when a mapping of that name was already there. Writes this
-/// process's id and no window.
+/// when it could not be made, and also when a mapping of that name was there before it and is
+/// still there after [`RECORD_PATIENCE`]. Writes this process's id and no window.
+///
+/// A mapping of the name that is already there is usually not a squatter's, for a moment: the
+/// instance before this one closes its mutex before its mapping (`Guard`'s drop), so a launch
+/// that took the mutex in between finds the old mapping; and a second launch inside
+/// [`Running::record`], which [`Running::wait_window`] repeats every 20 ms, holds the mapping
+/// open while it reads it. Either lets go within microseconds, so the call is made again every
+/// [`RECORD_RETRY`] until the name is free or the patience runs out. Only a mapping still there
+/// after that is taken for a squatter's, which costs a launch that meets one a tenth of a second.
 fn create_record(app_id: &str) -> (HANDLE, usize) {
     let name = object_name(app_id, "window");
-    // SAFETY: `SetLastError` takes a value and has no other effect. Clearing it makes the
-    // `ERROR_ALREADY_EXISTS` read below about this call alone: `CreateFileMappingW` sets it only
-    // when the mapping existed before, and leaves the last error alone when it did not.
-    unsafe { SetLastError(0) };
-    // SAFETY: a mapping backed by the paging file (`INVALID_HANDLE_VALUE`) of `RECORD` bytes,
-    // named by a NUL-terminated string that outlives the call; default security.
-    let mapping = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            PAGE_READWRITE,
-            0,
-            RECORD as u32,
-            name.as_ptr(),
-        )
-    };
-    if mapping.is_null() {
-        return (std::ptr::null_mut(), 0);
-    }
-    // SAFETY: `mapping` is the handle just opened.
-    let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    if existed {
-        // The mapping was there before this call, so this instance did not make it: a squatter
-        // did (see the module's "Deliberately not here"). Writing the record into it would let a
-        // stranger name the window a launch hands its command line to, so the handle is closed
-        // and nothing is published; the windows of the process are looked through instead.
+    let end = Instant::now() + RECORD_PATIENCE;
+    let mapping = loop {
+        // SAFETY: `SetLastError` takes a value and has no other effect. Clearing it makes the
+        // `ERROR_ALREADY_EXISTS` read below about this call alone: `CreateFileMappingW` sets it
+        // only when the mapping existed before, and leaves the last error alone when it did not.
+        unsafe { SetLastError(0) };
+        // SAFETY: a mapping backed by the paging file (`INVALID_HANDLE_VALUE`) of `RECORD` bytes,
+        // named by a NUL-terminated string that outlives the call; default security.
+        let mapping = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                RECORD as u32,
+                name.as_ptr(),
+            )
+        };
+        if mapping.is_null() {
+            return (std::ptr::null_mut(), 0);
+        }
+        // SAFETY: reads this thread's last error, set by the call just above.
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if !existed {
+            break mapping;
+        }
+        // The mapping was there before this call, so this instance did not make it. Writing the
+        // record into it would let whoever made it name the window a launch hands its command
+        // line to, so the handle is closed. Until the patience runs out the maker is taken for
+        // an instance that is going or a launch that is reading (see above), and the call is made
+        // again; after it, for a squatter (see the module's "Deliberately not here"), and this
+        // instance goes on with no record and publishes nothing.
         // SAFETY: the handle was opened here and nothing else holds it.
         unsafe { CloseHandle(mapping) };
-        return (std::ptr::null_mut(), 0);
-    }
+        if Instant::now() >= end {
+            return (std::ptr::null_mut(), 0);
+        }
+        std::thread::sleep(RECORD_RETRY);
+    };
     // SAFETY: `mapping` is the handle just made, at least `RECORD` bytes long.
     let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, RECORD) };
     let address = view.Value as usize;
@@ -299,11 +358,11 @@ fn create_record(app_id: &str) -> (HANDLE, usize) {
     // SAFETY: a view is page-aligned and `RECORD` bytes long, which the three atomics fit; the
     // memory is shared with other processes, which is what atomics are for.
     unsafe {
-        let (magic, pid, window) = record_fields(address);
-        // A mapping left open by a second launch that was reading it has an earlier record: every
-        // field is written again.
-        magic.store(0, Ordering::Release);
-        window.store(0, Ordering::Relaxed);
+        let (magic, pid, _) = record_fields(address);
+        // The mapping is new (one that was there is never written into, above), and a new
+        // mapping backed by the paging file is all zeroes: no magic and no window. The process id
+        // goes in first and the magic last, so a launch that opens the record in between reads
+        // no magic and takes nothing from it.
         pid.store(GetCurrentProcessId(), Ordering::Relaxed);
         magic.store(MAGIC, Ordering::Release);
     }
@@ -418,8 +477,10 @@ impl Running {
     }
 
     /// The process id of the instance that runs. `None` while that instance is between taking
-    /// the mutex and writing its record (microseconds), and when its record is closed to this
-    /// process (an elevated first instance seen from a plain launch).
+    /// the mutex and writing its record (microseconds, or up to a tenth of a second when it found
+    /// the record's name taken and tries again: see `create_record`), when its record is closed
+    /// to this process (an elevated first instance seen from a plain launch), and when the
+    /// mapping of that name is a squatter's that holds no whole record.
     pub fn pid(&self) -> Option<u32> {
         self.record().map(|(pid, _)| pid)
     }

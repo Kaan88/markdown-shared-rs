@@ -1,12 +1,16 @@
 //! Tests of `single_mutex`. Most run in one process: the mutex and its record are seen by a
 //! second `acquire` exactly as by a second process. One starts the test program again as a
-//! second process. The windows are hidden ones of the test's own.
+//! second process. The windows are the test's own: hidden ones, and for the tests that need a
+//! window that counts as visible, one that is never drawn, is off the screen and has no taskbar
+//! button, so nothing shows while the tests run.
 
 use super::*;
 use std::cell::RefCell;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use windows_sys::Win32::Foundation::{LRESULT, WPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_POPUP, WS_VISIBLE,
 };
 
 /// An id no other test, and no other run of the tests, uses.
@@ -60,8 +64,11 @@ fn window() -> isize {
     make_window(false)
 }
 
-/// A visible top-level window of this thread: the kind [`main_window_of`] picks when it looks
-/// through the windows of a process.
+/// A top-level window of this thread that Windows counts as visible (`WS_VISIBLE`, no owner, not
+/// a tool window): the kind [`main_window_of`] picks when it looks through the windows of a
+/// process. No person sees it: it is layered and never given its contents or its alpha, which
+/// Windows takes for "not drawn yet"; it is one pixel at (-32000, -32000), off every screen; and
+/// `WS_EX_NOACTIVATE` keeps it from the taskbar and from taking the focus.
 fn shown_window() -> isize {
     make_window(true)
 }
@@ -80,24 +87,29 @@ fn make_window(visible: bool) -> isize {
         lpszMenuName: std::ptr::null(),
         lpszClassName: name.as_ptr(),
     };
-    let style = if visible {
-        WS_POPUP | WS_VISIBLE
+    let (style, ex_style, at, side) = if visible {
+        (
+            WS_POPUP | WS_VISIBLE,
+            WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            -32000,
+            1,
+        )
     } else {
-        WS_POPUP
+        (WS_POPUP, 0, 0, 100)
     };
     // SAFETY: `class` and the name outlive the calls; registering twice (another test in the same
     // process) fails harmlessly and the class is already there.
     let hwnd = unsafe {
         RegisterClassW(&class);
         CreateWindowExW(
-            0,
+            ex_style,
             name.as_ptr(),
             name.as_ptr(),
             style,
-            0,
-            0,
-            100,
-            100,
+            at,
+            at,
+            side,
+            side,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -189,7 +201,13 @@ fn a_record_that_was_already_there_is_not_written_into() {
         )
     };
     assert!(!squatter.is_null(), "the squatter's mapping was not made");
+    let started = Instant::now();
     let guard = first(acquire(&app));
+    assert!(
+        started.elapsed() >= RECORD_PATIENCE,
+        "it gave up on the record's name after {:?}, before its patience ran out",
+        started.elapsed()
+    );
     assert!(guard.held(), "the mutex is still this instance's");
     // The window stays unpublished: the record is the squatter's, and this instance left it alone.
     let hwnd = window();
@@ -221,6 +239,74 @@ fn a_record_that_was_already_there_is_not_written_into() {
     let again = first(acquire(&app));
     assert!(running(acquire(&app)).pid().is_some());
     drop(again);
+}
+
+/// The record's name taken for a moment, as by the instance before this one that has closed its
+/// mutex but not yet its mapping, or by a second launch reading the record: the first instance
+/// tries again and writes its record once the name is free.
+#[test]
+fn a_record_name_held_for_a_moment_is_tried_again_and_written() {
+    let app = id("moment");
+    let name = object_name(&app, "window");
+    // SAFETY: as in `a_record_that_was_already_there_is_not_written_into`; the handle is closed
+    // below, while the other thread's `acquire` tries again.
+    let lingering = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            std::ptr::null(),
+            PAGE_READWRITE,
+            0,
+            RECORD as u32,
+            name.as_ptr(),
+        )
+    };
+    assert!(!lingering.is_null(), "the lingering mapping was not made");
+    let mutex_name = object_name(&app, "mutex");
+    let (tx, rx) = mpsc::channel();
+    let launch = {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let guard = first(acquire(&app));
+            let ok = guard.held() && guard.view != 0;
+            tx.send(()).unwrap();
+            // The guard lives until the main thread has looked at the record.
+            std::thread::park();
+            ok
+        })
+    };
+    // Once the mutex is there, the launch is in `create_record`, finding the name taken.
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        // SAFETY: a NUL-terminated name that outlives the call; the handle is closed at once.
+        let mutex = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, mutex_name.as_ptr()) };
+        if !mutex.is_null() {
+            // SAFETY: the handle was opened here and nothing else holds it.
+            unsafe { CloseHandle(mutex) };
+            break;
+        }
+        assert!(Instant::now() < end, "the launch never took the mutex");
+        std::thread::yield_now();
+    }
+    // It keeps trying while the name is taken; a tenth of it is watched here, then the name
+    // is freed well within its patience.
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(10)),
+        Err(RecvTimeoutError::Timeout),
+        "the launch gave up on the record's name at once"
+    );
+    // SAFETY: the handle was opened here and nothing else holds it.
+    unsafe { CloseHandle(lingering) };
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the launch did not return");
+    // SAFETY: no pointers.
+    let me = unsafe { GetCurrentProcessId() };
+    assert_eq!(
+        running(acquire(&app)).pid(),
+        Some(me),
+        "the record was written once the name was free"
+    );
+    launch.thread().unpark();
+    assert!(launch.join().unwrap(), "the launch has a record of its own");
 }
 
 #[test]
@@ -437,20 +523,21 @@ fn waiting_gives_the_window_published_late_and_not_a_visible_one_of_the_process(
     );
     assert_ne!(other.window(), Some(late), "nothing published yet");
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            std::thread::sleep(Duration::from_millis(100));
-            guard.publish_window(late);
-        });
-        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        let other = &other;
+        scope.spawn(move || tx.send(other.wait_window(Duration::from_secs(10))).unwrap());
+        // While nothing is published the waiter keeps waiting: it does not take the visible
+        // window. The time limit only says how long this test watches it wait.
         assert_eq!(
-            other.wait_window(Duration::from_secs(1)),
-            Some(late),
-            "the published window, not the visible one"
+            rx.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout),
+            "the waiter took a window before one was published"
         );
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "it waited for the publication: {:?}",
-            started.elapsed()
+        guard.publish_window(late);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(Some(late)),
+            "the published window, not the visible one, and well before the waiter's timeout"
         );
     });
     assert_eq!(other.window(), Some(late), "and still the published one");
@@ -464,18 +551,24 @@ fn waiting_ends_at_once_when_the_instance_goes() {
     let app = id("gone");
     let guard = first(acquire(&app));
     let other = running(acquire(&app));
-    let dropper = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        drop(guard);
-    });
-    let started = Instant::now();
-    assert_eq!(other.wait_window(Duration::from_secs(10)), None);
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "it waited {:?}, not the whole timeout",
-        started.elapsed()
+    let (tx, rx) = mpsc::channel();
+    let waiter = {
+        let other = other.clone();
+        std::thread::spawn(move || tx.send(other.wait_window(Duration::from_secs(10))).unwrap())
+    };
+    // While the instance runs and publishes nothing, the waiter waits.
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(50)),
+        Err(RecvTimeoutError::Timeout),
+        "the waiter ended while the instance still ran"
     );
-    dropper.join().unwrap();
+    drop(guard);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok(None),
+        "the waiter did not end soon after the instance went, well before its timeout"
+    );
+    waiter.join().unwrap();
     // The instance is gone, so the next acquire is the first instance.
     assert_eq!(other.pid(), None);
     assert!(first(acquire(&app)).held());
