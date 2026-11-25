@@ -16,7 +16,7 @@ use mdshared_ui::chrome::{WIN_BTN_W, WinButton, draw_win_button};
 use mdshared_ui::dropdown::{self, DROPDOWN_H, Dropdown, draw_dropdown};
 use mdshared_ui::expander;
 use mdshared_ui::flyout::{self, Flyout, Side};
-use mdshared_ui::gfx::{Face, Gfx, Painter, Rect, Rgb, rgb};
+use mdshared_ui::gfx::{Face, Gfx, Painter, Rect, Rgb, Wrap, rgb};
 use mdshared_ui::glyph;
 use mdshared_ui::infobar::{InfoBar, Severity, draw_infobar, severity_colors};
 use mdshared_ui::link::{self, LINK_H, draw_link};
@@ -30,6 +30,7 @@ use mdshared_ui::scroll::draw_scrollbar;
 use mdshared_ui::sections::{Entry, Sections};
 use mdshared_ui::segments::{self, SEGMENT_H, draw_selector};
 use mdshared_ui::select::Selection;
+use mdshared_ui::seltext::{self, SelectableText};
 use mdshared_ui::slider::{draw_progress, draw_spinner_at};
 use mdshared_ui::table::{self, Align, Column, Sort, Table};
 use mdshared_ui::textfield::{FieldColors, TextField};
@@ -560,6 +561,7 @@ fn verdict(p: &mut Painter, pal: &Palette, cell: Rect, expect: Expect) {
 enum Over {
     Nothing,
     FilterMenu,
+    SortMenu,
 }
 
 /// The programs with their boxes ticked.
@@ -613,20 +615,12 @@ fn programs(p: &mut Painter, pal: &Palette, over: Over) {
         None,
     );
 
-    let sort = Rect::new(right - 190.0, y, 190.0, DROPDOWN_H);
-    drop_field(
-        p,
-        pal,
-        sort,
-        &[
-            "Sort: Name",
-            "Sort: Publisher",
-            "Sort: Size",
-            "Sort: Expected leftovers",
-            "Sort: Install date",
-        ],
-        0,
-    );
+    // Purge's Sort is a DropDownButton with no fill and no border, whose MenuFlyout opens below
+    // it, aligned to its right edge.
+    let sort_label = "Sort: Name";
+    let sort_w = p.measure(Face::Ui, 13.0, sort_label) + 46.0;
+    let sort = Rect::new(right - sort_w, y, sort_w, DROPDOWN_H);
+    drop_button(p, pal, sort, sort_label, over == Over::SortMenu);
     let filter = Rect::new(sort.x - 86.0, y, 78.0, DROPDOWN_H);
     button(p, pal, filter, "Filter", Style::Subtle, Some(FILTER));
     let selected = &format!("{ticked} selected");
@@ -684,6 +678,42 @@ fn programs(p: &mut Painter, pal: &Palette, over: Over) {
         let mut menu = Menu::new(items, filter.x, filter.bottom(), false).around(filter);
         menu.draw_in(p, pal, Rect::new(0.0, 0.0, W, H));
     }
+    if over == Over::SortMenu {
+        let items = [
+            "Name",
+            "Publisher",
+            "Size",
+            "Expected leftovers",
+            "Install date",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, label)| Item::new(i, label))
+        .collect();
+        // Opened below the button; it would cross the window's right edge from the button's
+        // left, so `around` puts its right edge at the button's right, as Purge's flyout is.
+        let mut menu = Menu::new(items, sort.x, sort.bottom(), false).around(sort);
+        menu.draw_in(p, pal, Rect::new(0.0, 0.0, W, H));
+    }
+}
+
+/// A button with no fill and no border that opens a menu: a label and a chevron, as WinUI's
+/// DropDownButton with a transparent background. While its menu is open it shows the pressed
+/// fill. The toolkit has no such button (see `docs/PURGE-MOCKUP.md`).
+fn drop_button(p: &mut Painter, pal: &Palette, r: Rect, label: &str, open: bool) {
+    if open {
+        p.rbox(r, 4.0, pal.press);
+    }
+    p.text(
+        Face::Ui,
+        13.0,
+        r.x + 11.0,
+        r.cy(),
+        label,
+        pal.text,
+        r.w - 34.0,
+    );
+    p.icon(glyph::DOWN, 12.0, r.right() - 16.0, r.cy() + 1.0, pal.muted);
 }
 
 fn program_list(p: &mut Painter, pal: &Palette, r: Rect) {
@@ -982,38 +1012,28 @@ fn program_details(p: &mut Painter, pal: &Palette, r: Rect) {
     ];
     for (label, value) in commands {
         p.text(Face::Ui, 12.0, x, y, label, pal.muted, w);
-        y += 10.0;
-        for line in wrap_path(p, 11.5, value, w) {
-            p.text(Face::Mono, 11.5, x, y + 6.0, &line, pal.text, w);
-            y += 15.0;
-        }
-        y += 14.0;
+        y = mono(p, pal, 11.5, x, y + 9.0, w, value) + 13.0;
     }
 }
 
-/// Breaks a path or a command after a backslash or a space, so that no line is wider than `max`.
-/// (`Painter::paragraph` breaks at spaces only; `seltext` is not in this branch.)
-fn wrap_path(p: &mut Painter, size: f32, text: &str, max: f32) -> Vec<String> {
-    let mut lines = vec![String::new()];
-    for part in text.split_inclusive(['\\', ' ']) {
-        let line = lines.last().expect("never empty");
-        if !line.is_empty() && p.measure(Face::Mono, size, &format!("{line}{part}")) > max {
-            lines.push(String::new());
-        }
-        lines.last_mut().expect("never empty").push_str(part);
-    }
-    lines
-}
-
-/// Text in the monospaced face, wrapped as a path; returns the y under it.
-#[allow(clippy::too_many_arguments)] // a place, a width and a style
-fn mono(p: &mut Painter, size: f32, x: f32, y: f32, w: f32, text: &str, c: Rgb) -> f32 {
-    let mut y = y;
-    for line in wrap_path(p, size, text, w) {
-        p.text(Face::Mono, size, x, y + size * 0.7, &line, c, w);
-        y += size * 1.4;
-    }
-    y
+/// A path or a command in the monospaced face, selectable as Purge's details pane makes them:
+/// `seltext`, wrapped anywhere so that a word wider than `w` breaks inside it instead of being
+/// cut off at the card's edge. Nothing is selected here, as in a pane without the focus. Returns
+/// the y under the text.
+fn mono(p: &mut Painter, pal: &Palette, size: f32, x: f32, y: f32, w: f32, text: &str) -> f32 {
+    let mut model = SelectableText::new().with_wrap(Wrap::Anywhere);
+    model.set_text(text);
+    let h = p.paragraph_height_wrapped(Face::Mono, size, w, text, Wrap::Anywhere);
+    seltext::draw(
+        p,
+        pal,
+        Rect::new(x, y, w, h),
+        Face::Mono,
+        size,
+        &model,
+        false,
+    );
+    y + h
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1938,12 +1958,12 @@ fn leftover_selected(p: &mut Painter, pal: &Palette, r: Rect) {
     y += 26.0;
     y = mono(
         p,
+        pal,
         12.0,
         x,
         y,
         w,
         "C:\\Users\\tester\\AppData\\Roaming\\Mozilla",
-        pal.text,
     ) + 10.0;
     let mut cx = x;
     cx += chip(p, pal, cx, y + 10.0, "Likely", Tone::Caution) + 6.0;
@@ -2903,11 +2923,12 @@ fn settings(p: &mut Painter, pal: &Palette) {
 
 type Screen = (&'static str, fn(&mut Painter, &Palette));
 
-const SCREENS: [Screen; 12] = [
+const SCREENS: [Screen; 13] = [
     ("programs", |p, pal| programs(p, pal, Over::Nothing)),
     ("programs-filter", |p, pal| {
         programs(p, pal, Over::FilterMenu)
     }),
+    ("programs-sort", |p, pal| programs(p, pal, Over::SortMenu)),
     ("confirm", confirm),
     ("elevation", elevation),
     ("pipeline", |p, pal| pipeline(p, pal, false)),

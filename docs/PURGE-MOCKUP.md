@@ -21,6 +21,7 @@ the repository root, also when `CARGO_TARGET_DIR` points elsewhere. `-150` is sc
 | --- | --- | --- |
 | Programs | Header and Uninstall, tabs, search, filter, sort, list with column header and groups, details card, status strip | `purge-programs-light.png`, `purge-programs-dark.png`, `purge-programs-light-150.png`, `purge-programs-dark-150.png` |
 | Programs, filter menu | The same with the Filter menu open | `purge-programs-filter-light.png`, `purge-programs-filter-dark.png`, `purge-programs-filter-light-150.png`, `purge-programs-filter-dark-150.png` |
+| Programs, sort menu | The same with the Sort menu open | `purge-programs-sort-light.png`, `purge-programs-sort-dark.png`, `purge-programs-sort-light-150.png`, `purge-programs-sort-dark-150.png` |
 | Uninstall confirmation | Dialog: steps, command, signer, still-running warning, quiet mode, restore point | `purge-confirm-light.png`, `purge-confirm-dark.png`, `purge-confirm-light-150.png`, `purge-confirm-dark-150.png` |
 | Administrator permission | The dialog before the first elevation | `purge-elevation-light.png`, `purge-elevation-dark.png`, `purge-elevation-light-150.png`, `purge-elevation-dark-150.png` |
 | Uninstall pipeline, running | Program card, progress steps, still running, safety net | `purge-pipeline-light.png`, `purge-pipeline-dark.png`, `purge-pipeline-light-150.png`, `purge-pipeline-dark-150.png` |
@@ -35,7 +36,8 @@ the repository root, also when `CARGO_TARGET_DIR` points elsewhere. `-150` is sc
 ## What comes from the toolkit
 
 `table` (column header), `sections` (grouped lists), `select` (ticked programs), `textfield`,
-`segments`, `dropdown`, `menu`, `toggle`, `check`, `link`, `expander`, `infobar`, `flyout`,
+`seltext` (paths and commands), `segments`, `dropdown`, `menu`, `toggle`, `check`, `link`,
+`expander`, `infobar`, `flyout`,
 `overlay` (dialog and its buttons), `slider` (progress and spinner), `pane` (row fill), `scroll`,
 `chrome` (window buttons), `glyph`, `theme`. `rows` and `tokens` are not used.
 
@@ -45,6 +47,13 @@ The example draws these itself from boxes, lines and text.
 
 - Push buttons outside a dialog. Only the dialog buttons exist. There is no icon button, no subtle
   button and no button with an icon and a label. The example puts an icon on a dialog button.
+- A button that opens a menu (WinUI's DropDownButton): Sort, and the Filter and "···" buttons,
+  which open menus too. The example draws a label and a chevron and opens `menu::Menu::around`
+  the button; nothing ties the two together or draws the chevron.
+- A text field with a leading icon (the search box). The example draws the frame and the
+  magnifier itself and puts a `textfield` beside the icon.
+- Tooltips on controls. `overlay::Bubble::tip` draws a bubble, but nothing places it by a control
+  or times it; Purge gives its icon buttons tooltips. None is drawn here.
 - A navigation rail with icons, counts and badges.
 - A title bar with a pill in it.
 - A command bar, or an overflow button.
@@ -57,17 +66,21 @@ The example draws these itself from boxes, lines and text.
 - A small size bar inside a list cell.
 - A timeline strip.
 - The program tile with an initial.
-- Selectable text. `seltext` is on the branch `wk/seltext`, not on this base. Paths and commands
-  are plain text here.
-- Wrapping of paths. `Painter::paragraph` breaks at spaces only, so the example breaks paths
-  after a backslash itself.
+- Wrapping a path at a backslash. The paths and commands in the details cards are `seltext` with
+  `Wrap::Anywhere`: a word too wide for the card breaks where the card ends, which can be inside
+  a name ("CurrentVers" / "ion" in the registry key), not after the last backslash that fits, as
+  the example's own wrapping did before.
 - Icons: shield, lock, funnel, person, archive box and gear. The example has its own path data.
 - Mica. The title bar and rail are a flat colour.
 
 ## Widgets that looked wrong or did not fit
 
-- `theme::DARK.danger` is hard to read on dark surfaces. By calculation it is about 2.6 to 1 on
-  the card colour. It shows in the large leftovers line ("~1.3 GB cache and profile").
+- `theme::DARK.danger` is hard to read on dark surfaces: by calculation about 2.6 to 1 on the
+  card colour. Fixed for the InfoBar and what takes its colours from it: on a dark palette that is
+  not high contrast, `infobar::severity_colors` gives an error `infobar::DARK_ERROR_INK` (WinUI's
+  critical foreground, about 7 to 1 on the dark page), and the large leftovers line ("~1.3 GB
+  cache and profile") takes that ink. `DARK.danger` itself is unchanged; it is the close button's
+  hover fill.
 - `segments::draw_selector` looks like a switch with a filled segment. Purge's tabs are plain
   with an underline. Counts have to be part of the label.
 - `infobar` has a close cross unless `closable(false)` is set. Purge's bars have none. Its action
@@ -76,8 +89,6 @@ The example draws these itself from boxes, lines and text.
 - `overlay::dialog_card` takes a height from the caller and the dialog body does not scroll. The
   confirmation is 622 high. At Purge's smallest window (760 by 520) it would not fit.
 - `flyout` takes its content size from the caller. The example sets it by hand.
-- `dropdown` has no label of its own. "Sort: Name" is written into each option, so an open list
-  would repeat "Sort:".
 - `expander::draw_header` is a quiet grey heading. WinUI's expander is a bordered box, and this one
   is easy to read as a caption.
 
@@ -92,6 +103,6 @@ The example draws these itself from boxes, lines and text.
   under leftovers, the pipeline step details and the result panel's lines. The sample data does
   not agree between screens in every detail.
 
-Not drawn: the overflow and sort menus, child rows under a program, narrow windows (below 1000,
+Not drawn: the overflow menu, child rows under a program, narrow windows (below 1000,
 900 and 640), empty and error states, the quarantine's "Choose items" panel, history's bars for
 interrupted cleanups, and the security prompt itself (a native Windows dialog).
