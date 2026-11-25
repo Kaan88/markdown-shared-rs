@@ -198,7 +198,7 @@ New, fast-tracked:
 | D4 | **`chrome::*_animated`**: hover fades for the caption, bar and tab buttons | S | low | `chrome`, `anim` | claimed: Shared toolkit session, 2026-11-25 |
 | D5 | **One preset set for document apps** (menu, tip, toast, dialog), so both apps tune their durations in one place | S | low | `anim` presets | claimed: Shared toolkit session, 2026-11-25 |
 | D6 | **A shared tooltip model**: the delay, blocked after a press, the anchor; both apps carry the same `Tip` struct and timer | S | low | `overlay::Bubble` | claimed: Shared toolkit session, 2026-11-25 |
-| D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | claimed: Shared toolkit session, 2026-11-25 |
+| D7 | **Wake on a change of Windows' animation setting**, through the hidden window `platform::watch_contrast` already has | S | low | `platform` | done on `feat/md-fast`: `platform::watch_motion_reduced` now wakes on Windows too, from the contrast watch's hidden window (`WM_SETTINGCHANGE`, the setting read again and compared); the host takes it (`Wake::Motion`). Tested by messages sent to the window; the setting itself was not switched |
 
 ## Left over from what exists
 

@@ -325,8 +325,9 @@ nothing listens (no bus, no signal) does a later call start another reading, at 
 second. A reading that fails or never ends leaves the last answer standing: a setting that is on
 is not taken for off because the portal was slow. Each reading is numbered when it asks, and an
 answer older than the one kept is dropped, so a late answer cannot undo a newer change.
-`platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux only;
-elsewhere the wake is dropped), so the application has the right value a moment after it
+`platform::watch_motion_reduced(wake)` has a wake called when the answer changes (Linux, and
+on Windows when "Animation effects" is switched while the application runs, heard by the
+contrast watch's hidden window; on macOS the wake is dropped), so the application has the right value a moment after it
 starts and when the user changes the setting. The order of the two calls does not matter: a
 wake given after the portal already answered is called once at once.
 

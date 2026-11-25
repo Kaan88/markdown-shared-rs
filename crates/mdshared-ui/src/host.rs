@@ -394,6 +394,9 @@ enum Wake<M> {
     Message(M),
     /// The contrast watch saw high contrast switch, or its colours change (Windows).
     Contrast,
+    /// The system's wish for less motion changed while the window had the keyboard (Windows'
+    /// "Animation effects", Linux's portal).
+    Motion,
     /// An assistive technology arrived while the tree was not kept up to date: it was served
     /// the last one, and the nodes are asked for again.
     #[cfg(all(feature = "a11y", windows))]
