@@ -202,6 +202,8 @@ pub struct Frost {
     focused: bool,
     /// The colour to take out of the chrome, while it is frosted.
     key: Option<Key>,
+    /// The application's veil in place of the backdrop's own ([`Frost::set_veil`]).
+    veil: Option<u8>,
     /// The frosted regions of the last composed frame, in device px: x0, y0, x1, y1.
     pub areas: Vec<(usize, usize, usize, usize)>,
 }
@@ -218,6 +220,19 @@ impl Frost {
     /// ([`key_out`]); without it the compositor blurs behind an opaque rectangle and nothing shows.
     pub fn wants_alpha(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// How much of the key colour stays over the backdrop, in place of the backdrop's own
+    /// ([`veil`]: Mica 0, Acrylic 150): an application whose backdrop strength is a setting
+    /// passes it here. `None` (the default) goes back to the backdrop's own. Taken up by the next
+    /// [`sync`](Self::sync), which then says the look changed.
+    pub fn set_veil(&mut self, veil: Option<u8>) {
+        self.veil = veil;
+    }
+
+    /// The veil [`set_veil`](Self::set_veil) was given, `None` for the backdrop's own.
+    pub fn veil(&self) -> Option<u8> {
+        self.veil
     }
 
     /// Whether [`Frost::sync`] has anything to do: the setting is on, or was when last looked at.
@@ -256,7 +271,7 @@ impl Frost {
             }
         }
         let key = (self.asked != Backdrop::Off && focused)
-            .then(|| Key::new(key_colour(pal), veil(self.asked)));
+            .then(|| Key::new(key_colour(pal), self.veil.unwrap_or(veil(self.asked))));
         let changed = key != self.key;
         self.key = key;
         if self.key.is_none() {
@@ -621,6 +636,44 @@ mod tests {
         // Not asked again every frame.
         assert!(!f.sync(Backdrop::Acrylic, true, &DARK, &mut sys));
         assert_eq!(sys.sets.len(), 2);
+    }
+
+    /// The application's veil takes the backdrop's place, a change of it is a change of the look,
+    /// and `None` goes back to the backdrop's own.
+    #[test]
+    fn the_applications_veil_takes_the_backdrops_place() {
+        let mut f = Frost::default();
+        let mut sys = Fake::new(true);
+        f.sync(Backdrop::Acrylic, true, &DARK, &mut sys);
+        let own = *f.key().unwrap();
+        assert_eq!(own, Key::new(key_colour(&DARK), 150));
+        f.set_veil(Some(60));
+        assert_eq!(f.veil(), Some(60));
+        assert!(
+            f.sync(Backdrop::Acrylic, true, &DARK, &mut sys),
+            "a new look"
+        );
+        assert_eq!(*f.key().unwrap(), Key::new(key_colour(&DARK), 60));
+        assert!(
+            !f.sync(Backdrop::Acrylic, true, &DARK, &mut sys),
+            "and then settled"
+        );
+        // Mica under the same veil: the same key, so no change of the look.
+        assert!(!f.sync(Backdrop::Mica, true, &DARK, &mut sys));
+        assert_eq!(
+            *f.key().unwrap(),
+            Key::new(key_colour(&DARK), 60),
+            "Mica too"
+        );
+        f.set_veil(None);
+        assert!(f.sync(Backdrop::Mica, true, &DARK, &mut sys));
+        assert_eq!(*f.key().unwrap(), Key::new(key_colour(&DARK), 0));
+        // Not frosted (no focus): no key, whatever the veil.
+        f.set_veil(Some(200));
+        f.sync(Backdrop::Mica, false, &DARK, &mut sys);
+        assert!(f.key().is_none());
+        // The window system is asked nothing new for a veil.
+        assert_eq!(sys.sets, [Backdrop::Acrylic, Backdrop::Mica]);
     }
 
     #[test]
