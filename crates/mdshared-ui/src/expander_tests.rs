@@ -542,3 +542,116 @@ fn expander_sheet() {
         bmp.write_png(&out.join(file)).unwrap();
     }
 }
+
+/// One frame of an expander 16 ms after the last on `clock`, drawn by `draw_expander_turning`
+/// when `turning` and by `draw_expander_animated` otherwise, at `scale`: the bitmap, the body's
+/// rectangle and whether another frame was asked for.
+fn expander_frame(
+    anim: &mut Animator,
+    clock: &ManualClock,
+    scale: f32,
+    pal: &Palette,
+    expanded: bool,
+    turning: bool,
+) -> (Bitmap, Rect, bool) {
+    clock.advance_ms(16);
+    anim.begin_frame(clock.now());
+    let side = (240.0 * scale) as u32;
+    let mut bmp = Bitmap::new(side, side);
+    let mut gfx = Gfx::new();
+    let body = {
+        let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+        p.fill(Rect::new(0.0, 0.0, 240.0, 240.0), pal.page);
+        let (a, look) = (area(), Look::default());
+        if turning {
+            draw_expander_turning(
+                &mut p, pal, anim, "expander", a, "Details", expanded, look, BODY,
+            )
+        } else {
+            draw_expander_animated(
+                &mut p, pal, anim, "expander", a, "Details", expanded, look, BODY,
+            )
+        }
+    };
+    (bmp, body, anim.end_frame().is_some())
+}
+
+/// Two expanders run side by side, each on its own clock moved 16 ms a frame: one drawn by
+/// `draw_expander_animated`, one by `draw_expander_turning`.
+struct Pair {
+    plain: (Animator, ManualClock),
+    turning: (Animator, ManualClock),
+}
+
+impl Pair {
+    fn new(policy: impl Fn(&mut Animator)) -> Pair {
+        let (mut a, mut b) = (Animator::new(), Animator::new());
+        policy(&mut a);
+        policy(&mut b);
+        Pair {
+            plain: (a, ManualClock::new()),
+            turning: (b, ManualClock::new()),
+        }
+    }
+
+    fn frame(
+        &mut self,
+        scale: f32,
+        pal: &Palette,
+        expanded: bool,
+    ) -> ((Bitmap, Rect, bool), (Bitmap, Rect, bool)) {
+        let (a, ca) = &mut self.plain;
+        let plain = expander_frame(a, ca, scale, pal, expanded, false);
+        let (b, cb) = &mut self.turning;
+        let turning = expander_frame(b, cb, scale, pal, expanded, true);
+        (plain, turning)
+    }
+}
+
+#[test]
+fn the_turning_expander_is_the_animated_one_at_rest_and_turns_its_chevron_between() {
+    for scale in [1.0, 1.5] {
+        for pal in [&LIGHT, &DARK] {
+            let mut pair = Pair::new(|a| a.set_policy(crate::anim::Policy::Always));
+            for i in 0..2 {
+                let ((pa, ra, more_a), (ta, rt, more_t)) = pair.frame(scale, pal, false);
+                assert!(pa.pixels == ta.pixels, "frame {i}: closed at rest, {scale}");
+                assert_eq!(ra, rt);
+                assert!(!more_a && !more_t);
+            }
+            for expanded in [true, false] {
+                let mut differed = 0;
+                let mut rested = false;
+                for i in 0..20 {
+                    let ((pa, ra, more_a), (ta, rt, more_t)) = pair.frame(scale, pal, expanded);
+                    assert_eq!(ra, rt, "frame {i}: the body's rectangle");
+                    assert_eq!(more_a, more_t, "frame {i}: they end together");
+                    if pa.pixels != ta.pixels {
+                        differed += 1;
+                        assert!(more_t, "frame {i}: a turned chevron at rest");
+                    }
+                    if !more_t {
+                        rested = true;
+                        assert!(pa.pixels == ta.pixels, "frame {i}: at rest, {scale}");
+                    }
+                }
+                assert!(rested, "the turn never ended");
+                assert!(
+                    differed >= 5,
+                    "the chevron turned on {differed} frames only, scale {scale}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_turning_expander_turns_at_once_under_reduced_motion() {
+    let mut pair = Pair::new(|a| a.set_system_reduced(true));
+    for expanded in [false, true, false] {
+        let ((pa, ra, more_a), (ta, rt, more_t)) = pair.frame(1.0, &LIGHT, expanded);
+        assert!(pa.pixels == ta.pixels, "expanded {expanded}: it waited");
+        assert_eq!(ra, rt);
+        assert!(!more_a && !more_t, "a frame was asked under reduced motion");
+    }
+}
