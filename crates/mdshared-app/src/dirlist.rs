@@ -30,17 +30,22 @@
 //! remains the fallback for a folder that changed in a way the watcher did not report.
 //!
 //! Paths are compared exactly, as the platform spelled them: no case folding and no tidying of
-//! separators. A folder's own reading, and a watcher fed from the same folder, spell a name the
-//! same way; two names that differ only in case are two entries where the file system says so.
-//! When the list has a [folder](Listing::folder), a change is applied only when the path it
-//! names sits directly in that folder: a rename out of the folder is a removal, a rename into it
-//! a creation, and the folder itself is not one of its entries.
+//! separators. Two names that differ only in case are two entries where the file system says
+//! so. That puts one rule on the watcher that feeds [`Listing::apply`]: its paths must be
+//! spelled the way the folder spelled them, with no `\\?\` prefix and no 8.3 short name (on
+//! Windows both can name an entry the read returned under another spelling), and on macOS
+//! `/var` and `/private/var` are two paths, not one. When the list has a
+//! [folder](Listing::folder), a change is applied only when the path it names sits directly in
+//! that folder: a rename out of the folder is a removal, a rename into it a creation, and the
+//! folder itself is not one of its entries.
 //!
 //! Links are never followed. An entry that is a symbolic link or a Windows junction is
 //! [`Kind::Other`], so a link to a dead share or a loop cannot stall the read of the folder or
 //! send it anywhere else; the system reports a junction as a link too, and what it points at is
-//! the follow that would cost the read. The hidden flag and the times are the link's own, not
-//! its target's.
+//! the follow that would cost the read. A link to a folder is therefore not a [`Kind::Folder`]
+//! here, and an application that opens one must follow the link itself, off the thread that
+//! draws, as it would follow any slow path. The hidden flag and the times are the link's own,
+//! not its target's.
 //!
 //! Deliberately not here:
 //!
@@ -385,112 +390,10 @@ pub enum Change {
     Modified(Entry),
 }
 
-/// Where the rows of a list went after it changed: for each old row, its new one, or `None` when
-/// the entry is gone or was filtered out.
-///
-/// This is what an application hands to the toolkit's `select::Selection::remap` (as
-/// [`Remap::mapping`]) so that a selection follows its entries through a new sort, a filter, or a
-/// change on the disk.
-///
-/// A change describes itself with a handful of row edits and one row is followed through them
-/// when it is asked for, so a change on a list of a million entries costs no walk of them. A new
-/// sort or filter has no such description and keeps one answer per old row.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Remap {
-    /// The rows the list showed before it changed.
-    rows: usize,
-    way: Way,
-}
+mod remap;
 
-/// How a remap answers for an old row.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Way {
-    /// One answer for every old row, made when the view was rebuilt.
-    Exact(Vec<Option<usize>>),
-    /// The row edits one change made, applied in order, and the rows it names by hand.
-    Edited {
-        edits: Vec<Edit>,
-        /// Old rows whose answer is not what the edits give: a rename's old row, which follows
-        /// the entry to its new name, though the old path is gone.
-        named: Vec<(usize, Option<usize>)>,
-    },
-}
-
-/// One row edit, in the row numbering of the moment it was made.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Edit {
-    /// The row at `at` is gone, and the rows after it moved up one.
-    Removed(usize),
-    /// A row was inserted at `at`, and the rows from it moved down one.
-    Inserted(usize),
-}
-
-impl Default for Remap {
-    fn default() -> Remap {
-        Remap::exact(Vec::new())
-    }
-}
-
-impl Remap {
-    /// A remap with one answer per old row.
-    fn exact(new_of: Vec<Option<usize>>) -> Remap {
-        Remap {
-            rows: new_of.len(),
-            way: Way::Exact(new_of),
-        }
-    }
-
-    /// The new row of the old row `old`, or `None` when that entry is not shown any more.
-    pub fn get(&self, old: usize) -> Option<usize> {
-        match &self.way {
-            Way::Exact(new_of) => new_of.get(old).copied().flatten(),
-            Way::Edited { edits, named } => {
-                if let Some((_, to)) = named.iter().find(|(row, _)| *row == old) {
-                    return *to;
-                }
-                let mut row = old;
-                for edit in edits {
-                    match *edit {
-                        Edit::Removed(at) => {
-                            if row == at {
-                                return None;
-                            }
-                            if row > at {
-                                row -= 1;
-                            }
-                        }
-                        Edit::Inserted(at) => {
-                            if row >= at {
-                                row += 1;
-                            }
-                        }
-                    }
-                }
-                Some(row)
-            }
-        }
-    }
-
-    /// How many old rows this remap speaks for: the length of the list before it changed.
-    pub fn len(&self) -> usize {
-        self.rows
-    }
-
-    /// Whether there were no rows before the change.
-    pub fn is_empty(&self) -> bool {
-        self.rows == 0
-    }
-
-    /// Whether every old row is where it was, and none was lost.
-    pub fn unchanged(&self) -> bool {
-        (0..self.rows).all(|old| self.get(old) == Some(old))
-    }
-
-    /// The remap as the function `Selection::remap` takes, for `selection.remap(remap.mapping())`.
-    pub fn mapping(&self) -> impl Fn(usize) -> Option<usize> + '_ {
-        |old| self.get(old)
-    }
-}
+use remap::Edit;
+pub use remap::Remap;
 
 /// An index from a path to an entry's place in a [`Listing`], so one change finds its entry
 /// without reading the list.
@@ -571,7 +474,10 @@ pub struct Listing {
     /// name sort's key.
     lower: Vec<String>,
     index: Index,
-    /// The rows shown, as places in `entries`, filtered and sorted.
+    /// Every entry, sorted: the hidden switch and the filter only choose among these rows, so
+    /// neither of them sorts anything.
+    order: Vec<usize>,
+    /// The rows shown, as places in `entries`: a subsequence of `order`.
     view: Vec<usize>,
     filter: String,
     /// `filter` in lower case, which is what the entries' names are compared against.
@@ -588,6 +494,7 @@ impl Listing {
             entries: Vec::new(),
             lower: Vec::new(),
             index: Index::default(),
+            order: Vec::new(),
             view: Vec::new(),
             filter: String::new(),
             needle: String::new(),
@@ -609,6 +516,7 @@ impl Listing {
         self.entries.clear();
         self.lower.clear();
         self.index = Index::default();
+        self.order.clear();
         Remap::exact(vec![None; old.len()])
     }
 
@@ -616,7 +524,12 @@ impl Listing {
     pub fn set_entries(&mut self, entries: Vec<Entry>) -> Remap {
         let old = std::mem::take(&mut self.view);
         let lower: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
-        let view = self.view_of(&entries, &lower);
+        let order = self.order_of(&entries, &lower);
+        let view: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| self.shows_entry(&entries[i], &lower[i]))
+            .collect();
         // The rows of the new list are matched to the old ones by path, borrowed both ways, so
         // no path is copied for the remap.
         let mut at: HashMap<&Path, usize> = HashMap::with_capacity(view.len());
@@ -630,6 +543,7 @@ impl Listing {
         self.index = Index::of(&entries);
         self.entries = entries;
         self.lower = lower;
+        self.order = order;
         self.view = view;
         Remap::exact(new_of)
     }
@@ -642,6 +556,11 @@ impl Listing {
     /// except that a rename out of the folder removes its entry and a rename into it creates
     /// one. A rename's remap follows the entry to its new path, so a selection stays on it: the
     /// old row of `from` maps to the new row of `to`, though the two paths differ.
+    ///
+    /// Paths are matched exactly, as the folder spelled them, so the watcher must hand over its
+    /// own spelling: no `\\?\` prefix, no 8.3 short name, and on macOS `/var` and
+    /// `/private/var` are two paths. A path spelled otherwise is a path the list does not hold,
+    /// and the change is applied as a creation or ignored.
     pub fn apply(&mut self, change: Change) -> Remap {
         let rows = self.view.len();
         // The row edits the change makes, in the numbering of the moment each was made, and the
@@ -690,10 +609,7 @@ impl Listing {
                 }
             }
         }
-        Remap {
-            rows,
-            way: Way::Edited { edits, named },
-        }
+        Remap::edited(rows, edits, named)
     }
 
     /// How many rows are shown.
@@ -745,7 +661,14 @@ impl Listing {
         let old = std::mem::take(&mut self.view);
         self.filter = filter.to_string();
         self.needle = filter.to_lowercase();
-        self.rebuild();
+        // The rows were sorted already, and a filter keeps their order: the ones that stay are
+        // a subsequence of them, so nothing is sorted again for a keystroke.
+        self.view = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| self.shows(i))
+            .collect();
         self.remap_entries(&old)
     }
 
@@ -758,7 +681,12 @@ impl Listing {
     pub fn set_show_hidden(&mut self, show: bool) -> Remap {
         let old = std::mem::take(&mut self.view);
         self.show_hidden = show;
-        self.rebuild();
+        self.view = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| self.shows(i))
+            .collect();
         self.remap_entries(&old)
     }
 
@@ -771,7 +699,13 @@ impl Listing {
     pub fn set_sort(&mut self, sort: Sort) -> Remap {
         let old = std::mem::take(&mut self.view);
         self.sort = sort;
-        self.rebuild();
+        self.order = self.order_of(&self.entries, &self.lower);
+        self.view = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| self.shows(i))
+            .collect();
         self.remap_entries(&old)
     }
 
@@ -801,28 +735,27 @@ impl Listing {
             && (self.needle.is_empty() || lower.contains(&self.needle))
     }
 
-    /// The view of these entries under the list's filter, switches and sort.
-    fn view_of(&self, entries: &[Entry], lower: &[String]) -> Vec<usize> {
-        let mut view: Vec<usize> = (0..entries.len())
-            .filter(|&i| self.shows_entry(&entries[i], &lower[i]))
-            .collect();
+    /// Every entry, in the list's sort.
+    fn order_of(&self, entries: &[Entry], lower: &[String]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..entries.len()).collect();
         let sort = self.sort;
-        view.sort_by(|&a, &b| compare(&entries[a], &lower[a], &entries[b], &lower[b], sort));
-        view
-    }
-
-    /// Builds the view again from the entries: after the filter, the switches or the sort moved.
-    fn rebuild(&mut self) {
-        self.view = self.view_of(&self.entries, &self.lower);
+        order.sort_by(|&a, &b| compare(&entries[a], &lower[a], &entries[b], &lower[b], sort));
+        order
     }
 
     /// The place of entry `i` in the rows, by binary search; `Err` is where it would go.
     fn position_of(&self, i: usize) -> Result<usize, usize> {
-        self.view.binary_search_by(|&other| self.order(other, i))
+        self.view.binary_search_by(|&other| self.order_by(other, i))
+    }
+
+    /// The place of entry `i` in the sorted order, by binary search; `Err` is where it would go.
+    fn place_in_order(&self, i: usize) -> Result<usize, usize> {
+        self.order
+            .binary_search_by(|&other| self.order_by(other, i))
     }
 
     /// The comparison of the entry at place `other` with the entry at place `i`.
-    fn order(&self, other: usize, i: usize) -> Ordering {
+    fn order_by(&self, other: usize, i: usize) -> Ordering {
         compare(
             &self.entries[other],
             &self.lower[other],
@@ -830,6 +763,19 @@ impl Listing {
             &self.lower[i],
             self.sort,
         )
+    }
+
+    /// Takes entry `i` out of the sorted order.
+    fn order_remove(&mut self, i: usize) {
+        if let Ok(pos) = self.place_in_order(i) {
+            self.order.remove(pos);
+        }
+    }
+
+    /// Puts entry `i` into the sorted order, by binary search.
+    fn order_insert(&mut self, i: usize) {
+        let at = self.place_in_order(i).unwrap_or_else(|at| at);
+        self.order.insert(at, i);
     }
 
     /// Takes entry `i` out of the rows, if it is in them, and says which row went.
@@ -860,8 +806,10 @@ impl Listing {
             if let Some(pos) = old {
                 edits.push(Edit::Removed(pos));
             }
+            self.order_remove(i);
             self.entries[i] = entry;
             self.lower[i] = lower;
+            self.order_insert(i);
             let new = self.view_insert(i);
             if let Some(at) = new {
                 edits.push(Edit::Inserted(at));
@@ -872,6 +820,7 @@ impl Listing {
             self.lower.push(lower);
             let i = self.entries.len() - 1;
             self.index.add(&self.entries[i].path, i);
+            self.order_insert(i);
             if let Some(at) = self.view_insert(i) {
                 edits.push(Edit::Inserted(at));
             }
@@ -886,9 +835,14 @@ impl Listing {
         if let Some(pos) = self.view_remove(i) {
             edits.push(Edit::Removed(pos));
         }
+        self.order_remove(i);
         if last != i {
-            // The last entry takes this place: point its row at its new place before the
-            // entries move. Its row number is the one the removal above already moved it to.
+            // The last entry takes this place: point its places in the order and in the rows at
+            // its new one before the entries move. Its row number is the one the removal above
+            // already moved it to.
+            if let Ok(pos) = self.place_in_order(last) {
+                self.order[pos] = i;
+            }
             if let Ok(pos) = self.position_of(last) {
                 self.view[pos] = i;
             }

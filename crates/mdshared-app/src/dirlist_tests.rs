@@ -615,24 +615,44 @@ fn a_folder_read_on_a_worker_hands_its_entries_over_once() {
 #[test]
 fn a_folder_that_cannot_be_opened_says_so_and_a_vanished_entry_is_skipped() {
     let d = Dir::new("unreadable");
-    let file = d.file("kept.txt", b"x");
+    let kept = d.file("kept.txt", b"x");
+    let other = d.file("other.txt", b"y");
     // One entry, whose details are asked for after it has gone: the skip path itself, without
     // depending on the order the folder would list its entries in. On Windows the folder scan's
     // own record still describes a deleted entry, so the entry is asked of the disk only here.
     #[cfg(not(windows))]
     {
+        let gone = d.file("gone.txt", b"z");
         let mut items = fs::read_dir(&d.0).unwrap();
-        let item = items.next().expect("the folder has one entry").unwrap();
-        assert_eq!(item.file_name(), "kept.txt");
-        fs::remove_file(&file).unwrap();
+        let item = items
+            .find(|item| {
+                item.as_ref()
+                    .is_ok_and(|item| item.file_name() == "gone.txt")
+            })
+            .expect("the folder lists gone.txt")
+            .unwrap();
+        fs::remove_file(&gone).unwrap();
         assert!(
             read_entry(&item).is_none(),
             "an entry that vanished is skipped"
         );
     }
-    // Whatever an entry cannot say of itself, the rest of the folder is still read.
-    let skipped = read_with(&d.0, &|| false, &|_| None).unwrap();
-    assert!(skipped.is_empty() && file.is_file());
+    // One entry whose details cannot be had is skipped, and the others still arrive.
+    let partial = read_with(&d.0, &|| false, &|item| {
+        if item.file_name() == "other.txt" {
+            None
+        } else {
+            read_entry(item)
+        }
+    })
+    .unwrap();
+    let names: Vec<String> = partial.iter().map(|e| e.name.clone()).collect();
+    assert_eq!(
+        names,
+        ["kept.txt"],
+        "the unreadable one is skipped, the other stays"
+    );
+    assert!(kept.is_file() && other.is_file());
 
     // A folder that cannot be opened is an error, and reads as nothing.
     let missing = d.0.join("missing");
@@ -677,6 +697,79 @@ fn two_names_that_differ_only_in_case_are_two_entries() {
     let remap = listing.apply(Change::Removed(d.0.join("A.txt")));
     assert_eq!(remap.get(0), None);
     assert_eq!(names(&listing), ["a.txt"]);
+}
+
+#[test]
+fn a_remap_answers_nothing_for_a_row_that_never_was() {
+    let mut listing = Listing::new();
+    listing.set_entries(vec![
+        entry("a", Kind::File, 1, None),
+        entry("b", Kind::File, 2, None),
+    ]);
+    // A change's remap follows edits; a row past the list's old end has no answer.
+    let remap = listing.apply(Change::Created(entry("c", Kind::File, 3, None)));
+    assert_eq!(remap.len(), 2);
+    assert_eq!(remap.get(2), None, "there was no third row");
+    assert_eq!(remap.get(usize::MAX), None, "nor a row at the end of usize");
+    assert_eq!(remap.mapping()(2), None);
+    // A rebuilt view's remap is the same.
+    let remap = listing.set_sort(Sort {
+        column: Column::Size,
+        descending: true,
+    });
+    assert_eq!(remap.len(), 3);
+    assert_eq!(remap.get(3), None);
+    assert_eq!(remap.get(usize::MAX), None);
+}
+
+#[test]
+fn a_filter_keeps_the_sorted_order_and_sorts_nothing_again() {
+    let mut entries = Vec::with_capacity(100_000);
+    for i in 0..100_000 {
+        entries.push(entry(
+            &format!("file{i:06}"),
+            Kind::File,
+            (i % 97) as u64,
+            at((i % 1000) as u64),
+        ));
+    }
+    let mut listing = Listing::new();
+    listing.set_entries(entries);
+    listing.set_sort(Sort {
+        column: Column::Size,
+        descending: true,
+    });
+    let before: Vec<String> = names(&listing);
+
+    // A narrowed filter keeps the rows it shows in the order they had.
+    listing.set_filter("file00000");
+    let narrowed: Vec<String> = names(&listing);
+    let kept: Vec<String> = before
+        .iter()
+        .filter(|name| name.contains("file00000"))
+        .cloned()
+        .collect();
+    assert_eq!(narrowed, kept, "a filter keeps the order");
+
+    // A keystroke filters; it does not sort again. A hundred widenings and narrowings of a
+    // hundred thousand rows stay far inside the bound (a re-sort each time would not).
+    let started = Instant::now();
+    for _ in 0..50 {
+        listing.set_filter("");
+        listing.set_filter("file");
+    }
+    let elapsed = started.elapsed();
+    listing.set_filter("");
+    assert_eq!(
+        names(&listing),
+        before,
+        "clearing the filter restores the order"
+    );
+    eprintln!("100 filter changes on 100,000 entries took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "100 filter changes on 100,000 entries took {elapsed:?}"
+    );
 }
 
 #[test]
