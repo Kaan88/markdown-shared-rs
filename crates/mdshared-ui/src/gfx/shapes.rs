@@ -1,12 +1,10 @@
-//! More shapes for the [`Painter`]: a picture scaled into a rectangle, paths filled and
-//! stroked, rings and arcs, a row of columns for a waveform or a meter, and a gradient. All of
-//! them take logical px, honour the clip and the offset, and blend at an alpha, as the boxes
-//! and the text do.
+//! More shapes for the [`Painter`]: paths filled and stroked, rings and arcs, a row of columns
+//! for a waveform or a meter, and a gradient. All of them take logical px, honour the clip and
+//! the offset, and blend at an alpha, as the boxes and the text do.
 //!
-//! None of them keeps anything between calls: a shape is rasterized each time it is drawn.
-//! That suits what changes every frame (a progress ring, a meter) and small things. A large
-//! picture that is drawn every frame at one size is better scaled once by its owner and
-//! [`blit`](Painter::blit)ted; a cache of scaled pictures is not here.
+//! None of them keeps anything between calls: a shape is rasterized each time it is drawn. A
+//! picture is the same (`gfx::painted` has the scaler and the blit), and one drawn every frame
+//! at one size is better kept by its owner in a [`Picture`](crate::picture).
 
 use super::{Painter, Rect, Rgb, mix};
 use zeno::{Command, Point};
@@ -101,7 +99,7 @@ pub enum Along {
 
 /// How much of the pixel at `x, y` a rounded rectangle covers at its corners: 1 away from
 /// them. The rectangle is in device px, far edges outside.
-fn corner_cover(x: i32, y: i32, r: (i32, i32, i32, i32), rad: f32) -> f32 {
+pub(super) fn corner_cover(x: i32, y: i32, r: (i32, i32, i32, i32), rad: f32) -> f32 {
     if rad <= 0.0 {
         return 1.0;
     }
@@ -123,147 +121,7 @@ fn corner_cover(x: i32, y: i32, r: (i32, i32, i32, i32), rad: f32) -> f32 {
     }
 }
 
-/// Where each destination cell of an axis reads from: for cell `i` of `n` across a source `len`
-/// long, the first source index and the weights of it and the ones after it, summing to one.
-/// Shrinking, a cell is the average of the source under it (each source pixel weighted by its
-/// overlap), so fine detail does not turn to moiré; enlarging, it is two neighbours mixed.
-struct Taps {
-    /// Per cell: the first source index, and where its weights start and how many there are.
-    cells: Vec<(usize, usize, usize)>,
-    weights: Vec<f32>,
-}
-
-impl Taps {
-    fn new(cells: std::ops::Range<i32>, n: i32, len: u32) -> Taps {
-        let mut taps = Taps {
-            cells: Vec::with_capacity(cells.len()),
-            weights: Vec::new(),
-        };
-        let ratio = len as f64 / n as f64;
-        for i in cells {
-            let start = taps.weights.len();
-            let first;
-            if ratio > 1.0 {
-                let (a, b) = (i as f64 * ratio, ((i + 1) as f64 * ratio).min(len as f64));
-                first = (a.floor() as usize).min(len as usize - 1);
-                let mut s = first;
-                while (s as f64) < b && s < len as usize {
-                    let overlap = b.min(s as f64 + 1.0) - a.max(s as f64);
-                    taps.weights.push((overlap / (b - a)).max(0.0) as f32);
-                    s += 1;
-                }
-                if taps.weights.len() == start {
-                    taps.weights.push(1.0);
-                }
-            } else {
-                let at = ((i as f64 + 0.5) * ratio - 0.5).clamp(0.0, len as f64 - 1.0);
-                first = at.floor() as usize;
-                let f = (at - first as f64) as f32;
-                if first + 1 < len as usize && f > 0.0 {
-                    taps.weights.extend([1.0 - f, f]);
-                } else {
-                    taps.weights.push(1.0);
-                }
-            }
-            taps.cells.push((first, start, taps.weights.len() - start));
-        }
-        taps
-    }
-
-    /// The source indices any cell reads: the first, and one past the last.
-    fn reach(&self) -> (usize, usize) {
-        let lo = self.cells.iter().map(|c| c.0).min().unwrap_or(0);
-        let hi = self.cells.iter().map(|c| c.0 + c.2).max().unwrap_or(0);
-        (lo, hi)
-    }
-}
-
 impl Painter<'_> {
-    /// Draws a picture scaled into `dst`: `rgba` is `width` by `height` pixels of straight
-    /// (not premultiplied) RGBA, top down, as [`mdshared_text::decode_png_rgba`] gives them.
-    /// The picture fills the rectangle exactly (the caller keeps the aspect ratio by the
-    /// rectangle it gives), its corners rounded by `radius`, the whole blended at `alpha` on
-    /// top of the picture's own transparency. Only the pixels inside the clip are computed.
-    ///
-    /// Shrunk, each pixel is the average of the picture under it, weighed in premultiplied
-    /// alpha so that a cut-out gets no dark fringe; enlarged, neighbours are mixed. A buffer
-    /// shorter than `width * height * 4`, an empty picture or an empty rectangle draws nothing.
-    #[allow(clippy::too_many_arguments)] // a picture, where it goes and how: no natural grouping
-    pub fn image(
-        &mut self,
-        rgba: &[u8],
-        width: u32,
-        height: u32,
-        dst: Rect,
-        radius: f32,
-        alpha: f32,
-    ) {
-        let (x0, y0, x1, y1) = self.dev_rect(dst);
-        let pixels = (width as usize).checked_mul(height as usize);
-        let enough = pixels
-            .and_then(|n| n.checked_mul(4))
-            .is_some_and(|n| rgba.len() >= n);
-        if width == 0 || height == 0 || x1 <= x0 || y1 <= y0 || !enough || alpha.is_nan() {
-            return;
-        }
-        let alpha = alpha.clamp(0.0, 1.0);
-        let c = self.clip;
-        let (vx0, vy0, vx1, vy1) = (x0.max(c.0), y0.max(c.1), x1.min(c.2), y1.min(c.3));
-        if vx0 >= vx1 || vy0 >= vy1 || alpha <= 0.0 {
-            return;
-        }
-        let cols = Taps::new(vx0 - x0..vx1 - x0, x1 - x0, width);
-        let rows = Taps::new(vy0 - y0..vy1 - y0, y1 - y0, height);
-        // Across first: the source rows the visible rows read, each squeezed to the visible
-        // columns, in premultiplied alpha.
-        let (row_lo, row_hi) = rows.reach();
-        let vis_w = (vx1 - vx0) as usize;
-        let stride = width as usize * 4;
-        let mut across = vec![[0f32; 4]; vis_w * (row_hi - row_lo)];
-        for (k, sy) in (row_lo..row_hi).enumerate() {
-            let line = &rgba[sy * stride..(sy + 1) * stride];
-            let out = &mut across[k * vis_w..(k + 1) * vis_w];
-            for (px, &(first, start, n)) in out.iter_mut().zip(&cols.cells) {
-                let mut sum = [0f32; 4];
-                for (j, w) in cols.weights[start..start + n].iter().enumerate() {
-                    let s = &line[(first + j) * 4..(first + j) * 4 + 4];
-                    let a = s[3] as f32 / 255.0 * w;
-                    sum[0] += s[0] as f32 * a;
-                    sum[1] += s[1] as f32 * a;
-                    sum[2] += s[2] as f32 * a;
-                    sum[3] += a;
-                }
-                *px = sum;
-            }
-        }
-        // Then down, and onto the bitmap.
-        let rad = (radius * self.scale)
-            .min((x1 - x0) as f32 / 2.0)
-            .min((y1 - y0) as f32 / 2.0)
-            .max(0.0);
-        for (r, &(first, start, n)) in rows.cells.iter().enumerate() {
-            let y = vy0 + r as i32;
-            let o = (y as usize * self.bmp.width as usize + vx0 as usize) * 4;
-            let dst_row = &mut self.bmp.pixels[o..o + vis_w * 4];
-            for (i, d) in dst_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let mut px = [0f32; 4];
-                for (j, w) in rows.weights[start..start + n].iter().enumerate() {
-                    let s = across[(first - row_lo + j) * vis_w + i];
-                    for (p, s) in px.iter_mut().zip(s) {
-                        *p += s * w;
-                    }
-                }
-                let cover = alpha * corner_cover(vx0 + i as i32, y, (x0, y0, x1, y1), rad);
-                let keep = 1.0 - px[3].min(1.0) * cover;
-                // RGBA sums, BGRA framebuffer.
-                for ch in 0..3 {
-                    let v = px[2 - ch] * cover + d[ch] as f32 * keep;
-                    d[ch] = (v + 0.5).min(255.0) as u8;
-                }
-            }
-        }
-    }
-
     /// Blends a coverage mask, one byte a device pixel, in a colour at an alpha, inside the
     /// clip. `left, top` is where the mask's first pixel goes.
     fn blend_mask(&mut self, left: i32, top: i32, width: usize, data: &[u8], c: Rgb, alpha: f32) {
@@ -556,138 +414,6 @@ mod tests {
             .flat_map(|y| (0..w).map(move |x| (x, y)))
             .flat_map(|(x, y)| f(x, y))
             .collect()
-    }
-
-    #[test]
-    fn a_picture_at_its_own_size_is_copied_and_only_into_its_rectangle() {
-        let pic = picture(20, 10, |x, y| [x as u8 * 10, y as u8 * 20, 77, 255]);
-        let bmp = page(60, 40, 1.0, |p| {
-            p.image(&pic, 20, 10, Rect::new(5.0, 8.0, 20.0, 10.0), 0.0, 1.0);
-        });
-        for y in 0..40 {
-            for x in 0..60 {
-                let inside = (5..25).contains(&x) && (8..18).contains(&y);
-                let want = if inside {
-                    [(x - 5) as u8 * 10, (y - 8) as u8 * 20, 77]
-                } else {
-                    WHITE
-                };
-                assert_eq!(at(&bmp, x, y), want, "{x},{y}");
-            }
-        }
-        // Too few bytes, no size, no rectangle, no opacity: nothing, and no panic.
-        let blank = page(60, 40, 1.0, |_| ());
-        let r = Rect::new(5.0, 8.0, 20.0, 10.0);
-        let none = page(60, 40, 1.0, |p| {
-            p.image(&pic[..100], 20, 10, r, 0.0, 1.0);
-            p.image(&pic, 0, 10, r, 0.0, 1.0);
-            p.image(&pic, 20, 10, Rect::new(5.0, 8.0, 0.0, 10.0), 0.0, 1.0);
-            p.image(&pic, 20, 10, r, 0.0, 0.0);
-            p.image(&pic, 20, 10, r, 0.0, f32::NAN);
-            p.image(&pic, u32::MAX, u32::MAX, r, 0.0, 1.0);
-            p.image(&pic, 20, 10, Rect::new(500.0, 8.0, 20.0, 10.0), 0.0, 1.0);
-        });
-        assert!(none.pixels == blank.pixels);
-    }
-
-    #[test]
-    fn a_picture_blends_by_its_own_alpha_times_the_alpha_asked_for() {
-        // Black at full, half and no alpha, on white: three pixels of each.
-        let pic = picture(9, 1, |x, _| [0, 0, 0, [255, 128, 0][x as usize / 3]]);
-        let level = |alpha: f32, band: i32| {
-            let bmp = page(40, 20, 1.0, |p| {
-                p.image(&pic, 9, 1, Rect::new(5.0, 5.0, 30.0, 10.0), 0.0, alpha);
-            });
-            // Inside each band, where only pixels of one alpha are mixed.
-            at(&bmp, 5 + 3 + 10 * band, 10)[0] as i32
-        };
-        assert_eq!((level(1.0, 0), level(1.0, 2)), (0, 255));
-        assert!((level(1.0, 1) - 127).abs() <= 1);
-        assert!((level(0.5, 0) - 128).abs() <= 1);
-        assert!((level(0.5, 1) - 191).abs() <= 1);
-        assert_eq!(level(0.5, 2), 255);
-    }
-
-    #[test]
-    fn a_picture_shrunk_is_averaged_and_one_enlarged_is_mixed_between_its_pixels() {
-        // One-pixel stripes shrunk by 4.3: flat grey, not the moiré plain sampling gives.
-        let stripes = picture(430, 43, |x, _| {
-            let v = if x % 2 == 0 { 255 } else { 0 };
-            [v, v, v, 255]
-        });
-        let bmp = page(120, 30, 1.0, |p| {
-            p.image(
-                &stripes,
-                430,
-                43,
-                Rect::new(10.0, 10.0, 100.0, 10.0),
-                0.0,
-                1.0,
-            );
-        });
-        let levels: Vec<u8> = (10..110).map(|x| at(&bmp, x, 15)[1]).collect();
-        let (lo, hi) = (levels.iter().min().unwrap(), levels.iter().max().unwrap());
-        assert!(hi - lo <= 20 && (110..=146).contains(lo), "{lo}..{hi}");
-        // A cut-out shrunk: opaque white next to clear black leaves no dark fringe on white.
-        let cut = picture(400, 8, |x, _| if x < 203 { [255; 4] } else { [0, 0, 0, 0] });
-        let bmp = page(120, 30, 1.0, |p| {
-            p.image(&cut, 400, 8, Rect::new(10.0, 10.0, 100.0, 10.0), 0.0, 1.0);
-        });
-        assert_eq!(ink(&bmp).0, 0);
-        // Two pixels, black and white, enlarged to 40: black, a ramp, white.
-        let two = picture(2, 1, |x, _| {
-            [x as u8 * 255, x as u8 * 255, x as u8 * 255, 255]
-        });
-        let bmp = page(60, 20, 1.0, |p| {
-            p.image(&two, 2, 1, Rect::new(10.0, 5.0, 40.0, 10.0), 0.0, 1.0);
-        });
-        let row: Vec<u8> = (10..50).map(|x| at(&bmp, x, 10)[0]).collect();
-        assert_eq!((row[0], row[9], row[30], row[39]), (0, 0, 255, 255));
-        assert!(row.windows(2).all(|w| w[1] >= w[0]), "{row:?}");
-        assert!((row[19] as i32 - 121).abs() <= 8 && (row[20] as i32 - 134).abs() <= 8);
-    }
-
-    #[test]
-    fn a_picture_is_cut_by_the_clip_moved_by_the_offset_and_rounded_at_its_corners() {
-        let pic = picture(40, 40, |_, _| [0, 0, 0, 255]);
-        let r = Rect::new(10.0, 10.0, 40.0, 40.0);
-        // The clip: only its part, and exactly the pixels the whole draw has there.
-        let whole = page(80, 80, 1.0, |p| p.image(&pic, 40, 40, r, 8.0, 1.0));
-        let part = page(80, 80, 1.0, |p| {
-            let old = p.clip(Rect::new(0.0, 0.0, 30.0, 25.0));
-            p.image(&pic, 40, 40, r, 8.0, 1.0);
-            p.restore(old);
-        });
-        assert_eq!(ink(&part).1, (10, 10, 30, 25));
-        for y in 0..25 {
-            for x in 0..30 {
-                assert_eq!(at(&part, x, y), at(&whole, x, y));
-            }
-        }
-        // The corners are those of a box of the same radius.
-        let boxed = page(80, 80, 1.0, |p| p.rbox(r, 8.0, BLACK));
-        let mut worst = 0;
-        for y in 0..80 {
-            for x in 0..80 {
-                worst = worst.max((at(&whole, x, y)[0] as i32 - at(&boxed, x, y)[0] as i32).abs());
-            }
-        }
-        assert!(worst <= 2, "the corners differ from a box's by {worst}");
-        assert_eq!(at(&whole, 10, 10), WHITE);
-        assert_eq!(at(&whole, 30, 30), BLACK);
-        // The offset moves it by whole pixels; the scale makes it larger.
-        let moved = page(80, 80, 1.0, |p| {
-            let o = p.offset(7.0, -3.0);
-            p.image(&pic, 40, 40, r, 8.0, 1.0);
-            p.restore_offset(o);
-        });
-        for y in 3..80 {
-            for x in 7..80 {
-                assert_eq!(at(&moved, x, y - 3), at(&whole, x - 7, y));
-            }
-        }
-        let scaled = page(160, 160, 1.5, |p| p.image(&pic, 40, 40, r, 0.0, 1.0));
-        assert_eq!(ink(&scaled).1, (15, 15, 75, 75));
     }
 
     #[test]

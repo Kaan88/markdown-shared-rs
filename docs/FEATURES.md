@@ -2050,3 +2050,114 @@ test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- 
 explorer_tests` (exit 0; mdshared-ui 1129 passed, 33 ignored; doctests pass). Not run: the
 release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
 feature clippy/test lines, Linux and macOS. Not seen by a person in a window.
+
+## Pictures kept at their drawn size (`mdshared_ui::picture`, 2026-11-26, `feat/k14-pictures`, roadmap K14, Barbican BT1)
+
+`Painter::image` squeezes a picture into its rectangle on every call. An avatar, an icon or a
+badge drawn every frame therefore averages the same source pixels again and again. A
+`Picture` does that once: it keeps the pixels of the last size it drew, at that device size,
+and a later draw at the same size, scale and corner radius only blends them.
+
+- **The model and the cache are one small struct.** `Picture` holds the source `Image`, one
+  prepared buffer and a counter the tests read. It is `Clone`, with a `Debug` that prints the
+  sizes rather than the pixels; the buffer is straight RGBA with the rounded corners already
+  folded into its alpha, so a draw needs a blend and no coverage test.
+- **What prepares again.** The key is `round(dst.w * scale)` by `round(dst.h * scale)`, the
+  display scale's bits and the device corner radius's bits. The prepared size is a property
+  of the rectangle, not of where it sits: `dev_rect` rounds the left and right edges
+  separately, so at 1.25 and 1.5 the placed device width can be a pixel different from the
+  same rectangle moved by one logical px. The blit is clipped to the placed rectangle, so a
+  placement a pixel narrower loses the cached picture's last column or row, and one a pixel
+  wider leaves that column or row unpainted: nothing is painted past `dst`, into the next
+  item of a row. A move, a clip change or an alpha change therefore does not prepare, even at
+  fractional scales. A size, scale or radius change replaces the one prepared size; there is
+  no cache of several sizes, which is the caller's decision if it wants one.
+- **The same scaler, not a second one.** The scaling that was inside `Painter::image` moved
+  to its own file, `gfx/painted.rs`, as `Scaled` (taps, the across pass and the down pass)
+  and `blend_pixel`. `image` still uses it, so its pixels are unchanged; `prepare_image`
+  uses the same sampling and folds `corner_cover` into alpha; `blit_rgba` reuses
+  `blend_pixel` at 1:1. `gfx/shapes.rs` no longer holds the picture code (it was already
+  over a thousand lines; it is 829 now, `painted.rs` is 511 and `picture.rs` is 619).
+- **A prepared draw matches `Painter::image`** at the same device size, within 2 levels a
+  channel: the difference is the 8-bit rounding of the prepared buffer, and the test checks
+  scales 1, 1.5 and 2, a rounded corner, half alpha and a cut-out. An infinite or NaN radius
+  rounds as far as half the smaller side, exactly as `Painter::image`'s `f32::min` chain
+  does, and is tested against it.
+- **Limits.** A target over 1024 device px a side or a million pixels is handed to
+  `Painter::image`, which allocates only the visible part; a huge finite target therefore
+  draws its visible corner and prepares nothing. A zero, negative, NaN or infinite rectangle
+  draws nothing; a zero or NaN alpha draws nothing; an infinite or NaN radius rounds fully;
+  a huge finite radius is cut to half the smaller side. `Scaled::take` does its arithmetic in
+  64-bit and refuses a side beyond `i32::MAX` device px, so an absurd rectangle cannot
+  overflow or ask for a buffer larger than the clip it draws into. The prepared buffer is at
+  most a few MiB, but `prepare_image` also allocates 16 bytes for every source row the
+  destination reads, so a tall source scaled down can take hundreds of MiB; the cap comment
+  in `picture.rs` says so.
+- **The decoder slot.** `Decoder` is a trait with one method, `decode(&[u8], Limits) ->
+  Option<Image>`; any `Fn(&[u8], Limits) -> Option<Image>` is one, so an application writes a
+  closure for GIF, WebP, ICO or SVG. The `Limits` are passed in so a decoder can read the
+  header and refuse before allocating, as the built-in decoders do. `Picture::load(bytes,
+  limits, Some(&slot))` reads PNG and JPEG through `mdshared_text::image::decode`; the slot
+  is asked only when that says `Unsupported`, never for a damaged PNG or JPEG. The call is
+  wrapped in `catch_unwind` (`AssertUnwindSafe`), so a panic in it is `Error::Damaged`, and
+  an `Image` whose pixels are not `width * height * 4` or whose side is zero is `Damaged`
+  too. A picture over the `Limits` is `TooLarge`. It is not a registry and there is no
+  global: the slot is passed to the call that uses it.
+- **New public API:** `picture::{Picture, Decoder}`; `Picture::{new, load, size, draw}`.
+  `Painter::blit_rgba` and `prepare_image` are crate-private. No existing signature, public
+  field or drawing changed.
+
+Tests, eleven in `picture::tests`:
+
+- `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (three scales, radius,
+  alpha and a cut-out, within 2 levels a channel).
+- `a_second_draw_at_the_same_size_does_not_prepare_again` (draw, redraw, move: one prepare).
+- `a_move_at_a_fractional_scale_does_not_prepare_again` (scales 1.25 and 1.5, whole and
+  fractional moves, one prepare).
+- `an_alpha_change_does_not_prepare_again` (the same size at alpha 1 and 0.35, one prepare).
+- `an_infinite_or_nan_radius_rounds_as_the_painter_does` (each matches `Painter::image`,
+  one prepare, the corner clear).
+- `a_size_or_scale_change_prepares_again` (a wider target, the same device size at another
+  scale, back again, a new radius: one prepare each).
+- `the_clip_and_the_offset_are_honoured` (the inked box is exactly the clip's intersection;
+  the clipped draw and the whole draw together prepare once; the offset moves them by whole
+  pixels without preparing again).
+- `a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (at scale 1.5 a placement one
+  device px narrower than the cached width leaves the pixel just past `dst` untouched).
+- `zero_nan_and_huge_sizes_neither_panic_nor_prepare` (zero, negative, NaN and infinite
+  rectangles and a zero, NaN alpha draw nothing; a huge finite target is not prepared but
+  draws its visible corner; huge, infinite and NaN radii all round fully and prepare once).
+- `the_decoder_slot_reads_a_format_the_toolkit_refuses` (a GIF-shaped closure; no slot gives
+  the built-in error; a damaged PNG does not reach a slot that would take anything; a slot
+  picture over the limits is `TooLarge`).
+- `a_slot_that_panics_or_returns_a_broken_image_is_damaged` (a panicking decoder, a picture
+  with one byte too few and one with a zero side are all `Damaged`).
+
+Every new item is new API, so the tests do not compile on the code before this branch: that is
+their fail-before evidence. Each behaviour was also checked by breaking it and watching the
+test fail. Making the key check always true (prepare on every draw) failed
+`a_second_draw_at_the_same_size_does_not_prepare_again`,
+`a_size_or_scale_change_prepares_again`, `the_clip_and_the_offset_are_honoured` and
+`zero_nan_and_huge_sizes_neither_panic_nor_prepare`. Keying on the placed device size, as the
+first commit did, failed `a_move_at_a_fractional_scale_does_not_prepare_again`. Removing the
+corner coverage from `prepare_image` failed
+`a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (by 253 levels). Removing
+the clip from `blit_rgba` failed `the_clip_and_the_offset_are_honoured`. Drawing the blit
+past the placed rectangle, as the first commit did, failed
+`a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (the pixel outside `dst`
+became the picture's). Making `load` never call the slot failed
+`the_decoder_slot_reads_a_format_the_toolkit_refuses`; removing the `catch_unwind` failed
+`a_slot_that_panics_or_returns_a_broken_image_is_damaged`.
+
+Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (exit 0;
+mdshared-ui 1131 passed, 33 ignored, doc-tests 5 passed and 1 ignored; the other crates all
+passed). Not run: release builds, the rest of the seventeen-command matrix, Linux and macOS
+(CI will). **Not seen in a real window**: no application or example draws a `Picture` yet, and
+no person has looked at it; the evidence is pixel tests against `Painter::image`.
+
+Known limits, for later: `Painter::dev_x`/`dev_y` saturate a product to `i32::MAX` and then
+add the painter's offset, which overflows in debug for a coordinate near 2.2e9. That was
+already true before this branch; `Picture` only inherits it. A tall source scaled down can
+still make `prepare_image` allocate hundreds of MiB, as above.
