@@ -16,13 +16,24 @@ pub(super) const DEFAULT_INTERVAL: Option<Duration> = if cfg!(windows) {
 };
 pub(super) const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-type Snapshot = BTreeMap<PathBuf, Entry>;
+pub(super) type Snapshot = BTreeMap<PathBuf, Entry>;
+pub(super) type Scan = io::Result<Option<Snapshot>>;
+
+#[derive(PartialEq, Eq)]
+enum Stage {
+    Start,
+    Waiting,
+    Read,
+    ScanOnly,
+}
 
 pub(super) struct Periodic {
     interval: Duration,
     deadline: Option<Instant>,
     /// What the caller should have after applying the reports, not just the last scan.
     known: Option<Snapshot>,
+    epoch: u64,
+    stage: Stage,
 }
 
 impl Periodic {
@@ -42,11 +53,15 @@ impl Periodic {
             interval,
             deadline: Some(deadline),
             known: initial.map(snapshot),
+            epoch: 0,
+            stage: Stage::Start,
         })
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        (self.stage != Stage::Waiting)
+            .then_some(self.deadline)
+            .flatten()
     }
 
     #[cfg(test)]
@@ -75,35 +90,63 @@ impl Periodic {
         }
     }
 
-    /// Runs one due scan. Completion, even on error, schedules the next cycle; time
-    /// spent blocked does not build up missed scans or restart requests.
-    pub(super) fn run_due(
-        &mut self,
-        now: Instant,
-        restart: impl FnOnce(),
-        scan: impl FnOnce() -> io::Result<Option<Snapshot>>,
-        finished: impl FnOnce() -> Instant,
-    ) -> Vec<Signal> {
-        if self.deadline.is_none_or(|deadline| now < deadline) {
-            return Vec::new();
+    pub(super) fn restart_finished(&mut self, succeeded: bool) {
+        if self.stage == Stage::Waiting {
+            self.stage = if succeeded {
+                Stage::Read
+            } else {
+                Stage::ScanOnly
+            };
         }
-        restart();
-        let result = scan();
-        let end = finished();
-        // If the clock's remaining representable range ever becomes too short, do
-        // not schedule repeatedly at an already-expired deadline.
-        self.deadline = end.checked_add(self.interval);
+    }
+
+    /// Returns whether a read is due. On the first call for a cycle, request a restart
+    /// and suspend the deadline until the owner acknowledges it.
+    pub(super) fn ready(&mut self, now: Instant, restart: impl FnOnce()) -> bool {
+        if self.deadline().is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        if self.stage == Stage::Start {
+            self.stage = Stage::Waiting;
+            restart();
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn sync_epoch(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.known = None;
+        }
+    }
+
+    /// Prepare a report without mutating the baseline: events or queue resets may
+    /// invalidate it between reading the directory and publishing the result.
+    pub(super) fn report(&self, result: &Scan) -> (Vec<Signal>, Option<Vec<Entry>>) {
         match result {
             Ok(Some(current)) => {
-                let signals = self.known.as_ref().map_or_else(
-                    || vec![Signal::Rescan],
-                    |known| differences(known, &current),
-                );
-                self.known = Some(current);
-                signals
+                let signals = self
+                    .known
+                    .as_ref()
+                    .map_or_else(|| vec![Signal::Rescan], |known| differences(known, current));
+                let reset = (signals.first() == Some(&Signal::Rescan))
+                    .then(|| current.values().cloned().collect());
+                (signals, reset)
             }
-            Ok(None) => vec![Signal::Lost],
-            Err(_) => Vec::new(),
+            Ok(None) => (vec![Signal::Lost], None),
+            Err(_) => (Vec::new(), None),
+        }
+    }
+
+    /// Only a report that made it into the queue can advance the baseline and timer.
+    pub(super) fn committed(&mut self, result: Scan, end: Instant) {
+        if let Ok(Some(current)) = result {
+            self.known = Some(current);
+        }
+        self.deadline = end.checked_add(self.interval);
+        if self.stage == Stage::Read {
+            self.stage = Stage::Start;
         }
     }
 }
@@ -193,6 +236,26 @@ mod tests {
         }
     }
 
+    fn scan_cycle(
+        periodic: &mut Periodic,
+        now: Instant,
+        restart: impl Fn(),
+        scan: impl FnOnce() -> Scan,
+        end: Instant,
+    ) -> Vec<Signal> {
+        if !periodic.ready(now, &restart) {
+            if periodic.stage != Stage::Waiting {
+                return Vec::new();
+            }
+            periodic.restart_finished(true);
+            assert!(periodic.ready(now, || panic!("started a second restart")));
+        }
+        let result = scan();
+        let (signals, _) = periodic.report(&result);
+        periodic.committed(result, end);
+        signals
+    }
+
     #[test]
     fn a_slow_recovery_scan_does_not_queue_missed_cycles() {
         let start = Instant::now();
@@ -201,31 +264,41 @@ mod tests {
         let restarts = Cell::new(0);
         let restart = || restarts.set(restarts.get() + 1);
         assert!(
-            periodic
-                .run_due(start, restart, || panic!("early scan"), || start)
-                .is_empty()
+            scan_cycle(
+                &mut periodic,
+                start,
+                restart,
+                || panic!("early scan"),
+                start
+            )
+            .is_empty()
         );
         assert_eq!(restarts.get(), 0);
         let due = start + interval;
         let finish = due + interval * 10;
         assert!(
-            periodic
-                .run_due(
-                    due,
-                    restart,
-                    || {
-                        assert_eq!(restarts.get(), 1, "restart requested before scanning");
-                        Err(io::ErrorKind::PermissionDenied.into())
-                    },
-                    || finish
-                )
-                .is_empty()
+            scan_cycle(
+                &mut periodic,
+                due,
+                restart,
+                || {
+                    assert_eq!(restarts.get(), 1, "restart requested before scanning");
+                    Err(io::ErrorKind::PermissionDenied.into())
+                },
+                finish
+            )
+            .is_empty()
         );
         assert_eq!(periodic.deadline(), Some(finish + interval));
         assert!(
-            periodic
-                .run_due(finish, restart, || panic!("catch-up scan"), || finish)
-                .is_empty()
+            scan_cycle(
+                &mut periodic,
+                finish,
+                restart,
+                || panic!("catch-up scan"),
+                finish
+            )
+            .is_empty()
         );
         assert_eq!(restarts.get(), 1);
     }
@@ -251,7 +324,7 @@ mod tests {
         let disk = || snapshot([entry("changed", 4), entry("new-name", 3), entry("new", 5)]);
         let due = start + interval;
         assert_eq!(
-            periodic.run_due(due, || {}, || Ok(Some(disk())), || due),
+            scan_cycle(&mut periodic, due, || {}, || Ok(Some(disk())), due),
             [
                 Signal::Changed(Change::Removed("gone".into())),
                 Signal::Changed(Change::Modified(entry("changed", 4))),
@@ -259,11 +332,7 @@ mod tests {
             ]
         );
         let next = due + interval;
-        assert!(
-            periodic
-                .run_due(next, || {}, || Ok(Some(disk())), || next)
-                .is_empty()
-        );
+        assert!(scan_cycle(&mut periodic, next, || {}, || Ok(Some(disk())), next).is_empty());
     }
 
     #[test]
@@ -272,12 +341,15 @@ mod tests {
         let mut periodic = Periodic::new(Duration::from_secs(1), start, None).unwrap();
         let due = periodic.deadline().unwrap();
         let disk = || Ok(Some(snapshot([entry("a", 1)])));
-        assert_eq!(periodic.run_due(due, || {}, disk, || due), [Signal::Rescan]);
+        assert_eq!(
+            scan_cycle(&mut periodic, due, || {}, disk, due),
+            [Signal::Rescan]
+        );
         let next = periodic.deadline().unwrap();
-        assert!(periodic.run_due(next, || {}, disk, || next).is_empty());
+        assert!(scan_cycle(&mut periodic, next, || {}, disk, next).is_empty());
         let missing = periodic.deadline().unwrap();
         assert_eq!(
-            periodic.run_due(missing, || {}, || Ok(None), || missing),
+            scan_cycle(&mut periodic, missing, || {}, || Ok(None), missing),
             [Signal::Lost]
         );
     }

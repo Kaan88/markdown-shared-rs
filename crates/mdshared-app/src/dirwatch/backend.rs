@@ -1,5 +1,5 @@
 //! Owns and restarts the native watcher off the application and metadata threads.
-//! A stuck native destructor retains one process-wide slot until it returns.
+//! A process-wide slot survives until both the owner and metadata worker exit.
 
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,13 +9,13 @@ use std::sync::{Arc, Weak};
 const MAX_OWNERS: usize = 64;
 static OWNERS: Slots = Slots::new(MAX_OWNERS);
 
-struct Slots {
+pub(super) struct Slots {
     limit: usize,
     used: AtomicUsize,
 }
 
 impl Slots {
-    const fn new(limit: usize) -> Self {
+    pub(super) const fn new(limit: usize) -> Self {
         Self {
             limit,
             used: AtomicUsize::new(0),
@@ -31,7 +31,7 @@ impl Slots {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "directory watcher backend-owner limit ({}) reached",
+                        "directory watcher worker-pair limit ({}) reached",
                         self.limit
                     ),
                 )
@@ -48,21 +48,50 @@ impl Drop for Slot<'_> {
     }
 }
 
+pub(super) struct WorkerPermit(Arc<Slot<'static>>);
+
+impl WorkerPermit {
+    pub(super) fn spawn(
+        self,
+        work: impl FnOnce() + Send + 'static,
+    ) -> io::Result<std::thread::JoinHandle<()>> {
+        let Self(slot) = self;
+        std::thread::Builder::new()
+            .name("mdshared-dirwatch".into())
+            .spawn(move || {
+                let _slot = slot;
+                work();
+            })
+    }
+}
+
+type Ack = Box<dyn FnOnce(io::Result<()>) + Send>;
+
 /// Only the application handle owns a sender. Dropping it disconnects the channel even
 /// if a slow metadata scan still holds a restart handle.
 pub(super) struct Owner {
-    requests: Arc<SyncSender<()>>,
+    requests: Arc<SyncSender<Ack>>,
     #[cfg(test)]
     pub(super) thread: Option<std::thread::JoinHandle<()>>,
 }
 
-pub(super) struct Restart(Weak<SyncSender<()>>);
+pub(super) struct Restart(Weak<SyncSender<Ack>>);
 
 impl Restart {
-    /// At most one request may wait behind a busy owner.
-    pub(super) fn request(&self) {
-        if let Some(sender) = self.0.upgrade() {
-            _ = sender.try_send(());
+    /// The owner acknowledges after re-registration finishes, including on failure.
+    pub(super) fn request(&self, ack: impl FnOnce(io::Result<()>) + Send + 'static) {
+        let ack: Ack = Box::new(ack);
+        let Some(sender) = self.0.upgrade() else {
+            ack(Err(io::ErrorKind::BrokenPipe.into()));
+            return;
+        };
+        if let Err(error) = sender.try_send(ack) {
+            use std::sync::mpsc::TrySendError;
+            let (ack, kind) = match error {
+                TrySendError::Full(ack) => (ack, io::ErrorKind::WouldBlock),
+                TrySendError::Disconnected(ack) => (ack, io::ErrorKind::BrokenPipe),
+            };
+            ack(Err(kind.into()));
         }
     }
 }
@@ -78,17 +107,18 @@ impl Owner {
 pub(super) fn start<T, R: Send + 'static>(
     register: impl FnOnce() -> io::Result<(T, R)> + Send + 'static,
     restart: impl FnMut(&mut T) -> io::Result<()> + Send + 'static,
-) -> io::Result<(Owner, R)> {
+) -> io::Result<(Owner, R, WorkerPermit)> {
     start_with_slots(&OWNERS, register, restart)
 }
 
-fn start_with_slots<T, R: Send + 'static>(
+pub(super) fn start_with_slots<T, R: Send + 'static>(
     slots: &'static Slots,
     register: impl FnOnce() -> io::Result<(T, R)> + Send + 'static,
     mut restart: impl FnMut(&mut T) -> io::Result<()> + Send + 'static,
-) -> io::Result<(Owner, R)> {
-    let slot = slots.claim()?;
-    let (requests, receive) = sync_channel(1);
+) -> io::Result<(Owner, R, WorkerPermit)> {
+    let slot = Arc::new(slots.claim()?);
+    let permit = WorkerPermit(Arc::clone(&slot));
+    let (requests, receive) = sync_channel::<Ack>(1);
     let requests = Arc::new(requests);
     let alive = Arc::downgrade(&requests);
     let (ready, registered) = sync_channel(1);
@@ -108,8 +138,12 @@ fn start_with_slots<T, R: Send + 'static>(
                     return;
                 }
             };
-            while receive.recv().is_ok() && alive.strong_count() != 0 {
-                _ = restart(&mut watcher);
+            while let Ok(ack) = receive.recv() {
+                if alive.strong_count() == 0 {
+                    ack(Err(io::ErrorKind::BrokenPipe.into()));
+                    break;
+                }
+                ack(restart(&mut watcher));
             }
             drop(watcher);
         })?;
@@ -123,7 +157,7 @@ fn start_with_slots<T, R: Send + 'static>(
     let result = registered
         .recv()
         .map_err(|_| io::Error::other("directory watcher backend exited during registration"))??;
-    Ok((owner, result))
+    Ok((owner, result, permit))
 }
 
 #[cfg(test)]
@@ -144,8 +178,9 @@ mod tests {
             }
         }
 
-        let (mut owner, ()) =
+        let (mut owner, (), permit) =
             start_with_slots(&SLOTS, move || Ok((Gated(entered, gate), ())), |_| Ok(())).unwrap();
+        drop(permit);
         let thread = owner.thread.take().unwrap();
         drop(owner);
         entering.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -153,7 +188,7 @@ mod tests {
             .err()
             .expect("a stuck owner must still count");
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(error.to_string().contains("backend-owner limit"));
+        assert!(error.to_string().contains("worker-pair limit"));
         drop(release);
         thread.join().unwrap();
         assert!(start_with_slots(&SLOTS, || Ok(((), ())), |_| Ok(())).is_ok());
@@ -162,7 +197,7 @@ mod tests {
     #[test]
     fn restart_reuses_the_backend_and_retries_after_a_failure() {
         let (send, receive) = sync_channel(4);
-        let (mut owner, ()) = start(
+        let (mut owner, (), _permit) = start(
             || Ok((0, ())),
             move |calls| {
                 *calls += 1;
@@ -176,12 +211,55 @@ mod tests {
         .unwrap();
         let restart = owner.restart_handle();
         for expected in [1, 2] {
-            restart.request();
+            let (send, ack) = sync_channel(1);
+            restart.request(move |result| {
+                _ = send.send(result);
+            });
             assert_eq!(
                 receive.recv_timeout(Duration::from_secs(5)).unwrap(),
                 expected
             );
+            assert_eq!(
+                ack.recv_timeout(Duration::from_secs(5)).unwrap().is_ok(),
+                expected == 2
+            );
         }
+        let thread = owner.thread.take().unwrap();
+        drop(owner);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn native_restart_acknowledges_completion_not_entry() {
+        let (entered, entering) = sync_channel(1);
+        let (release, gate) = sync_channel::<()>(0);
+        let (mut owner, (), _permit) = start(
+            || Ok(((), ())),
+            move |_| {
+                entered.send(()).unwrap();
+                _ = gate.recv();
+                Err(io::ErrorKind::PermissionDenied.into())
+            },
+        )
+        .unwrap();
+        let (ack, acknowledged) = sync_channel(1);
+        owner.restart_handle().request(move |result| {
+            _ = ack.send(result);
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            acknowledged.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(release);
+        assert_eq!(
+            acknowledged
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
         let thread = owner.thread.take().unwrap();
         drop(owner);
         thread.join().unwrap();

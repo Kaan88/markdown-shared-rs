@@ -2851,8 +2851,9 @@ reads under the captured root and rewrites only the reported path, so changing t
 directory cannot redirect its metadata reads. A path whose parent is not the root is dropped.
 
 Drop stops delivery, then signals native teardown without waiting for either thread. A
-filesystem call already in progress may keep its thread occupied. At most 64 backend owners
-may be outstanding per process, including owners blocked in teardown. The builder returns
+filesystem call already in progress may keep its thread occupied. At most 64 watcher worker
+pairs may be outstanding per process. Each pair keeps its slot until **both** the backend
+owner and the metadata worker exit, including after drop. The builder returns
 `WouldBlock` at the limit; the older constructors still return `None`. Only `NotFound` counts as
 absence in a metadata read: a creation that vanished is dropped, and a modification or rename
 whose destination vanished becomes a removal. Other errors invalidate the incremental batch
@@ -2869,23 +2870,32 @@ still present, a rescan is the fallback. Without periodic reconciliation this is
 **Periodic reconciliation.** On Windows the default is 30 seconds: missed changes are
 eventually found without constantly reading large or remote folders. It is off by default
 on other platforms. `reconcile_interval(None)` or zero disables it; positive intervals
-below one second are rounded up to one second. The worker requests re-registration on the
-existing native backend and does a strict directory read. Restart work is off the worker and
-caller threads, with at most one request pending. A failed re-registration can be retried
-on the next cycle. A slow read cannot stack up more reads: there is one worker, and the
-interval starts again after the read finishes.
+below one second are rounded up to one second. The worker waits for the native owner to
+acknowledge its re-registration attempt before doing a strict directory read. It can still
+handle native events while waiting. On a reported restart failure, periodic scans continue
+without further restart attempts. A native restart that never returns cannot acknowledge the
+cycle. A slow read cannot stack up more reads. A pending native
+burst settles first, and a callback arriving during the read or diff discards that scan and
+triggers a retry after the burst settles. This lets a native rename transfer selection before
+an inferred removal or creation can replace the selected row.
 
 With `initial_entries` from the caller's unfiltered list, the worker starts with that
-baseline and keeps it in step with the changes it reports. Otherwise the first complete
-read reports `Rescan` on the usual path to establish a baseline; the caller handles it as
-any other rescan (read off the drawing thread). Later reads report removals, creations and
-metadata changes through `Changed`; no rename identity is inferred from a snapshot.
+baseline and keeps it in step with the changes it reports. When it needs a new baseline,
+the first complete read queues `Rescan` with the exact entries used for comparison.
+Call `woken()` and `take_with_snapshot()` to drain both atomically; install the snapshot
+for that `Rescan` and then apply later signals in order. As before, an unaccompanied `Rescan`
+requires an independent read. Legacy `take()` discards a supplied snapshot and returns a
+standalone `Rescan`; recovery does not assume that the independent read installed the worker's
+entries, and the next complete scan offers a fresh snapshot. Once a baseline is shared,
+later reads report removals, creations and metadata changes through `Changed`. No rename
+identity is inferred from a snapshot.
 An incomplete read is never used as a snapshot. If opening the root says it no longer
 exists or is not a directory, the worker reports `Lost`. Native notification failures are
 still not observable as such, and snapshots cannot recover changes that happen and undo
 themselves between reads.
 
-**Public API.** `DirWatcher` (`new`, `with_debounce`, `builder`, `folder`, `take`, `woken`),
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `builder`, `folder`, `take`,
+`take_with_snapshot`, `woken`),
 `DirWatcherBuilder` (`debounce`, `reconcile_interval`, `initial_entries`, `start`), `Signal`
 (`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
 `deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. No existing public
@@ -2987,6 +2997,13 @@ deadline or the owner cap failed the corresponding fake-backend test. Linux x86-
 passed with the `pkg-config` stub on Rust 1.100.0, without linking or running anything for
 Linux. The reconciliation test uses a silent fake backend; it does not reproduce a native
 overflow or stalled SMB share. macOS was not checked in this round.
+
+Second re-review: all six checks passed (Windows Rust 1.99.1 fmt, workspace and
+no-default-features Clippy, all-features `mdshared-app` tests with 655 passed and one
+ignored, Linux x86-64 Clippy with the stub, and the catalogue check). Fake-clock or
+channel-gated regressions failed when scan ordering, snapshot invalidation, the shared
+permit, or restart acknowledgement was disabled. Linux was type-checked only; macOS and
+real Windows restart failures, overflows and blocked network calls were not exercised.
 
 ## X13. The Markdown page renderer
 

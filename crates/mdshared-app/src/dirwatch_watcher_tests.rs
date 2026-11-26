@@ -284,7 +284,7 @@ fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
 
     let (started, teardown) = channel();
     let (release, gate) = channel();
-    let (mut backend, ()) =
+    let (mut backend, (), _permit) =
         backend::start(move || Ok((GatedBackend(started, gate), ())), |_| Ok(())).unwrap();
     let owner_thread = backend.thread.take().unwrap();
     let inbox = Arc::new(Inbox::default());
@@ -306,6 +306,64 @@ fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
     assert!(inbox.stopped());
     dropping.join().unwrap();
     owner_thread.join().unwrap();
+}
+
+#[test]
+fn dropping_a_watcher_with_a_stalled_scan_keeps_the_slot_until_both_threads_exit() {
+    use std::sync::mpsc::channel;
+
+    static SLOTS: backend::Slots = backend::Slots::new(1);
+    let start = || backend::start_with_slots(&SLOTS, || Ok(((), ())), |_| Ok(()));
+    let (mut owner, (), permit) = start().unwrap();
+    let restart = owner.restart_handle();
+    let owner_thread = owner.thread.take().unwrap();
+    let inbox = Arc::new(Inbox::default());
+    let shared = Arc::new(Shared::default());
+    let now = Instant::now();
+    let mut periodic = Periodic::new(Duration::from_secs(1), now, None).unwrap();
+    periodic.make_due(now);
+    let mut worker = Worker {
+        inbox: Arc::clone(&inbox),
+        shared: Arc::clone(&shared),
+        coalescer: Coalescer::new(folder(), DEBOUNCE),
+        read: Arc::new(|_| panic!("no incremental events")),
+        root: folder(),
+        started: None,
+        periodic: Some(periodic),
+    };
+    let watcher = DirWatcher {
+        folder: folder(),
+        _backend: owner,
+        inbox,
+        shared,
+    };
+    let (entered, entering) = channel();
+    let (release, gate) = channel::<()>();
+    let for_ack = Arc::clone(&worker.inbox);
+    let worker_thread = permit
+        .spawn(move || {
+            worker.run_with_scan(
+                &|| panic!("a stopped watcher cannot report"),
+                &|| {
+                    let for_ack = Arc::clone(&for_ack);
+                    restart.request(move |result| for_ack.restart_finished(result.is_ok()));
+                },
+                &|_| {
+                    entered.send(()).unwrap();
+                    _ = gate.recv();
+                    Ok(Some(Default::default()))
+                },
+            );
+        })
+        .unwrap();
+
+    entering.recv_timeout(Duration::from_secs(5)).unwrap();
+    drop(watcher);
+    owner_thread.join().unwrap();
+    assert_eq!(start().err().unwrap().kind(), io::ErrorKind::WouldBlock);
+    drop(release);
+    worker_thread.join().unwrap();
+    assert!(start().is_ok());
 }
 
 /// The thread reads no path after the watcher is dropped, even when a report had several.
@@ -444,6 +502,7 @@ fn a_silent_backend_still_recovers_the_listing_and_gets_a_restart_request() {
         started: None,
         periodic: Some(periodic),
     };
+    let for_ack = Arc::clone(&inbox);
     let thread = std::thread::spawn(move || {
         worker.run(
             &|| {
@@ -451,6 +510,7 @@ fn a_silent_backend_still_recovers_the_listing_and_gets_a_restart_request() {
             },
             || {
                 _ = restart.send(());
+                for_ack.restart_finished(true);
             },
         )
     });

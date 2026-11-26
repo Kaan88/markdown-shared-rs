@@ -692,7 +692,8 @@ impl DirWatcherBuilder {
     /// Supplies the caller's current full listing as the first comparison baseline.
     ///
     /// Use unfiltered entries with paths under the folder spelling passed to the builder.
-    /// Without a baseline, the first successful recovery scan requests a [`Signal::Rescan`].
+    /// Without a baseline, the first successful recovery scan provides a snapshot through
+    /// [`DirWatcher::take_with_snapshot`].
     /// This setting has no effect when recovery is disabled.
     pub fn initial_entries(mut self, entries: Vec<Entry>) -> Self {
         self.initial = Some(entries);
@@ -700,7 +701,7 @@ impl DirWatcherBuilder {
     }
 
     /// Registers the watcher and starts its worker. Unlike [`DirWatcher::new`], this returns
-    /// an error with details, including `WouldBlock` when 64 native owners are outstanding.
+    /// an error with details, including `WouldBlock` when 64 watcher worker pairs are outstanding.
     pub fn start(self, wake: impl Fn() + Send + Sync + 'static) -> io::Result<DirWatcher> {
         let root = notify_root(&self.folder)?;
         let read_root = root.clone();
@@ -795,7 +796,7 @@ impl DirWatcher {
         let for_events = Arc::clone(&inbox);
         let watch_root = root.clone();
         let restart_root = root.clone();
-        let (backend, identity) = backend::start(
+        let (backend, identity, permit) = backend::start(
             move || {
                 let mut watcher =
                     notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -838,9 +839,13 @@ impl DirWatcher {
         };
         let restart = backend.restart_handle();
         // The handle is dropped at once: the thread is not waited for. See `DirWatcher`.
-        _ = std::thread::Builder::new()
-            .name("mdshared-dirwatch".to_string())
-            .spawn(move || worker.run(&wake, || restart.request()))?;
+        let for_ack = Arc::clone(&inbox);
+        _ = permit.spawn(move || {
+            worker.run(&wake, || {
+                let for_ack = Arc::clone(&for_ack);
+                restart.request(move |result| for_ack.restart_finished(result.is_ok()));
+            });
+        })?;
         Ok(DirWatcher {
             folder,
             _backend: backend,
@@ -857,11 +862,26 @@ impl DirWatcher {
     /// The settled reports waiting, in the order they were settled, and forgets them.
     ///
     /// A pending rescan supersedes incremental changes; a lost watch supersedes both.
+    /// This method discards any attached snapshot; recovery will not assume an
+    /// independent reread installed the same entries. Use [`Self::take_with_snapshot`]
+    /// to install the exact snapshot and continue with incremental recovery.
     ///
     /// Call [`woken`](Self::woken) before this, as [`FileWatcher::woken`](crate::watch::FileWatcher::woken)
     /// is called, so a report settled during the call wakes again instead of being missed.
     pub fn take(&self) -> Vec<Signal> {
         self.shared.take()
+    }
+
+    /// Drains reports and any exact directory snapshot attached to the first `Rescan`.
+    ///
+    /// Call [`Self::woken`] first. If entries are present, install them with
+    /// [`crate::dirlist::Listing::set_entries`] instead of rereading for that first signal.
+    /// Then apply the subsequent signals in order. `Some` with no entries means the folder
+    /// was empty; `None` means there is no snapshot and a `Rescan` still needs a full read.
+    /// The watcher compares future changes with the entries returned by this call, so
+    /// install them before applying or taking any later reports.
+    pub fn take_with_snapshot(&self) -> (Vec<Signal>, Option<Vec<Entry>>) {
+        self.shared.take_with_snapshot()
     }
 
     /// Says the reports taken so far have been dealt with, so the next one wakes again.
