@@ -241,10 +241,10 @@ fn a_hidden_junction_is_listed_and_hidden() {
         junction.hidden,
         "the link's own hidden attribute is what hides it"
     );
-    assert_ne!(
+    assert_eq!(
         junction.kind,
-        Kind::File,
-        "a junction is the system's own kind of directory, or at worst other"
+        Kind::Other,
+        "a junction is a reparse point, which the scan reports as a link, so it is not followed"
     );
 }
 

@@ -36,10 +36,11 @@
 //! names sits directly in that folder: a rename out of the folder is a removal, a rename into it
 //! a creation, and the folder itself is not one of its entries.
 //!
-//! Links are never followed. An entry that is a symbolic link is [`Kind::Other`], so a link to a
-//! dead share or a loop cannot stall the read of the folder or send it anywhere else; a Windows
-//! junction, which the system itself reports as a directory, is a [`Kind::Folder`]. The hidden
-//! flag and the times are the link's own, not its target's.
+//! Links are never followed. An entry that is a symbolic link or a Windows junction is
+//! [`Kind::Other`], so a link to a dead share or a loop cannot stall the read of the folder or
+//! send it anywhere else; the system reports a junction as a link too, and what it points at is
+//! the follow that would cost the read. The hidden flag and the times are the link's own, not
+//! its target's.
 //!
 //! Deliberately not here:
 //!
@@ -76,7 +77,7 @@ pub enum Kind {
     /// A plain file.
     File,
     /// Neither a file nor a folder, and nothing this module follows: a symbolic link (to a
-    /// file, a folder, a dead path or itself), a device, a socket, a pipe.
+    /// file, a folder, a dead path or itself), a Windows junction, a device, a socket, a pipe.
     Other,
 }
 
@@ -137,8 +138,8 @@ fn name_of(path: &Path) -> String {
 /// Builds an entry from a path and the details the system gave for the entry itself.
 ///
 /// `file_type` is what the folder scan gave, so a link is known to be a link without opening
-/// anything; it is [`Kind::Other`], except that a type the system itself calls a directory (a
-/// Windows junction) is a folder. Nothing here follows a link.
+/// anything, and it is [`Kind::Other`]: the scan calls a Windows junction a link as well, and
+/// asking what a link points at is the follow this module refuses. Nothing here follows a link.
 fn entry_of(path: PathBuf, name: String, file_type: &FileType, meta: &Metadata) -> Entry {
     let kind = if file_type.is_symlink() {
         Kind::Other

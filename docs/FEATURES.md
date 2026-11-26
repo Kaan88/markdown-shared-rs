@@ -1990,12 +1990,14 @@ the window is never in that call.
 
 **Links are never followed.** `read` uses the scan's own `DirEntry::file_type` and
 `DirEntry::metadata` (on Windows both come from the folder scan, so neither costs another
-read), and `Entry::at` uses `symlink_metadata`. A symbolic link is `Kind::Other` whatever it
-points at, so a link to a dead share, a link to another folder or a link to itself cannot stall
-the read of the folder or send it anywhere else; a Windows junction, which the system itself
-reports as a directory, is a `Kind::Folder`. The hidden flag and the times are the link's own,
-never its target's, which is what makes a hidden junction such as `C:\Documents and Settings`
-come out hidden; the junction test sets the attribute on the link itself and checks it.
+read), and `Entry::at` uses `symlink_metadata`. A symbolic link or a Windows junction is
+`Kind::Other` whatever it points at, so a link to a dead share, a link to another folder or a
+link to itself cannot stall the read of the folder or send it anywhere else. A junction cannot
+be told from a symbolic link without asking what it points at — the scan and the link's own
+metadata both call it a link — and that question is the follow this refuses, so no link is ever
+a `Kind::Folder`; it is listed, with the link's own hidden flag and times, which is what makes a
+hidden junction such as `C:\Documents and Settings` come out hidden. The junction test sets the
+attribute on the link itself and checks that it is listed, hidden and Other.
 
 **What an entry holds.** Name, kind, size, modified and created times, and the hidden flag: the
 `FILE_ATTRIBUTE_HIDDEN` attribute on Windows, a leading dot elsewhere. The times are
@@ -2038,7 +2040,8 @@ Tests, `dirlist_tests.rs` (20) and one in `mdshared-ui`'s `select`:
   elsewhere), and a hidden junction on Windows is listed and hidden (skipped with a note where
   `mklink /J` is not available);
 - a link to a folder, a dead link and a link to itself are all listed as `Kind::Other` and the
-  folder is still read to its end (skipped with a note where the machine will not make links);
+  folder is still read to its end (skipped with a note where the machine will not make links),
+  and a junction is Other as well;
 - every column sorts with the folders first, the name sort is natural, the direction turns, the
   name then the path settle every tie, and a click turns a column round;
 - the filter and the hidden switch narrow the list, together, and their remap says what went;
