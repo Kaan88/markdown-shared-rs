@@ -154,6 +154,9 @@ pub fn pick_save_async(
 }
 
 #[cfg(windows)]
+mod clipboard_owner;
+
+#[cfg(windows)]
 mod imp {
     use super::*;
     use crate::tokens::SystemColors;
@@ -161,8 +164,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
     use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
-        SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
         GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
@@ -179,10 +182,10 @@ mod imp {
     }
 
     /// Opens the clipboard, retrying briefly; returns whether it is now open.
-    fn open_clipboard() -> bool {
+    fn open_clipboard(owner: HWND) -> bool {
         for _ in 0..10 {
-            // SAFETY: a null owner window is allowed; associates with the current task.
-            if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            // SAFETY: readers may pass NULL; writers pass their own live window.
+            if unsafe { OpenClipboard(owner) } != 0 {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -191,16 +194,25 @@ mod imp {
     }
 
     pub fn clipboard_text() -> Option<String> {
-        if !open_clipboard() {
+        clipboard_text_with_limit(None)
+    }
+
+    pub(super) fn clipboard_may_have_text() -> bool {
+        // SAFETY: the format query needs neither an open clipboard nor a buffer.
+        unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 }
+    }
+
+    pub(super) fn clipboard_text_with_limit(limit: Option<usize>) -> Option<String> {
+        if !open_clipboard(std::ptr::null_mut()) {
             return None;
         }
-        let result = read_clipboard_open();
+        let result = read_clipboard_open(limit);
         // SAFETY: the clipboard was opened by this thread above.
         unsafe { CloseClipboard() };
         result
     }
 
-    fn read_clipboard_open() -> Option<String> {
+    fn read_clipboard_open(limit: Option<usize>) -> Option<String> {
         // SAFETY: the clipboard is open; the returned handle is owned by the system.
         let h: HANDLE = unsafe { GetClipboardData(CF_UNICODETEXT) };
         if h.is_null() {
@@ -214,12 +226,12 @@ mod imp {
         // SAFETY: h is locked, so querying its size is valid.
         let max = unsafe { GlobalSize(h) } / 2;
         // SAFETY: ptr points to `max` readable u16 units while the lock is held.
-        let units = unsafe { std::slice::from_raw_parts(ptr, max) };
-        let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-        let text = String::from_utf16_lossy(&units[..len]);
+        let scan = max.min(limit.map_or(max, |n| n.saturating_add(1)));
+        let units = unsafe { std::slice::from_raw_parts(ptr, scan) };
+        let text = super::clipboard_owner::decode_text(units, limit);
         // SAFETY: matches the GlobalLock above.
         unsafe { GlobalUnlock(h) };
-        Some(text.replace("\r\n", "\n"))
+        text
     }
 
     /// Text and HTML together: CF_UNICODETEXT and "HTML Format". The text is what counts; the
@@ -231,7 +243,7 @@ mod imp {
         cf.push(0);
         // SAFETY: a NUL-terminated UTF-16 name.
         let format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
-        if !open_clipboard() {
+        if !super::clipboard_owner::window().is_some_and(open_clipboard) {
             return false;
         }
         // SAFETY: the clipboard was opened by this thread above.
@@ -254,7 +266,7 @@ mod imp {
     pub fn clipboard_html_format() -> Option<Vec<u8>> {
         // SAFETY: a NUL-terminated UTF-16 name.
         let format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
-        if format == 0 || !open_clipboard() {
+        if format == 0 || !open_clipboard(std::ptr::null_mut()) {
             return None;
         }
         // SAFETY: the clipboard is open; the returned handle is owned by the system.
@@ -316,7 +328,7 @@ mod imp {
         };
         let data = wide(text);
         let bytes = data.len() * 2;
-        if !open_clipboard() {
+        if !super::clipboard_owner::window().is_some_and(open_clipboard) {
             return false;
         }
         let ok = write_clipboard_open(&data, bytes);
@@ -949,6 +961,37 @@ mod imp {
     pub fn clipboard_text() -> Option<String> {
         with_clipboard(|c| c.get_text().ok())
     }
+
+    pub(super) fn clipboard_may_have_text() -> bool {
+        // arboard's Linux backends expose no metadata-only query for text.
+        #[cfg(not(target_os = "macos"))]
+        return true;
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+            use objc2_foundation::NSArray;
+            // SAFETY: AppKit exports a live, immutable NSString for this type.
+            let string = unsafe { NSPasteboardTypeString };
+            NSPasteboard::generalPasteboard()
+                .availableTypeFromArray(&NSArray::from_slice(&[string]))
+                .is_some()
+        }
+    }
+
+    pub(super) fn clipboard_text_with_limit(limit: usize) -> Option<String> {
+        #[cfg(not(target_os = "macos"))]
+        return clipboard_text().filter(|s| s.len() <= limit);
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+            // SAFETY: AppKit exports a live, immutable NSString for this type.
+            let string = unsafe { NSPasteboardTypeString };
+            let value = NSPasteboard::generalPasteboard().stringForType(string)?;
+            // The pasteboard supplies an NSString; cap the UTF-16 length before scanning for
+            // the UTF-8 byte count, then cap again before copying into a Rust String.
+            (value.length() <= limit && value.len_utf8() <= limit).then(|| value.to_string())
+        }
+    }
     pub fn set_clipboard_text(text: &str) -> bool {
         with_clipboard(|c| c.set_text(text).ok()).is_some()
     }
@@ -1397,6 +1440,17 @@ mod imp {
 /// UTF-8 text from the clipboard, if any.
 pub fn clipboard_text() -> Option<String> {
     imp::clipboard_text()
+}
+
+pub(crate) fn clipboard_may_have_text() -> bool {
+    imp::clipboard_may_have_text()
+}
+
+pub(crate) fn clipboard_text_bounded(limit: usize) -> Option<String> {
+    #[cfg(windows)]
+    return imp::clipboard_text_with_limit(Some(limit));
+    #[cfg(not(windows))]
+    imp::clipboard_text_with_limit(limit)
 }
 /// Puts text on the clipboard. Returns false on failure.
 pub fn set_clipboard_text(text: &str) -> bool {
@@ -2303,11 +2357,25 @@ mod explorer_tests {
     }
 
     #[test]
-    fn clipboard_round_trip() {
+    fn clipboard_round_trip_has_a_real_windows_owner() {
         let _lock = clipboard_lock();
         let s = "İstanbul ı ğ 😀 ok\nsecond line";
         assert!(set_clipboard_text(s));
+        // SAFETY: this query takes no arguments and returns the clipboard's current owner.
+        let owner = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardOwner() };
+        assert_eq!(
+            Some(owner),
+            clipboard_owner::window(),
+            "the writer's window must own the clipboard"
+        );
+        assert!(!owner.is_null());
+        assert!(clipboard_may_have_text());
         assert_eq!(clipboard_text().as_deref(), Some(s));
+        assert_eq!(
+            clipboard_text_bounded(s.len() + 1).as_deref(),
+            Some(s.replace('\n', "\r\n").as_str())
+        );
+        assert!(clipboard_text_bounded(4).is_none());
     }
 
     #[test]

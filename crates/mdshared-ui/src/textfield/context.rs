@@ -16,16 +16,24 @@ pub enum ContextAction {
     SelectAll,
 }
 
-trait Clipboard {
-    fn read(&mut self) -> Option<String>;
+/// Maximum UTF-8 byte length a field will accept from the clipboard, before single-line cleaning.
+pub const MAX_PASTE_BYTES: usize = 64 * 1024;
+
+pub(super) trait Clipboard {
+    fn may_have_text(&mut self) -> bool;
+    fn read(&mut self, limit: usize) -> Option<String>;
     fn write(&mut self, text: &str) -> bool;
 }
 
-struct SystemClipboard;
+pub(super) struct SystemClipboard;
 
 impl Clipboard for SystemClipboard {
-    fn read(&mut self) -> Option<String> {
-        platform::clipboard_text()
+    fn may_have_text(&mut self) -> bool {
+        platform::clipboard_may_have_text()
+    }
+
+    fn read(&mut self, limit: usize) -> Option<String> {
+        platform::clipboard_text_bounded(limit)
     }
 
     fn write(&mut self, text: &str) -> bool {
@@ -35,7 +43,8 @@ impl Clipboard for SystemClipboard {
 
 impl TextField {
     /// The four items for a [`crate::menu::Menu`] or [`crate::submenu::Cascade`]. Call when
-    /// opening the menu so the enabled state reflects the current selection and clipboard.
+    /// opening the menu. Paste is enabled when text is advertised or the platform cannot
+    /// cheaply check. The clipboard payload is not read until Paste is chosen.
     /// A secret field never consults the clipboard; only Select all can be enabled.
     pub fn context_menu(&self) -> Vec<Item<ContextAction>> {
         self.context_menu_with(&mut SystemClipboard)
@@ -51,8 +60,8 @@ impl TextField {
 
     fn context_menu_with(&self, clipboard: &mut impl Clipboard) -> Vec<Item<ContextAction>> {
         use ContextAction::*;
-        let can_copy = !self.secret && self.has_selection();
-        let can_paste = !self.secret && paste_text(clipboard.read().as_deref()).is_some();
+        let can_copy = self.selection_for_export().is_some();
+        let can_paste = !self.secret && clipboard.may_have_text();
         vec![
             Item::new(Cut, "Cut").enabled(can_copy),
             Item::new(Copy, "Copy").enabled(can_copy),
@@ -61,15 +70,19 @@ impl TextField {
         ]
     }
 
-    fn apply_with(&mut self, action: ContextAction, clipboard: &mut impl Clipboard) -> bool {
+    pub(super) fn apply_with(
+        &mut self,
+        action: ContextAction,
+        clipboard: &mut impl Clipboard,
+    ) -> bool {
         use ContextAction::*;
         match action {
-            Cut | Copy if !self.secret && self.has_selection() => {
-                clipboard.write(self.selected_text()) && (action == Copy || self.delete_selection())
+            Cut | Copy => {
+                self.selection_for_export()
+                    .is_some_and(|text| clipboard.write(text))
+                    && (action == Copy || self.delete_selection())
             }
-            Paste if !self.secret => {
-                paste_text(clipboard.read().as_deref()).is_some_and(|text| self.insert(text))
-            }
+            Paste => self.paste_with(true, false, clipboard),
             SelectAll if !self.is_empty() => {
                 self.select_all();
                 true
@@ -77,10 +90,30 @@ impl TextField {
             _ => false,
         }
     }
-}
 
-fn paste_text(text: Option<&str>) -> Option<&str> {
-    text.filter(|text| !super::clean(text).is_empty())
+    pub(super) fn paste_with(
+        &mut self,
+        allowed: bool,
+        first_line: bool,
+        clipboard: &mut impl Clipboard,
+    ) -> bool {
+        if !allowed || self.secret {
+            return false;
+        }
+        let Some(text) = clipboard
+            .read(MAX_PASTE_BYTES)
+            .filter(|text| text.len() <= MAX_PASTE_BYTES)
+        else {
+            return false;
+        };
+        let text = if first_line {
+            text.lines().next().unwrap_or("")
+        } else {
+            text.as_str()
+        };
+        let clean = super::clean(text);
+        !clean.is_empty() && self.insert_clean(&clean)
+    }
 }
 
 #[cfg(test)]
@@ -90,14 +123,22 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         text: Option<String>,
+        probes: usize,
         reads: usize,
+        requested_limit: Option<usize>,
         writes: usize,
         fail_write: bool,
     }
 
     impl Clipboard for Fake {
-        fn read(&mut self) -> Option<String> {
+        fn may_have_text(&mut self) -> bool {
+            self.probes += 1;
+            self.text.is_some()
+        }
+
+        fn read(&mut self, limit: usize) -> Option<String> {
             self.reads += 1;
+            self.requested_limit = Some(limit);
             self.text.clone()
         }
 
@@ -121,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_rows_follow_selection_and_usable_clipboard_text() {
+    fn menu_rows_follow_selection_and_advertised_clipboard_text() {
         let mut f = TextField::new();
         let mut clipboard = Fake::default();
         assert_eq!(
@@ -145,7 +186,8 @@ mod tests {
         assert_eq!(enabled(&f, &mut clipboard), [Cut, Copy, Paste, SelectAll]);
         for text in [None, Some(""), Some("\0")] {
             clipboard.text = text.map(str::to_owned);
-            assert_eq!(enabled(&f, &mut clipboard), [Cut, Copy, SelectAll]);
+            let rows = enabled(&f, &mut clipboard);
+            assert_eq!(rows.contains(&Paste), text.is_some());
             assert!(!f.apply_with(Paste, &mut clipboard));
             assert_eq!(f.selected_text(), "Jane");
         }
@@ -194,10 +236,73 @@ mod tests {
         for action in [Cut, Copy, Paste] {
             assert!(!f.apply_with(action, &mut clipboard));
         }
-        assert_eq!(f.selected_text(), "secret");
-        assert_eq!((clipboard.reads, clipboard.writes), (0, 0));
+        assert!(f.has_selection());
+        assert_eq!(f.selection_for_export(), None);
+        assert_eq!(
+            (clipboard.probes, clipboard.reads, clipboard.writes),
+            (0, 0, 0)
+        );
         // The public system adapters are safe to call in the secret case as well.
         assert!(!f.context_menu()[2].enabled);
         assert!(!f.apply_context_action(Paste));
+    }
+
+    #[test]
+    fn menu_only_probes_and_oversized_paste_reads_once_without_editing() {
+        let mut f = TextField::new();
+        f.set_text("replace");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some(format!("x{}", "\x01".repeat(MAX_PASTE_BYTES))),
+            ..Fake::default()
+        };
+        assert!(enabled(&f, &mut clipboard).contains(&Paste));
+        assert_eq!((clipboard.probes, clipboard.reads), (1, 0));
+        assert!(!f.apply_with(Paste, &mut clipboard));
+        assert_eq!(clipboard.reads, 1);
+        assert_eq!(clipboard.requested_limit, Some(MAX_PASTE_BYTES));
+        assert_eq!(f.selection_for_export(), Some("replace"));
+        clipboard.text = Some("x".repeat(MAX_PASTE_BYTES));
+        assert!(f.apply_with(Paste, &mut clipboard));
+        assert_eq!(clipboard.reads, 2);
+        assert_eq!(f.text().len(), MAX_PASTE_BYTES);
+    }
+
+    #[test]
+    fn keyboard_checks_permission_before_reading_and_both_pastes_clean_unicode_separators() {
+        use crate::keys::{KeyName, Mods};
+        let mut f = TextField::new();
+        let mut clipboard = Fake {
+            text: Some("a\u{2028}b\u{2029}c".to_owned()),
+            ..Fake::default()
+        };
+        let mods = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let key = KeyName::Char('v');
+        f.set_text("kept");
+        f.select_all();
+        assert_eq!(
+            f.handle_key_with(&key, mods, None, false, &mut clipboard),
+            Some(false)
+        );
+        f.set_secret(true);
+        assert_eq!(
+            f.handle_key_with(&key, mods, None, true, &mut clipboard),
+            Some(false)
+        );
+        assert_eq!(clipboard.reads, 0);
+        assert_eq!(f.text(), "kept");
+        f.set_secret(false);
+        assert_eq!(
+            f.handle_key_with(&key, mods, None, true, &mut clipboard),
+            Some(true)
+        );
+        assert_eq!(f.text(), "a b c");
+        f.select_all();
+        assert!(f.apply_with(Paste, &mut clipboard));
+        assert_eq!(f.text(), "a b c");
+        assert_eq!(clipboard.reads, 2);
     }
 }

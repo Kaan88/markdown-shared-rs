@@ -253,7 +253,7 @@ impl App for Demo {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fields = std::array::from_fn(|_| TextField::new());
     fields[0]
-        .set_text("Click, Shift+click, or drag past an edge to select more of this long line.");
+        .set_text("abc אבג def — cafe\u{301}; drag past either edge to select more of this line.");
     fields[1].set_text("not a real password");
     fields[1].set_secret(true);
     host::run(

@@ -44,10 +44,12 @@ use crate::keys::{KeyName, Mods};
 use std::time::Duration;
 
 mod context;
+mod diagnostic;
 mod draw;
+mod line;
 mod pointer;
 
-pub use context::ContextAction;
+pub use context::{ContextAction, MAX_PASTE_BYTES};
 pub use pointer::{FieldHit, Pointer};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +95,8 @@ pub struct TextField {
     caret: usize,
     /// Byte offset of the other end of the selection; equal to `caret` when nothing is selected.
     anchor: usize,
+    /// Which visual side of a bidi boundary the pointer chose.
+    affinity: Option<parley::Affinity>,
     /// Horizontal scroll in logical px.
     scroll: f32,
     /// What an input method is composing, drawn at the caret until it is committed or dropped.
@@ -110,7 +114,7 @@ const MASK: char = '•';
 /// The text an input method is composing (winit's `Ime::Preedit`): drawn underlined where it will
 /// go, not yet part of the text. `cursor` is the input method's caret or selected clause in it,
 /// byte offsets.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Preedit {
     pub text: String,
     pub cursor: Option<(usize, usize)>,
@@ -135,6 +139,7 @@ impl TextField {
         TextField::default()
     }
 
+    /// The owner's raw value, including in a secret field. Do not log or export it blindly.
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -151,6 +156,7 @@ impl TextField {
     /// Makes the field a secret one: its text is drawn as dots and cannot be copied or cut.
     pub fn set_secret(&mut self, on: bool) {
         self.secret = on;
+        self.affinity = None;
     }
 
     pub fn is_secret(&self) -> bool {
@@ -169,8 +175,10 @@ impl TextField {
         }
     }
 
-    /// Sets or clears what an input method is composing at the caret. Returns true if it changed.
+    /// Sets or clears what an input method is composing. Invalid cursor offsets are discarded;
+    /// an empty composition clears the preedit. Returns true if the validated state changed.
     pub fn set_preedit(&mut self, preedit: Option<Preedit>) -> bool {
+        let preedit = preedit.and_then(|pre| Preedit::new(pre.text, pre.cursor));
         let changed = self.preedit != preedit;
         self.restart |= changed;
         self.preedit = preedit;
@@ -184,6 +192,7 @@ impl TextField {
     /// Replaces the text, caret at the end, no selection.
     pub fn set_text(&mut self, text: &str) {
         self.restart = true;
+        self.affinity = None;
         self.text = clean(text);
         self.caret = self.text.len();
         self.anchor = self.caret;
@@ -193,6 +202,7 @@ impl TextField {
 
     pub fn clear(&mut self) {
         self.restart = true;
+        self.affinity = None;
         self.preedit = None;
         self.text.clear();
         self.caret = 0;
@@ -202,6 +212,7 @@ impl TextField {
 
     pub fn select_all(&mut self) {
         self.restart = true;
+        self.affinity = None;
         self.anchor = 0;
         self.caret = self.text.len();
     }
@@ -214,22 +225,34 @@ impl TextField {
         (self.caret.min(self.anchor), self.caret.max(self.anchor))
     }
 
+    /// Raw owner access to the selected bytes, including in a secret field. Use
+    /// [`Self::selection_for_export`] for clipboard, drag payloads or other exports.
     pub fn selected_text(&self) -> &str {
         let (a, b) = self.sel_range();
         &self.text[a..b]
+    }
+
+    /// The selected text for export, or `None` when there is no selection or the field is secret.
+    pub fn selection_for_export(&self) -> Option<&str> {
+        (!self.secret && self.has_selection()).then(|| self.selected_text())
     }
 
     /// Inserts typed or pasted text at the caret, replacing the selection. Control characters are
     /// dropped; newlines and tabs become spaces. Returns true if the text changed.
     pub fn insert(&mut self, text: &str) -> bool {
         let clean = clean(text);
+        self.insert_clean(&clean)
+    }
+
+    fn insert_clean(&mut self, clean: &str) -> bool {
         self.restart = true;
+        self.affinity = None;
         self.preedit = None;
         if clean.is_empty() && !self.has_selection() {
             return false;
         }
         let (a, b) = self.sel_range();
-        self.text.replace_range(a..b, &clean);
+        self.text.replace_range(a..b, clean);
         self.caret = a + clean.len();
         self.anchor = self.caret;
         true
@@ -241,6 +264,7 @@ impl TextField {
             return false;
         }
         self.restart = true;
+        self.affinity = None;
         let (a, b) = self.sel_range();
         self.text.replace_range(a..b, "");
         self.caret = a;
@@ -315,6 +339,7 @@ impl TextField {
     /// a selection to its start/end. Returns true if the TEXT changed.
     pub fn key(&mut self, key: EditKey, word: bool, extend: bool) -> bool {
         self.restart = true;
+        self.affinity = None;
         match key {
             EditKey::Left | EditKey::Right | EditKey::Home | EditKey::End => {
                 let (a, b) = self.sel_range();
@@ -360,13 +385,25 @@ impl TextField {
     /// selection (Shift), deletion, Ctrl+A/C/X/V when `clipboard` is on, and typed text. `typed`
     /// is the text the key event produced. `None` when the key is not an editing key (the caller
     /// treats it as its own: Enter, Escape, Up, Down, Tab, a shortcut); otherwise whether the
-    /// TEXT changed. Paste takes the clipboard's first line.
+    /// TEXT changed. Paste takes the clipboard's first line, within [`MAX_PASTE_BYTES`], and is
+    /// never read for a secret field or when `clipboard` is false.
     pub fn handle_key(
         &mut self,
         key: &KeyName,
         mods: Mods,
         typed: Option<&str>,
         clipboard: bool,
+    ) -> Option<bool> {
+        self.handle_key_with(key, mods, typed, clipboard, &mut context::SystemClipboard)
+    }
+
+    fn handle_key_with(
+        &mut self,
+        key: &KeyName,
+        mods: Mods,
+        typed: Option<&str>,
+        clipboard: bool,
+        source: &mut impl context::Clipboard,
     ) -> Option<bool> {
         let (key, mods) = crate::keys::text_key(key.clone(), mods);
         let key = &key;
@@ -383,24 +420,16 @@ impl TextField {
                 false
             }
             KeyName::Char('c') if mods.ctrl && !mods.alt => {
-                if clipboard && self.has_selection() && !self.secret {
-                    crate::platform::set_clipboard_text(self.selected_text());
+                if clipboard {
+                    self.apply_with(ContextAction::Copy, source);
                 }
                 false
             }
             KeyName::Char('x') if mods.ctrl && !mods.alt => {
-                if clipboard && self.has_selection() && !self.secret {
-                    crate::platform::set_clipboard_text(self.selected_text());
-                    self.delete_selection()
-                } else {
-                    false
-                }
+                clipboard && self.apply_with(ContextAction::Cut, source)
             }
             KeyName::Char('v') if mods.ctrl && !mods.alt => {
-                match crate::platform::clipboard_text().filter(|_| clipboard) {
-                    Some(t) => self.insert(t.lines().next().unwrap_or("")),
-                    None => false,
-                }
+                self.paste_with(clipboard, true, source)
             }
             KeyName::Enter
             | KeyName::Escape
@@ -445,6 +474,7 @@ impl TextField {
     /// Shift.
     pub fn press(&mut self, x: f32, stops: &[f32], extend: bool) {
         self.restart = true;
+        self.affinity = None;
         let at = self.offset_at(x + self.scroll, stops);
         self.caret = at;
         if !extend {
@@ -455,6 +485,7 @@ impl TextField {
     /// Mouse drag to `x`: extends the selection from the press anchor.
     pub fn drag(&mut self, x: f32, stops: &[f32]) {
         self.restart = true;
+        self.affinity = None;
         self.caret = self.offset_at(x + self.scroll, stops);
     }
 
@@ -495,6 +526,7 @@ impl TextField {
             b += ch.len_utf8();
         }
         self.restart = true;
+        self.affinity = None;
         self.anchor = a;
         self.caret = b;
     }
@@ -585,14 +617,20 @@ impl TextField {
 
 /// Drops control characters; newlines and tabs become spaces.
 fn clean(text: &str) -> String {
-    text.replace("\r\n", "\n")
-        .chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
-            c if c.is_control() => None,
-            c => Some(c),
-        })
-        .collect()
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push(' ');
+            }
+            '\n' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -649,7 +687,8 @@ mod tests {
         at(&mut f, 5);
         assert_eq!(f.masked(f.caret), 4 * MASK.len_utf8());
         f.select_word_at(1.0, &stops("•••••"));
-        assert_eq!(f.selected_text(), "sk-ğü");
+        assert_eq!(f.caret(), (f.text().len(), 0));
+        assert_eq!(f.selection_for_export(), None);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{TextField, draw::reveal_scroll};
+use super::{TextField, draw::reveal_scroll, line::Line};
 use crate::{
     clicks::{ClickCounter, click_slop, within},
     cursor::Cursor,
@@ -48,8 +48,9 @@ impl FieldHit {
         (self.valid() && self.area.contains(at.0, at.1)).then_some(Cursor::Text)
     }
 
-    fn stops(self, field: &TextField, gfx: &mut Gfx) -> Vec<f32> {
-        gfx.caret_stops_at(self.face, self.size, &field.display(), self.scale)
+    fn line(self, shown: &str, gfx: &mut Gfx) -> Line {
+        let layout = gfx.field_layout(self.face, self.size, shown, self.scale, [0; 3]);
+        Line::new(&layout, self.scale)
     }
 }
 
@@ -122,25 +123,33 @@ impl Pointer {
             self.clicks.reset();
         }
         field.set_preedit(None);
-        let stops = hit.stops(field, gfx);
-        let total = stops.last().copied().unwrap_or_default();
-        field.scroll = field.scroll.clamp(0.0, (total + 1.0 - hit.area.w).max(0.0));
-        let x = at.0 - hit.area.x;
-        let base = match count {
-            _ if mods.shift || count == 1 => {
-                field.press(x, &stops, mods.shift);
-                None
-            }
-            2 => {
-                field.select_word_at(x, &stops);
-                Some(field.sel_range())
-            }
-            _ => {
+        let shown = field.display();
+        let line = hit.line(&shown, gfx);
+        let scroll = field
+            .scroll
+            .clamp(0.0, (line.width + 1.0 - hit.area.w).max(0.0));
+        let x = at.0 - snapped_origin(hit, scroll);
+        let word = (count == 2 && !mods.shift && !field.secret).then(|| line.word_at(&shown, x));
+        field.scroll = scroll;
+        let base = if mods.shift || count == 1 {
+            field.move_to_stop(line.hit(x), mods.shift);
+            None
+        } else {
+            if let Some(word) = word {
+                field.anchor = word.start;
+                field.move_to_stop(
+                    super::line::Stop {
+                        byte: word.end,
+                        affinity: parley::Affinity::Upstream,
+                    },
+                    true,
+                );
+            } else {
                 field.select_all();
-                Some(field.sel_range())
             }
+            Some(field.sel_range())
         };
-        reveal(field, &stops, hit.area.w);
+        reveal(field, &line, hit.area.w);
         self.held = Some(Held {
             start: at,
             at,
@@ -235,12 +244,17 @@ impl Pointer {
         if !hit.valid() {
             return false;
         }
-        let stops = hit.stops(field, gfx);
-        let before = (field.caret(), field.scroll);
+        let line = hit.line(&field.display(), gfx);
+        let before = (field.caret(), field.scroll, field.affinity);
         let x = held.at.0 - hit.area.x;
         let width = hit.area.w;
-        let (x, outside) = edge_target(x, width, field.scroll, &stops);
-        field.drag(x, &stops);
+        let (x, outside) = edge_target(x, width, field.scroll, &line);
+        let x = if outside == 0 {
+            held.at.0 - snapped_origin(hit, field.scroll)
+        } else {
+            x + field.scroll
+        };
+        field.move_to_stop(line.hit(x), true);
         // Dragging after a multi-click keeps at least the original word (or whole field).
         if let Some((lo, hi)) = held
             .base
@@ -250,16 +264,19 @@ impl Pointer {
                 field.anchor = hi;
             } else {
                 field.anchor = lo;
-                field.caret = field.caret.max(hi);
+                if field.caret < hi {
+                    field.caret = hi;
+                    field.affinity = Some(parley::Affinity::Upstream);
+                }
             }
         }
-        let total = reveal(field, &stops, width);
+        reveal(field, &line, width);
         let more = match outside {
             -1 => field.scroll > 0.0,
-            1 => field.scroll < (total + 1.0 - width).max(0.0),
+            1 => field.scroll < (line.width + 1.0 - width).max(0.0),
             _ => false,
         };
-        let changed = before != (field.caret(), field.scroll);
+        let changed = before != (field.caret(), field.scroll, field.affinity);
         if more && changed {
             self.deadline = now.checked_add(SCROLL_INTERVAL);
         }
@@ -267,26 +284,28 @@ impl Pointer {
     }
 }
 
-fn reveal(field: &mut TextField, stops: &[f32], width: f32) -> f32 {
-    let total = stops.last().copied().unwrap_or_default();
-    let index = field.text[..field.caret].chars().count();
-    field.scroll = reveal_scroll(field.scroll, stops[index], total, width);
-    total
+fn snapped_origin(hit: FieldHit, scroll: f32) -> f32 {
+    ((hit.area.x - scroll) * hit.scale).round() / hit.scale
+}
+
+fn reveal(field: &mut TextField, line: &Line, width: f32) {
+    field.scroll = reveal_scroll(
+        field.scroll,
+        line.x(field.shaped_stop(field.caret)),
+        line.width,
+        width,
+    );
 }
 
 /// A bounded look-ahead from the edge, advancing at least to the next hidden stop. A tiny
 /// overshoot must still scroll even when the caret stops are far apart.
-fn edge_target(x: f32, width: f32, scroll: f32, stops: &[f32]) -> (f32, i8) {
+fn edge_target(x: f32, width: f32, scroll: f32, line: &Line) -> (f32, i8) {
     if x < 0.0 {
-        let edge = stops
-            .iter()
-            .copied()
-            .filter(|&s| s < scroll)
-            .reduce(f32::max);
+        let edge = line.edges().filter(|&s| s < scroll).reduce(f32::max);
         (edge.map_or(x, |s| x.max(-MAX_STEP).min(s - scroll)), -1)
     } else if x >= width {
         let edge = scroll + (width - 1.0).max(0.0);
-        let next = stops.iter().copied().filter(|&s| s > edge).reduce(f32::min);
+        let next = line.edges().filter(|&s| s > edge).reduce(f32::min);
         (
             next.map_or(x, |s| x.min(width + MAX_STEP).max(s - scroll)),
             1,

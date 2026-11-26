@@ -1,7 +1,11 @@
 //! Drawing a single-line field into the caller's text rectangle.
 
-use super::{FieldColors, TextField};
+use super::{
+    FieldColors, TextField,
+    line::{Line, Stop},
+};
 use crate::gfx::{Face, Painter, Rect};
+use parley::Affinity;
 
 impl TextField {
     /// Draws text, selection and caret inside `area` (the text area, already inset from the box
@@ -39,20 +43,24 @@ impl TextField {
             None if self.secret => (self.masked(self.caret), self.masked(self.anchor)),
             None => (self.caret, self.anchor),
         };
-        let stops = p.caret_stops(face, size, &shown);
-        let total = stops.last().copied().unwrap_or(0.0);
-        let caret_idx = shown[..caret_b].chars().count().min(stops.len() - 1);
-        let anchor_idx = shown[..anchor_b].chars().count().min(stops.len() - 1);
-        let cx = stops[caret_idx];
+        let (layout, scale) = p.field_layout(face, size, &shown, colors.text);
+        let line = Line::new(&layout, scale);
+        let cx = line.x(Stop {
+            byte: caret_b,
+            affinity: self
+                .affinity
+                .filter(|_| composing.is_none())
+                .unwrap_or(Affinity::Downstream),
+        });
 
         // Keep the caret in view, then keep the scroll within the text.
-        self.scroll = reveal_scroll(self.scroll, cx, total, area.w);
+        self.scroll = reveal_scroll(self.scroll, cx, line.width, area.w);
 
         let cy = area.cy();
         let h = size * 1.25;
         let top = cy - h / 2.0;
         let old = p.clip(area);
-        let ox = area.x - self.scroll;
+        let ox = ((area.x - self.scroll) * scale).round() / scale;
         if shown.is_empty() {
             p.text(
                 face,
@@ -64,34 +72,36 @@ impl TextField {
                 area.w,
             );
         } else {
-            if focused && caret_idx != anchor_idx {
-                let (a, b) = (
-                    stops[caret_idx.min(anchor_idx)],
-                    stops[caret_idx.max(anchor_idx)],
-                );
-                p.fill_a(Rect::new(ox + a, top, b - a, h), colors.selection, 0.35);
+            if focused && caret_b != anchor_b {
+                line.spans(caret_b.min(anchor_b)..caret_b.max(anchor_b), |s| {
+                    p.fill_a(
+                        Rect::new(ox + s.start, top, s.end - s.start, h),
+                        colors.selection,
+                        0.35,
+                    );
+                });
             }
-            p.text(face, size, ox, cy, &shown, colors.text, f32::INFINITY);
+            p.paint_field_layout(&layout, ox, cy);
             if let Some(pre) = composing {
                 let at = self.caret;
-                p.underline_range(
-                    face,
-                    size,
-                    ox,
-                    cy,
-                    &shown,
-                    at..at + pre.text.len(),
-                    colors.text,
-                );
+                let baseline = layout.get(0).map_or(0.0, |l| l.metrics().baseline);
+                let underline =
+                    ((cy * scale - layout.height() / 2.0).round() + baseline.round() + 2.0) / scale;
+                line.spans(at..at + pre.text.len(), |s| {
+                    p.fill(
+                        Rect::new(ox + s.start, underline, s.end - s.start, p.px()),
+                        colors.text,
+                    );
+                });
                 // The clause the input method has selected, a second line under it.
                 if let Some((a, b)) = pre.cursor.filter(|c| c.0 < c.1) {
-                    let a_x = p.measure(face, size, &shown[..at + a]);
-                    let b_x = p.measure(face, size, &shown[..at + b]);
-                    p.fill_a(
-                        Rect::new(ox + a_x, top, b_x - a_x, h),
-                        colors.selection,
-                        0.25,
-                    );
+                    line.spans(at + a..at + b, |s| {
+                        p.fill_a(
+                            Rect::new(ox + s.start, top, s.end - s.start, h),
+                            colors.selection,
+                            0.25,
+                        );
+                    });
                 }
             }
         }

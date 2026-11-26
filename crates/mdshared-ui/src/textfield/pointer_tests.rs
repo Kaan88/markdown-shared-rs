@@ -27,7 +27,7 @@ impl Rig {
             size: 16.0,
             scale: 1.5,
         };
-        if hit.stops(&field, &mut gfx).get(1).copied().unwrap_or(0.0) <= 0.0 {
+        if hit.line(&field.display(), &mut gfx).width <= 0.0 {
             eprintln!("skipped: no advancing glyph for the test text in the system fonts");
             return None;
         }
@@ -41,8 +41,20 @@ impl Rig {
     }
 
     fn at(&mut self, index: usize) -> (f32, f32) {
-        let x = self.hit.stops(&self.field, &mut self.gfx)[index];
-        (self.hit.area.x + x - self.field.scroll, self.hit.area.cy())
+        let shown = self.field.display();
+        let byte = shown
+            .char_indices()
+            .nth(index)
+            .map_or(shown.len(), |(b, _)| b);
+        let line = self.hit.line(&shown, &mut self.gfx);
+        let x = line.x(super::super::line::Stop {
+            byte,
+            affinity: parley::Affinity::Downstream,
+        });
+        (
+            snapped_origin(self.hit, self.field.scroll) + x,
+            self.hit.area.cy(),
+        )
     }
 
     fn press(&mut self, at: (f32, f32), shift: bool) -> bool {
@@ -204,7 +216,7 @@ fn the_secret_uses_masked_stops_and_double_click_does_not_expose_word_boundaries
         return;
     };
     r.field.set_secret(true);
-    if r.hit.stops(&r.field, &mut r.gfx)[1] <= 0.0 {
+    if r.hit.line(&r.field.display(), &mut r.gfx).width <= 0.0 {
         eprintln!("skipped: no advancing bullet glyph in the system fonts");
         return;
     }
@@ -212,7 +224,132 @@ fn the_secret_uses_masked_stops_and_double_click_does_not_expose_word_boundaries
     r.click(at, false);
     assert_eq!(r.field.caret(), (2, 2));
     r.click(at, false);
-    assert_eq!(r.field.selected_text(), "é ç");
+    assert_eq!(r.field.caret(), (r.field.text().len(), 0));
+    assert_eq!(r.field.selection_for_export(), None);
+}
+
+#[test]
+fn rtl_left_edge_hits_the_logical_end_and_decomposed_word_keeps_its_accent() {
+    let Some(mut r) = Rig::new("אבג") else {
+        return;
+    };
+    r.click((r.hit.area.x + 0.5, r.hit.area.cy()), false);
+    assert_eq!(
+        r.field.caret(),
+        (r.field.text().len(), r.field.text().len())
+    );
+
+    let Some(mut r) = Rig::new("e\u{301} z") else {
+        return;
+    };
+    let start = r.hit.area.x;
+    let end_of_cluster = r.at(2).0;
+    let y = r.hit.area.cy();
+    assert!(end_of_cluster > start);
+    r.click((start + (end_of_cluster - start) * 0.8, y), false);
+    assert_eq!(
+        r.field.caret(),
+        (3, 3),
+        "the accent has no caret stop of its own"
+    );
+    r.click((start + (end_of_cluster - start) * 0.8, y), false);
+    assert_eq!(r.field.selection_for_export(), Some("e\u{301}"));
+}
+
+#[test]
+fn a_mixed_direction_selection_paints_two_bands_with_an_unselected_gap() {
+    let Some(mut r) = Rig::new("a אבג b") else {
+        return;
+    };
+    r.field.key(EditKey::Home, false, false);
+    for _ in 0..3 {
+        r.field.key(EditKey::Right, false, true);
+    }
+    assert_eq!(r.field.selection_for_export(), Some("a א"));
+    let mut bitmap = Bitmap::new(420, 75);
+    let mut p = Painter::new(&mut bitmap, &mut r.gfx, r.hit.scale);
+    p.fill(Rect::new(0.0, 0.0, 280.0, 50.0), [255; 3]);
+    r.field.draw(
+        &mut p,
+        r.hit.area,
+        r.hit.face,
+        r.hit.size,
+        &FieldColors {
+            text: [255; 3],
+            placeholder: [100; 3],
+            selection: [0, 100, 255],
+            caret: [0; 3],
+        },
+        "",
+        true,
+        false,
+    );
+    // Above the glyphs, but within the selection highlight. Count contiguous coloured runs.
+    let y = ((r.hit.area.cy() - r.hit.size * 0.625) * r.hit.scale).ceil() as usize;
+    let row = &bitmap.pixels[y * 420 * 4..(y + 1) * 420 * 4];
+    let mut last = false;
+    let mut bands = 0;
+    for px in row.as_chunks::<4>().0 {
+        let colored = px[2] < 254;
+        bands += usize::from(colored && !last);
+        last = colored;
+    }
+    assert_eq!(bands, 2);
+}
+
+#[test]
+fn drawing_a_long_field_does_not_shape_its_prefixes() {
+    let Some(mut r) = Rig::new(&"abcd ".repeat(128)) else {
+        return;
+    };
+    let mut gfx = Gfx::new();
+    let mut bitmap = Bitmap::new(420, 75);
+    let mut p = Painter::new(&mut bitmap, &mut gfx, r.hit.scale);
+    r.field.draw(
+        &mut p,
+        r.hit.area,
+        r.hit.face,
+        r.hit.size,
+        &FieldColors {
+            text: [0; 3],
+            placeholder: [100; 3],
+            selection: [0, 100, 255],
+            caret: [0; 3],
+        },
+        "",
+        true,
+        true,
+    );
+    assert_eq!(gfx.cached_layouts(), 1);
+}
+
+#[test]
+fn a_public_preedit_cursor_inside_a_character_is_discarded_before_drawing() {
+    let Some(mut r) = Rig::new("base") else {
+        return;
+    };
+    assert!(r.field.set_preedit(Some(super::super::Preedit {
+        text: "é".into(),
+        cursor: Some((1, 1)),
+    })));
+    assert_eq!(r.field.preedit().unwrap().cursor, None);
+    let mut bitmap = Bitmap::new(420, 75);
+    let mut p = Painter::new(&mut bitmap, &mut r.gfx, r.hit.scale);
+    r.field.draw(
+        &mut p,
+        r.hit.area,
+        r.hit.face,
+        r.hit.size,
+        &FieldColors {
+            text: [0; 3],
+            placeholder: [100; 3],
+            selection: [0, 100, 255],
+            caret: [0; 3],
+        },
+        "",
+        true,
+        true,
+    );
 }
 
 #[test]
