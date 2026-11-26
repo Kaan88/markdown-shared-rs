@@ -32,9 +32,10 @@ these crates for geometry, state and drawing. An idle window does no work; keep 
 | `mdshared-app` | Plumbing with no window system: paths, files, settings file layer, recents, single instance, watching, worker thread and pool, fuzzy match, formatting, updates, crash reports, the notes library | notify |
 | `mdshared-ui` | The toolkit: painter, palettes, icons, widgets, list and layout models, animation, key parsing, and the OS glue (`platform`) | `mdshared-app`, `mdshared-text`, winit, zeno |
 | `mdshared-term` | A terminal emulator's model: VT parser, screen, selection, key and mouse encoding | nothing at all |
+| `mdshared-pty` | A pseudo-terminal: start a program in a terminal of its own, bytes out and in, resize, exit status | nothing of ours (`windows-sys`, `libc`) |
 
 `mdshared-ui` depends on winit only for types (`Window`, key events); it never runs a loop.
-`mdshared-term` and `mdshared-fetch` depend on none of the other crates, on purpose.
+`mdshared-term`, `mdshared-pty` and `mdshared-fetch` depend on none of the other crates, on purpose.
 
 ## How the applications use it
 
@@ -73,9 +74,11 @@ cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnin
 cargo test --release -p mdshared-ui --features host host::
 cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
 cargo test --release -p mdshared-ui --features host,a11y host::
+cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
+cargo test --release -p mdshared-ui --features term termview
 ```
 
-Run all fifteen before you say a change is done. The Windows job of CI also runs the host's
+Run all seventeen before you say a change is done. The Windows job of CI also runs the host's
 example for two seconds (`cargo run --release -p mdshared-ui --features host,a11y --example host
 -- --seconds 2`): run it too after a change to `host`. While working, the debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
@@ -191,7 +194,7 @@ the docs ends with what was run and what was not.
 - Subject: `<crate or area>: <what, in plain words>`, for example
   `mdshared-ui: splitter, an area cut into two panes by a handle that is dragged`.
   Areas in use: `mdshared-ui`, `mdshared-app`, `mdshared-text`, `mdshared-highlight`,
-  `mdshared-fetch`, `mdshared-term`, `shared` (several crates), `docs`, `ci`.
+  `mdshared-fetch`, `mdshared-term`, `mdshared-pty`, `shared` (several crates), `docs`, `ci`.
 - Body: what was added and how it behaves, then what was run and what was not. A new
   dependency is justified here.
 - An agent's commit ends with a trailer naming the model that wrote it, for example

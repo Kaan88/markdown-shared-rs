@@ -1565,3 +1565,120 @@ Run: `cargo test -p mdshared-term` (51 unit tests and the crate's doctest pass; 
 fourteen tests, the seven above among them) and the three commands below, on Windows only.
 Compiled, not run, on Linux and macOS. Not seen by a person: no window draws a selection yet
 (roadmap T1).
+
+## A pseudo-terminal (`mdshared-pty`, 2026-11-26, `feat/terminal-pty-grid`, roadmap T2)
+
+A new crate, because this is where the `unsafe` system calls for a terminal live and nothing
+else should carry them. `Pty::spawn(&Command, cols, rows, wake)` starts a program with a
+terminal of its own and returns at once; `take_output` gives the bytes it wrote (for
+`mdshared_term::Screen::feed`), `write` queues bytes for it (keys, a paste, the screen's
+replies), `resize` tells it the new size, `exit` says how it ended.
+
+Decisions:
+
+- **Three threads a terminal, one wake.** Read, write and wait each block in the system, so
+  each has a thread; the caller's side never blocks. The wake is a plain closure, as in
+  `mdshared_app::job`, and it is called once per batch: after a wake nothing more comes until
+  the output was taken. A program that prints fast therefore costs one wake a frame, not one a
+  read.
+- **Output is held back at 4 MB** (`HIGH_WATER`). Untaken output stops the reading thread, the
+  system's buffer fills, and the program waits. A flood costs a fixed amount of memory. Tested
+  with about 9 MB printed while nothing was taken.
+- **`exit` waits for the output.** It answers only when the program has ended, the output has
+  ended and all of it was taken, so the last lines a program prints before it ends are never
+  lost to a caller that closes the view on `exit`.
+- **Windows: the console is closed when the program ends**, by the waiting thread. That is
+  what ends the output pipe, and it ends anything else still attached to the console. The
+  standard handles are passed as "none" on purpose: without that a caller whose own output is
+  redirected (a test runner) hands its redirected handles to the program.
+- **Dropping the `Pty` ends the program.** On Windows the console is closed and then the
+  program is terminated: closing alone was measured to leave `cmd.exe` in `pause` alive for
+  more than 30 seconds. On Unix the program gets `SIGHUP`.
+- **The command line is built here.** Arguments are quoted by the C runtime's rules; the
+  program is looked for on the `PATH` the program will get (`.exe`, `.com`, `.cmd`, `.bat`);
+  a `.cmd` or `.bat` runs through `cmd.exe /d /s /c`, and an argument with a quote, a percent
+  sign or a line break is refused for it, since no quoting makes those safe for `cmd.exe`.
+- **Unix: the standard library starts the child** (it forks and executes safely from a program
+  with threads); the only step added between the two is a new session with the slave as its
+  controlling terminal. `TERM` is `xterm-256color` unless the command sets it. After the
+  program ends the output is called ended 50 ms later even if a background child still holds
+  the terminal open.
+- **Dependencies:** `windows-sys` 0.59 and `libc`, both in the lock already, for the calls
+  themselves. `mdshared-term` is a dev-dependency only (the doc example and one test).
+
+Run on Windows 11: `cargo test -p mdshared-pty` (17 tests and the doctest), which start real
+`cmd.exe` processes: output and exit code, typed input, environment and folder, the size seen
+by the program before and after a resize, kill, drop, the flood, a batch file with arguments,
+a `Screen` on the other side; and `cargo clippy -p mdshared-pty --all-targets -- -D warnings`.
+
+Not verified: **the Unix side was never run.** It was compiled and linted from Windows for
+`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and `aarch64-linux-android` (roadmap T8).
+Windows before 11 was not tried (ConPTY needs Windows 10 1809; before 11 22H2 closing the
+console waits for the output to be read, which the reading thread does, untested). No
+full-screen program (an editor, a pager) was driven through it by the tests, and nothing has
+been seen in a window: that needs the grid drawing (roadmap T1) and an application.
+
+## Terminal grid (`mdshared_ui::termview`, feature `term`, 2026-11-26, `feat/terminal-pty-grid`, roadmap T1)
+
+Draws a `mdshared_term::Screen` into a rectangle with the toolkit's `Painter`. The application
+owns the screen, the pseudo-terminal, the selection, the scroll offset, the focus and the
+bitmap; nothing here keeps a rectangle or reads a clock.
+
+Decisions:
+
+- **Whole-pixel cells.** A cell is a whole number of device pixels: as wide as the font's "0"
+  advance, rounded, and as tall as the font's line, rounded up. The grid starts at the area's
+  rounded corner, so lines meet across cells and 200 columns do not drift. What is left over at
+  the right and bottom is padding in the background colour.
+- **Each character is shaped once and drawn in any colour.** `CellFont` keeps its own parley
+  contexts and `TextEngine`. A character is laid out once per bold, italic and size and kept,
+  up to 4096 shapes, and is drawn at its cell through the new
+  `TextEngine::draw_layout_clipped_tinted`, so neither shapes nor glyph masks depend on colour.
+  A glyph is centred in its one- or two-cell span by whole pixels, so a fallback glyph of
+  another width sits centred, on the cell's baseline. Spaces are not drawn. The painter's own
+  text path could not be used: its engine is private and its layout cache is keyed by colour,
+  which a screen of true-colour text would flood. Measured: a full 200 by 60 frame of coloured
+  glyphs is 3.0 ms, about 255 ns a cell (release, warm cache, Windows).
+- **Box drawing and blocks as shapes.** U+2500 to U+259F come from a table of arms (light,
+  heavy, double), not from the font. Lines sit at a position fixed by the cell size and run to
+  the cell's edge; corners and tees are filled; double lines turn into each other, stay open
+  inside and stop at a single line that crosses them; dashes, rounded corners (antialiased
+  quarter rings) and diagonals are there; eighths, halves and quadrants split a cell at the
+  same pixels everywhere; shades are 25, 50 and 75 % fills. Tested: every pair of line
+  characters meets edge to edge at four cell sizes.
+- **Colours.** `Scheme::from_palette`: the page and text colours as the default pair; Windows
+  Terminal's Campbell sixteen on dark and One Half Light on light; the cursor in the text
+  colour with the page colour under it; the selection as the toolkit's text selection shows it.
+  The 256-colour cube and the grey ramp are xterm's and are computed. Inverse swaps, dim is
+  half way to the background, hidden draws only the background. `bold_is_bright` is there and
+  off. The struct is `#[non_exhaustive]` so that T7's named schemes can add fields.
+- **Only the changed rows.** Each row is drawn alone, clipped to its band, background first. A
+  row drawn by `draw_rows` is pixel for pixel the row `draw_screen` draws and nothing outside
+  the bands is touched (tested at scale 1 and 1.5, both palettes). The cheapest correct path
+  with this painter is to keep the last frame's bitmap and repaint the rows
+  `View::damage(screen.take_dirty())` gives. While scrolled back, any change redraws the whole
+  view, since `take_dirty` cannot say whether output moved lines into the scrollback. A change
+  of selection, focus, scroll, scheme or size is the application's to redraw.
+- **The cursor.** Block (filled, the character in `cursor_text`), bar or underline, as DECSCUSR
+  asks; a hollow block in every shape without the focus; not drawn when the program hides it or
+  it is scrolled out of view; both cells of a wide character. It blinks through
+  `Animator::blink`, and only while focused, visible, in view and asked to blink: otherwise
+  nothing is asked for, so an idle window stays idle. At rest and under reduced motion the
+  animated drawing is the plain one pixel for pixel (tested).
+
+Outside the module: `mdshared_text::TextEngine::draw_layout_clipped_tinted` was added (the
+untinted `draw_layout_clipped` now shares its body; its pixels and its signature are
+unchanged, tested), and `mdshared-ui` got the optional dependency `mdshared-term` behind the
+feature `term`.
+
+Not here: the SGR blink attribute (drawn steady), underline styles and colours, ligatures
+across cells, Powerline glyphs as shapes, smooth scrolling, accessibility of the grid, named
+colour schemes (T7). In the light scheme ANSI 7 and 15 barely show on the white page, as in
+One Half Light.
+
+Run on Windows: `cargo test -p mdshared-ui --features term termview` (unit and pixel tests in
+both palettes), the sheet (`termview_sheet`, looked at by the agent that wrote it and by the
+reviewing session, not by the owner), the speed test (`termview_speed`, release),
+`cargo clippy -p mdshared-ui --features term --all-targets -- -D warnings`, and
+`cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
+has been seen only through the application that uses it.
