@@ -1964,3 +1964,79 @@ from the caller); a scroll area that also reports how much is left to a screen r
 K12); and an application or Barbican screen using it, which is what would show it to a person
 first.
 
+## A folder's entries as a file manager's list (`mdshared_app::dirlist`, 2026-11-26, `feat/f1-dir-listing`, roadmap F1)
+
+The model behind a files list: what a folder holds, sorted, filtered and kept in step with the
+disk without reading it all again, plus a remap that keeps the selection on its entries.
+
+**Where it lives, and why.** It reads files and runs a worker, and it draws nothing, so it is in
+`mdshared-app` ([NEW-MODULE.md](NEW-MODULE.md)). That places it below `mdshared-ui`, which is why
+it has its own `Column` and `Sort` rather than borrowing `table::Sort`: `mdshared-app` cannot
+depend on the toolkit. The application maps a header hit to `Listing::toggle_sort(Column::...)`,
+and a click on a column already sorted the same way turns the direction round, as `Table` does.
+
+**Reading, off the window thread.** `read(dir, cancel)` lists the entries in the folder's own
+order and asks `cancel` before each one; an entry it cannot read (deleted between being listed
+and being asked for, a name the system will not open) is skipped, and a folder that cannot be
+opened gives nothing. `FolderRead::start(dir, wake)` runs that on a `job::Job` — one long read
+per folder is what a job is for, while the pool is for many short pieces — and `take` hands the
+folder and its entries over once, after the wake. Cancelling, by `FolderRead::cancel` or by
+dropping the handle, delivers nothing: `take` drops what a cancelled read had read instead of
+handing it over half read. A cancel is seen between entries and cannot interrupt a system call,
+so a dead network path keeps its worker thread where it is; the window is never in that call.
+
+**What an entry holds.** Name, kind (folder, file, other), size, modified and created times, and
+the hidden flag: the `FILE_ATTRIBUTE_HIDDEN` attribute on Windows, a leading dot elsewhere. The
+times are `Option<SystemTime>` because a file system may not have a birth time. A folder's size
+is what the system reports for it, usually zero — its contents are never added up.
+
+**Sorting.** Folders come first whatever the column and the direction; names use
+`fmt::natural_cmp`, so `"file2"` comes before `"file10"`; times sort with "unknown" before any
+time; the sort is stable, so entries whose keys are equal keep the order the folder gave them.
+The hidden switch and the filter are plain state: a case-insensitive substring of the name,
+and the system's own hidden flag.
+
+**Changes without a re-read.** `Change::{Created, Removed, Renamed { from, to }, Modified}` is
+what a watcher (F2) will report; `apply` moves only the entry it names. A `Modified` for a path
+the list does not hold inserts it, because a save the watcher reports as a change may be a file
+it never reported being created. A `Renamed` carries the entry read at its new path
+(`Entry::at`), which is how one path's details are read without listing the folder.
+
+**The selection.** Every call that changes the rows returns a `Remap`: for each old row, its
+new row or `None`. The application hands it over as `selection.remap(remap.mapping())`. A rename
+needs one step the paths cannot give: the old path is not in the list any more, so `apply` maps
+the old row of `from` to the new row of `to` itself, and the selection stays on the entry under
+its new name.
+
+Tests, `dirlist_tests.rs` (11) and one in `mdshared-ui`'s `select` (1):
+
+- reading a temporary folder gives the right entries, kinds, size and row lookups;
+- the system's way of hiding is read (attribute on Windows via `attrib +h`, a dot elsewhere);
+- every column sorts with the folders first, the name sort is natural, the direction turns,
+  the stability is visible in equal keys, and a click turns a column round;
+- the filter and the hidden switch narrow the list, together, and their remap says what went;
+- create, remove, rename and modify applied one by one give the same list as a full re-read
+  (and a modify of a path never listed inserts it);
+- a remap says where each old row went through a re-sort, a rename and a removal;
+- a cancelled read delivers nothing: an always-cancelled read reads nothing, a part-way cancel
+  stops there, and a cancelled `FolderRead` hands nothing over even when its thread finished;
+- a folder read on a worker hands its entries over once;
+- an entry that vanished between being listed and being read is skipped without a panic, and a
+  missing folder or path gives nothing;
+- in `mdshared-ui`, a selection follows its entry through a re-sort, a rename and a removal.
+
+Each test was seen failing under a mutation of the implementation, one at a time: kind always
+`File`, hidden always false, plain `cmp` instead of `natural_cmp`, folders not first, the filter
+ignored, the hidden switch ignored, `apply` dropping a new entry, `apply` not replacing, the
+rename mapping removed (failing both the app test and the toolkit selection test), `read`
+ignoring the cancel flag, `take` handing a cancelled read over, an unreadable entry panicking,
+a remap of all `None`, the worker never handing over, and a toggle that never turns. Each
+mutation failed exactly the test named for it, and the file was restored afterwards.
+
+Run on Windows 11: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, and `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (all pass:
+`mdshared-app` 550 tests with 11 new, `mdshared-ui` 1140 in the workspace run). Not built, run or linted on
+Linux or macOS: the Unix hidden flag and the birth-time path were neither compiled nor run. Nothing here was seen
+by a person or used by an application: it is a model with no drawing. Left for later: F2, the
+watcher that says what changed, and the application's list view.
