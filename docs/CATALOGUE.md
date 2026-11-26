@@ -173,7 +173,7 @@ No window system. All of it is usable from a test with a temporary folder.
 No dependencies, no window, no process: bytes in, a grid out, events to bytes. Its crate doc
 lists what a full terminal has that this does not yet (combining marks, OSC 8 and 52, the kitty
 keyboard protocol, images). The width of the screen can now be reflowed: the wrapped lines are
-joined and wrapped again, as xterm, VTE and kitty do.
+joined and wrapped again, as VTE and kitty do.
 
 | Module | For | Start at |
 |---|---|---|

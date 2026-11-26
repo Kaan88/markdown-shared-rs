@@ -5,20 +5,10 @@
 use crate::screen::*;
 use crate::screen_tests::{at, check, fed, grid};
 
-/// One line's content as text: the cells up to the last one that is not a plain blank, with the
-/// spacers of wide characters left out. A wrapped line keeps its blank cells, which are spaces
-/// written where the text broke off, except the one cell a wide character was moved out of.
+/// One line's content as text: the cells the line holds text in, with the spacers of wide
+/// characters left out.
 fn content(line: &Line) -> String {
-    let end = match (line.wrapped(), line.is_padded()) {
-        (true, false) => line.len(),
-        (true, true) => line.len().saturating_sub(1),
-        (false, _) => line
-            .cells()
-            .iter()
-            .rposition(|cell| !cell.is_spacer() && *cell != Cell::BLANK)
-            .map_or(0, |at| at + 1),
-    };
-    text_of(&line.cells()[..end])
+    text_of(&line.cells()[..line.text_len()])
 }
 
 /// Every line the screen keeps, the scrollback first, with each run of soft-wrapped lines joined
@@ -127,6 +117,69 @@ fn narrowing_and_widening_again_gives_back_the_same_lines() {
     assert_eq!(grid(&s), before);
     assert_eq!(s.scrollback_len(), 0);
     assert_eq!(at(&s), at_before);
+    check(&s);
+}
+
+#[test]
+fn a_character_inserted_at_the_start_of_a_wrapped_row_survives_a_reflow() {
+    // The row that goes on in the next one has an empty cell at its end, for the wide character
+    // that did not fit; inserting a cell at its start moves that empty cell off the row, and the
+    // row's text grows by one. A reflow that went on believing the row had an empty cell at its
+    // end dropped the "c" of "abc漢".
+    let mut s = fed(4, 3, "abc漢");
+    assert_eq!(grid(&s), "abc\n漢\n");
+    s.feed(b"\x1b[1;1H\x1b[@");
+    assert_eq!(s.row_text(0), " abc");
+    s.resize_reflow(10, 3);
+    assert_eq!(s.row_text(0), " abc漢");
+    assert_eq!(logical(&s), [" abc漢"]);
+    check(&s);
+}
+
+#[test]
+fn inserting_at_the_start_of_a_row_does_not_split_a_wide_character() {
+    // The same insert with a wide character in the row: it moves one cell right, whole, and the
+    // reflow joins the line with both its cells intact.
+    let mut s = fed(4, 3, "a漢字");
+    assert_eq!(grid(&s), "a漢\n字\n");
+    s.feed(b"\x1b[1;1H\x1b[@");
+    assert_eq!((s.cell(0, 2).ch, s.cell(0, 3).is_spacer()), ('漢', true));
+    s.resize_reflow(10, 3);
+    assert_eq!(s.row_text(0), " a漢字");
+    assert_eq!(
+        (s.cell(0, 2).ch, s.cell(0, 3).is_spacer()),
+        ('漢', true),
+        "the character is still two cells wide"
+    );
+    assert_eq!(logical(&s), [" a漢字"]);
+    check(&s);
+}
+
+#[test]
+fn a_narrowing_behind_the_alternate_screen_keeps_the_whole_line() {
+    // The main screen is cut to three columns while the alternate one is shown; the cells it
+    // loses are the empty end of a row, not text, so widening again brings the line back whole.
+    let mut s = fed(4, 3, "abc漢");
+    s.feed(b"\x1b[?1049h");
+    s.resize_reflow(3, 3);
+    s.feed(b"\x1b[?1049l");
+    s.resize_reflow(10, 3);
+    assert_eq!(s.row_text(0), "abc漢");
+    assert_eq!(logical(&s), ["abc漢"]);
+    check(&s);
+}
+
+#[test]
+fn a_widening_behind_the_alternate_screen_does_not_grow_spaces() {
+    // The other way: a row cut to four columns, padded to eight behind the alternate screen, and
+    // joined again at ten. The padding is not text, so no space appears in the line.
+    let mut s = fed(4, 3, "abcdefgh");
+    s.feed(b"\x1b[?1049h");
+    s.resize_reflow(8, 3);
+    s.feed(b"\x1b[?1049l");
+    s.resize_reflow(10, 3);
+    assert_eq!(s.row_text(0), "abcdefgh");
+    assert_eq!(logical(&s), ["abcdefgh"]);
     check(&s);
 }
 

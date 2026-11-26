@@ -2,8 +2,8 @@
 //!
 //! [`Cell`] is one character with its colours and attributes; [`Line`] is a row of them, of the
 //! grid or of the scrollback, with the two facts the rest of the crate needs about it: whether
-//! it goes on in the next line (a soft wrap, see [`Line::wrapped`]) and whether its blank cells
-//! at the end are padding. Everything here is plain data and arithmetic; nothing
+//! it goes on in the next line (a soft wrap, see [`Line::wrapped`]) and how many of its cells
+//! hold text (see [`Line::text_len`]). Everything here is plain data and arithmetic; nothing
 //! draws, reads a clock or knows about a [`Screen`](crate::screen::Screen).
 //!
 //! The types are re-exported from [`crate::screen`], so the path of every one of them is what
@@ -102,11 +102,12 @@ impl Cell {
 pub struct Line {
     pub(crate) cells: Vec<Cell>,
     pub(crate) wrapped: bool,
-    /// The last cell is blank because a wide character did not fit in it and was moved to the
-    /// line below, not because a space was written there. A wrapped line's blank cells are
-    /// otherwise part of the text, which is why this is remembered: joining such a line into
-    /// another one drops this one cell and no other.
-    padded: bool,
+    /// How many cells hold text: the ones written, up to the last of them. The cells after it
+    /// were never written, or were erased, or were left empty for a wide character that did not
+    /// fit; they are padding, of whatever colour, and a caller that joins two lines drops them.
+    /// It is not something the cells say by themselves, since a written space and a cell
+    /// nothing was written to are the same cell.
+    pub(crate) text_len: usize,
 }
 
 impl Line {
@@ -114,30 +115,20 @@ impl Line {
         Line {
             cells: vec![fill; cols],
             wrapped: false,
-            padded: false,
+            text_len: 0,
         }
     }
 
-    /// A line of the cells given, going on in the next one when `wrapped`. The caller keeps the
-    /// grid's habit: a wide character and its spacer cell travel together, and a line of the
-    /// grid is as wide as the screen.
-    pub(crate) fn from_cells(cells: Vec<Cell>, wrapped: bool) -> Line {
+    /// A line of the cells given, `text_len` of which are text, going on in the next one when
+    /// `wrapped`. The caller keeps the grid's habit: a wide character and its spacer cell
+    /// travel together, and a line of the grid is as wide as the screen.
+    pub(crate) fn from_cells(cells: Vec<Cell>, wrapped: bool, text_len: usize) -> Line {
+        let text_len = text_len.min(cells.len());
         Line {
             cells,
             wrapped,
-            padded: false,
+            text_len,
         }
-    }
-
-    /// Whether the last cell is blank only because a wide character was moved down a line. Such
-    /// a cell is not a space of the text, and a caller joining the lines drops it.
-    pub(crate) fn is_padded(&self) -> bool {
-        self.padded
-    }
-
-    /// Says that the last cell is such a blank, or that it is not one any more.
-    pub(crate) fn set_padded(&mut self, padded: bool) {
-        self.padded = padded;
     }
 
     /// Takes the cells out and leaves the line empty: for a caller that joins this line into
@@ -151,6 +142,13 @@ impl Line {
     /// written on. [`cell`](Self::cell) reads either without caring.
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// How many cells of the line hold text: the ones the program wrote, up to the last of
+    /// them. The cells after it are padding, whatever their colour, and are what the line's
+    /// text does not include; a blank cell inside this length is a space that was written.
+    pub fn text_len(&self) -> usize {
+        self.text_len
     }
 
     pub fn len(&self) -> usize {
@@ -203,6 +201,11 @@ impl Line {
         }
         self.clean_edges(a, b, blank);
         self.cells[a..b].fill(blank);
+        // Erasing the tail of the text takes the text with it; erasing inside it does not, and
+        // neither does erasing past its end.
+        if b >= self.text_len {
+            self.text_len = self.text_len.min(a);
+        }
         if b == self.cells.len() {
             self.wrapped = false;
         }
@@ -210,13 +213,14 @@ impl Line {
 
     pub(crate) fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::BLANK);
+        self.text_len = self.text_len.min(cols);
         // A wide character cut in two by the new edge goes altogether, and the cell it leaves
-        // is a blank that is not a space of the text.
+        // is not text.
         if let Some(last) = self.cells.last_mut()
             && last.width == 2
         {
             *last = Cell::BLANK;
-            self.padded = true;
+            self.text_len = self.text_len.min(cols.saturating_sub(1));
         }
     }
 }

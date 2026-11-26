@@ -61,6 +61,11 @@ impl Screen {
                 let cols = line.cells.len();
                 line.cells[cols - n..].fill(blank);
                 line.wrapped = false;
+                // The text loses the cells that were deleted out of it.
+                if col < line.text_len {
+                    let gone = n.min(line.text_len - col);
+                    line.text_len -= gone;
+                }
                 self.dirty[row] = true;
                 self.pending = false;
             }

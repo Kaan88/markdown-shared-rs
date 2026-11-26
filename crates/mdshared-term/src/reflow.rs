@@ -8,17 +8,14 @@
 //! clock or an event: the screen hands its lines over and puts the result back, and the tests
 //! call this directly.
 //!
-//! The rules, which are the ones xterm, VTE and kitty follow:
+//! The rules, which are the ones VTE and kitty follow:
 //!
 //! - A line whose `wrapped` is false ends its line of text. A hard break therefore stays where
 //!   it is, and the lines on either side of it are wrapped apart.
-//! - The blank cells at the end of a line of text are not text: they are what the screen did not
-//!   write yet, and they are dropped. The blank cells at the end of a line that goes on in the
-//!   next one are text, though, because a space was written where the line broke off; only the
-//!   one cell a wide character was moved out of is dropped, and [`Line`] says which line that
-//!   happened on. So a wrap that fell on a space keeps it, and a wrap that fell on a wide
-//!   character does not grow one. A blank cell the program gave a colour or another attribute is
-//!   kept: it is something on the screen.
+//! - Only the cells the program wrote are text: [`Line::text_len`] says how many there are, and
+//!   every cell past it is dropped, whatever its colour. So a space written where the line broke
+//!   off is kept, and the cell a wide character was moved out of is not, and neither is an
+//!   erased or coloured blank tail.
 //! - A character two cells wide is never cut: when it does not fit in the last column of the
 //!   row being built, that column stays empty and the character goes in the row below, exactly
 //!   as writing it at the right edge does.
@@ -78,14 +75,9 @@ pub(crate) fn reflow(
             starts.push(cells.len());
             let line = &mut lines[i];
             let wrapped = line.wrapped();
-            // A blank cell at the end of a line is not text. The blank cells at the end of a
-            // wrapped line are, though: a space was written where the text broke off, and only
-            // the one cell a wide character was moved out of is dropped.
-            let keep = match (wrapped, line.is_padded()) {
-                (true, false) => line.len(),
-                (true, true) => line.len().saturating_sub(1),
-                (false, _) => content_end(line.cells()),
-            };
+            // The cells the line holds text in are the ones it was written with; the rest is
+            // padding of whatever colour, and is not part of the line of text.
+            let keep = line.text_len.min(line.len());
             let mut taken = line.take_cells();
             taken.truncate(keep);
             cells.append(&mut taken);
@@ -111,7 +103,6 @@ pub(crate) fn reflow(
         loop {
             let mut row = vec![Cell::BLANK; cols];
             let mut to = 0;
-            let mut padded = false;
             while at < cells.len() {
                 let wide = span(&cells, at) == 2;
                 let mut w = if wide { 2 } else { 1 };
@@ -120,10 +111,8 @@ pub(crate) fn reflow(
                         // One column of room for a wide character, as writing one gives it.
                         w = 1;
                     } else {
-                        // Only a wide character leaves a cell empty, and only in the last
-                        // column: it is marked as a blank that is not text. A row that is
-                        // simply full has no such cell.
-                        padded = wide && to + 1 == cols;
+                        // The cell it did not fit in stays empty, as writing it at the right
+                        // edge leaves it, and is not counted in the row's text.
                         break;
                     }
                 }
@@ -155,9 +144,7 @@ pub(crate) fn reflow(
                 }
             }
             let more = at < cells.len();
-            let mut line = Line::from_cells(row, more);
-            line.set_padded(padded);
-            out.push(line);
+            out.push(Line::from_cells(row, more, to));
             if !more {
                 // The cursor past the last cell of the text stands after it, and as far along
                 // the row as the new width has columns for. When the row is full, that place is
@@ -184,15 +171,6 @@ pub(crate) fn reflow(
         i += 1;
     }
     (out, place)
-}
-
-/// How many cells of `cells` are content: those up to the last one that is not a plain blank.
-/// The blank cells after it are cells nothing was written to.
-fn content_end(cells: &[Cell]) -> usize {
-    cells
-        .iter()
-        .rposition(|cell| *cell != Cell::BLANK)
-        .map_or(0, |at| at + 1)
 }
 
 /// How many cells the character at `at` takes: two when it and the spacer after it are both
@@ -241,9 +219,32 @@ mod tests {
         out
     }
 
-    /// A written line of `text`, going on in the next when `wrapped`.
+    /// A written line of `text`, going on in the next when `wrapped`, whose text is all of it
+    /// (for a line that ends) or all of its cells (for one that goes on in the next).
     fn line(text: &str, wrapped: bool) -> Line {
-        Line::from_cells(cells_of(text), wrapped)
+        let cells = cells_of(text);
+        let text_len = if wrapped {
+            cells.len()
+        } else {
+            content_end(&cells)
+        };
+        Line::from_cells(cells, wrapped, text_len)
+    }
+
+    /// A line of `text` whose last cell is padding, not text: what a wide character that did not
+    /// fit leaves behind.
+    fn padded(text: &str) -> Line {
+        let cells = cells_of(text);
+        let text_len = cells.len().saturating_sub(1);
+        Line::from_cells(cells, true, text_len)
+    }
+
+    /// How many of these cells are not blank: the end of what the program wrote.
+    fn content_end(cells: &[Cell]) -> usize {
+        cells
+            .iter()
+            .rposition(|cell| *cell != Cell::BLANK)
+            .map_or(0, |at| at + 1)
     }
 
     /// The text of each produced row, with the trailing spaces dropped.
@@ -312,30 +313,36 @@ mod tests {
         // broke off, so they stay: the join is "ab  cd" and the line of text is not shortened.
         let (out, _) = reflow(vec![line("ab  ", true), line("cd", false)], 0, 3, false, 6);
         assert_eq!(rows(&out), ["ab  cd"]);
-        // The one cell a wide character was moved out of is not a space of the text, and only
-        // that one cell is dropped.
-        let mut pad = line("ab ", true);
-        pad.set_padded(true);
-        let (out, _) = reflow(vec![pad, line("漢", false)], 0, 3, false, 8);
+        // The cell a wide character was moved out of is not text, so the join is "ab漢"; a
+        // written space before it is text, so it stays.
+        let (out, _) = reflow(vec![padded("ab "), line("漢", false)], 0, 3, false, 8);
         assert_eq!(rows(&out), ["ab漢"]);
-        // A blank cell before it was written where the text broke off, so it stays.
-        let mut pad = line("ab  ", true);
-        pad.set_padded(true);
-        let (out, _) = reflow(vec![pad, line("漢", false)], 0, 3, false, 8);
+        let (out, _) = reflow(vec![padded("ab  "), line("漢", false)], 0, 3, false, 8);
         assert_eq!(rows(&out), ["ab 漢"]);
     }
 
     #[test]
-    fn a_coloured_blank_is_content_and_is_kept() {
+    fn a_cell_with_no_character_is_empty_whatever_its_colour() {
         let red = Cell {
             bg: Color::Indexed(1),
             ..Cell::BLANK
         };
         let cells = vec![cells_of("a")[0], red, red];
-        let (out, _) = reflow(vec![Line::from_cells(cells, false)], 0, 0, false, 4);
+        // A coloured blank inside the line's text was written, so it stays.
+        let (out, _) = reflow(
+            vec![Line::from_cells(cells.clone(), false, 3)],
+            0,
+            0,
+            false,
+            4,
+        );
         assert_eq!(out[0].len(), 4);
         assert_eq!(out[0].cells()[..3], [cells_of("a")[0], red, red]);
-        assert_eq!(out[0].cell(3), Cell::BLANK);
+        // The same cells past the end of the text are padding, whatever their colour.
+        let (out, _) = reflow(vec![Line::from_cells(cells, false, 1)], 0, 0, false, 4);
+        assert_eq!(out[0].cells()[0], cells_of("a")[0]);
+        assert_eq!(out[0].cell(1), Cell::BLANK);
+        assert_eq!(out[0].text_len(), 1);
     }
 
     #[test]

@@ -457,12 +457,10 @@ impl Screen {
             self.scrollback.pop_front();
             self.dropped += 1;
         }
-        // Trailing blanks are not worth keeping, except in a line that goes on in the next:
-        // there they are spaces of the text.
-        while !line.wrapped && line.cells.last() == Some(&Cell::BLANK) {
-            line.cells.pop();
-        }
-        line.cells.shrink_to_fit();
+        // Only the cells the line holds text in are worth keeping: the padding after them is
+        // not, and in a line that goes on in the next the blanks before that point are spaces
+        // of its text.
+        line.cells.truncate(line.text_len);
         self.scrollback.push_back(line);
     }
 
@@ -581,12 +579,18 @@ impl Screen {
         line.clean_edges(col, col, blank);
         line.cells[col..].rotate_right(n);
         line.cells[col..col + n].fill(blank);
-        // A wide character whose second cell was pushed off the edge goes with it, and the
-        // cell it leaves is a blank that is not a space of the text.
+        // The text moves right with its cells, as far as the row holds it.
+        let mut text_len = line.text_len;
+        if col < text_len {
+            text_len = (text_len + n).min(cols);
+        }
+        // A wide character whose second cell was pushed off the edge goes with it, and is not
+        // text any more.
         if line.cells[cols - 1].width == 2 {
             line.cells[cols - 1] = blank;
-            line.set_padded(true);
+            text_len = text_len.min(cols.saturating_sub(1));
         }
+        line.text_len = text_len;
         self.dirty[row] = true;
     }
 
@@ -617,9 +621,9 @@ impl Screen {
         }
         if w == 2 && self.col == self.cols - 1 {
             if self.modes.autowrap {
-                // It does not fit in the last column: that one stays empty and it goes below.
+                // It does not fit in the last column: that one stays empty, and the erase takes
+                // it out of the line's text, so joining the lines drops it, and it goes below.
                 self.erase(self.row, self.col, self.cols);
-                self.grid[self.row].set_padded(true);
                 self.wrap();
             } else {
                 self.col = self.cols - 2;
@@ -647,10 +651,9 @@ impl Screen {
                 ..cell
             };
         }
-        if col + w >= cols {
-            // The last cell holds a character again, so it is not a pad any more.
-            line.set_padded(false);
-        }
+        // What was written is text, up to here even when a blank cell is written over one
+        // that stood later in the line.
+        line.text_len = line.text_len.max(col + w);
         self.dirty[row] = true;
         if col + w >= cols {
             self.col = cols - 1;

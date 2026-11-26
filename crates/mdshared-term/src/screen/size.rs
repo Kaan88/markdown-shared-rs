@@ -81,7 +81,7 @@ impl Screen {
 
     /// Changes the screen's size and re-wraps it: when the width changes, the primary screen and
     /// its scrollback are joined back into the lines of text they were (see [`Line::wrapped`])
-    /// and wrapped again at the new width, as xterm, VTE and kitty do, so that a line longer than
+    /// and wrapped again at the new width, as VTE and kitty do, so that a line longer than
     /// the screen is not cut and nothing is lost when the screen widens again.
     ///
     /// - A hard line break, one whose line is not marked as wrapped, stays where it is.

@@ -2059,9 +2059,9 @@ history narrowed and widened again came back chopped, and a `vim` on the primary
 the `wrapped` flag, set when the text reached the right edge and went on in the line below, so
 the screen knew which rows were one line of text. `Screen::resize_reflow(cols, rows)` uses it:
 when the width changes it joins every run of wrapped rows back into the line of text they were,
-wraps each again at the new width, and puts the result back. It is the behaviour of xterm, VTE
-and kitty; `Screen::resize` is the same call without it, so an application that wants the old
-cut keeps calling `resize`.
+wraps each again at the new width, and puts the result back. It is the behaviour of VTE and
+kitty (xterm has none); `Screen::resize` is the same call without it, so an application that
+wants the old cut keeps calling `resize`.
 
 The rules:
 
