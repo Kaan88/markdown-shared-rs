@@ -82,10 +82,22 @@ fn clipboard_visits_each_flat_span_once() {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn clipboard_declines_offsets_inside_a_utf8_character() {
+    let doc = crate::parse("aéz");
+    assert_eq!(selection_html(&doc, 0, 2), None);
+    assert_eq!(selection_html(&doc, 2, 4), None);
+    assert_eq!(selection_html(&doc, 1, 3).as_deref(), Some("<p>é</p>"));
+}
+
 /// The selected range `from..to` (offsets into `Document::text`) as an HTML fragment, or `None`
-/// when the range holds nothing to copy.
+/// when the range holds nothing to copy or either offset is not a UTF-8 boundary.
 pub fn selection_html(doc: &Document, from: u32, to: u32) -> Option<String> {
-    if from >= to || to as usize > doc.text.len() {
+    if from >= to
+        || !doc.text.is_char_boundary(from as usize)
+        || !doc.text.is_char_boundary(to as usize)
+    {
         return None;
     }
     let mut w = Writer {
