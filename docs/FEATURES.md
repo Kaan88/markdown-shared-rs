@@ -2286,3 +2286,10 @@ failed when the preference was disabled, and targeted regressions also failed fo
 fill, program precedence, reset, visibility and wide coverage. The screen state test
 failed when zero did not clear the explicit flag. The extra release CI matrix was not run
 locally. Not run on Linux or macOS; not seen by a person in a live terminal.
+
+Left open from the review (non-blocking): a DECSCUSR value above 6 (`CSI 7 SP q`, a typo like
+`CSI 12 SP q`) counts as the program's own choice and gives a block, so it hides the
+application's preference; xterm and VTE ignore such values. The fix is to leave the shape, the
+blink and the flag unchanged above 6 (`screen/protocol.rs`, the `SP q` arm). When `feat/t3-reflow`
+is merged with this branch, its `screen/dispatch.rs` must carry the line that sets
+`cursor_style_is_explicit`, or the preference silently beats every program.
