@@ -55,32 +55,6 @@ fn text_of(cells: &[Cell]) -> String {
         .collect()
 }
 
-/// The text of the line of text the cursor is on that comes before the cursor, whether the
-/// cursor is on a character or past the end of the text: what a resize must leave the cursor
-/// standing in. Each line of text before it contributes all it holds, cut where its last
-/// character is, as `logical` cuts it.
-fn before_cursor(s: &Screen) -> String {
-    let cursor = s.screen_start() + s.cursor().row as u64;
-    let mut out = String::new();
-    let mut line_text = String::new();
-    for n in s.first_line()..=cursor {
-        let line = s.line_at(n).expect("the cursor's line is there");
-        if n == cursor {
-            // A cursor that hangs past a full row stands after its last cell.
-            let upto = (s.cursor().col + usize::from(s.pending())).min(line.len());
-            line_text.push_str(&text_of(&line.cells()[..upto]));
-        } else {
-            line_text.push_str(&content(line));
-        }
-        if !line.wrapped() {
-            out.push_str(line_text.trim_end_matches(' '));
-            line_text.clear();
-        }
-    }
-    out.push_str(line_text.trim_end_matches(' '));
-    out
-}
-
 /// Asserts that two screens hold the same thing: the same lines with the same wrapped flags,
 /// the same history, the same cursor and the same modes.
 fn assert_same(a: &Screen, b: &Screen) {
@@ -352,64 +326,6 @@ fn a_change_of_height_alone_is_what_it_was() {
 }
 
 #[test]
-fn the_logical_content_survives_a_random_resize_round_trip() {
-    // A small generator with a fixed seed: the same text every run.
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    for round in 0..1500 {
-        let cols = 2 + (next() % 24) as usize;
-        let rows = 2 + (next() % 5) as usize;
-        let mut s = Screen::new(cols, rows, usize::MAX);
-        let mut text = String::new();
-        for _ in 0..(next() % 6) {
-            for _ in 0..(next() % 30) {
-                text.push(match next() % 10 {
-                    0 => '漢',
-                    1 | 2 => ' ',
-                    _ => (b'a' + (next() % 26) as u8) as char,
-                });
-            }
-            // Most lines are ended by a hard break; some run on into the next.
-            if next() % 4 != 0 {
-                text.push_str("\r\n");
-            }
-        }
-        s.feed(text.as_bytes());
-        let before = logical(&s);
-        let place = before_cursor(&s);
-        let narrow = 2 + (next() % 24) as usize;
-        let narrow_rows = 2 + (next() % 5) as usize;
-        s.resize_reflow(narrow, narrow_rows);
-        check(&s);
-        assert_eq!(
-            logical(&s),
-            before,
-            "round {round}: {text:?} at {narrow} columns, {narrow_rows} rows"
-        );
-        assert_eq!(
-            before_cursor(&s),
-            place,
-            "round {round}: the cursor's place in the text, at {narrow} columns"
-        );
-
-        // And back to the size it was: the same lines again, and the cursor in its place.
-        s.resize_reflow(cols, rows);
-        check(&s);
-        assert_eq!(
-            logical(&s),
-            before,
-            "round {round}: {text:?} back at {cols}"
-        );
-        assert_eq!(before_cursor(&s), place, "round {round}: the cursor back");
-    }
-}
-
-#[test]
 fn the_text_below_the_cursor_is_kept_and_the_overflow_goes_into_the_scrollback() {
     // Six full lines on six rows, the cursor at the top: narrowing makes every line four rows
     // long, and not one of them may be lost below the screen.
@@ -469,4 +385,179 @@ fn an_anchor_line_the_ring_dropped_is_not_reported() {
         None,
         "a line the scrollback dropped has no place to point at"
     );
+}
+
+/// Every line of text the screen keeps, exactly as it holds it: the cells a line says are text,
+/// with the spacers of wide characters left out, the soft-wrapped rows joined and the empty
+/// rows after the last line dropped. Read from the screen alone, so that a test can compare it
+/// with the text it wrote itself.
+fn exact(s: &Screen) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut joined = false;
+    for n in s.first_line()..s.end_line() {
+        let line = s.line_at(n).expect("every kept line is there");
+        let text = text_of(&line.cells()[..line.text_len()]);
+        if joined {
+            out.last_mut().expect("a line to join").push_str(&text);
+        } else {
+            out.push(text);
+        }
+        joined = line.wrapped();
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
+}
+
+/// Asserts that the lines the screen keeps are the end of the lines the test wrote: the ring may
+/// have dropped whole rows from the front, which cuts the first one, and nothing else may have
+/// changed, character for character and space for space.
+fn assert_kept(model: &[String], screen: &Screen, round: usize) {
+    let kept = exact(screen);
+    if kept.is_empty() {
+        return;
+    }
+    let mut tail: Vec<&String> = model.iter().collect();
+    while tail.last().is_some_and(|line| line.is_empty()) {
+        tail.pop();
+    }
+    assert!(
+        kept.len() <= tail.len(),
+        "round {round}: {} lines kept of {} written: {kept:?}",
+        kept.len(),
+        tail.len()
+    );
+    let start = tail.len() - kept.len();
+    for (i, (line, want)) in kept.iter().zip(tail[start..].iter()).enumerate() {
+        if i == 0 {
+            assert!(
+                want.ends_with(line),
+                "round {round}: the first kept line {line:?} is not the end of {want:?}"
+            );
+        } else {
+            assert_eq!(line, *want, "round {round}: line {}", start + i);
+        }
+    }
+}
+
+#[test]
+fn the_text_the_test_wrote_survives_a_random_sequence_of_resizes() {
+    // The model is the lines the test writes; the screen's reflow must give them back, whatever
+    // it does with the rows in between. Nothing here reads the screen to decide what to expect.
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..600 {
+        let cols = 3 + (next() % 18) as usize;
+        let rows = 2 + (next() % 4) as usize;
+        let mut s = Screen::new(cols, rows, 20);
+        let mut model: Vec<String> = Vec::new();
+        let count = 1 + (next() % 5) as usize;
+        for i in 0..count {
+            let mut line = String::new();
+            for _ in 0..(next() % 24) {
+                line.push(match next() % 10 {
+                    0 => '漢',
+                    1 | 2 => ' ',
+                    _ => (b'a' + (next() % 26) as u8) as char,
+                });
+            }
+            let red = next() % 4 == 0;
+            if red {
+                s.feed(b"\x1b[41m");
+            }
+            s.feed(line.as_bytes());
+            if red {
+                s.feed(b"\x1b[0m");
+            }
+            if i + 1 < count {
+                s.feed(b"\r\n");
+            }
+            model.push(line);
+        }
+        // Put the cursor in the middle of the content now and then, and enter the alternate
+        // screen: neither writes a character.
+        if next() % 2 == 0 {
+            let row = 1 + (next() % rows as u64) as usize;
+            let col = 1 + (next() % cols as u64) as usize;
+            s.feed(format!("\x1b[{row};{col}H").as_bytes());
+        }
+        let alt = next() % 3 == 0;
+        if alt {
+            s.feed(b"\x1b[?1049h");
+        }
+        // The width changes and the height does not: a change of height alone is `resize`'s,
+        // which drops the rows below the cursor, and has its own test.
+        let mut width = cols;
+        for _ in 0..(1 + next() % 3) {
+            width = 2 + (next() % 20) as usize;
+            s.resize_reflow(width, rows);
+            check(&s);
+        }
+        if alt {
+            s.feed(b"\x1b[?1049l");
+        }
+        check(&s);
+        assert_kept(&model, &s, round);
+        // And back to where it started: every line the ring still holds reads as it was
+        // written, spaces and wide characters and all.
+        if s.first_line() == 0 {
+            s.resize_reflow(cols, rows);
+            check(&s);
+            if s.first_line() == 0 {
+                let mut want = model.clone();
+                while want.last().is_some_and(|line| line.is_empty()) {
+                    want.pop();
+                }
+                assert_eq!(
+                    exact(&s),
+                    want,
+                    "round {round}: after {width} columns, back at {cols}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ich_irm_ech_and_cursor_moves_keep_the_text_through_resizes() {
+    // The operations the review named, one after another with a resize after each, asserting
+    // the exact text every time.
+    let mut s = Screen::new(8, 4, 100);
+    s.feed(b"abcdefgh");
+    assert_eq!(s.row_text(0), "abcdefgh");
+    // ICH in the middle of a full row: two cells open, and the last two fall off it.
+    s.feed(b"\x1b[1;3H\x1b[2@");
+    assert_eq!(s.row_text(0), "ab  cdef");
+    s.resize_reflow(5, 4);
+    assert_eq!(logical(&s), ["ab  cdef"]);
+    // DCH at the start of the row, which is the first row of a wrapped line: the tail of the
+    // row is blanked, so what was one line of text is two now, and stays two.
+    s.feed(b"\x1b[1;1H\x1b[2P");
+    assert_eq!(logical(&s), ["  c", "def"]);
+    s.resize_reflow(8, 4);
+    assert_eq!(logical(&s), ["  c", "def"]);
+    // IRM: a character written at the start of the row pushes the rest of the row right, and
+    // the cell that falls off its end is gone from the text.
+    s.feed(b"\x1b[4h\x1b[1;1HXY\x1b[4l");
+    assert_eq!(s.row_text(0), "XY  c");
+    s.resize_reflow(3, 4);
+    assert_eq!(logical(&s), ["XY  c", "def"]);
+    // ECH erases to the end of the first row: the row's text ends there, and the rows below it
+    // are lines of text of their own now.
+    s.feed(b"\x1b[1;2H\x1b[2X");
+    assert_eq!(logical(&s), ["X", " c", "def"]);
+    s.resize_reflow(6, 4);
+    assert_eq!(logical(&s), ["X", " c", "def"]);
+    // A cursor move and EL: the rest of the row goes with the text that was on it.
+    s.feed(b"\x1b[1;2H\x1b[K");
+    assert_eq!(logical(&s), ["X", " c", "def"]);
+    s.resize_reflow(10, 4);
+    assert_eq!(logical(&s), ["X", " c", "def"]);
+    check(&s);
 }

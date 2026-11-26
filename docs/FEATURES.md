@@ -2054,117 +2054,141 @@ feature clippy/test lines, Linux and macOS. Not seen by a person in a window.
 ## Lines re-wrapped when the width changes (`Screen::resize_reflow`, 2026-11-26, `feat/t3-reflow`, roadmap T3)
 
 `Screen::resize` cut a line longer than the new width at it, and the cells were gone: a shell's
-history narrowed and widened again came back chopped, and a `vim` on the primary screen (or a
-`less` before it takes the alternate one) lost the middles of its lines. Lines already carried
-the `wrapped` flag, set when the text reached the right edge and went on in the line below, so
-the screen knew which rows were one line of text. `Screen::resize_reflow(cols, rows)` uses it:
-when the width changes it joins every run of wrapped rows back into the line of text they were,
-wraps each again at the new width, and puts the result back. It is the behaviour of VTE and
-kitty (xterm has none); `Screen::resize` is the same call without it, so an application that
-wants the old cut keeps calling `resize`.
+history narrowed and widened again came back chopped, and a `vim` on the primary screen lost the
+middles of its lines. Lines already carried the `wrapped` flag, set when the text reached the
+right edge and went on in the line below, so the screen knew which rows were one line of text.
+`Screen::resize_reflow(cols, rows)` uses it: when the width changes it joins every run of wrapped
+rows back into the line of text they were, wraps each again at the new width, and puts the result
+back. It is the behaviour of VTE and kitty (xterm has none); `Screen::resize` is the same call
+without it, so an application that wants the old cut keeps calling `resize`.
 
 The rules:
 
 - A row whose `wrapped` is false ends a line of text, so a hard line break stays where it is;
   the rows on either side of it are wrapped apart.
-- The blank cells at the end of a line of text are not text and are dropped. The blank cells at
-  the end of a row that goes on in the next are text, though, because a space was written where
-  the line broke off: they are kept, so a command split at a space comes back whole. The blank
-  cells after the last character of a line (`ab` and a row of blanks) are dropped. A blank cell
-  the program gave a colour or another attribute is kept: it is something on the screen.
-- The one cell a wide character was moved out of is not text. That is `Line`'s new private
-  `padded` flag: `print` sets it when a wide character does not fit in the last column and the
-  column is blanked for it, `insert_blanks` and a cut wide character in `Line::resize` set it
-  too, and writing a character into that last cell clears it. It is the only way to tell a space
-  that was written from a cell that was left empty, which the cells alone cannot say.
+- Only the cells a line holds text in are text. `Line` records how many there are,
+  `Line::text_len`, and every call that writes, inserts, deletes, erases or cuts keeps it in
+  step: `print` (what was written is text up to there, a space included), `erase` (erasing the
+  tail takes the text with it, erasing inside it does not, which is where `ECH`, `EL` and `ED`
+  all come out), `insert_blanks` (`ICH` and the insert mode: the text moves right with its
+  cells, as far as the row holds it), `DCH` (the text loses the cells deleted out of it) and
+  `Line::resize` (a cut row's text is cut too). So the padding of a row is not text, whatever
+  its colour, while a space written where the line broke off, and the spaces up to the cursor,
+  are; a wrap that fell on a space does not grow or lose one, and the empty cell a wide
+  character was moved out of is not text.
 - A character two cells wide is never cut: when it does not fit in the last column of the row
-  being built, that column stays empty (a pad) and the character goes in the row below, exactly
-  as writing it at the right edge does. A screen one column wide has no room for any of them, so
-  it keeps one cell, as `print` does.
+  being built, that column stays empty and the character goes in the row below, exactly as
+  writing it at the right edge does. A screen one column wide has no room for any of them, so it
+  keeps one cell, as `print` does.
 - The cursor stays on the same character of the same line of text: its place is carried as a
   cell offset into the joined line of text, not as a screen position, and put back at the same
   offset of the new wrapping. A cursor on the second cell of a wide character counts as after
   it. A cursor past the end of the text (a prompt) keeps its column as far as the new width has
   columns for it, and a cursor that hangs past a full row keeps its pending wrap, which is why
-  `Screen::pending()` is now public: a caller that must tell "on the last character" from "after
-  it" had no way to ask.
-- The grid stays at the end of the buffer, so the rows the new wrapping saved come back out of
-  the scrollback onto the screen and the rows it added go into it, up to the scrollback's limit
-  (the oldest are dropped by the ring, as always). The cursor's line stays on the screen: it
-  keeps its row when the text above it wraps to the same height, and when more than a screenful
-  of text ends up below it, it is put on the top row and the lines below the screen are lost, as
-  the lines below the cursor are when rows go. Nothing else is dropped.
-- The scroll region becomes the whole screen, the tab stops reach the new columns, every row is
-  marked changed, and a change of height alone or a resize on the alternate screen goes to
-  `resize` unchanged: a full-screen program's own picture is cut and padded, not reflowed.
+  `Screen::pending()` is public. The saved cursor of `ESC 7`, `CSI s` and mode 1048 is carried
+  the same way, so `ESC 8` and leaving the alternate screen give the same character back.
+- The grid holds the bottom of the content, as kitty's does: the empty rows below the last line
+  of text (or below the cursor, whichever is lower) are dropped, the rows the new wrapping added
+  above them go into the scrollback, up to the scrollback's limit (the oldest are dropped by the
+  ring, as always), and nothing below is thrown away. The cursor's line keeps its row when the
+  text between it and the bottom of the content fits the screen; when that text is taller than
+  the screen it goes into the history and the cursor's row is the top one, which keeps every
+  line. A change of height alone is `resize`'s, which still drops the rows below the cursor.
+- The alternate screen is not reflowed: it is a picture the program drew cell by cell, and it is
+  cut and padded exactly as `resize` does. The primary screen behind it is a text, though, and is
+  joined, wrapped and renumbered as if it were shown, its cursor and saved places included.
+- The scroll region becomes the whole screen, the tab stops reach the new columns, and every row
+  is marked changed.
 - A selection cannot survive it: its line numbers and columns point into a buffer that was
   joined and wrapped again, and after the re-wrap a number can land on another line that happens
   to read the same. `Screen` counts its reflows in a private `reflows` field, `Selection` keeps
   the count it was made under, and `Selection::is_intact` (and so `follow`) answers false when
   they differ. The caller drops the selection, as it does when a program rewrites the text; no
   remapping is offered.
+- A caller that was scrolled back keeps its place by asking: `resize_reflow_anchored(cols, rows,
+  Some(line))` is the same call and returns where the content that was at that absolute line is
+  now (`None` when the ring dropped it), and `termview::View::at_line(screen, line)` puts the
+  view back on it. `termview`'s module example shows the pair.
 
 The new private module `reflow` holds the joining and wrapping as a pure function
-(`reflow::reflow(lines, cursor, col, pending, cols)`), so the rules are tested without a
-`Screen`: it takes the lines and returns the new ones and the cursor's place. `Line` gained
-`from_cells`, `take_cells`, `is_padded` and `set_padded`, all crate-visible; `Screen` gained
-`resize_reflow`, `pending` and the crate-visible `reflows`. No public signature changed.
+(`reflow::reflow(lines, spots, cols)`), so the rules are tested without a `Screen`: it takes the
+lines and the places to carry (the cursor, the saved cursor, the caller's anchor) and returns the
+new lines and where each place landed. `Line` gained `text_len`, `from_cells`, `take_cells` and
+crate-visible fields; `Screen` gained `resize_reflow`, `resize_reflow_anchored`, `pending` and
+the crate-visible `reflows`; `termview::View` gained `at_line`. No public signature changed and
+no dependency was added. `screen.rs` was split on the way into `line.rs` (`Color`, `Attrs`,
+`Cell`, `Line`), `screen/size.rs` and `screen/dispatch.rs`, every file under a thousand lines,
+with the public paths re-exported unchanged.
 
-Tests. In `reflow::tests`, against the pure function: `a_wrap_is_joined_and_wrapped_again_at_the_new_width`
-(two wrapped rows of one line become two rows of four at a narrower width and come back at the
-wider one, the cursor hanging past a full row with its pending wrap), `a_hard_break_ends_a_run_and_the_blank_cells_at_an_end_are_not_text`
-(the last row's blanks are dropped, a wrapped row's are kept, the one pad cell is dropped),
-`a_coloured_blank_is_content_and_is_kept`, `a_wide_character_at_the_edge_moves_down_and_is_never_cut`
-(four rows wide it fits whole, three it is padded off and whole on the next row, one column it
-takes the one, and a cursor on its second cell lands after it) and
+Tests. In `reflow::tests`, against the pure function: `a_wrap_is_joined_and_wrapped_again_at_the_new_width`,
+`a_hard_break_ends_a_run_and_the_blank_cells_at_an_end_are_not_text`,
+`a_cell_with_no_character_is_empty_whatever_its_colour`,
+`a_wide_character_at_the_edge_moves_down_and_is_never_cut` and
 `a_cursor_past_the_end_of_a_full_row_keeps_its_pending_wrap`. In `reflow_tests`, against a
-`Screen`: `narrowing_and_widening_again_gives_back_the_same_lines` (a 20-column screen narrowed
-to 7 and widened gives the same rows and the same cursor, with the rows that went into the
-scrollback coming back), `the_cursor_stays_on_the_same_character_of_the_same_line` (the cursor
-is put on the `k` of a row that fills the width exactly and is on the `k` after a resize and
-after coming back), `a_hard_break_stays_where_it_is`, `a_wide_character_at_the_edge_is_padded_off_and_never_cut`,
-`the_scrollback_is_reflowed_and_the_ring_keeps_its_limit` (the history is wrapped again, no line
-is wider than the screen, the ring drops the oldest rows of a line that grew and the screen's
-rows do not move), `the_alternate_screen_is_resized_as_a_plain_resize_resizes_it` (a screen
-resized with both calls is the same, before and after the alternate screen is left),
-`a_change_of_height_alone_is_what_it_was` (three heights, both calls, same screen) and
-`the_logical_content_survives_a_random_resize_round_trip` (1500 rounds of a fixed-seed
-generator: random words, spaces and wide characters on random rows, a random width and height,
-then back; the lines of text and the text before the cursor are the same, and the grid invariants
-hold). In `select::tests`, `a_reflow_of_the_width_drops_a_selection_and_a_change_of_height_does_not`.
+`Screen`: `narrowing_and_widening_again_gives_back_the_same_lines`,
+`the_cursor_stays_on_the_same_character_of_the_same_line`, `a_hard_break_stays_where_it_is`,
+`a_wide_character_at_the_edge_is_padded_off_and_never_cut`,
+`the_scrollback_is_reflowed_and_the_ring_keeps_its_limit`,
+`the_alternate_screen_is_cut_and_the_main_screen_behind_it_is_reflowed`,
+`a_change_of_height_alone_is_what_it_was`, the four cases the review found
+(`a_character_inserted_at_the_start_of_a_wrapped_row_survives_a_reflow`,
+`inserting_at_the_start_of_a_row_does_not_split_a_wide_character`,
+`a_narrowing_behind_the_alternate_screen_keeps_the_whole_line`,
+`a_widening_behind_the_alternate_screen_does_not_grow_spaces`), the saved cursor's two
+(`the_saved_cursor_follows_its_text_through_a_reflow`,
+`the_main_screen_behind_the_alternate_one_is_reflowed_with_its_saved_cursor`), the anchoring
+three (`the_text_below_the_cursor_is_kept_and_the_overflow_goes_into_the_scrollback`,
+`an_anchor_line_is_reported_where_its_text_went`,
+`an_anchor_line_the_ring_dropped_is_not_reported`), a script of the operations the review named
+with a resize after each (`ich_irm_ech_and_cursor_moves_keep_the_text_through_resizes`, which
+walks ICH, DCH, the insert mode, ECH, a cursor move and EL and asserts the exact text), and the
+random one: `the_text_the_test_wrote_survives_a_random_sequence_of_resizes` writes its own lines
+(`a` to `z`, spaces, wide characters, some in a red background), moves the cursor into the middle
+of the content now and then, enters and leaves the alternate screen, resizes the width two to
+three times on a twenty-row ring limit, and compares the screen with the text it wrote - not with
+anything read from the screen - allowing only that the ring may have dropped whole rows from the
+front, and, when nothing was dropped, that coming back to the first width gives every line
+character for character, spaces included. In `select::tests`,
+`a_reflow_of_the_width_drops_a_selection_and_a_change_of_height_does_not`. In `mdshared-ui`,
+`termview::tests::a_scrolled_back_view_stays_on_its_text_through_a_reflow`.
 
-Fail-before evidence: with the body of `resize_reflow` replaced by `self.resize(cols, rows)` (the
-old behaviour, so that everything compiles), the seven tests that assert the new behaviour
-failed — six in `reflow_tests` (the two "unchanged" ones, the alternate screen and the height,
-passed, which is what they are for) and the `select` one — and with the reflow count taken out
-of `is_intact` the `select` test failed on `assertion failed: !sel.follow(&s)`, because the wrap
-happened to leave the selected characters where the numbers pointed. While the code was being
-written, `a_wide_character_at_the_edge_moves_down_and_is_never_cut` failed with a fourth row
-holding the spacer of a wide character squeezed into one column, and the random round trip failed
-on a space lost at a wrap (`"dca漢kqxo bis x 漢zvdnuyl"` became `"dca漢kqxo bis x漢zvdnuyl"`),
-which is what the `padded` flag and its one-cell rule were written for.
+Fail-before evidence, each fix with the test that fails without it: with `resize_reflow`'s body
+replaced by `self.resize(cols, rows)`, the seven tests that assert the new behaviour failed and
+the two "unchanged" ones passed; with the reflow count taken out of `is_intact`, the selection
+test failed on `assert!(!sel.follow(&s))`; at the branch's first commit (in a worktree, with the
+tests copied in), the four review cases failed with the symptoms the review reported
+(`" ab漢"` for `" abc漢"`, `('漢', false)` for `('漢', true)`, `"ab漢"` for `"abc漢"`,
+`"abcd    ef"` for `"abcdefgh"`), and they failed again here when the `ICH` bookkeeping and the
+`Line::resize` bookkeeping were removed one at a time; with the saved place left where it was,
+the two saved-cursor tests failed (the cursor on the prompt's first row, column 5); with the
+alternate screen sent back through `resize`, the two main-screen tests failed,
+`["main linng", "second"]` for `["main line that is long", "second"]`; with the grid put where
+the cursor is rather than at the bottom of the content, the anchoring test failed with
+`["aaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbb", "cccccccccc"]` of six lines.
 
 Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
-test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
-explorer_tests` (exit 0; mdshared-ui 1148 passed, 34 ignored, 4 filtered; mdshared-term 65
-passed and its doctest). Not run: the release commands, the `recycle`, `media-session`, `notify`,
-`host`, `host,a11y` and `term` feature clippy/test lines, Linux and macOS. Not driven by an
-application: no window calls `resize_reflow` yet, so it is not seen by a person, and
-`termview`'s example and `Metrics::grid_size` doc now name it.
+clippy -p mdshared-ui --all-targets --features term -- -D warnings` (exit 0); `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests` (exit 0; mdshared-term 74 passed and its doctest, mdshared-ui 1148 passed, 34
+ignored, 4 filtered); `cargo test -p mdshared-ui --features term termview` (exit 0). Not run: the
+release commands, the `recycle`, `media-session`, `notify`, `host` and `host,a11y` feature lines,
+Linux and macOS. Not driven by an application: no window calls `resize_reflow` yet, so it is not
+seen by a person.
 
 Known limits, for later:
 
-- **The saved cursor is not re-placed.** `ESC 7`, `CSI s` and mode 1048 keep a screen row and
-  column, not a place in a line of text, so after a reflow they point at whatever is at that row
-  and column now. A program that saves, prints, resizes and restores (a prompt in `bash` does
-  not; a full-screen program is on the alternate screen, which is not reflowed) can land a row
-  out. This was already true of `resize`, which clamps them.
-- **An erased tail of a wrapped row joins as a space.** A program that erases part of the tail
-  of a row without ending the wrap (`ECH`, or `ICH` blanking a wide character at the edge)
-  leaves blanks that the cells cannot tell from written spaces, so they are kept, one per
-  resize. An erase to the end of the row clears the wrap, so the common cases do not.
+- **The scrollback's limit counts rows, not lines of text.** A window dragged narrower step by
+  step re-wraps the whole history at every step, and at a narrow width the rows can pass the
+  limit, which drops the oldest lines for good: coming back to the wide width cannot bring them
+  back. Callers should use `resize` while the drag is going on and `resize_reflow_anchored` once
+  when it settles, which the method's doc and `termview`'s example say; keeping the history as
+  lines of text rather than rows would fix it for good.
+- **A height-only resize still drops the rows below the cursor.** That is `resize`'s behaviour,
+  kept as it was; only a change of width goes through the reflow, which keeps them.
 - **A screen one column wide keeps a wide character in one cell**, as writing it there does, so
   going through one column and back loses its width.
-- **A selection is dropped, not remapped**; a view scrolled back (the application's own offset)
-  is the application's to move, as it is for any resize.
+- **The cursor's row when the text below it is taller than the screen.** Every line is kept, but
+  the cursor's line goes above the grid and its row is reported as the top one.
+- **A selection is dropped, not remapped**, and the place a view scrolled back holds has to be
+  asked for with an anchor: `Screen` keeps no view of its own.
