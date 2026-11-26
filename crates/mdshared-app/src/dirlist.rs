@@ -6,8 +6,9 @@
 //! that is slow to read (a network drive, a drive that went away) must never hold up the window:
 //!
 //! - [`read`] reads a folder on the calling thread and can be stopped between two entries;
-//! - [`FolderRead`] runs [`read`] on a worker thread ([`Job`](crate::job::Job)) and hands the
-//!   entries over once, on the thread that owns the list;
+//!   [`read_checked`] is the same read with the folder's own error kept;
+//! - [`FolderRead`] runs the read on a worker thread ([`Job`](crate::job::Job)) and hands the
+//!   entries over once, on the thread that owns the list, with the error kept too;
 //! - [`Listing`] holds what was read and answers the questions a list asks (how many rows, the
 //!   entry of a row, the row of an entry) without touching the disk;
 //! - [`Entry::at`] reads one path's details, for a change the watcher reports by path.
@@ -24,9 +25,21 @@
 //!
 //! How the list is kept in step with the disk: the application's watcher (roadmap F2) says what
 //! changed, the application reads the new details with [`Entry::at`] where it needs them, and
-//! calls [`Listing::apply`] with one [`Change`]. Only that entry moves, nothing is read again;
-//! [`Listing::set_entries`] with a fresh [`read`] remains the fallback for a folder that changed
-//! in a way the watcher did not report.
+//! calls [`Listing::apply`] with one [`Change`]. Only that entry moves, by binary search in the
+//! sorted rows, and nothing is read again; [`Listing::set_entries`] with a fresh [`read`]
+//! remains the fallback for a folder that changed in a way the watcher did not report.
+//!
+//! Paths are compared exactly, as the platform spelled them: no case folding and no tidying of
+//! separators. A folder's own reading, and a watcher fed from the same folder, spell a name the
+//! same way; two names that differ only in case are two entries where the file system says so.
+//! When the list has a [folder](Listing::folder), a change is applied only when the path it
+//! names sits directly in that folder: a rename out of the folder is a removal, a rename into it
+//! a creation, and the folder itself is not one of its entries.
+//!
+//! Links are never followed. An entry that is a symbolic link is [`Kind::Other`], so a link to a
+//! dead share or a loop cannot stall the read of the folder or send it anywhere else; a Windows
+//! junction, which the system itself reports as a directory, is a [`Kind::Folder`]. The hidden
+//! flag and the times are the link's own, not its target's.
 //!
 //! Deliberately not here:
 //!
@@ -40,10 +53,10 @@
 
 use crate::fmt::natural_cmp;
 use crate::job::Job;
-use crate::paths::{NAMES_IGNORE_CASE, strip_verbatim};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::fs::{self, Metadata};
+use std::fs::{self, FileType, Metadata};
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -62,7 +75,8 @@ pub enum Kind {
     Folder,
     /// A plain file.
     File,
-    /// Neither a file nor a folder: a device, a socket, a pipe, or a link whose target is gone.
+    /// Neither a file nor a folder, and nothing this module follows: a symbolic link (to a
+    /// file, a folder, a dead path or itself), a device, a socket, a pipe.
     Other,
 }
 
@@ -81,14 +95,17 @@ pub struct Entry {
     /// A folder, a file, or something else.
     pub kind: Kind,
     /// The size in bytes as the system reports it. A folder is usually zero here: its contents
-    /// are never added up, which would read the whole tree.
+    /// are never added up, which would read the whole tree. A link's size is the link's own.
     pub size: u64,
-    /// When the entry last changed, where the system can say. `None` where it cannot.
+    /// When the entry last changed, where the system can say. `None` where it cannot. A link's
+    /// own time, never its target's.
     pub modified: Option<SystemTime>,
     /// When the entry was created, where the system can say (some Linux file systems cannot).
     /// `None` where it cannot.
     pub created: Option<SystemTime>,
-    /// Whether the system hides it: the hidden attribute on Windows, a leading dot elsewhere.
+    /// Whether the system hides it: the hidden attribute on Windows (which a hidden junction
+    /// such as `C:\Documents and Settings` carries), a leading dot elsewhere. The link's own
+    /// flag, never its target's.
     pub hidden: bool,
 }
 
@@ -96,32 +113,45 @@ impl Entry {
     /// The entry for `path`, or `None` when it cannot be read: it does not exist, its folder
     /// cannot be opened, or the system refuses its details.
     ///
+    /// A link is not followed: the details are the link's own (`symlink_metadata`), so a dead
+    /// link still has an entry and a link to a folder is [`Kind::Other`].
+    ///
     /// This is how an application turns a path that a watcher reports into the entry to hand to
     /// [`Listing::apply`]. It reads the disk, so it belongs off the thread that draws; a single
     /// entry's details are quick, but a dead network path answers slowly.
     pub fn at(path: impl AsRef<Path>) -> Option<Entry> {
         let path = path.as_ref();
-        let meta = fs::metadata(path).ok()?;
-        Some(entry_of(path, &meta))
+        let meta = fs::symlink_metadata(path).ok()?;
+        let name = name_of(path);
+        Some(entry_of(path.to_path_buf(), name, &meta.file_type(), &meta))
     }
 }
 
-/// Builds an entry from a path and the details the system gave for it.
-fn entry_of(path: &Path, meta: &Metadata) -> Entry {
-    let name = path
-        .file_name()
+/// The last part of a path as a name, or the whole path when it has no last part (a root).
+fn name_of(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let kind = if meta.is_dir() {
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Builds an entry from a path and the details the system gave for the entry itself.
+///
+/// `file_type` is what the folder scan gave, so a link is known to be a link without opening
+/// anything; it is [`Kind::Other`], except that a type the system itself calls a directory (a
+/// Windows junction) is a folder. Nothing here follows a link.
+fn entry_of(path: PathBuf, name: String, file_type: &FileType, meta: &Metadata) -> Entry {
+    let kind = if file_type.is_symlink() {
+        Kind::Other
+    } else if file_type.is_dir() {
         Kind::Folder
-    } else if meta.is_file() {
+    } else if file_type.is_file() {
         Kind::File
     } else {
         Kind::Other
     };
     let hidden = is_hidden(&name, meta);
     Entry {
-        path: path.to_path_buf(),
+        path,
         name,
         kind,
         size: meta.len(),
@@ -146,6 +176,23 @@ fn is_hidden(name: &str, meta: &Metadata) -> bool {
     name.starts_with('.')
 }
 
+/// One entry of a folder, from the scan's own record of it, or `None` when the system will not
+/// give its details (it was deleted between being listed and being asked for, or its name is not
+/// one the system will open).
+///
+/// Nothing here follows a link: [`DirEntry::metadata`](fs::DirEntry::metadata) reports the link
+/// itself, which on Windows costs no extra read because the folder scan already carried it.
+fn read_entry(item: &fs::DirEntry) -> Option<Entry> {
+    let file_type = item.file_type().ok()?;
+    let meta = item.metadata().ok()?;
+    Some(entry_of(
+        item.path(),
+        item.file_name().to_string_lossy().into_owned(),
+        &file_type,
+        &meta,
+    ))
+}
+
 /// The entries of `dir` in the folder's own order, as far as `cancel` lets the read go.
 ///
 /// `cancel` is asked before each entry; once it says true the read stops and what it has read so
@@ -154,38 +201,57 @@ fn is_hidden(name: &str, meta: &Metadata) -> bool {
 /// (see [`FolderRead`]).
 ///
 /// An entry that cannot be read (it was deleted between being listed and its details being asked
-/// for, its name is not one the system will open, a folder's contents may not be listed) is
-/// skipped, so the answer is always usable. A folder that cannot be opened gives nothing.
+/// for, its name is not one the system will open) is skipped, so the answer is always usable. A
+/// folder that cannot be opened gives nothing; [`read_checked`] keeps the error instead.
 pub fn read(dir: &Path, cancel: &dyn Fn() -> bool) -> Vec<Entry> {
-    let Ok(listing) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
+    read_checked(dir, cancel).unwrap_or_default()
+}
+
+/// [`read`], with the folder's own error kept: a folder that cannot be opened (it is gone, it is
+/// not a folder, it may not be listed) is an `Err`, so the application can tell it from a folder
+/// that is simply empty.
+///
+/// An entry that cannot be read is still skipped rather than failing the whole read, and a
+/// cancel still ends the read and returns what it had.
+pub fn read_checked(dir: &Path, cancel: &dyn Fn() -> bool) -> io::Result<Vec<Entry>> {
+    read_with(dir, cancel, &read_entry)
+}
+
+/// [`read_checked`], with the step that turns one scanned item into an entry given by the
+/// caller: the real one is [`read_entry`], and a test gives one that reads nothing to show that
+/// the read goes on past an entry the system would not describe.
+fn read_with(
+    dir: &Path,
+    cancel: &dyn Fn() -> bool,
+    entry_of_item: &dyn Fn(&fs::DirEntry) -> Option<Entry>,
+) -> io::Result<Vec<Entry>> {
+    let listing = fs::read_dir(dir)?;
     let mut entries = Vec::new();
-    for entry in listing {
+    for item in listing {
         if cancel() {
             break;
         }
         // An entry the system could not hand over at all is skipped, like an unreadable one.
-        let Ok(entry) = entry else {
+        let Ok(item) = item else {
             continue;
         };
-        if let Some(entry) = Entry::at(entry.path()) {
+        if let Some(entry) = entry_of_item(&item) {
             entries.push(entry);
         }
     }
-    entries
+    Ok(entries)
 }
 
 /// A folder read on a worker thread, whose entries the window takes when they are ready.
 ///
 /// [`FolderRead::start`] makes the thread; the wake it is given is called once when the work
-/// ends, so the window can ask [`FolderRead::take`] then. Nothing blocks the caller, and the
-/// read is abandoned with [`FolderRead::cancel`] or by dropping this handle, without waiting for
-/// the thread: a cancelled read delivers nothing, even when its thread had already read
-/// something.
+/// ends, so the window can ask [`FolderRead::take`] or [`FolderRead::take_checked`] then.
+/// Nothing blocks the caller, and the read is abandoned with [`FolderRead::cancel`] or by
+/// dropping this handle, without waiting for the thread: a cancelled read delivers nothing, even
+/// when its thread had already read something.
 pub struct FolderRead {
     dir: PathBuf,
-    job: Job<Vec<Entry>>,
+    job: Job<io::Result<Vec<Entry>>>,
 }
 
 impl FolderRead {
@@ -201,7 +267,7 @@ impl FolderRead {
         let dir = dir.into();
         let for_work = dir.clone();
         let job = Job::start(wake, move |cancel, _| {
-            read(&for_work, &|| cancel.cancelled())
+            read_checked(&for_work, &|| cancel.cancelled())
         })?;
         Ok(FolderRead { dir, job })
     }
@@ -218,20 +284,34 @@ impl FolderRead {
     }
 
     /// Asks the read to stop. It returns at once and the read stops between two entries; the
-    /// entries it had read are thrown away, so [`FolderRead::take`] gives `None`.
+    /// entries it had read are thrown away, so neither take gives anything.
     pub fn cancel(&self) {
         self.job.cancel();
     }
 
     /// The folder and its entries, once the read has ended: `None` while it still runs, `None`
     /// again after they were taken, and `None` for a cancelled read, whose entries are dropped
-    /// here rather than handed over half read.
+    /// here rather than handed over half read. A folder that could not be opened gives an empty
+    /// list here, as [`read`] does; use [`take_checked`](Self::take_checked) to see the error.
+    ///
+    /// A read is handed over once: whichever of the two takes is called first takes it.
     pub fn take(&mut self) -> Option<(PathBuf, Vec<Entry>)> {
         if self.job.cancelled() {
             self.job.take();
             return None;
         }
-        self.job.take().map(|entries| (self.dir.clone(), entries))
+        let entries = self.job.take()?.unwrap_or_default();
+        Some((self.dir.clone(), entries))
+    }
+
+    /// [`take`](Self::take), with the folder's own error kept: an `Err` says the folder could
+    /// not be opened, so the application can tell it from a folder that is empty.
+    pub fn take_checked(&mut self) -> Option<(PathBuf, io::Result<Vec<Entry>>)> {
+        if self.job.cancelled() {
+            self.job.take();
+            return None;
+        }
+        Some((self.dir.clone(), self.job.take()?))
     }
 }
 
@@ -244,8 +324,9 @@ impl Drop for FolderRead {
 /// The column a list is sorted by.
 ///
 /// Folders come first whatever the column and the direction; among the rest, a column's own order
-/// decides, and entries whose keys are equal keep the order of [`Listing::all`]. Times sort with
-/// "unknown" (`None`) before any time.
+/// decides, then the name in [`natural_cmp`]'s order, then the path's bytes. The last two make
+/// the order total, so two runs of the same entries always come out the same way. Times sort
+/// with "unknown" (`None`) before any time.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Column {
     /// The name, in [`natural_cmp`]'s order, so `"file2"` comes before `"file10"`.
@@ -282,6 +363,10 @@ impl Sort {
 /// Each variant carries what the list needs to change one entry in place; nothing is re-read.
 /// A [`Change::Modified`] for a path the list does not hold inserts it, because a save the
 /// watcher reported as a change may be a file it never reported being created.
+///
+/// With a [folder](Listing::folder), only a path directly inside it is applied: a rename out of
+/// the folder is a [`Removed`](Change::Removed), a rename into it a
+/// [`Created`](Change::Created), and anything else outside is ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     /// An entry appeared. An entry already listed under the same path takes its place.
@@ -305,33 +390,99 @@ pub enum Change {
 /// This is what an application hands to the toolkit's `select::Selection::remap` (as
 /// [`Remap::mapping`]) so that a selection follows its entries through a new sort, a filter, or a
 /// change on the disk.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// A change describes itself with a handful of row edits and one row is followed through them
+/// when it is asked for, so a change on a list of a million entries costs no walk of them. A new
+/// sort or filter has no such description and keeps one answer per old row.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Remap {
-    new_of: Vec<Option<usize>>,
+    /// The rows the list showed before it changed.
+    rows: usize,
+    way: Way,
+}
+
+/// How a remap answers for an old row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Way {
+    /// One answer for every old row, made when the view was rebuilt.
+    Exact(Vec<Option<usize>>),
+    /// The row edits one change made, applied in order, and the rows it names by hand.
+    Edited {
+        edits: Vec<Edit>,
+        /// Old rows whose answer is not what the edits give: a rename's old row, which follows
+        /// the entry to its new name, though the old path is gone.
+        named: Vec<(usize, Option<usize>)>,
+    },
+}
+
+/// One row edit, in the row numbering of the moment it was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edit {
+    /// The row at `at` is gone, and the rows after it moved up one.
+    Removed(usize),
+    /// A row was inserted at `at`, and the rows from it moved down one.
+    Inserted(usize),
+}
+
+impl Default for Remap {
+    fn default() -> Remap {
+        Remap::exact(Vec::new())
+    }
 }
 
 impl Remap {
+    /// A remap with one answer per old row.
+    fn exact(new_of: Vec<Option<usize>>) -> Remap {
+        Remap {
+            rows: new_of.len(),
+            way: Way::Exact(new_of),
+        }
+    }
+
     /// The new row of the old row `old`, or `None` when that entry is not shown any more.
     pub fn get(&self, old: usize) -> Option<usize> {
-        self.new_of.get(old).copied().flatten()
+        match &self.way {
+            Way::Exact(new_of) => new_of.get(old).copied().flatten(),
+            Way::Edited { edits, named } => {
+                if let Some((_, to)) = named.iter().find(|(row, _)| *row == old) {
+                    return *to;
+                }
+                let mut row = old;
+                for edit in edits {
+                    match *edit {
+                        Edit::Removed(at) => {
+                            if row == at {
+                                return None;
+                            }
+                            if row > at {
+                                row -= 1;
+                            }
+                        }
+                        Edit::Inserted(at) => {
+                            if row >= at {
+                                row += 1;
+                            }
+                        }
+                    }
+                }
+                Some(row)
+            }
+        }
     }
 
     /// How many old rows this remap speaks for: the length of the list before it changed.
     pub fn len(&self) -> usize {
-        self.new_of.len()
+        self.rows
     }
 
     /// Whether there were no rows before the change.
     pub fn is_empty(&self) -> bool {
-        self.new_of.is_empty()
+        self.rows == 0
     }
 
     /// Whether every old row is where it was, and none was lost.
     pub fn unchanged(&self) -> bool {
-        self.new_of
-            .iter()
-            .enumerate()
-            .all(|(old, new)| *new == Some(old))
+        (0..self.rows).all(|old| self.get(old) == Some(old))
     }
 
     /// The remap as the function `Selection::remap` takes, for `selection.remap(remap.mapping())`.
@@ -340,11 +491,64 @@ impl Remap {
     }
 }
 
+/// An index from a path to an entry's place in a [`Listing`], so one change finds its entry
+/// without reading the list.
+///
+/// Keyed by a hash of the path, so no path is copied; a bucket holds the few places whose paths
+/// hash alike and the paths themselves decide.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Index {
+    buckets: HashMap<u64, Vec<usize>>,
+}
+
+impl Index {
+    /// The index of every entry, by path.
+    fn of(entries: &[Entry]) -> Index {
+        let mut index = Index::default();
+        for (i, entry) in entries.iter().enumerate() {
+            index.add(&entry.path, i);
+        }
+        index
+    }
+
+    fn hash(path: &Path) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The place of the entry at exactly `path`.
+    fn find(&self, entries: &[Entry], path: &Path) -> Option<usize> {
+        self.buckets
+            .get(&Self::hash(path))?
+            .iter()
+            .copied()
+            .find(|&i| entries[i].path == path)
+    }
+
+    fn add(&mut self, path: &Path, index: usize) {
+        self.buckets
+            .entry(Self::hash(path))
+            .or_default()
+            .push(index);
+    }
+
+    fn remove(&mut self, path: &Path, index: usize) {
+        let hash = Self::hash(path);
+        if let Some(bucket) = self.buckets.get_mut(&hash) {
+            bucket.retain(|&i| i != index);
+            if bucket.is_empty() {
+                self.buckets.remove(&hash);
+            }
+        }
+    }
+}
+
 /// The entries of one folder, filtered and sorted: what a file manager's list shows.
 ///
-/// The list holds every entry read ([`all`](Self::all), in the folder's own order) and the rows
-/// it shows ([`visible`](Self::visible), filtered and sorted). Every method that changes the rows
-/// returns a [`Remap`] that says where each old row went.
+/// The list holds every entry read ([`all`](Self::all), in the order the folder gave them) and
+/// the rows it shows ([`visible`](Self::visible), filtered and sorted). Every method that changes
+/// the rows returns a [`Remap`] that says where each old row went.
 ///
 /// A new list is sorted by name, ascending; folders come first; hidden entries are left out; and
 /// the filter is empty.
@@ -352,14 +556,25 @@ impl Remap {
 /// Nothing here reads the disk or the clock. What it holds is given to it: the entries from
 /// [`read`] or [`FolderRead`], and the one entry of a [`Change`] the application read with
 /// [`Entry::at`].
+///
+/// Each entry's lower-cased name is made once, when the entry comes in, and is the key the
+/// filter and the name column compare; a change finds, removes and re-inserts its entry by
+/// binary search in the sorted rows instead of sorting them again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Listing {
     folder: Option<PathBuf>,
-    /// Every entry read, in the order the folder gave them. The view indexes into this.
+    /// Every entry, in the order the folder gave them; a removal puts the last entry in the
+    /// place of the one that went, so the order is the folder's only until something changes.
     entries: Vec<Entry>,
-    /// The rows shown, as indices into `entries`, filtered and sorted.
+    /// The name of each entry in lower case, parallel to `entries`: the filter's key and the
+    /// name sort's key.
+    lower: Vec<String>,
+    index: Index,
+    /// The rows shown, as places in `entries`, filtered and sorted.
     view: Vec<usize>,
     filter: String,
+    /// `filter` in lower case, which is what the entries' names are compared against.
+    needle: String,
     show_hidden: bool,
     sort: Sort,
 }
@@ -370,8 +585,11 @@ impl Listing {
         Listing {
             folder: None,
             entries: Vec::new(),
+            lower: Vec::new(),
+            index: Index::default(),
             view: Vec::new(),
             filter: String::new(),
+            needle: String::new(),
             show_hidden: false,
             sort: Sort::DEFAULT,
         }
@@ -385,53 +603,96 @@ impl Listing {
     /// Names the folder the list belongs to and forgets every entry: for a list that shows
     /// another folder now. Its filter, its sort and its switches stay.
     pub fn set_folder(&mut self, folder: Option<PathBuf>) -> Remap {
-        let old = self.view_paths();
+        let old = std::mem::take(&mut self.view);
         self.folder = folder;
         self.entries.clear();
-        self.rebuild();
-        self.remap_from(&old)
+        self.lower.clear();
+        self.index = Index::default();
+        Remap::exact(vec![None; old.len()])
     }
 
     /// Replaces every entry with a fresh reading of the folder, keeping the filter and the sort.
     pub fn set_entries(&mut self, entries: Vec<Entry>) -> Remap {
-        let old = self.view_paths();
+        let old = std::mem::take(&mut self.view);
+        let lower: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
+        let view = self.view_of(&entries, &lower);
+        // The rows of the new list are matched to the old ones by path, borrowed both ways, so
+        // no path is copied for the remap.
+        let mut at: HashMap<&Path, usize> = HashMap::with_capacity(view.len());
+        for (row, &i) in view.iter().enumerate() {
+            at.insert(entries[i].path.as_path(), row);
+        }
+        let new_of = old
+            .iter()
+            .map(|&i| at.get(self.entries[i].path.as_path()).copied())
+            .collect();
+        self.index = Index::of(&entries);
         self.entries = entries;
-        self.rebuild();
-        self.remap_from(&old)
+        self.lower = lower;
+        self.view = view;
+        Remap::exact(new_of)
     }
 
     /// Applies one change to the entries, keeping everything else: only the entry the change
-    /// names is added, removed, replaced or moved, and nothing is read from the disk.
+    /// names is added, removed, replaced or moved, by binary search in the rows, and nothing is
+    /// read from the disk.
     ///
-    /// A rename's remap follows the entry to its new path, so a selection stays on it: the old
-    /// row of `from` maps to the new row of `to`, though the two paths differ.
+    /// With a [folder](Self::folder), a change whose path is not directly inside it is ignored,
+    /// except that a rename out of the folder removes its entry and a rename into it creates
+    /// one. A rename's remap follows the entry to its new path, so a selection stays on it: the
+    /// old row of `from` maps to the new row of `to`, though the two paths differ.
     pub fn apply(&mut self, change: Change) -> Remap {
-        let old = self.view_paths();
-        let mut renamed = None;
+        let rows = self.view.len();
+        // The row edits the change makes, in the numbering of the moment each was made, and the
+        // few old rows whose answer the edits cannot give.
+        let mut edits: Vec<Edit> = Vec::new();
+        let mut named: Vec<(usize, Option<usize>)> = Vec::new();
         match change {
-            Change::Created(entry) | Change::Modified(entry) => self.put(entry),
+            Change::Created(entry) | Change::Modified(entry) => {
+                if self.inside(&entry.path) {
+                    let (_, replaced) = self.put(entry, &mut edits);
+                    if let Some((old, new)) = replaced {
+                        named.push((old, Some(new)));
+                    }
+                }
+            }
             Change::Removed(path) => {
-                let gone = path_key(&path);
-                self.entries.retain(|entry| path_key(&entry.path) != gone);
+                if self.inside(&path)
+                    && let Some(i) = self.index.find(&self.entries, &path)
+                {
+                    self.take_out(i, &mut edits);
+                }
             }
             Change::Renamed { from, to } => {
-                let gone = path_key(&from);
-                let moved = path_key(&to.path);
-                self.entries.retain(|entry| path_key(&entry.path) != gone);
-                self.put(to);
-                renamed = Some((gone, moved));
+                // The row the entry had before anything moves, for the selection to follow it.
+                let from_row = self
+                    .inside(&from)
+                    .then(|| self.index.find(&self.entries, &from))
+                    .flatten()
+                    .and_then(|i| self.position_of(i).ok());
+                let inside_to = self.inside(&to.path);
+                if inside_to && let Some(j) = self.index.find(&self.entries, &to.path) {
+                    // A name the list already shows is replaced by the new entry.
+                    self.take_out(j, &mut edits);
+                }
+                if let Some(i) = self.index.find(&self.entries, &from) {
+                    self.take_out(i, &mut edits);
+                }
+                if inside_to {
+                    let (new, replaced) = self.put(to, &mut edits);
+                    if let Some((old, moved)) = replaced {
+                        named.push((old, Some(moved)));
+                    }
+                    if let Some(row) = from_row {
+                        named.push((row, self.position_of(new).ok()));
+                    }
+                }
             }
         }
-        self.rebuild();
-        let mut remap = self.remap_from(&old);
-        if let Some((gone, moved)) = renamed {
-            // The old path is not in the list any more, so the path matching would lose the
-            // row: it is where the entry went under its new name.
-            if let Some(old_row) = old.iter().position(|path| path_key(path) == gone) {
-                remap.new_of[old_row] = self.row_of_key(&moved);
-            }
+        Remap {
+            rows,
+            way: Way::Edited { edits, named },
         }
-        remap
     }
 
     /// How many rows are shown.
@@ -455,17 +716,10 @@ impl Listing {
     }
 
     /// The shown row of the entry at `path`, or `None` when no row shows it (not read, hidden,
-    /// or filtered out). Paths are compared as the system compares names: without case where
-    /// the system ignores it.
+    /// or filtered out). Paths are compared exactly, as the folder spelled them.
     pub fn row_of(&self, path: &Path) -> Option<usize> {
-        self.row_of_key(&path_key(path))
-    }
-
-    /// The shown row of the entry whose path key is `wanted`.
-    fn row_of_key(&self, wanted: &str) -> Option<usize> {
-        self.view
-            .iter()
-            .position(|&i| path_key(&self.entries[i].path) == wanted)
+        let i = self.index.find(&self.entries, path)?;
+        self.position_of(i).ok()
     }
 
     /// The shown entries, top to bottom: filter and sort applied.
@@ -473,7 +727,8 @@ impl Listing {
         self.view.iter().map(|&i| &self.entries[i])
     }
 
-    /// Every entry read, in the folder's own order, before the filter and the sort.
+    /// Every entry read, in the order the folder gave them until a change; a removal moves the
+    /// last entry into the place of the one that went.
     pub fn all(&self) -> &[Entry] {
         &self.entries
     }
@@ -486,10 +741,11 @@ impl Listing {
     /// Shows only the entries whose name contains `filter`, ignoring case. An empty filter
     /// shows every entry the hidden switch allows.
     pub fn set_filter(&mut self, filter: &str) -> Remap {
-        let old = self.view_paths();
+        let old = std::mem::take(&mut self.view);
         self.filter = filter.to_string();
+        self.needle = filter.to_lowercase();
         self.rebuild();
-        self.remap_from(&old)
+        self.remap_entries(&old)
     }
 
     /// Whether hidden entries are shown.
@@ -499,10 +755,10 @@ impl Listing {
 
     /// Shows or hides the entries the system hides (see [`Entry::hidden`]).
     pub fn set_show_hidden(&mut self, show: bool) -> Remap {
-        let old = self.view_paths();
+        let old = std::mem::take(&mut self.view);
         self.show_hidden = show;
         self.rebuild();
-        self.remap_from(&old)
+        self.remap_entries(&old)
     }
 
     /// The current sort.
@@ -512,10 +768,10 @@ impl Listing {
 
     /// Sorts by `sort`, folders first.
     pub fn set_sort(&mut self, sort: Sort) -> Remap {
-        let old = self.view_paths();
+        let old = std::mem::take(&mut self.view);
         self.sort = sort;
         self.rebuild();
-        self.remap_from(&old)
+        self.remap_entries(&old)
     }
 
     /// A click on a column's title: sorted by another column, the list is now sorted by this one,
@@ -525,60 +781,138 @@ impl Listing {
         self.set_sort(Sort { column, descending })
     }
 
-    /// Puts an entry in, replacing the entry with the same path when there is one.
-    fn put(&mut self, entry: Entry) {
-        let wanted = path_key(&entry.path);
-        match self
-            .entries
-            .iter_mut()
-            .find(|held| path_key(&held.path) == wanted)
-        {
-            Some(held) => *held = entry,
-            None => self.entries.push(entry),
+    /// Whether the entry at `path` sits directly in the list's folder (or the list has no
+    /// folder, which applies everything). The folder itself is not one of its entries.
+    fn inside(&self, path: &Path) -> bool {
+        match self.folder.as_deref() {
+            None => true,
+            Some(folder) => path.parent() == Some(folder),
         }
     }
 
-    /// Builds the view from the entries: the filter, the hidden switch and the sort.
-    fn rebuild(&mut self) {
-        let needle = self.filter.to_lowercase();
-        let mut view = Vec::with_capacity(self.entries.len());
-        for (i, entry) in self.entries.iter().enumerate() {
-            if !self.show_hidden && entry.hidden {
-                continue;
-            }
-            if !needle.is_empty() && !entry.name.to_lowercase().contains(&needle) {
-                continue;
-            }
-            view.push(i);
-        }
+    /// Whether the entry at place `i` passes the filter and the hidden switch.
+    fn shows(&self, i: usize) -> bool {
+        self.shows_entry(&self.entries[i], &self.lower[i])
+    }
+
+    fn shows_entry(&self, entry: &Entry, lower: &str) -> bool {
+        (self.show_hidden || !entry.hidden)
+            && (self.needle.is_empty() || lower.contains(&self.needle))
+    }
+
+    /// The view of these entries under the list's filter, switches and sort.
+    fn view_of(&self, entries: &[Entry], lower: &[String]) -> Vec<usize> {
+        let mut view: Vec<usize> = (0..entries.len())
+            .filter(|&i| self.shows_entry(&entries[i], &lower[i]))
+            .collect();
         let sort = self.sort;
-        view.sort_by(|&a, &b| compare(&self.entries[a], &self.entries[b], sort));
-        self.view = view;
+        view.sort_by(|&a, &b| compare(&entries[a], &lower[a], &entries[b], &lower[b], sort));
+        view
     }
 
-    /// The paths of the shown rows, in order: what the next view is matched against.
-    fn view_paths(&self) -> Vec<PathBuf> {
-        self.view
-            .iter()
-            .map(|&i| self.entries[i].path.clone())
-            .collect()
+    /// Builds the view again from the entries: after the filter, the switches or the sort moved.
+    fn rebuild(&mut self) {
+        self.view = self.view_of(&self.entries, &self.lower);
     }
 
-    /// Where each of `old`'s rows is in the view as it is now.
-    fn remap_from(&self, old: &[PathBuf]) -> Remap {
-        if old.is_empty() {
-            return Remap::default();
+    /// The place of entry `i` in the rows, by binary search; `Err` is where it would go.
+    fn position_of(&self, i: usize) -> Result<usize, usize> {
+        self.view.binary_search_by(|&other| self.order(other, i))
+    }
+
+    /// The comparison of the entry at place `other` with the entry at place `i`.
+    fn order(&self, other: usize, i: usize) -> Ordering {
+        compare(
+            &self.entries[other],
+            &self.lower[other],
+            &self.entries[i],
+            &self.lower[i],
+            self.sort,
+        )
+    }
+
+    /// Takes entry `i` out of the rows, if it is in them, and says which row went.
+    fn view_remove(&mut self, i: usize) -> Option<usize> {
+        let pos = self.position_of(i).ok()?;
+        self.view.remove(pos);
+        Some(pos)
+    }
+
+    /// Puts entry `i` into the rows, by binary search, if it passes the filter and the switches,
+    /// and says which row it took.
+    fn view_insert(&mut self, i: usize) -> Option<usize> {
+        if !self.shows(i) {
+            return None;
         }
-        let mut at = HashMap::with_capacity(self.view.len());
+        let at = self.position_of(i).unwrap_or_else(|at| at);
+        self.view.insert(at, i);
+        Some(at)
+    }
+
+    /// Adds or replaces `entry`, returning its place in `entries`, recording the rows it moved
+    /// in `edits`, and, when it replaced an entry that was shown, the row the entry itself went
+    /// from and to (its own row is not something the edits can answer: they removed it).
+    fn put(&mut self, entry: Entry, edits: &mut Vec<Edit>) -> (usize, Option<(usize, usize)>) {
+        let lower = entry.name.to_lowercase();
+        if let Some(i) = self.index.find(&self.entries, &entry.path) {
+            let old = self.view_remove(i);
+            if let Some(pos) = old {
+                edits.push(Edit::Removed(pos));
+            }
+            self.entries[i] = entry;
+            self.lower[i] = lower;
+            let new = self.view_insert(i);
+            if let Some(at) = new {
+                edits.push(Edit::Inserted(at));
+            }
+            (i, old.zip(new))
+        } else {
+            self.entries.push(entry);
+            self.lower.push(lower);
+            let i = self.entries.len() - 1;
+            self.index.add(&self.entries[i].path, i);
+            if let Some(at) = self.view_insert(i) {
+                edits.push(Edit::Inserted(at));
+            }
+            (i, None)
+        }
+    }
+
+    /// Removes entry `i` from the entries, the keys and the index, and its row from the rows,
+    /// recording the row in `edits`.
+    fn take_out(&mut self, i: usize, edits: &mut Vec<Edit>) {
+        let last = self.entries.len() - 1;
+        if let Some(pos) = self.view_remove(i) {
+            edits.push(Edit::Removed(pos));
+        }
+        if last != i {
+            // The last entry takes this place: point its row at its new place before the
+            // entries move. Its row number is the one the removal above already moved it to.
+            if let Ok(pos) = self.position_of(last) {
+                self.view[pos] = i;
+            }
+        }
+        let removed = self.entries.swap_remove(i);
+        self.lower.swap_remove(i);
+        self.index.remove(&removed.path, i);
+        if last != i {
+            self.index.remove(&self.entries[i].path, last);
+            self.index.add(&self.entries[i].path, i);
+        }
+    }
+
+    /// Where each of `old`'s places is, when the entries did not move (a filter, a switch or a
+    /// sort): the rows were rebuilt, and only their places changed.
+    fn remap_entries(&self, old: &[usize]) -> Remap {
+        let mut row_of = vec![usize::MAX; self.entries.len()];
         for (row, &i) in self.view.iter().enumerate() {
-            at.insert(path_key(&self.entries[i].path), row);
+            row_of[i] = row;
         }
-        Remap {
-            new_of: old
-                .iter()
-                .map(|path| at.get(&path_key(path)).copied())
+        Remap::exact(
+            old.iter()
+                .map(|&i| row_of.get(i).copied().filter(|&row| row != usize::MAX))
                 .collect(),
-        }
+        )
     }
 }
 
@@ -588,46 +922,33 @@ impl Default for Listing {
     }
 }
 
-/// Compares two entries under `sort`: folders first, then the column, then the direction.
+/// Compares two entries under `sort`: folders first, then the column, then the name and the
+/// path, so that the order is total and two runs of the same entries agree.
 ///
-/// The comparison is a stable sort's key: two entries that come out equal keep the order of
-/// [`Listing::all`], which is the order the folder gave them.
-fn compare(a: &Entry, b: &Entry, sort: Sort) -> Ordering {
+/// The name column compares the cached lower-case names, which is [`natural_cmp`] on the names
+/// themselves; the tiebreak then separates names that differ only in case, and the path settles
+/// anything left (none, where every path is unique).
+fn compare(a: &Entry, a_lower: &str, b: &Entry, b_lower: &str, sort: Sort) -> Ordering {
     match (a.kind == Kind::Folder, b.kind == Kind::Folder) {
         (true, false) => return Ordering::Less,
         (false, true) => return Ordering::Greater,
         _ => {}
     }
     let by_column = match sort.column {
-        Column::Name => natural_cmp(&a.name, &b.name),
+        Column::Name => natural_cmp(a_lower, b_lower),
         Column::Kind => a.kind.cmp(&b.kind),
         Column::Size => a.size.cmp(&b.size),
         Column::Modified => a.modified.cmp(&b.modified),
         Column::Created => a.created.cmp(&b.created),
     };
-    if sort.descending {
+    let by_column = if sort.descending {
         by_column.reverse()
     } else {
         by_column
-    }
-}
-
-/// The key two spellings of one path share: no verbatim prefix, no trailing separator, `\` on
-/// Windows, and without case where the system ignores it.
-fn path_key(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    let mut key = strip_verbatim(&text).unwrap_or_else(|| text.into_owned());
-    if cfg!(windows) {
-        key = key.replace('/', "\\");
-    }
-    while key.len() > 1 && (key.ends_with('\\') || key.ends_with('/')) && !key.ends_with(":\\") {
-        key.pop();
-    }
-    if NAMES_IGNORE_CASE {
-        key.to_lowercase()
-    } else {
-        key
-    }
+    };
+    by_column
+        .then_with(|| natural_cmp(&a.name, &b.name))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 #[cfg(test)]

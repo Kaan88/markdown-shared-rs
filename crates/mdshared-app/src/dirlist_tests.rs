@@ -66,6 +66,18 @@ fn wait_until(mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Makes a folder link pointing at `target`; false where the machine does not allow it.
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+}
+
 /// Marks `path` hidden with the system's own tool; the attribute is what Windows hides by.
 #[cfg(windows)]
 fn make_hidden(path: &Path) {
@@ -75,6 +87,23 @@ fn make_hidden(path: &Path) {
         .status()
         .expect("attrib runs");
     assert!(status.success(), "attrib +h {path:?} failed");
+}
+
+/// Sets the hidden attribute on the link itself, never on what it points at.
+#[cfg(windows)]
+fn hide_link(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, SetFileAttributesW,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated wide string that outlives both calls, and neither call
+    // keeps the pointer.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    assert_ne!(attributes, u32::MAX, "the link is there: {path:?}");
+    // SAFETY: the same NUL-terminated string, still alive; the call only reads it.
+    let done = unsafe { SetFileAttributesW(wide.as_ptr(), attributes | FILE_ATTRIBUTE_HIDDEN) };
+    assert_ne!(done, 0, "the link's own attribute is set: {path:?}");
 }
 
 #[test]
@@ -123,12 +152,15 @@ fn reading_a_folder_gives_its_entries_and_their_kinds() {
 }
 
 #[test]
-fn the_systems_way_of_hiding_an_entry_is_read() {
+fn the_systems_way_of_hiding_a_file_is_read() {
     let d = Dir::new("hidden-read");
     d.file(".dot", b"x");
-    let plain = d.file("plain", b"x");
+    d.file("plain", b"x");
     #[cfg(windows)]
-    make_hidden(&plain);
+    {
+        let plain = d.0.join("plain");
+        make_hidden(&plain);
+    }
     let entries = read(&d.0, &|| false);
     let named = |name: &str| {
         entries
@@ -149,6 +181,71 @@ fn the_systems_way_of_hiding_an_entry_is_read() {
         assert!(named(".dot").hidden, "a leading dot hides it");
         assert!(!named("plain").hidden);
     }
+}
+
+#[test]
+fn links_are_listed_as_other_and_never_followed() {
+    let d = Dir::new("links");
+    d.dir("real");
+    if !link_dir(Path::new("real"), &d.0.join("to-folder")) {
+        eprintln!("skipped: this machine does not let a test make a symbolic link");
+        return;
+    }
+    if !link_dir(Path::new("missing"), &d.0.join("broken"))
+        || !link_dir(Path::new("loop"), &d.0.join("loop"))
+    {
+        eprintln!("skipped: a link to a missing path or to itself could not be made");
+        return;
+    }
+    let entries = read(&d.0, &|| false);
+    let kind = |name: &str| entries.iter().find(|e| e.name == name).map(|e| e.kind);
+    assert_eq!(
+        kind("to-folder"),
+        Some(Kind::Other),
+        "a link to a folder is not followed"
+    );
+    assert_eq!(
+        kind("broken"),
+        Some(Kind::Other),
+        "a dead link is still listed"
+    );
+    assert_eq!(kind("loop"), Some(Kind::Other), "a loop is not entered");
+    assert_eq!(kind("real"), Some(Kind::Folder));
+    assert_eq!(entries.len(), 4, "nothing was skipped: {entries:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_hidden_junction_is_listed_and_hidden() {
+    let d = Dir::new("junction");
+    let target = d.dir("target");
+    let link = d.0.join("junction");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if !made {
+        eprintln!("skipped: mklink /J is not available here");
+        return;
+    }
+    hide_link(&link);
+    let entries = read(&d.0, &|| false);
+    let junction = entries
+        .iter()
+        .find(|e| e.name == "junction")
+        .expect("the junction is listed");
+    assert!(
+        junction.hidden,
+        "the link's own hidden attribute is what hides it"
+    );
+    assert_ne!(
+        junction.kind,
+        Kind::File,
+        "a junction is the system's own kind of directory, or at worst other"
+    );
 }
 
 #[test]
@@ -179,15 +276,15 @@ fn every_column_sorts_with_the_folders_first_and_names_naturally() {
         ["zdir", "adir", "file10", "file2", "file1", "dev"]
     );
 
-    // Size, the folders first and then the files by size; the equal folders keep the order
-    // the folder gave them, which is what a stable sort promises.
+    // Size, the folders first and then the files by size; equal sizes fall back to the name, so
+    // the order is the same however the folder listed them.
     listing.set_sort(Sort {
         column: Column::Size,
         descending: false,
     });
     assert_eq!(
         names(&listing),
-        ["zdir", "adir", "dev", "file2", "file1", "file10"]
+        ["adir", "zdir", "dev", "file2", "file1", "file10"]
     );
     listing.set_sort(Sort {
         column: Column::Size,
@@ -195,7 +292,7 @@ fn every_column_sorts_with_the_folders_first_and_names_naturally() {
     });
     assert_eq!(
         names(&listing),
-        ["zdir", "adir", "file10", "file1", "file2", "dev"]
+        ["adir", "zdir", "file10", "file1", "file2", "dev"]
     );
 
     // Modified, with an unknown time first and the folders by their own times.
@@ -208,14 +305,14 @@ fn every_column_sorts_with_the_folders_first_and_names_naturally() {
         ["zdir", "adir", "dev", "file2", "file1", "file10"]
     );
 
-    // Created: unknown for every entry, so each group keeps the read order.
+    // Created: unknown for every entry, so the name decides every tie.
     listing.set_sort(Sort {
         column: Column::Created,
         descending: false,
     });
     assert_eq!(
         names(&listing),
-        ["zdir", "adir", "file10", "file2", "file1", "dev"]
+        ["adir", "zdir", "dev", "file1", "file2", "file10"]
     );
 
     // Kind: folders first, then file, then other.
@@ -225,7 +322,7 @@ fn every_column_sorts_with_the_folders_first_and_names_naturally() {
     });
     assert_eq!(
         names(&listing),
-        ["zdir", "adir", "file10", "file2", "file1", "dev"]
+        ["adir", "zdir", "file1", "file2", "file10", "dev"]
     );
 }
 
@@ -326,66 +423,154 @@ fn filtering_and_the_hidden_switch_narrow_the_list() {
 #[test]
 fn applying_a_change_gives_the_same_list_as_a_full_read() {
     let d = Dir::new("apply");
-    d.file("a.txt", b"one");
-    d.file("b.txt", b"two");
-    d.file("m.txt", b"three");
+    // Equal sizes, so the name tiebreak is what orders the files under the size column.
+    d.file("a.txt", b"11");
+    d.file("b.txt", b"11");
+    d.file("c.txt", b"11");
+    d.file("m.txt", b"11");
     d.dir("s");
+    let before = read(&d.0, &|| false);
 
-    let mut listing = Listing::new();
-    listing.set_folder(Some(d.0.clone()));
-    listing.set_entries(read(&d.0, &|| false));
-    assert_eq!(names(&listing), ["s", "a.txt", "b.txt", "m.txt"]);
-
-    // The disk changes the four ways a watcher reports.
-    let created = d.file("c.txt", b"four");
+    // The disk changes in the five ways a list must follow.
+    let created = d.file("d.txt", b"11");
     fs::remove_file(d.0.join("b.txt")).unwrap();
     fs::rename(d.0.join("a.txt"), d.0.join("z.txt")).unwrap();
-    fs::write(d.0.join("m.txt"), b"three and more").unwrap();
-    // And one the watcher never reported as a create: a change to a file not in the list.
-    let missed = d.file("n.txt", b"new");
+    fs::write(d.0.join("m.txt"), b"more").unwrap();
+    fs::remove_file(d.0.join("c.txt")).unwrap();
+    fs::create_dir(d.0.join("c.txt")).unwrap();
 
-    let remap = listing.apply(Change::Created(Entry::at(&created).unwrap()));
-    assert_eq!(remap.len(), 4);
-    assert!(!remap.unchanged(), "a row was added");
-    listing.apply(Change::Removed(d.0.join("b.txt")));
-    let remap = listing.apply(Change::Renamed {
-        from: d.0.join("a.txt"),
-        to: Entry::at(d.0.join("z.txt")).unwrap(),
-    });
-    // "a.txt" was row 1; "z.txt" is the last row of the files now.
-    assert_eq!(remap.get(1), Some(3));
-    listing.apply(Change::Modified(Entry::at(d.0.join("m.txt")).unwrap()));
-    let remap = listing.apply(Change::Modified(Entry::at(&missed).unwrap()));
-    // "z.txt", the last row, was pushed down by the file the watcher missed.
-    assert_eq!(remap.get(3), Some(4));
-    assert_eq!(remap.len(), 4);
+    let changes = [
+        Change::Created(Entry::at(&created).unwrap()),
+        Change::Removed(d.0.join("b.txt")),
+        Change::Renamed {
+            from: d.0.join("a.txt"),
+            to: Entry::at(d.0.join("z.txt")).unwrap(),
+        },
+        Change::Modified(Entry::at(d.0.join("m.txt")).unwrap()),
+        Change::Modified(Entry::at(d.0.join("c.txt")).unwrap()),
+    ];
+    let after = read(&d.0, &|| false);
 
-    let mut fresh = Listing::new();
-    fresh.set_entries(read(&d.0, &|| false));
+    // Applied one by one, the list is the one a fresh reading gives, under every column and
+    // both directions.
+    for column in [
+        Column::Name,
+        Column::Kind,
+        Column::Size,
+        Column::Modified,
+        Column::Created,
+    ] {
+        for descending in [false, true] {
+            let sort = Sort { column, descending };
+            let mut incremental = Listing::new();
+            incremental.set_folder(Some(d.0.clone()));
+            incremental.set_entries(before.clone());
+            incremental.set_sort(sort);
+            for change in changes.clone() {
+                incremental.apply(change);
+            }
+            let mut fresh = Listing::new();
+            fresh.set_folder(Some(d.0.clone()));
+            fresh.set_entries(after.clone());
+            fresh.set_sort(sort);
+            assert_eq!(
+                incremental.visible().cloned().collect::<Vec<_>>(),
+                fresh.visible().cloned().collect::<Vec<_>>(),
+                "{column:?}, descending {descending}"
+            );
+        }
+    }
     assert_eq!(
-        listing.all().len(),
-        fresh.all().len(),
-        "every entry is either applied or read"
+        names(&freshly_read(&d.0)),
+        ["c.txt", "s", "d.txt", "m.txt", "z.txt"]
     );
-    assert_eq!(
-        listing.visible().cloned().collect::<Vec<_>>(),
-        fresh.visible().cloned().collect::<Vec<_>>(),
-        "the applied list is the one a full read gives"
-    );
-    assert_eq!(names(&listing), ["s", "c.txt", "m.txt", "n.txt", "z.txt"]);
-    assert_eq!(listing.entry(2).unwrap().size, 14, "the change was applied");
+}
+
+/// A fresh reading of the folder, by name.
+fn freshly_read(dir: &Path) -> Listing {
+    let mut listing = Listing::new();
+    listing.set_entries(read(dir, &|| false));
+    listing
 }
 
 #[test]
-fn a_cancelled_read_delivers_nothing() {
-    let d = Dir::new("cancel");
+fn a_rename_onto_a_listed_name_replaces_it() {
+    let mut listing = Listing::new();
+    listing.set_entries(vec![
+        entry("a", Kind::File, 1, None),
+        entry("b", Kind::File, 2, None),
+    ]);
+    let remap = listing.apply(Change::Renamed {
+        from: PathBuf::from("/made/up/a"),
+        to: entry("b", Kind::Folder, 0, None),
+    });
+    assert_eq!(names(&listing), ["b"], "the name is listed once");
+    assert_eq!(listing.entry(0).unwrap().kind, Kind::Folder);
+    assert_eq!(
+        remap.get(0),
+        Some(0),
+        "the row of \"a\" follows to the new \"b\""
+    );
+    assert_eq!(remap.get(1), None, "the old \"b\" was replaced");
+}
+
+#[test]
+fn a_change_outside_the_folder_is_ignored() {
+    let folder = PathBuf::from("/made/up");
+    let elsewhere = |name: &str| Entry {
+        path: PathBuf::from("/elsewhere").join(name),
+        name: name.to_string(),
+        kind: Kind::File,
+        size: 1,
+        modified: None,
+        created: None,
+        hidden: false,
+    };
+    let mut listing = Listing::new();
+    listing.set_folder(Some(folder.clone()));
+    listing.set_entries(vec![entry("a", Kind::File, 1, None)]);
+
+    // A creation outside changes nothing.
+    let remap = listing.apply(Change::Created(elsewhere("b")));
+    assert_eq!(listing.len(), 1);
+    assert!(remap.unchanged());
+    // A removal of a path outside changes nothing.
+    listing.apply(Change::Removed(PathBuf::from("/elsewhere/a")));
+    assert_eq!(listing.len(), 1);
+    // The folder itself is not one of its entries.
+    listing.apply(Change::Removed(folder.clone()));
+    assert_eq!(listing.len(), 1);
+
+    // A rename out of the folder is a removal.
+    let remap = listing.apply(Change::Renamed {
+        from: folder.join("a"),
+        to: elsewhere("a"),
+    });
+    assert!(listing.is_empty());
+    assert_eq!(remap.get(0), None);
+
+    // A rename into the folder is a creation.
+    listing.apply(Change::Renamed {
+        from: PathBuf::from("/elsewhere/b"),
+        to: entry("b", Kind::File, 1, None),
+    });
+    assert_eq!(names(&listing), ["b"]);
+}
+
+#[test]
+fn a_cancelled_read_reads_nothing() {
+    let d = Dir::new("cancel-none");
+    d.file("a.txt", b"x");
+    assert!(read(&d.0, &|| true).is_empty());
+    assert!(read_checked(&d.0, &|| true).unwrap().is_empty());
+}
+
+#[test]
+fn a_cancel_part_way_stops_the_read() {
+    let d = Dir::new("cancel-part");
     for i in 0..5 {
         d.file(&format!("f{i}"), b"x");
     }
-    // Asked before the first entry, the flag stops the read at once.
-    assert!(read(&d.0, &|| true).is_empty());
-
-    // Raised after two entries, it stops the read there: a dead folder is abandoned.
     let asked = Cell::new(0);
     let entries = read(&d.0, &|| {
         let n = asked.get();
@@ -393,17 +578,18 @@ fn a_cancelled_read_delivers_nothing() {
         n >= 2
     });
     assert_eq!(entries.len(), 2, "{entries:?}");
+}
 
-    // The worker's handle throws away what a cancelled read had read, even when its thread
-    // has already finished.
+#[test]
+fn a_cancelled_folder_read_hands_nothing_over() {
+    let d = Dir::new("cancel-worker");
+    d.file("a.txt", b"x");
+    // Cancelled before the thread could notice, the handle still gives nothing, even though the
+    // work may have read the folder to its end.
     let mut job = FolderRead::start(d.0.clone(), || {}).unwrap();
-    assert_eq!(job.dir(), d.0.as_path());
     job.cancel();
     wait_until(|| !job.running());
-    assert!(
-        job.take().is_none(),
-        "a cancelled read delivers nothing, though it may have read entries"
-    );
+    assert!(job.take().is_none());
 }
 
 #[test]
@@ -411,37 +597,86 @@ fn a_folder_read_on_a_worker_hands_its_entries_over_once() {
     let d = Dir::new("worker");
     d.file("a.txt", b"x");
     let mut job = FolderRead::start(d.0.clone(), || {}).unwrap();
+    assert_eq!(job.dir(), d.0.as_path());
     wait_until(|| !job.running());
     let (dir, entries) = job.take().expect("the read ends with its entries");
     assert_eq!(dir, d.0);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "a.txt");
     assert!(job.take().is_none(), "a result is handed over once");
+
+    // A folder that cannot be opened is an error through the checked take.
+    let mut job = FolderRead::start(d.0.join("missing"), || {}).unwrap();
+    wait_until(|| !job.running());
+    let (_, result) = job.take_checked().expect("the read ends");
+    assert!(result.is_err(), "a folder that cannot be opened says so");
 }
 
 #[test]
-fn unreadable_entries_are_skipped_without_a_panic() {
+fn a_folder_that_cannot_be_opened_says_so_and_a_vanished_entry_is_skipped() {
     let d = Dir::new("unreadable");
-    d.file("kept.txt", b"x");
-    d.dir("gone");
-    // The folder is deleted between being listed and its details being asked for: its
-    // entry cannot be read, and the read goes on.
-    let first = Cell::new(true);
-    let entries = read(&d.0, &|| {
-        if first.replace(false) {
-            let _ = fs::remove_dir_all(d.0.join("gone"));
-        }
-        false
-    });
-    assert!(
-        entries.iter().all(|e| e.name != "gone"),
-        "an entry that vanished is skipped: {entries:?}"
-    );
-    assert!(entries.iter().any(|e| e.name == "kept.txt"));
+    let file = d.file("kept.txt", b"x");
+    // One entry, whose details are asked for after it has gone: the skip path itself, without
+    // depending on the order the folder would list its entries in. On Windows the folder scan's
+    // own record still describes a deleted entry, so the entry is asked of the disk only here.
+    #[cfg(not(windows))]
+    {
+        let mut items = fs::read_dir(&d.0).unwrap();
+        let item = items.next().expect("the folder has one entry").unwrap();
+        assert_eq!(item.file_name(), "kept.txt");
+        fs::remove_file(&file).unwrap();
+        assert!(
+            read_entry(&item).is_none(),
+            "an entry that vanished is skipped"
+        );
+    }
+    // Whatever an entry cannot say of itself, the rest of the folder is still read.
+    let skipped = read_with(&d.0, &|| false, &|_| None).unwrap();
+    assert!(skipped.is_empty() && file.is_file());
 
-    // A folder that cannot be opened, and a path that cannot be read, give nothing.
-    assert!(read(&d.0.join("missing"), &|| false).is_empty());
-    assert!(Entry::at(d.0.join("missing")).is_none());
+    // A folder that cannot be opened is an error, and reads as nothing.
+    let missing = d.0.join("missing");
+    assert!(read_checked(&missing, &|| false).is_err());
+    assert!(read(&missing, &|| false).is_empty());
+    assert!(Entry::at(&missing).is_none());
+}
+
+#[test]
+fn two_paths_that_differ_only_in_case_are_two_entries() {
+    let upper = entry("A.txt", Kind::File, 1, None);
+    let lower = entry("a.txt", Kind::File, 1, None);
+    let mut listing = Listing::new();
+    listing.set_entries(vec![upper.clone(), lower.clone()]);
+    assert_eq!(listing.len(), 2, "two paths, two rows");
+    // The names owe their order to the path's bytes once the case-folding key ties.
+    assert_eq!(listing.row_of(&upper.path), Some(0));
+    assert_eq!(listing.row_of(&lower.path), Some(1));
+    listing.apply(Change::Removed(upper.path.clone()));
+    assert_eq!(listing.len(), 1, "one path removed, one left");
+    assert_eq!(listing.row_of(&lower.path), Some(0));
+}
+
+#[test]
+fn two_names_that_differ_only_in_case_are_two_entries() {
+    let d = Dir::new("case");
+    d.file("A.txt", b"a");
+    let second = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(d.0.join("a.txt"));
+    if second.is_err() {
+        eprintln!("skipped: this file system does not tell A.txt from a.txt");
+        return;
+    }
+    let mut listing = Listing::new();
+    listing.set_entries(read(&d.0, &|| false));
+    assert_eq!(names(&listing), ["A.txt", "a.txt"], "one entry each");
+    assert_eq!(listing.row_of(&d.0.join("A.txt")), Some(0));
+    assert_eq!(listing.row_of(&d.0.join("a.txt")), Some(1));
+    // A change for one of them moves one entry only.
+    let remap = listing.apply(Change::Removed(d.0.join("A.txt")));
+    assert_eq!(remap.get(0), None);
+    assert_eq!(names(&listing), ["a.txt"]);
 }
 
 #[test]
@@ -508,5 +743,36 @@ fn a_change_to_an_entry_not_listed_inserts_it_and_one_already_there_replaces_it(
         listing.len(),
         1,
         "removing what is not there changes nothing"
+    );
+}
+
+#[test]
+fn a_thousand_changes_on_a_hundred_thousand_entries_are_quick() {
+    let mut entries = Vec::with_capacity(100_000);
+    for i in 0..100_000 {
+        entries.push(entry(
+            &format!("file{i:06}"),
+            Kind::File,
+            (i % 97) as u64,
+            at((i % 1000) as u64),
+        ));
+    }
+    let mut listing = Listing::new();
+    listing.set_entries(entries);
+    let started = Instant::now();
+    for k in 0..1_000 {
+        listing.apply(Change::Created(entry(
+            &format!("a{k:04}"),
+            Kind::File,
+            5,
+            at(1),
+        )));
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(listing.len(), 101_000);
+    eprintln!("1,000 changes on 100,000 entries took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "1,000 changes on 100,000 entries took {elapsed:?}"
     );
 }
