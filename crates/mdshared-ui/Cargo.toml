@@ -143,6 +143,10 @@ name = "scroll_dialog"
 required-features = ["host"]
 
 [[example]]
+name = "colour_picker"
+required-features = ["host"]
+
+[[example]]
 name = "host"
 required-features = ["host"]
 
