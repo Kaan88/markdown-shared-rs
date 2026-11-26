@@ -8,9 +8,14 @@
 //! ([`Selection::extend`]), asks [`Selection::span_on`] for what to paint on each line, and
 //! [`Selection::text`] for what to copy.
 //!
-//! What it does not know: when the program rewrites the cells under it. The numbers follow text
-//! only when the whole screen scrolls, so a caller drops the selection when output changes a row
-//! it covers ([`Screen::take_dirty`] against [`Selection::range`]), as terminals do.
+//! The numbers follow the text when the whole screen scrolls, so a selection made before output
+//! arrives still covers the same characters when they are in the scrollback. They do not follow
+//! text when a program rewrites cells in place, so after each [`Screen::feed`] the caller asks
+//! [`Selection::follow`]: it says whether the cells still hold the text the selection was made
+//! on, and the caller drops the selection when they do not, as terminals do. A selection keeps
+//! the text it holds as a 64-bit fingerprint rather than as characters, so it stays small and
+//! copyable; a rewrite that leaves the text exactly as it was is not noticed, and neither is
+//! one whose text happens to fingerprint the same way (which no real output does).
 
 use crate::screen::{Line, Screen};
 
@@ -57,6 +62,21 @@ pub struct Selection {
     anchor: (Point, Point),
     /// The first and last cell of the unit the pointer is on now.
     head: (Point, Point),
+    /// The fingerprint of [`Selection::text`] when the selection was made, extended or clipped:
+    /// what it last saw under itself, which [`Selection::is_intact`] compares with what is
+    /// there now.
+    held: u64,
+}
+
+/// A 64-bit fingerprint of a string (FNV-1a), so that a selection can tell whether the cells
+/// under it still hold the text they held without keeping the text.
+fn fingerprint(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// The characters that belong to a word besides letters and digits: those of file paths, web
@@ -109,9 +129,9 @@ impl Selection {
     /// grows by lines.
     ///
     /// A word is a run of letters, digits and the characters of [`WORD_PUNCTUATION`], or a run
-    /// of blanks, or one other character; it does not cross from one row to the next, also not
-    /// where a line wrapped. A line is the whole line of text: a row together with the rows it
-    /// wrapped from and into.
+    /// of blanks, or one other character; it crosses from one row into the next where the text
+    /// wrapped, since the two rows are one line of text, and stops at a hard line break. A line
+    /// is the whole line of text: a row together with the rows it wrapped from and into.
     pub fn start(screen: &Screen, at: Point, kind: SelectionKind, clicks: u8) -> Selection {
         let unit = match clicks {
             0 | 1 => Unit::Cell,
@@ -119,18 +139,22 @@ impl Selection {
             _ => Unit::Line,
         };
         let extent = unit_at(screen, at, unit);
-        Selection {
+        let mut sel = Selection {
             kind,
             unit,
             anchor: extent,
             head: extent,
-        }
+            held: 0,
+        };
+        sel.held = fingerprint(&sel.text(screen));
+        sel
     }
 
     /// Moves the end that is being dragged to `to`. The other end stays where the press was;
     /// the selection grows by the unit it was started with, to either side of the press.
     pub fn extend(&mut self, screen: &Screen, to: Point) {
         self.head = unit_at(screen, to, self.unit);
+        self.held = fingerprint(&self.text(screen));
     }
 
     pub fn kind(&self) -> SelectionKind {
@@ -191,13 +215,16 @@ impl Selection {
 
     /// Cuts the selection to the lines the screen still keeps: the part that was in lines the
     /// scrollback has dropped is let go. Returns false when nothing of it is left (the caller
-    /// then drops the selection).
+    /// then drops the selection). An end that was cut takes what is left as its text now, so the
+    /// part that survived is not later mistaken for a rewrite; a call that cuts nothing leaves
+    /// the text it holds alone, so a program's rewrite is still noticed afterwards.
     pub fn clip(&mut self, screen: &Screen) -> bool {
         let (first, end) = (screen.first_line(), screen.end_line());
         let (_, last) = self.range();
         if last.line < first || self.is_empty() {
             return false;
         }
+        let before = (self.anchor, self.head);
         let stream = self.kind == SelectionKind::Stream;
         for p in [
             &mut self.anchor.0,
@@ -217,7 +244,34 @@ impl Selection {
                 }
             }
         }
+        if (self.anchor, self.head) != before {
+            self.held = fingerprint(&self.text(screen));
+        }
         true
+    }
+
+    /// Whether the cells the selection covers still hold the text they held when it was made,
+    /// extended or clipped. A screen that scrolled leaves the text where the line numbers point,
+    /// so it stays intact; a program that rewrote or erased those cells makes it false, and the
+    /// caller drops the selection. An empty selection is intact: it has no text to lose.
+    pub fn is_intact(&self, screen: &Screen) -> bool {
+        self.held == fingerprint(&self.text(screen))
+    }
+
+    /// Follows the screen after output: whether the selection still covers the text it was made
+    /// on, which the caller keeps when it does and drops when it does not. False when that text
+    /// was rewritten or erased. False too once the first line of the selection has left the ring:
+    /// the text it holds is then not all there any more (the top of it is gone), so it is dropped
+    /// whole, even when lines at the bottom survive; [`clip`](Self::clip) is the call that keeps
+    /// that surviving part instead. A selection that reaches past the last line of the screen is
+    /// clamped to it and kept, which a resize does. A press that was not dragged is empty, and
+    /// `follow` answers false for it because there is no text to keep: the caller holds the press
+    /// itself until the drag.
+    pub fn follow(&mut self, screen: &Screen) -> bool {
+        if !self.is_intact(screen) {
+            return false;
+        }
+        self.clip(screen)
     }
 
     /// The selected text. Each row gives its selected characters without trailing spaces, and
@@ -267,23 +321,10 @@ fn unit_at(screen: &Screen, at: Point, unit: Unit) -> (Point, Point) {
             let (a, b) = cell_span(line, at.col);
             (Point::new(at.line, a), Point::new(at.line, b))
         }
-        Unit::Word => {
-            let Some(line) = line else {
-                return (at, at);
-            };
-            let kind = class(shown(line, at.col));
-            let (mut a, mut b) = cell_span(Some(line), at.col);
-            // A character that is neither blank nor of a word is a word alone.
-            if kind != 2 {
-                while a > 0 && class(shown(line, a - 1)) == kind {
-                    a -= 1;
-                }
-                while b + 1 < line.len() && class(shown(line, b + 1)) == kind {
-                    b += 1;
-                }
-            }
-            (Point::new(at.line, a), Point::new(at.line, b))
-        }
+        Unit::Word => match line {
+            Some(line) => word_at(screen, at, line),
+            None => (at, at),
+        },
         Unit::Line => {
             let (mut top, mut bottom) = (at.line, at.line);
             while top > screen.first_line() && screen.line_at(top - 1).is_some_and(Line::wrapped) {
@@ -297,6 +338,56 @@ fn unit_at(screen: &Screen, at: Point, unit: Unit) -> (Point, Point) {
             (Point::new(top, 0), Point::new(bottom, END))
         }
     }
+}
+
+/// The first and last cell of the word at `at`, which is on `line`. A word runs on into the row
+/// before where that row wrapped into this one, and into the row after where this one wraps,
+/// because a wrapped row and the row it continues are one line of text. A hard line break stops
+/// it, and so does a row of a different class: a run of blanks, a word, or one other character.
+fn word_at(screen: &Screen, at: Point, line: &Line) -> (Point, Point) {
+    let kind = class(shown(line, at.col));
+    let (mut a, mut b) = cell_span(Some(line), at.col);
+    // A character that is neither blank nor of a word is a word alone.
+    if kind == 2 {
+        return (Point::new(at.line, a), Point::new(at.line, b));
+    }
+    let mut top = at.line;
+    while let Some(line) = screen.line_at(top) {
+        while a > 0 && class(shown(line, a - 1)) == kind {
+            a -= 1;
+        }
+        if a > 0 {
+            break;
+        }
+        let Some(prev) = top.checked_sub(1).and_then(|t| screen.line_at(t)) else {
+            break;
+        };
+        // The row before goes on in this one only where it wrapped, and its last cell has to
+        // be of the word: after a hard break the word stops at the start of this row.
+        if prev.is_empty() || !prev.wrapped() || class(shown(prev, prev.len() - 1)) != kind {
+            break;
+        }
+        top -= 1;
+        a = prev.len() - 1;
+    }
+    let mut bottom = at.line;
+    while let Some(line) = screen.line_at(bottom) {
+        while b + 1 < line.len() && class(shown(line, b + 1)) == kind {
+            b += 1;
+        }
+        if b + 1 < line.len() || !line.wrapped() {
+            break;
+        }
+        let Some(next) = screen.line_at(bottom + 1) else {
+            break;
+        };
+        if next.is_empty() || class(shown(next, 0)) != kind {
+            break;
+        }
+        bottom += 1;
+        b = 0;
+    }
+    (Point::new(top, a), Point::new(bottom, b))
 }
 
 #[cfg(test)]
@@ -363,14 +454,15 @@ mod tests {
     #[test]
     fn a_second_click_takes_a_word_and_grows_by_words() {
         let s = screen("cd ~/src/a-b.rs  (x)");
-        // 12 columns: "cd ~/src/a-b" wraps into ".rs  (x)".
+        // 12 columns: "cd ~/src/a-b" wraps into ".rs  (x)", so the path is one word over two
+        // rows; nothing else in the line is one.
         let word = |line: u64, col: usize| {
             Selection::start(&s, Point::new(line, col), SelectionKind::Stream, 2).text(&s)
         };
         assert_eq!(word(0, 0), "cd");
         assert_eq!(word(0, 1), "cd");
-        assert_eq!(word(0, 5), "~/src/a-b");
-        assert_eq!(word(1, 1), ".rs");
+        assert_eq!(word(0, 5), "~/src/a-b.rs");
+        assert_eq!(word(1, 1), "~/src/a-b.rs");
         // Blanks are a run of their own (which copies as nothing), and a bracket is alone.
         let blank = Selection::start(&s, Point::new(1, 3), SelectionKind::Stream, 2);
         assert_eq!(blank.range(), (Point::new(1, 3), Point::new(1, 4)));
@@ -379,7 +471,7 @@ mod tests {
         // Dragged, it grows by whole words to either side.
         let mut sel = Selection::start(&s, Point::new(0, 5), SelectionKind::Stream, 2);
         sel.extend(&s, Point::new(0, 1));
-        assert_eq!(sel.text(&s), "cd ~/src/a-b");
+        assert_eq!(sel.text(&s), "cd ~/src/a-b.rs");
         sel.extend(&s, Point::new(1, 6));
         assert_eq!(sel.text(&s), "~/src/a-b.rs  (x");
     }
@@ -472,5 +564,158 @@ mod tests {
             1,
         );
         assert!(!empty.clip(&s));
+    }
+
+    #[test]
+    fn a_word_crosses_a_soft_wrap_and_stops_at_a_hard_break() {
+        let s = screen("abcdefghijklmnop\r\nsecond line");
+        // 12 columns: "abcdefghijkl" wrapped into "mnop", which a hard break ends; "second
+        // line" is a line of its own below it.
+        assert_eq!(s.row_text(0), "abcdefghijkl");
+        assert_eq!(s.row_text(1), "mnop");
+        assert!(s.line_at(0).is_some_and(Line::wrapped));
+        assert!(!s.line_at(1).is_some_and(Line::wrapped));
+        let word = |line: u64, col: usize| {
+            Selection::start(&s, Point::new(line, col), SelectionKind::Stream, 2)
+        };
+        let whole = word(0, 4);
+        assert_eq!(whole.range(), (Point::new(0, 0), Point::new(1, 3)));
+        assert_eq!(whole.text(&s), "abcdefghijklmnop");
+        // From either row of the wrap it is the same word.
+        assert_eq!(word(1, 0).range(), whole.range());
+        assert_eq!(word(1, 3).text(&s), "abcdefghijklmnop");
+        // The hard break between "mnop" and "second" stops it.
+        let second = word(2, 2);
+        assert_eq!(second.range(), (Point::new(2, 0), Point::new(2, 5)));
+        assert_eq!(second.text(&s), "second");
+        // Grown by words it goes over the wrap and no further than the line's end.
+        let mut sel = word(0, 4);
+        sel.extend(&s, Point::new(2, 7));
+        assert_eq!(sel.text(&s), "abcdefghijklmnop\nsecond line");
+    }
+
+    #[test]
+    fn a_line_crosses_a_soft_wrap_and_stops_at_a_hard_break() {
+        let s = screen("abcdefghijklmnop\r\nsecond\r\nthird");
+        // Rows 0 and 1 are one line; rows 2 and 3 are lines of their own.
+        for line in [0, 1] {
+            let sel = Selection::start(&s, Point::new(line, 4), SelectionKind::Stream, 3);
+            assert_eq!(sel.range(), (Point::new(0, 0), Point::new(1, END)));
+            assert_eq!(sel.text(&s), "abcdefghijklmnop");
+        }
+        for line in [2, 3] {
+            let sel = Selection::start(&s, Point::new(line, 1), SelectionKind::Stream, 3);
+            assert_eq!(sel.range(), (Point::new(line, 0), Point::new(line, END)));
+        }
+        let second = Selection::start(&s, Point::new(2, 1), SelectionKind::Stream, 3);
+        assert_eq!(second.text(&s), "second");
+    }
+
+    #[test]
+    fn a_selection_follows_its_text_into_the_scrollback() {
+        let mut s = Screen::new(12, 3, 100);
+        s.feed(b"first\r\nsecond\r\nthird");
+        let mut sel = drag(&s, (1, 0), (1, 5), SelectionKind::Stream);
+        assert_eq!(sel.text(&s), "second");
+        assert!(sel.is_intact(&s));
+        assert!(sel.follow(&s));
+        // Two more lines: its row is in the scrollback, under the same number, with the same
+        // text, so the selection follows it.
+        s.feed(b"\r\nfourth\r\nfifth");
+        assert_eq!(s.screen_start(), 2);
+        assert!(sel.is_intact(&s));
+        assert!(sel.follow(&s));
+        assert_eq!(sel.text(&s), "second");
+        assert_eq!(sel.range(), (Point::new(1, 0), Point::new(1, 5)));
+        // A press that was not dragged holds no text, so there is nothing for it to keep.
+        let mut press = Selection::start(&s, Point::new(2, 0), SelectionKind::Stream, 1);
+        assert!(!press.follow(&s));
+        // When the ring drops the line itself there is nothing left to follow.
+        let mut ring = Screen::new(12, 3, 2);
+        ring.feed(b"zero\r\none\r\ntwo");
+        let mut gone = drag(&ring, (0, 0), (0, 3), SelectionKind::Stream);
+        assert_eq!(gone.text(&ring), "zero");
+        ring.feed(b"\r\nthree\r\nfour\r\nfive");
+        assert_eq!(ring.first_line(), 1);
+        assert!(!gone.follow(&ring));
+    }
+
+    #[test]
+    fn a_rewrite_or_an_erase_of_the_selected_cells_drops_the_selection() {
+        let mut s = screen("hello world\r\nnext");
+        let mut sel = drag(&s, (0, 0), (0, 4), SelectionKind::Stream);
+        assert_eq!(sel.text(&s), "hello");
+        // Cells the selection does not cover leave its text alone, so it stays.
+        s.feed(b"\x1b[1;7H\x1b[K");
+        assert_eq!(s.row_text(0), "hello");
+        assert!(sel.is_intact(&s));
+        assert!(sel.follow(&s));
+        assert_eq!(sel.text(&s), "hello");
+        // Writing over a selected cell changes the text under it.
+        s.feed(b"\x1b[1;2HXX");
+        assert_eq!(s.row_text(0), "hXXlo");
+        assert!(!sel.is_intact(&s));
+        assert!(!sel.follow(&s));
+        // Erasing the line of a selection drops it.
+        let mut erased = drag(&s, (1, 0), (1, 3), SelectionKind::Stream);
+        assert_eq!(erased.text(&s), "next");
+        s.feed(b"\x1b[2;1H\x1b[2K");
+        assert!(!erased.follow(&s));
+        // And so does clearing the whole screen.
+        let mut cleared = drag(&s, (0, 0), (0, 4), SelectionKind::Stream);
+        assert_eq!(cleared.text(&s), "hXXlo");
+        s.feed(b"\x1b[2J");
+        assert!(!cleared.follow(&s));
+        // Writing the same characters again is not a change of the selected text.
+        let mut same = screen("hello");
+        let mut kept = drag(&same, (0, 0), (0, 4), SelectionKind::Stream);
+        same.feed(b"\x1b[1;1Hhello");
+        assert!(kept.follow(&same));
+        assert_eq!(kept.text(&same), "hello");
+    }
+
+    #[test]
+    fn a_selection_whose_first_line_left_the_ring_is_dropped_even_when_its_text_is_empty() {
+        let mut s = Screen::new(12, 3, 2);
+        s.feed(b"\r\n\r\nx");
+        // A line selection of the empty first line: it holds no text at all, so nothing about
+        // the text it holds can change while the line scrolls away.
+        let mut empty = Selection::start(&s, Point::new(0, 1), SelectionKind::Stream, 3);
+        assert_eq!(empty.text(&s), "");
+        assert!(empty.is_intact(&s));
+        s.feed(b"\r\n\r\n\r\n\r\n");
+        assert_eq!(s.first_line(), 2);
+        assert!(empty.is_intact(&s));
+        // The line is gone from the top of the ring, so there is nothing left of the selection;
+        // it must not be kept just because its text is still what it was.
+        assert!(!empty.follow(&s));
+    }
+
+    #[test]
+    fn a_clip_that_cuts_nothing_leaves_a_rewrite_to_be_noticed() {
+        let mut s = screen("hello world");
+        let mut sel = drag(&s, (0, 0), (0, 4), SelectionKind::Stream);
+        s.feed(b"\x1b[1;2HXX");
+        assert_eq!(s.row_text(0), "hXXlo world");
+        // Nothing was cut, so the clip must not take the new text as what the selection holds.
+        assert!(sel.clip(&s));
+        assert!(!sel.is_intact(&s));
+        assert!(!sel.follow(&s));
+    }
+
+    #[test]
+    fn a_full_row_ended_by_a_hard_break_stops_a_word_at_the_row_edge() {
+        let s = screen("abcdefghijkl\r\nmnop");
+        // Row 0 fills all 12 columns but ended with a hard break, so "abcdefghijkl" and "mnop"
+        // are two words even though their cells touch.
+        assert_eq!(s.row_text(0), "abcdefghijkl");
+        assert_eq!(s.row_text(1), "mnop");
+        assert!(!s.line_at(0).is_some_and(Line::wrapped));
+        let one = Selection::start(&s, Point::new(0, 3), SelectionKind::Stream, 2);
+        assert_eq!(one.range(), (Point::new(0, 0), Point::new(0, 11)));
+        assert_eq!(one.text(&s), "abcdefghijkl");
+        let two = Selection::start(&s, Point::new(1, 2), SelectionKind::Stream, 2);
+        assert_eq!(two.range(), (Point::new(1, 0), Point::new(1, 3)));
+        assert_eq!(two.text(&s), "mnop");
     }
 }
