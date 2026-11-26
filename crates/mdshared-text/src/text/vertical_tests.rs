@@ -164,6 +164,10 @@ fn neighbouring_fractional_sizes_do_not_share_cached_masks() {
 /// One half-em square at glyph 0. Only the tables swash needs to scale this glyph are
 /// included. Touch both top points in Y, then move them by a signed 26.6 pixel distance.
 fn square_font(shift: i16) -> FontData {
+    square_font_with_tail(shift, &[])
+}
+
+fn square_font_with_tail(shift: i16, tail: &[u8]) -> FontData {
     let mut head = [0; 54];
     head[..4].copy_from_slice(&[0, 1, 0, 0]);
     head[12..16].copy_from_slice(&0x5f0f3cf5_u32.to_be_bytes());
@@ -185,9 +189,11 @@ fn square_font(shift: i16) -> FontData {
         0xb0, 2, 0x17, // SLOOP, two points
         0xb1, 2, 3, 0xb8, hi, lo, 0x38, // SHPIX, points 2 and 3
     ];
-    maxp[26..28].copy_from_slice(&(program.len() as u16).to_be_bytes());
-    let mut glyf = vec![0, 1, 0, 0, 0, 0, 2, 0, 2, 0, 0, 3, 0, program.len() as u8];
+    let instruction_len = program.len() + tail.len();
+    maxp[26..28].copy_from_slice(&(instruction_len as u16).to_be_bytes());
+    let mut glyf = vec![0, 1, 0, 0, 0, 0, 2, 0, 2, 0, 0, 3, 0, instruction_len as u8];
     glyf.extend(program);
+    glyf.extend(tail);
     glyf.extend([0x31, 0x21, 0x11, 0x21, 2, 0, 0xfe, 0, 2, 0]);
     glyf.resize(glyf.len().next_multiple_of(2), 0);
     let loca = [0, 0, 0, (glyf.len() / 2) as u8];
@@ -248,31 +254,61 @@ fn check_rejected_fit(font: &FontData, size: f32, expected_shift: f32, modes: &[
         for sub in 0..4 {
             let legacy = legacy_mask_in(&mut linear, 0, sub, mode.format());
             let got = mask(&mut engine, font, 0, size, sub);
-            let p = legacy.placement;
-            assert_eq!(
-                (got.left, got.top, got.w, got.h),
-                (p.left, p.top, p.width, p.height)
-            );
-            assert_eq!(got.data.len(), (p.width * p.height * 3) as usize);
-            match mode {
-                Subpixel::None => assert!(
-                    got.data
-                        .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .copied()
-                        .eq(legacy.data.iter().map(|&a| [a; 3]))
-                ),
-                _ => assert!(
-                    got.data
-                        .as_chunks::<3>()
-                        .0
-                        .iter()
-                        .zip(legacy.data.as_chunks::<4>().0)
-                        .all(|(a, b)| a[..] == b[..3])
-                ),
-            }
+            assert_mask_matches(&got, &legacy, mode);
             assert_eq!(engine.vertical.linear.points(), outline.points());
+        }
+    }
+}
+
+fn assert_mask_matches(got: &Entry, expected: &Image, mode: Subpixel) {
+    let p = expected.placement;
+    assert_eq!(
+        (got.left, got.top, got.w, got.h),
+        (p.left, p.top, p.width, p.height)
+    );
+    assert_eq!(got.data.len(), (p.width * p.height * 3) as usize);
+    let rgb = got.data.as_chunks::<3>().0.iter().copied();
+    match mode {
+        Subpixel::None => assert!(rgb.eq(expected.data.iter().map(|&a| [a; 3]))),
+        _ => assert!(
+            rgb.eq(expected
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&[r, g, b, _]| [r, g, b]))
+        ),
+    }
+}
+
+#[test]
+fn a_glyph_program_that_errors_after_moving_points_keeps_the_unhinted_pixels() {
+    // POP on the empty stack after SHPIX has already moved the top edge by one pixel.
+    let font = square_font_with_tail(64, &[0x21]);
+    check_rejected_fit(
+        &font,
+        16.0,
+        1.0,
+        &[Subpixel::None, Subpixel::Rgb, Subpixel::Bgr],
+    );
+}
+
+#[test]
+fn a_successful_hint_keeps_the_previous_pixels_at_every_phase() {
+    let font = square_font(64);
+    let reference = FontRef::from_index(font.data.as_ref(), 0).unwrap();
+    let size = 16.0;
+    let mut ctx = ScaleContext::new();
+    let mut hinted = ctx.builder(reference).size(size).hint(true).build();
+    let mut engine = TextEngine::new(4 << 20);
+    for mode in [Subpixel::None, Subpixel::Rgb, Subpixel::Bgr] {
+        engine.set_subpixel(mode);
+        for sub in 0..4 {
+            // The fixture's hinted X is exactly the unhinted X, so swash's full hinted
+            // mask is the baseline for the old Y-only fitter.
+            let previous = legacy_mask_in(&mut hinted, 0, sub, mode.format());
+            assert_eq!(previous.placement.height, 9);
+            assert_mask_matches(&mask(&mut engine, &font, 0, size, sub), &previous, mode);
         }
     }
 }

@@ -1,11 +1,15 @@
 //! Fit monochrome glyphs to pixel rows without changing their horizontal outline.
-//! The text engine supplies both outlines on a cache miss; there is no shaping or blending here.
+//! The text engine supplies the unhinted outline on a cache miss; this module tries a
+//! pedantic hinted draw and renders the mask. There is no shaping or blending here.
 
 use swash::scale::Source;
 use swash::scale::image::{Content, Image};
 use swash::scale::outline::Outline;
-use swash::zeno::{Format, Mask, Origin, Scratch, Vector};
+use swash::zeno::{Format, Mask, Origin, Point, Scratch, Vector, Verb};
 use swash::{FontRef, tag_from_bytes};
+
+mod hinting;
+use hinting::Hinter;
 
 #[cfg(test)]
 #[path = "vertical_tests.rs"]
@@ -34,21 +38,33 @@ pub(super) fn can_hint_at_size(font: FontRef<'_>, size: f32) -> bool {
 #[derive(Default)]
 pub(super) struct Vertical {
     pub(super) linear: Outline,
-    pub(super) hinted: Outline,
+    hinter: Hinter,
     scratch: Scratch,
 }
 
 impl Vertical {
+    pub(super) fn draw_hinted(
+        &mut self,
+        font: FontRef<'_>,
+        index: u32,
+        glyph: u16,
+        size: f32,
+        coords: impl Iterator<Item = i16>,
+    ) -> bool {
+        self.hinter.draw(font, index, glyph, size, coords).is_some()
+    }
+
     /// Try the hinted Y coordinates with the exact unhinted X coordinates. Matching commands and
     /// nearby X coordinates are a geometric check, not proof of point identity. Keep the linear
     /// path untouched until the candidate passes the movement, bounds and raster-size checks.
     pub(super) fn fit(&mut self, size: f32, format: Format, offset: Vector) -> Option<Image> {
         let linear = self.linear.points();
-        let hinted = self.hinted.points();
+        let path = &mut self.hinter.path;
+        let hinted = &mut path.points;
         let limit = size * FIT_LIMIT_EM;
-        if self.linear.verbs() != self.hinted.verbs()
+        if self.linear.verbs() != path.verbs
             || linear.len() != hinted.len()
-            || !linear.iter().zip(hinted).all(|(a, b)| {
+            || !linear.iter().zip(hinted.iter()).all(|(a, b)| {
                 (a.x - b.x).abs() <= 1.0 / 16.0
                     && (a.y - b.y).abs() <= limit
                     && a.x.abs() <= limit
@@ -60,17 +76,23 @@ impl Vertical {
         // The accepted control points must all lie within four ems of the origin on each
         // axis. The curves stay within that box too. Stage the combined path in `hinted` so
         // even an in-budget fit that fails the pixel mask check cannot alter `linear`.
-        for (hinted, linear) in self.hinted.points_mut().iter_mut().zip(linear) {
+        for (hinted, linear) in hinted.iter_mut().zip(linear) {
             hinted.x = linear.x;
         }
-        let image = render_outline(&self.hinted, &mut self.scratch, format, offset)?;
-        std::mem::swap(&mut self.linear, &mut self.hinted);
+        let image = render_outline(hinted, &path.verbs, &mut self.scratch, format, offset)?;
+        self.linear.points_mut().copy_from_slice(hinted);
         Some(image)
     }
 
     /// Rasterize the unhinted fallback under the same limits as the fitted path.
     pub(super) fn render(&mut self, format: Format, offset: Vector) -> Option<Image> {
-        render_outline(&self.linear, &mut self.scratch, format, offset)
+        render_outline(
+            self.linear.points(),
+            self.linear.verbs(),
+            &mut self.scratch,
+            format,
+            offset,
+        )
     }
 }
 
@@ -86,20 +108,20 @@ fn mask_bytes(format: Format, width: u32, height: u32) -> Option<usize> {
 /// Rasterize with the same origin and offsets as swash's monochrome renderer, but reject
 /// non-finite or excessive coordinates before zeno sees them. The colour path is separate.
 fn render_outline(
-    outline: &Outline,
+    points: &[Point],
+    verbs: &[Verb],
     scratch: &mut Scratch,
     format: Format,
     offset: Vector,
 ) -> Option<Image> {
-    if !outline
-        .points()
+    if !points
         .iter()
         .all(|p| p.x.abs() <= MAX_COORD && p.y.abs() <= MAX_COORD)
     {
         return None;
     }
     let mut bytes = None;
-    let mut mask = Mask::with_scratch(outline.path(), scratch);
+    let mut mask = Mask::with_scratch((points, verbs), scratch);
     mask.format(format)
         .origin(Origin::BottomLeft)
         .offset(offset)

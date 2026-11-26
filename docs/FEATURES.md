@@ -50,10 +50,11 @@ not launched, and Linux and macOS were not run.
 
 ## Vertical-only text hinting (`mdshared_text::text`)
 
-On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
-skrifa to preserve linear metrics, but that is not a guarantee of bit-identical X coordinates:
+On an eligible monochrome glyph cache miss, swash scales the unhinted outline and the fitter
+draws the hinted outline through skrifa with swash's smooth LCD settings. Preserving linear
+metrics is not a guarantee of bit-identical X coordinates:
 the hinted draw can use different scaling precision. Skrifa can return a rounded TrueType
-advance from that draw; swash uses only the outline and discards the returned metrics. The
+advance from that draw; the fitter uses only the outline and discards the returned metrics. The
 rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
 commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
 rather than risking a bad geometric match. A fit is also rejected if any Y moves more than
@@ -63,7 +64,7 @@ side over 8192 px, and masks over 4 MiB (one byte per alpha pixel or four per LC
 The fitter keeps the unhinted outline if only the fit fails; if neither can be rasterized,
 the glyph draws no ink. The existing quarter-pixel X phases, subpixel offsets, colour glyph
 sources, and blending are unchanged. Parley still supplies all positions and advances;
-no API or dependency was added.
+the public API is unchanged.
 
 At fractional device sizes, the fitter first checks bit 3 of the font's OpenType
 `head.flags`. If it is set (or cannot be read), the fitter skips hinting: skrifa's
@@ -93,14 +94,17 @@ grid in both themes. See `E:/mds-target/vhint/shots/review/{unhinted,before,afte
 The review fix changed 143 pixels on the 125% UI sheet; the other five sheets did not
 change from the pre-fix render.
 
+**Finding 1 fixed (Astra review, 2026-11-26):** Swash 0.2.10 can return a partly fitted
+TrueType outline after a glyph-program error. The fitter now draws with
+`DrawSettings::hinted(instance, true)` and keeps the unhinted outline on error, before any
+geometric checks or Y replacement. With owner approval it names `skrifa = "=0.44.0"`
+directly; this is the version already used by swash in `Cargo.lock`. A synthetic test
+moves the top edge one pixel before the program errors and verifies unhinted masks in
+all three modes at all four X phases. The same program without the error matches the
+previous hinted masks at those phases.
+
 ### Left open from the Astra review (2026-11-26)
 
-- **Finding 1 — Waiting for the owner: pedantic glyph draws.** Swash 0.2.10 can return a partly fitted
-   TrueType outline after a glyph-program error and has no pedantic setting. A plausible
-   partial fit can still pass the geometric checks. The recommended option is a direct
-   `skrifa = "=0.44.0"` dependency naming the version already in `Cargo.lock`, for a
-   pedantic draw that falls back on error. The alternative is a swash patch exposing that
-   setting.
 - **Finding 3 — Point correspondence.** Matching commands and point counts with X within 1/16 px is a
    geometric check, not proof of point identity. TrueType on-curve flags can change contour
    construction, and in CFF/CFF2 different degenerate segments can disappear after scaling.
@@ -121,9 +125,10 @@ change from the pre-fix render.
 **Other open questions:**
 
 - Outline-matching fallback happens glyph by glyph and is not counted.
-- A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
-  hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
-  has not been measured.
+- A cold eligible miss scales the outline twice and runs the hinter. Like swash, the fitter
+   caches eight hinting instances per format group (TrueType, CFF/CFF2, other), keyed by
+   face, exact device size and normalized coordinates. A busy page can make it rebuild them.
+   Cold-cache cost has not been measured.
 - The exact-size cache key also drops the old 1/64 px bucketing for unhinted glyphs, so sizes
   that differ only by float noise no longer share masks (fewer hits, not wrong pixels). Keying
   on "hinted or not" plus the old bucket would keep the old hit rate.
@@ -138,6 +143,9 @@ updating. The full release CI matrix was not run.
 For the Astra bounds fix, the Windows workspace Clippy and test checks with `host,a11y`
 (`explorer_tests` excluded), formatting and the catalogue check passed on Rust 1.99.1.
 The synthetic regressions fail without the corresponding geometry or mask-size guards.
+For the pedantic draw, those checks passed again, and the Windows release renderer suite
+passed with the existing goldens and an explicit `MDV_ENGINE` path. Linux `mdshared-text`
+Clippy with a `pkg-config` stub type-checked only; nothing was linked or run on Linux.
 The sheets have not been judged by a person or checked in a running application. Linux and
 macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
 

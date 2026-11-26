@@ -7,6 +7,9 @@ publish.workspace = true
 [dependencies]
 parley = "=0.12.0"
 swash = "=0.2.10"
+# Pedantic outline draws (owner approved 2026-11-26). Keep this pin at the same
+# skrifa version swash resolves to, so the two scaling passes use the same engine.
+skrifa = { version = "=0.44.0", default-features = false }
 png = "0.18"
 # JPEG for cover art, thumbnails and photos (`image`); pure Rust. The owner chose it on
 # 2026-11-24 (docs/ROADMAP.md, "Decided by the owner").
