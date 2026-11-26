@@ -514,8 +514,14 @@ fn entry(path: PathBuf) -> Entry {
 }
 
 /// A reader that knows these entries and no others.
-fn knows(entries: Vec<Entry>) -> impl Fn(&Path) -> Option<Entry> {
-    move |path| entries.iter().find(|entry| entry.path == path).cloned()
+fn knows(entries: Vec<Entry>) -> impl Fn(&Path) -> io::Result<Entry> {
+    move |path| {
+        entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .cloned()
+            .ok_or_else(|| io::ErrorKind::NotFound.into())
+    }
 }
 
 #[test]
@@ -552,9 +558,24 @@ fn a_modified_entry_that_vanished_is_removed() {
 }
 
 #[test]
+fn unreadable_entries_request_reconciliation_instead_of_disappearing() {
+    let read = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    for verdict in [
+        Verdict::Modified(p("a")),
+        Verdict::Created(p("a")),
+        Verdict::Renamed {
+            from: p("a"),
+            to: p("b"),
+        },
+    ] {
+        assert_eq!(signal_of(verdict, &read), Some(Signal::Rescan));
+    }
+}
+
+#[test]
 fn a_removal_is_reported_without_reading_anything() {
     let path = p("a.txt");
-    let reads_nothing = |_: &Path| -> Option<Entry> { panic!("a removal reads nothing") };
+    let reads_nothing = |_: &Path| -> io::Result<Entry> { panic!("a removal reads nothing") };
     assert_eq!(
         signal_of(Verdict::Removed(path.clone()), &reads_nothing),
         Some(Signal::Changed(Change::Removed(path)))
@@ -597,7 +618,7 @@ fn a_rename_whose_new_name_vanished_is_a_removal_of_the_old_name() {
 
 #[test]
 fn a_rescan_is_a_rescan() {
-    let reads_nothing = |_: &Path| -> Option<Entry> { panic!("a rescan reads nothing") };
+    let reads_nothing = |_: &Path| -> io::Result<Entry> { panic!("a rescan reads nothing") };
     assert_eq!(
         signal_of(Verdict::Rescan, &reads_nothing),
         Some(Signal::Rescan)
@@ -875,6 +896,6 @@ fn a_lost_watch_clears_what_was_pending() {
 
 #[test]
 fn a_lost_verdict_is_a_lost_signal() {
-    let reads_nothing = |_: &Path| -> Option<Entry> { panic!("a lost watch reads nothing") };
+    let reads_nothing = |_: &Path| -> io::Result<Entry> { panic!("a lost watch reads nothing") };
     assert_eq!(signal_of(Verdict::Lost, &reads_nothing), Some(Signal::Lost));
 }

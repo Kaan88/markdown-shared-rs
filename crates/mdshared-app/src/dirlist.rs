@@ -126,10 +126,14 @@ impl Entry {
     /// [`Listing::apply`]. It reads the disk, so it belongs off the thread that draws; a single
     /// entry's details are quick, but a dead network path answers slowly.
     pub fn at(path: impl AsRef<Path>) -> Option<Entry> {
-        let path = path.as_ref();
-        let meta = fs::symlink_metadata(path).ok()?;
+        Self::at_checked(path.as_ref()).ok()
+    }
+
+    /// Like `at`, without losing the reason a metadata read failed.
+    pub(crate) fn at_checked(path: &Path) -> io::Result<Entry> {
+        let meta = fs::symlink_metadata(path)?;
         let name = name_of(path);
-        Some(entry_of(path.to_path_buf(), name, &meta.file_type(), &meta))
+        Ok(entry_of(path.to_path_buf(), name, &meta.file_type(), &meta))
     }
 }
 

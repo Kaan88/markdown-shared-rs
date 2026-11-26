@@ -122,11 +122,12 @@ fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
     let read: Arc<Read> = Arc::new(move |path: &Path| {
         started_tx.send(()).ok();
         release.lock().unwrap().recv().ok();
-        Some(entry_at(path.to_path_buf()))
+        Ok(entry_at(path.to_path_buf()))
     });
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(4);
     let watcher = DirWatcher::start(
         dir.clone(),
+        notify_root(&dir).unwrap(),
         Duration::from_millis(20),
         move || {
             let _ = wake_tx.try_send(());
@@ -185,7 +186,7 @@ fn a_stopped_watcher_reads_no_more_paths() {
         counted.fetch_add(1, Ordering::AcqRel);
         started_tx.send(()).ok();
         release.lock().unwrap().recv().ok();
-        Some(entry_at(path.to_path_buf()))
+        Ok(entry_at(path.to_path_buf()))
     });
     let wake = || {};
     let for_work = Arc::clone(&inbox);
@@ -207,14 +208,9 @@ fn a_stopped_watcher_reads_no_more_paths() {
     assert!(shared.take().is_empty(), "nothing was reported");
 }
 
-// The watcher on a real folder. Windows only: the other systems have their own rename
-// machinery and are type-checked, not run, from the machine this was written on.
-
 /// A folder of its own under the temporary folder, removed when dropped.
-#[cfg(windows)]
 struct Dir(PathBuf);
 
-#[cfg(windows)]
 impl Dir {
     fn new(name: &str) -> Dir {
         let dir =
@@ -225,11 +221,20 @@ impl Dir {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Dir {
     fn drop(&mut self) {
         _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn a_relative_report_reads_metadata_under_the_captured_root() {
+    let dir = Dir::new("absolute-reader");
+    std::fs::write(dir.0.join("a.txt"), "contents").unwrap();
+    let relative = PathBuf::from("not-the-watch-root").join("a.txt");
+    let entry = read_from_root(&dir.0, &relative).unwrap();
+    assert_eq!(entry.path, relative);
+    assert_eq!(entry.size, 8);
 }
 
 /// The shown names of a list, in its order.

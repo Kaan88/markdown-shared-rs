@@ -65,10 +65,7 @@ fn want(disk: &BTreeMap<String, u64>) -> Vec<(String, u64)> {
 
 /// Applies every verdict to `listing`, reading through `disk`.
 fn apply(listing: &mut Listing, verdicts: Vec<Verdict>, disk: &BTreeMap<String, u64>) {
-    let read = |path: &Path| {
-        let name = path.file_name()?.to_str()?;
-        disk.get(name).map(|generation| entry(name, *generation))
-    };
+    let read = |path: &Path| read_disk(disk, path);
     for verdict in verdicts {
         match verdict {
             Verdict::Rescan | Verdict::Lost => panic!("no overflow in a made-up folder"),
@@ -79,6 +76,13 @@ fn apply(listing: &mut Listing, verdicts: Vec<Verdict>, disk: &BTreeMap<String, 
             }
         }
     }
+}
+
+fn read_disk(disk: &BTreeMap<String, u64>, path: &Path) -> io::Result<Entry> {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+    disk.get(name)
+        .map(|generation| entry(name, *generation))
+        .ok_or_else(|| io::ErrorKind::NotFound.into())
 }
 
 /// The verdicts of these events, all seen a millisecond apart and settled after the quiet
@@ -433,10 +437,7 @@ impl Run {
                     }
                     other => {
                         let disk = &self.disk;
-                        let read = |path: &Path| {
-                            let name = path.file_name()?.to_str()?;
-                            disk.get(name).map(|generation| entry(name, *generation))
-                        };
+                        let read = |path: &Path| read_disk(disk, path);
                         if let Some(signal) = signal_of(other, &read) {
                             signals.push(signal);
                         }

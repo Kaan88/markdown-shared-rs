@@ -82,8 +82,9 @@ mod translate;
 use crate::dirlist::{Change, Entry};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use order::{Item, settled};
-use resolve::signal_of;
+use resolve::{read_from_root, signal_of};
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -771,7 +772,7 @@ impl Shared {
 }
 
 /// Reads one path's entry; `Entry::at` in a real watcher, a made-up disk in a test.
-type Read = dyn Fn(&Path) -> Option<Entry> + Send + Sync;
+type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
 
 /// Watches one folder and reports what changed in it, settled, as [`Signal`]s.
 ///
@@ -825,11 +826,15 @@ impl DirWatcher {
         debounce: Duration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Option<DirWatcher> {
+        let folder = folder.into();
+        let root = notify_root(&folder)?;
+        let read_root = root.clone();
         DirWatcher::start(
-            folder.into(),
+            folder,
+            root,
             debounce,
             wake,
-            Arc::new(|path: &Path| Entry::at(path)),
+            Arc::new(move |path| read_from_root(&read_root, path)),
         )
     }
 
@@ -837,11 +842,11 @@ impl DirWatcher {
     /// real watcher, and a made-up disk in a test of this module.
     fn start(
         folder: PathBuf,
+        root: PathBuf,
         debounce: Duration,
         wake: impl Fn() + Send + Sync + 'static,
         read: Arc<Read>,
     ) -> Option<DirWatcher> {
-        let root = notify_root(&folder)?;
         let inbox = Arc::new(Inbox::default());
         let shared = Arc::new(Shared::default());
         let names = Translator::new(folder.clone(), root.clone());
@@ -959,6 +964,11 @@ fn run(
                     other => signal_of(other, &*read),
                 };
                 if let Some(signal) = signal {
+                    if signal == Signal::Rescan {
+                        signals.clear();
+                        signals.push(signal);
+                        break;
+                    }
                     signals.push(signal);
                 }
             }
