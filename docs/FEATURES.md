@@ -1784,3 +1784,103 @@ reviewing session, not by the owner), the speed test (`termview_speed`, release)
 `cargo clippy -p mdshared-ui --features term --all-targets -- -D warnings`, and
 `cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
 has been seen only through the application that uses it.
+
+## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
+
+An application that shapes its own text with parley can now hand that layout to the painter
+and get it drawn with a brush per run: a colour, a family, a size, a weight and the fourth byte
+of the brush (raised, lowered, marked) as the layout says them. The painter draws the layout's
+glyph runs through its own `TextEngine::draw_layout_clipped`, so the glyph cache, the subpixel
+masks and the antialiasing are the ones every other text draw uses, and nothing is shaped or
+rasterized twice. A spelling squiggle is one path, drawn under a run of the caller's choosing.
+
+API added, all of it additive:
+
+- `gfx::Brush` is public (it was a private alias in `gfx.rs`): red, green, blue and a fourth
+  byte that is 255 on the baseline or `mdshared_text::text::{RAISED, LOWERED, MARKED}`. It is
+  the same type as `mdshared_text::text::Brush`.
+- `Painter::rich_text(&layout, x, y) -> Rect` draws the whole layout at a point in logical px,
+  at the painter's scale, offset and clip, and answers the rectangle the lines cover in logical
+  px, so a caller can put a background, a caret or a squiggle against it without measuring
+  again.
+- `Painter::wavy_underline(band, thickness, wavelength, c, alpha)` draws a squiggle across the
+  whole width of `band` and fills its height.
+- New module `richtext`: `runs(&layout) -> Vec<RunBox>` gives every glyph run's byte range, the
+  box it was placed in and its line's baseline, in the layout's own units; `RunBox`; and
+  `parley` and `Brush` re-exported, so an application names one version of parley (the one this
+  crate draws with) and needs no dependency of its own on it.
+
+Decisions:
+
+- **The layout is in device units.** Parley is shaped at a size, so a caller shapes at
+  `size * scale`, as `Painter::paragraph` already does internally, and passes the place in
+  logical px. The returned rectangle divides by the scale, so its size is the layout's logical
+  size. Anything else would need a second shaping per scale.
+- **The band is the squiggle's clip.** A round stroke end reaches half its thickness past the
+  path's end, so a squiggle that must not paint outside its band (the test's requirement, and a
+  spelling checker's) is drawn with the band intersected into the painter's clip for the one
+  call, and the clip is restored after it. Nothing else about the caller's clip changes.
+- **The wave is one path of quadratics.** A whole number of equal half waves across the band
+  starts and ends it on the middle line whatever the width; each half wave is one quadratic
+  whose control point is twice the amplitude out, which puts its top exactly half the band's
+  height less half the stroke from the middle line. So the stroke fills the band edge to edge
+  and no later mark is needed to close a gap: the pixels of every column of the band are inked,
+  which is what "continuous under a run" means here. A wavelength that is zero, negative or not
+  a number gives one wave across the band; a wavelength far below a pixel is cut at a thousand
+  half waves, since nothing on a display would show the rest.
+- **Where `runs` gets a byte range.** Parley places glyph runs (split at style changes, which a
+  change of brush, family or size is) but a glyph run carries no byte range: `Run::text_range`
+  is the whole shaped run's, which a style change does not split. A shaped run's visual clusters
+  are grouped by style in the same visual order as its glyph runs, so the k-th stretch of one
+  style among them is the k-th glyph run, and its clusters' byte ranges are its own. That is
+  how `runs` pairs a range with a box, and a right-to-left line is tested because a pairing
+  that ignored visual order would still give both ranges while swapping their boxes.
+- **Mixed families need no code.** Each run's font, size and normalized coordinates come from
+  the layout, as `TextEngine` already reads them, so a run in the mono family is drawn with it;
+  the test checks that parley shaped the two runs in two different fonts and that the pixels
+  are the engine's own.
+
+Tests (`cargo test -p mdshared-ui --lib rich`), each of which is new and does not compile
+against the tree before this change; each assertion was also shown failing under a mutation:
+
+- `gfx::rich::tests::two_runs_are_drawn_in_their_own_colours`: two runs of one text in red and
+  blue; the strongest pixel inside each run's box is nearer that run's colour than the other's
+  and within 60 of it, and the whole drawing is the `TextEngine`'s own draw of the same layout
+  at the same place, pixel for pixel. Drawing every run in the first run's colour fails it with
+  "run 1 is [200, 30, 30], not near [20, 60, 220]".
+- `a_run_of_another_family_is_drawn_as_that_family_shaped_it`: the mono family on the second
+  half; `runs` reports two ranges, parley resolved two different fonts, and the pixels are the
+  engine's.
+- `a_wavy_underline_is_continuous_across_its_band_and_stays_inside_it`: every device column of
+  the band has ink in it, nothing outside the band is touched, the crest and the trough reach
+  the band's first and last row, the two halves of one wavelength are on opposite sides of the
+  middle line, a band thinner than the stroke is a straight line filling it, and zero, negative
+  or NaN thickness, alpha or band draw nothing. A straight line instead of a wave fails it
+  ("no crest").
+- `the_painter_clip_cuts_the_layout_and_the_wave`: outside the clip the bitmap is the page
+  before the draw, inside it is the unclipped drawing pixel for pixel, the text ink is on both
+  sides of the clip's edge and the clipped one keeps its share. A `rich_text` that draws nothing
+  fails it.
+- `the_scale_places_the_layout_and_keeps_the_wave_in_its_band`: at scale 1, 1.5 and 2, the
+  answered rectangle is the layout's size divided by the scale, the pixels are the engine's at
+  the doubled place, and the wave's ink box is exactly the band in device px (240 by 10 at
+  scale 2).
+- `richtext::tests::each_run_gives_its_text_and_the_box_it_was_placed_in`,
+  `a_run_that_changes_colour_back_again_is_three_runs` (red, blue, red gives 0..4, 4..7,
+  7..11 and three boxes that follow each other),
+  `a_right_to_left_line_keeps_each_range_with_its_own_box` (the long run's box is the wide one
+  and the logically first run is placed on the right), and
+  `a_wrapped_layout_reports_its_runs_line_by_line` (every byte in exactly one run, in order, a
+  later line below an earlier one) all fail when `runs` reports the shaped run's own range (`0..11`
+  three times, `0..10` for both halves).
+
+Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+--features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
+--features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
+test binary passes; the `mdshared-ui` library alone ran 1125 tests with 34 ignored and 4
+filtered, and the doctests passed); and the sheet
+`cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
+`target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
+a marked word squiggled under, and raised and lowered runs). The agent that wrote it looked at
+both sheets; the owner has not. Not run on Linux or macOS. Not seen in a window: no application
+uses it yet.
