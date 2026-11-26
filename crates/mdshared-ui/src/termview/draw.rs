@@ -36,7 +36,7 @@ fn cursor_at(screen: &Screen, view: &View) -> Option<CursorAt> {
         row,
         col,
         cells,
-        shape: c.shape,
+        shape: view.cursor_style(screen).0,
     })
 }
 
@@ -94,8 +94,9 @@ fn look(
 /// cells `selection` covers ([`Selection::span_on`], read in absolute line numbers, so it stays
 /// on its text in the scrollback) and the cursor over its cell: a filled block with the
 /// character in [`Scheme::cursor_text`], a bar at the cell's left edge or a line at its bottom,
-/// as the program asked, and a hollow block in every shape while the view is not focused. A
-/// cursor that the program hid, or that is scrolled out of the view, is not drawn. A wide
+/// as the program asked or as set by [`View::cursor_preference`], and a hollow block in every
+/// shape while the view is not focused. A cursor that the program hid, or that is scrolled out
+/// of the view, is not drawn. A wide
 /// character takes its two cells; the cursor and the selection on either half cover both.
 /// Box-drawing and block characters (U+2500 to U+259F) are drawn as shapes that join from cell
 /// to cell ([`is_box_char`](super::is_box_char)); other characters come from `font`, bold and
@@ -194,7 +195,7 @@ pub fn draw_screen_with_background(
 /// [`Screen::take_dirty`](mdshared_term::Screen::take_dirty), then presents those bands.
 /// Changes the screen cannot know of are the application's to add: a new selection (the rows
 /// of the old and the new one, or everything), focus, the scroll offset, the scheme, a resize
-/// (everything, with [`draw_screen`]).
+/// (everything, with [`draw_screen`]), or the cursor preference (the cursor's row).
 #[allow(clippy::too_many_arguments)] // drawing call: the grid, its look, its state and the rows
 pub fn draw_rows(
     p: &mut Painter,
@@ -582,8 +583,8 @@ fn draw_box(
 
 /// Whether the cursor is to be shown this frame, with blinking: asks `anim` to
 /// [`blink`](Animator::blink) `id` at `blink` on and off, but only while the cursor can blink
-/// (the view has the focus, the program has not hidden the cursor nor asked for a steady one,
-/// and the cursor is on the view). Otherwise, and when `blink` is `None` (the system's caret
+/// (the view has the focus, the cursor is visible and on the view, and its style allows
+/// blinking). Otherwise, and when `blink` is `None` (the system's caret
 /// blinking is off, `platform::caret_blink_time`) or motion is reduced, the cursor is shown and
 /// nothing is asked, so the animator wants no frame for it and an idle window stays idle.
 ///
@@ -600,7 +601,7 @@ pub fn cursor_blinks_on(
     let can = view.is_focused()
         && view.is_cursor_shown()
         && c.visible
-        && c.blinking
+        && view.cursor_style(screen).1
         && view.cursor_row(screen).is_some();
     match blink {
         Some(half) if can => anim.blink(id, half, half),
