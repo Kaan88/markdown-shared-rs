@@ -46,14 +46,7 @@ impl TextField {
         let cx = stops[caret_idx];
 
         // Keep the caret in view, then keep the scroll within the text.
-        let max_scroll = (total + 1.0 - area.w).max(0.0);
-        if cx - self.scroll > area.w - 1.0 {
-            self.scroll = cx - (area.w - 1.0);
-        }
-        if cx < self.scroll {
-            self.scroll = cx;
-        }
-        self.scroll = self.scroll.clamp(0.0, max_scroll);
+        self.scroll = reveal_scroll(self.scroll, cx, total, area.w);
 
         let cy = area.cy();
         let h = size * 1.25;
@@ -108,4 +101,16 @@ impl TextField {
         }
         p.restore(old);
     }
+}
+
+/// Move the smallest distance that reveals the caret and keep the scroll within the text.
+pub(super) fn reveal_scroll(mut scroll: f32, cx: f32, total: f32, width: f32) -> f32 {
+    let max_scroll = (total + 1.0 - width).max(0.0);
+    if cx - scroll > width - 1.0 {
+        scroll = cx - (width - 1.0);
+    }
+    if cx < scroll {
+        scroll = cx;
+    }
+    scroll.clamp(0.0, max_scroll)
 }

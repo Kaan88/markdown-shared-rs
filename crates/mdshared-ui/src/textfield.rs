@@ -1,6 +1,7 @@
 //! A single-line text field for the hand-drawn UI. It owns the text, the caret, the selection and
 //! the horizontal scroll; the app feeds it keys, pasted text and mouse positions, and draws it with
-//! a [`Painter`]. No clipboard or windowing code lives here.
+//! a [`Painter`]. [`Pointer`] adds mouse editing; [`TextField::context_menu`] supplies the items
+//! for a popup the application owns. No windowing code lives here.
 //!
 //! # The caret's blink
 //!
@@ -42,7 +43,12 @@ use crate::gfx::{Face, Painter, Rect, Rgb};
 use crate::keys::{KeyName, Mods};
 use std::time::Duration;
 
+mod context;
 mod draw;
+mod pointer;
+
+pub use context::ContextAction;
+pub use pointer::{FieldHit, Pointer};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditKey {

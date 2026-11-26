@@ -4,6 +4,35 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Mouse editing in a single-line field (`mdshared_ui::textfield`)
+
+Keep one `Pointer::system(scale)` per `TextField`. Pass the same text rectangle, face, font
+size and scale to `FieldHit` that the field draws with. `FieldHit::cursor` requests the I-beam;
+`Pointer::press` accepts a primary press inside the field, which the caller can then focus.
+The field measures its own caret stops using the same code as drawing, including for masked
+text. `pointer_move` extends the selection from the initial click or Shift anchor; double
+click selects a word and triple click selects all. The caller routes moves and releases even
+outside the field, schedules a wake at `deadline()` for `tick()`, and cancels on loss of focus.
+At a horizontal edge the drag advances through hidden text, even with the pointer at rest,
+and stops at the end or on release. `clicks::ClickCounter`, also used by the host, can be used
+directly for a multi-line composer or the `seltext` paragraph.
+
+On a right press, cancel the drag and open a `menu::Menu` or `submenu::Cascade` with
+`TextField::context_menu()`. The right press need not change the selection. Hand the chosen
+item back to `apply_context_action`. Cut deletes only after a successful clipboard write.
+Paste replaces the selection and uses the field's single-line cleaning, turning newlines and
+tabs into spaces. The menu never uses the clipboard for secrets. The previous low-level
+pointer and keyboard methods are unchanged; applications opt in by routing events.
+
+Try `cargo run -p mdshared-ui --features host --example textfield` with the normal and
+secret fields. On Windows with Rust 1.99.1, formatting, workspace Clippy and tests with
+`host,a11y`, the catalogue check, and the example build passed. The workspace run passed
+2,379 tests; 45 were ignored and four `explorer_tests` cases were explicitly skipped.
+Tests cover selection and click thresholds, auto-scroll wake-ups, and clipboard actions with
+a fake clipboard. The drag's selection pixels match the equivalent keyboard selection; the
+test failed with the drag update bypassed. The example was not launched, so the live
+clipboard, cursor and menu have not been checked by a person. Linux and macOS were not run.
+
 ## Vertical-only text hinting (`mdshared_text::text`)
 
 On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
