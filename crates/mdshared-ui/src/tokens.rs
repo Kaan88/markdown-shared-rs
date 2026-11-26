@@ -25,10 +25,11 @@
 //! which [`Sizes::DEFAULT`] names, so no application's look moves); fonts; a link colour and a
 //! button text colour in the palette (it has neither field; [`SystemColors::hot_light`] and
 //! [`SystemColors::button_text`] are there for an application that draws its own); and
-//! watching the system. The application asks again on winit's `ThemeChanged` or when the
-//! window gains the focus, as for [`crate::platform::system_is_dark`]; a switch of the
-//! contrast theme reaches no winit event, so on Windows [`crate::platform::watch_contrast`]
-//! wakes the application for it.
+//! watching the system itself. On Windows and macOS the application asks again on winit's
+//! `ThemeChanged` or when the window gains the focus, as for
+//! [`crate::platform::system_is_dark`]; on Linux [`crate::platform::watch_system_dark`] wakes
+//! it when the portal answers. A switch of the contrast theme reaches no winit event, so on
+//! Windows [`crate::platform::watch_contrast`] wakes the application for it.
 
 use crate::cover::{contrast, luminance};
 use crate::gfx::{Rgb, mix, rgb};
@@ -498,9 +499,10 @@ impl Tokens {
     /// gives one (a high-contrast look keeps its own accent). High contrast is the system's
     /// contrast theme where the system gives its colours
     /// ([`crate::platform::system_contrast_colors`], Windows) and the toolkit's high-contrast
-    /// palettes elsewhere ([`Tokens::high_contrast_with`]). Each call asks the system; on
-    /// Linux that is the settings portal, up to half a second for each question when it does
-    /// not answer.
+    /// palettes elsewhere ([`Tokens::high_contrast_with`]). Each call asks the system. On
+    /// Linux the answer is the settings portal's last one, kept by
+    /// [`crate::platform::system_is_dark`]; the portal is read on a helper thread, so the call
+    /// never waits for it ([`crate::platform::watch_system_dark`] wakes when it answers).
     pub fn from_system(follow_accent: bool) -> Tokens {
         let dark = crate::platform::system_is_dark();
         if crate::platform::system_high_contrast() {

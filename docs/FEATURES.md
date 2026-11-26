@@ -1784,3 +1784,51 @@ reviewing session, not by the owner), the speed test (`termview_speed`, release)
 `cargo clippy -p mdshared-ui --features term --all-targets -- -D warnings`, and
 `cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
 has been seen only through the application that uses it.
+
+## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
+
+`platform::system_is_dark` used to ask the settings portal on the calling thread with a 500 ms
+limit and cache `false` when it did not answer: a first frame could wait half a second and then
+settle for the wrong theme. It now has the shape `motion_reduced` was given.
+
+- **The same state machine.** `platform::LastGood` (the last good answer, who is reading, who
+  listens, the wake, and the stamp that drops a late answer) keeps the dark theme as it keeps
+  the wish for less motion. `read_and_watch` is shared by the two: the caller passes the
+  `LastGood` it fills, the portal namespaces whose `SettingChanged` signals concern it, and a
+  function that reads the setting from an open bus. `motion_reduced` and `system_is_dark` differ
+  only in those three arguments.
+- **The call never blocks.** A new private `ask_in_background` takes the lock, claims a reading
+  when none is under way and none listens (at most once a second), starts the helper thread, and
+  gives the last answer at once: `false` before the first one, the last good answer after it. A
+  timeout is `None`, which `LastGood::answer` ignores, so a dark theme is never overwritten with
+  `false` because the portal was slow.
+- **The same listener.** The first reading stays subscribed to the portal's `SettingChanged`
+  signal and reads `org.freedesktop.appearance` `color-scheme` again at each change; only that
+  namespace's signals count. The last answer wakes the application.
+- **New API:** `platform::watch_system_dark(wake)`, the counterpart of
+  `watch_motion_reduced(wake)`. On Linux it stores the wake in the dark theme's `LastGood`, and a
+  wake given after an answer is called once at once, on the caller's thread. On Windows and
+  macOS it is dropped and never called, because winit's `ThemeChanged` already tells the window;
+  those two systems read the theme directly, as before.
+- No signature changed, no public enum or struct gained a variant or a field, and Windows and
+  macOS behave exactly as they did. The old one-shot `imp::portal_prefers_dark` (500 ms limit)
+  is now a test helper only and shares `read_dark` with the production path.
+
+Tests, none of which needs a D-Bus (`platform::dark_tests`):
+`platform::dark_tests::a_slow_or_absent_answer_does_not_block_and_returns_the_last_good_value`,
+`platform::dark_tests::a_timeout_does_not_overwrite_a_good_value_with_false` and
+`platform::dark_tests::a_later_answer_updates_the_value_and_wakes`. Each failed before the
+change because `ask_in_background` did not exist; renaming it made all three (and the production
+call site) fail with E0425.
+
+Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (mdshared-ui: 1118
+passed, 33 ignored; doctests pass; exit 0), and the three dark tests on their own. Earlier, the
+release workspace clippy and test, and the release clippy and tests of `recycle`,
+`media-session` and `notify` plus the `a11y` clippy, also passed. Not run: the release host,
+host+a11y and term clippy/test commands, the host example, the release `a11y` tests, and the
+rest of the matrix after that point. Linux: `cargo check -p mdshared-ui --all-targets --target
+x86_64-unknown-linux-gnu` type-checked with a stub `pkg-config` (exit 0); nothing was linked.
+**Not run on a real Linux desktop**: the portal thread, the `SettingChanged` listener and the
+wake are type-checked only, and Linux CI runs the rest. macOS was not compiled.
