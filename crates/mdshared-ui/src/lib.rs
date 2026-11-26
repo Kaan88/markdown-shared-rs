@@ -3,6 +3,8 @@
 //! command table, OS glue, the generic drawing of the shell (title row and tabs, panes,
 //! scrollbar, tooltips, toasts, dialog frames), info bars, sliders, knobs and faders, drop-down
 //! lists and toggle switches ([`dropdown`], [`toggle`]), a colour picker ([`colour_picker`]),
+//! everyday controls ([`controls`]: push buttons, an icon button, a menu button, a split button
+//! and a framed text field),
 //! expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, a scroll area ([`scrollarea`]), the keyboard focus over the
@@ -24,6 +26,7 @@ pub mod check;
 pub mod chrome;
 pub mod colour_picker;
 pub mod commands;
+pub mod controls;
 pub mod corners;
 pub mod cover;
 pub mod cursor;

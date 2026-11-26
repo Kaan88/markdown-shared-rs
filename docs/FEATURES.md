@@ -2161,3 +2161,121 @@ Known limits, for later: `Painter::dev_x`/`dev_y` saturate a product to `i32::MA
 add the painter's offset, which overflows in debug for a coordinate near 2.2e9. That was
 already true before this branch; `Picture` only inherits it. A tall source scaled down can
 still make `prepare_image` allocate hundreds of MiB, as above.
+
+## Everyday controls (roadmap K4, first slice): `controls`
+
+Roadmap K4 is the everyday controls a settings page or a dashboard needs. It is large, so this
+branch does its first slice and leaves the rest there: **not here** are the check box with a
+label and a mixed state, the radio group, the chip with remove, the badge and count, the card,
+the divider and the avatar. What is here is `mdshared_ui::controls`, a directory module with
+three parts, all in the toolkit's immediate-mode shape: plain models and free `draw_*`
+functions that change nothing.
+
+- `button`: a push button in four kinds — primary (the accent fill), secondary (a quiet fill
+  with an edge), subtle (no fill until the pointer is over it) and destructive (the danger
+  fill) — and six states: rest, hovered, pressed (only while the pointer is still on it, as
+  `overlay::draw_dialog_button` reads a press), focused (a ring through `focus`), disabled and
+  default (the button Enter presses). The colours are one shared `Style` per kind, so the menu
+  and split buttons in `menu_button` look the same. The filled kinds are drawn in
+  `Face::Semibold`, as a dialog's primary button is, and the other two in `Face::Ui`.
+- `icon_button`: a square subtle button with one glyph and the text of its tooltip;
+  `IconButton::over(key, rect)` builds the `tooltip::Over` the caller hands to
+  `Tooltip::hover`, and drawing stays `overlay::Bubble::tip`.
+- `menu_button`: `MenuButton`, whose whole face opens a menu, and `SplitButton`, whose label
+  acts and whose `CHEVRON_W`-wide chevron opens it. `menu_under(menu, button)` is
+  `Menu::around(button)`; the menu itself, its items, its keys and its Escape stay the caller's.
+  The keys are Windows' own: Space, Enter and Down open a menu button; Space and Enter run a
+  split button's action while Down and Alt+Down open its menu.
+- `field`: `FramedField` wraps a `TextField` with a frame, an optional leading icon, a clear
+  button while there is text and an error message under the box. The field keeps no clock: the
+  caller blinks the caret with `draw_blinking` and the animator, as it does for `TextField`.
+
+Look decisions the owner should see:
+
+- A disabled button of **any** kind is the one quiet `field` frame with a faint label, in
+  semibold, whatever its kind — exactly `overlay::draw_dialog_button_disabled`'s behaviour,
+  which ignores the role once a button cannot be pressed. The kind no longer shows.
+- The destructive fill is `palette::danger` with white text (`button::ON_DANGER`): the palette
+  has no "on danger" colour, and `on_accent` is a dark navy in the dark palette (1.7:1 on the
+  dark red), while white is 5.6:1 in both.
+- A default button is marked with a line just inside its edge: the accent, except on the two
+  filled kinds, where it is a lighter line mixed from `on_accent` and the fill so it reads
+  against the fill.
+- The framed field always reserves the clear button's room at the right, so the text does not
+  shift when the first character is typed or the field is cleared. Focused, the frame and a
+  2 px line along the bottom are the accent; with an error, both are `danger`.
+- **Escape does not clear the field by default.** The brief asked for it "if that is the
+  existing convention"; it is not — in this toolkit Escape closes dialogs (`settings`), popups
+  (`dropdown`), the colour picker and the command palette. `set_escape_clears(true)` turns it
+  on for a search box, and with an empty field Escape is still `Outcome::Unused`, so the
+  caller's Escape still closes what it closes.
+
+**New public API:** `controls::button::{Button, Kind, Look, draw, key, hit, cursor, width,
+button_rect, HEIGHT, RADIUS, PAD, TEXT, ON_DANGER}`; `controls::icon_button::{IconButton, draw,
+rect, SIZE, ICON}`; `controls::menu_button::{MenuButton, SplitButton, Half, Halves, SplitLook,
+Press, draw, draw_split, key, menu_under, menu_button_w, split_button_w, chevron_rect,
+label_rect, halves, hit, CHEVRON, GAP, CHEVRON_W}`; `controls::field::{FramedField, Look, Hit,
+Outcome, draw, draw_blinking, HEIGHT, ERROR_H, ICON_W, CLEAR, CLEAR_PAD, PAD, RADIUS, TEXT,
+ERROR_TEXT}`. No existing signature, public field or drawing changed; the new module is
+declared in `lib.rs` and the example in `Cargo.toml`. No dependency was added.
+
+Tests, 40 and one `#[ignore]`d sheet:
+
+- `button_tests.rs` (13): `the_rectangle_is_as_wide_as_the_label_plus_its_padding`,
+  `a_hit_is_inside_the_button_and_not_outside_it`,
+  `enter_and_space_activate_a_button_and_the_other_keys_do_not`,
+  `a_button_asks_for_the_hand_cursor`,
+  `every_kind_and_state_draws_differently_in_both_palettes`,
+  `the_four_kinds_differ_at_rest_in_both_palettes`, `each_kind_is_filled_in_its_own_colour`,
+  `a_press_counts_only_while_the_pointer_is_on_the_button`,
+  `the_keyboard_draws_the_ring_outside_the_button`,
+  `a_disabled_button_is_the_same_quiet_frame_whatever_its_kind`,
+  `a_default_button_has_an_accent_line_and_primary_a_lighter_one`,
+  `a_button_with_no_room_draws_nothing`, and
+  `the_destructive_label_reads_against_the_red_in_both_palettes` (4.5:1 or better).
+- `icon_button_tests.rs` (5): the square, its hit and keys, the glyph and six states in both
+  palettes, the quiet disabled look, the empty rectangle, and
+  `the_icon_button_gives_the_tooltip_model_its_text_and_anchor` (the delay, the "shows at the
+  anchor" answer and the bubble under the square).
+- `menu_button_tests.rs` (10): the width and the chevron's room, the menu button's keys, the
+  split button's keys and two halves, `the_two_halves_share_the_button_and_hit_where_they_are`,
+  `the_menu_opens_around_the_button_below_and_above_near_an_edge` (below, above near the
+  bottom, left near the right), the chevron and hover pixels, the halves lighting on their
+  own, the focus ring and default mark on the whole button, the quiet disabled split, and an
+  empty rectangle.
+- `field_tests.rs` (12): the height and the error band, the clear button's place and when it
+  shows, the icon's and the clear button's room (and that the text does not shift), the press
+  on the clear button against the text area, `the_field_keeps_the_focus_after_the_clear_button`
+  (the caret is still drawn at the start of the text area), the error's colour and message
+  under the box, the focused edge and bottom line, Escape on and off, the editing keys,
+  the placeholder, the quiet disabled field, and an empty rectangle.
+- `controls_sheet` (`#[ignore]`): four kinds in six states, the icon, menu and split buttons
+  and three framed fields, light and dark, at scale 1 and 1.5, written to
+  `target/specimen/controls.png` and `controls-150.png`
+  (`cargo test -p mdshared-ui controls_sheet -- --ignored`).
+
+Fail-before evidence. Every test is new API, so it does not compile before the branch. Each was
+then shown to fail with its behaviour removed, in two mutations. First, every public model and
+drawing was neutered (widths 0, hits false, keys false, draws empty, `menu_under` unconverted,
+`halves` empty, `over` with no text, the field's `height` 0, `clear_rect` and `error_rect` none,
+`press` outside, `key` unused): 34 of the 40 failed. The six that survived assert that
+nonsense draws **nothing**, that a disabled control takes no mark (five tests), and that the
+destructive label's contrast is 4.5:1 (a colour constant). The second mutation — the `sane`
+guards answering true and the disabled branches removed — failed the first five as well (plus
+six more); setting `ON_DANGER` to black failed the contrast test in the light palette. So each
+of the 40 has a run in which it failed.
+
+Run on Windows (branch `feat/k4-controls`, `CARGO_TARGET_DIR=E:/mds-target/k4`):
+`cargo fmt --all --check` (clean); `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0);
+`cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests` (exit 0; mdshared-ui 1199 passed, 35 ignored; the other crates all passed);
+`cargo run -p mdshared-ui --features host,a11y --example controls -- --seconds 2` (exit 0, two
+frames drawn, the timer woke it and it closed); the sheet test wrote both PNGs.
+
+Not run: the rest of the seventeen-command matrix (the `recycle`, `media-session`, `notify`,
+`a11y`, `host`, `term` single-feature forms and the Linux type-check), release builds, and
+everything on Linux and macOS (CI will). **Not seen by a person**: the example has opened once
+for two seconds with no pointer or keyboard on it, and no application draws these controls yet;
+the sheet PNGs were generated and looked at by the agent, which is not the owner's approval of
+how they look.
