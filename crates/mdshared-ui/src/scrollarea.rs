@@ -6,6 +6,10 @@
 //!
 //! ```text
 //! let rows = area.layout_column(view, &Flex::column().gap(8.0), &items);
+//! for (i, r) in rows.iter().enumerate() {
+//!     // Every control is offered each frame; the area reveals the focused one when it arrives.
+//!     area.reveal_focus(&focus, i, (r.x as f64, r.y as f64), (r.w as f64, r.h as f64));
+//! }
 //! let saved = area.scrolled(&mut p, view);   // clip to `view` and move to content (0, 0)
 //! for (r, item) in rows.iter().zip(&items) {
 //!     draw_row(&mut p, *r, item);
@@ -23,8 +27,9 @@
 //!
 //! The focus is passed in ([`ScrollArea::reveal_focus`]) rather than held: the id type is the
 //! application's, as in [`Focus`]. `reveal` moves the offset at once, and `reveal_focus` only
-//! when the focus has come to another control, so a wheel or a key is not undone on the next
-//! frame. An application that wants the offset to glide keeps a
+//! when the focus arrives at a control, including coming back to one after the focus left the
+//! area, so a wheel or a key is not undone on the next frame. An application that wants the
+//! offset to glide keeps a
 //! [`SmoothScroll`](crate::scroll::SmoothScroll) for each axis as [`viewport`] describes and
 //! gives [`ScrollArea::set_offset`] what it draws each frame.
 //!
@@ -635,8 +640,11 @@ mod tests {
         focus.focus(2);
         assert!(offer(&mut a, &focus, &rows));
         assert_eq!(a.offset(), (0.0, 1330.0));
-        // The person wheels to the top of the body.
+        // The same focus must not reveal again after a scroll, or the view would be pinned:
+        // the call for row 1 must not clear what the call for row 2 then restores.
         a.set_offset((0.0, 0.0));
+        assert!(!offer(&mut a, &focus, &rows));
+        assert_eq!(a.offset(), (0.0, 0.0));
         // Tab goes to the button outside the area: the area sees the focus leave.
         focus.focus(3);
         assert!(!offer(&mut a, &focus, &rows));

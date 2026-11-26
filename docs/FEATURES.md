@@ -1881,6 +1881,10 @@ Known limits for later:
 - The example's own rough edges: a press on a scrollbar focuses the row under it, the bars are
   drawn active whenever a row is hovered, and the hovered row stays as it was after a wheel
   turn until the pointer moves.
+- If an application stops calling `reveal_focus` while its area is hidden, the area cannot see
+  the focus leave; when it reopens with the focus still on the same control, that control is
+  not revealed. Call `reveal` directly when the area reopens, or keep offering the controls
+  while it is hidden (which costs nothing).
 
 Left for later: momentum and rubber-banding at the ends; dragging a thumb and the bar's hover
 fade (`scroll::draw_scrollbar_animated` is ready for it, `draw_bars_animated` takes `active`
