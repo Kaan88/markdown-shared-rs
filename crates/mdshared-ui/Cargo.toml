@@ -159,5 +159,9 @@ name = "textfield"
 required-features = ["host"]
 
 [[example]]
+name = "settings_textfield"
+required-features = ["host"]
+
+[[example]]
 name = "term_backdrop"
 required-features = ["host", "term"]

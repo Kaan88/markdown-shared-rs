@@ -732,6 +732,7 @@ pub struct Form {
     pages: Vec<Page>,
     /// One per item of every page; only text rows use theirs.
     slots: Vec<Vec<Slot>>,
+    text_pointer: super::text_edit::TextPointer,
     current: usize,
     focus: Focus,
     /// The focus ring shows once the keyboard has been used.
@@ -759,6 +760,7 @@ impl Form {
             title: title.into(),
             pages: Vec::new(),
             slots: Vec::new(),
+            text_pointer: super::text_edit::TextPointer::default(),
             current: 0,
             focus: Focus::List,
             focus_visible: false,
@@ -801,6 +803,7 @@ impl Form {
     /// Replaces the pages (values or what is disabled changed elsewhere), keeping the page shown,
     /// the keyboard where it is, and the caret of a text box whose text is unchanged.
     pub fn set_pages(&mut self, pages: Vec<Page>) {
+        self.cancel_text_pointer();
         let focus_id = self.focus_id();
         let mut old: Vec<(u32, TextField)> = Vec::new();
         for (c, page) in self.pages.iter().enumerate() {
@@ -952,6 +955,9 @@ impl Form {
             return false;
         }
         self.show_page(c);
+        if self.focus != f {
+            self.cancel_text_pointer();
+        }
         self.focus = f;
         true
     }
@@ -963,6 +969,7 @@ impl Form {
             return false;
         }
         if c != self.current {
+            self.cancel_text_pointer();
             self.current = c;
             self.menu = None;
             self.hover = None;
@@ -1416,6 +1423,7 @@ impl Form {
 
     /// A key press; `typed` is the text the event produced.
     pub fn key(&mut self, key: &KeyName, mods: Mods, typed: Option<&str>) -> Outcome {
+        self.cancel_text_pointer();
         if let Some((i, menu)) = &mut self.menu {
             let i = *i;
             return match key {
@@ -1614,6 +1622,7 @@ impl Form {
     /// button comes up over the same control; a text box places its caret at once; a press
     /// outside the card closes the dialog (with a dropdown open, only the dropdown).
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
+        self.cancel_text_pointer();
         self.drag = None;
         self.pressed = None;
         self.menu_pressed = None;
@@ -2118,6 +2127,7 @@ fn stepper_parts(c: Rect) -> (Rect, Rect, Rect) {
 }
 
 mod motion;
+mod text_edit;
 
 #[cfg(test)]
 mod frozen;
