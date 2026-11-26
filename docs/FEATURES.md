@@ -3116,3 +3116,16 @@ Format, workspace Clippy with `host,a11y`, preview-server Clippy and the catalog
 passed. Release renderer tests passed (159 passed, two ignored), including all eight
 goldens, whose hashes did not change. Release preview-server tests passed (22 passed).
 Linux renderer Clippy passed with the `pkg-config` stub; Unix runtime behavior was not tested.
+
+PR #53 Windows CI: the `render` integration tests shared engine configuration. The
+source-hit test could set the engine path between another test's full-page and slice
+renders. Forcing that order reproduced `4663.8486 vs 3622` exactly. The suite now
+sets up the engine before rendering fixtures, and the slice comparison still checks
+the original height and pixel assertions with a second engine lookup between renders.
+This did not involve the layout cache; #15 remains open.
+On Windows with Rust 1.99.1, the regression passed in isolation and the entire render
+integration binary passed 60 runs with 64 test threads. Format, workspace Clippy with
+`host,a11y`, the catalogue, release render (159 passed) and release preview server
+(22 passed) passed. Release workspace tests passed (2,304 passed, four Explorer tests
+excluded to leave the desktop alone). All eight golden hashes were unchanged.
+CI, Linux and macOS were not rerun for this test-only change.
