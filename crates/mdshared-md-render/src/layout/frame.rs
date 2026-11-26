@@ -13,11 +13,7 @@ use std::collections::HashMap;
 const MAX_WIDTH: u32 = 8192;
 
 pub(super) fn layout_size(options: &Options) -> (f32, f32) {
-    let scale = if options.scale.is_finite() {
-        options.scale.clamp(0.1, 8.0)
-    } else {
-        1.0
-    };
+    let scale = options.layout_scale();
     (
         options.width.max(120.0).min(MAX_WIDTH as f32 / scale),
         scale,

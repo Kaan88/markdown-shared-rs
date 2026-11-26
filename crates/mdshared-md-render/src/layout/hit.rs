@@ -138,7 +138,8 @@ impl DocumentRenderer {
                 code
             });
         // A little slack around the box, which is a small target.
-        let slack = 3.0 * options.scale;
+        let scale = options.layout_scale();
+        let slack = 3.0 * scale;
         let task = cached
             .tasks
             .iter()
@@ -166,7 +167,7 @@ impl DocumentRenderer {
             (None, None) => doc.blocks.get(task? as usize)?.text.start,
         };
         let on_text = line.is_some_and(|line| {
-            let slack = 2.0 * options.scale;
+            let slack = 2.0 * scale;
             distance(line, local) == 0.0 && x >= line.x0 - slack && x <= line.x1 + slack
         });
         let mut hit = Hit {

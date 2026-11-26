@@ -51,6 +51,7 @@ use store::ImageStore;
 pub struct Options {
     /// Logical page width, before the device scale.
     pub width: f32,
+    /// Device pixels per logical pixel, clamped to 0.1–8. Non-finite scales use 1.
     pub scale: f32,
     pub theme: Theme,
     /// Clip the bitmap and stop laying out past this many logical px (at least one device row).
@@ -74,6 +75,14 @@ impl Default for Options {
 }
 
 impl Options {
+    fn layout_scale(&self) -> f32 {
+        if self.scale.is_finite() {
+            self.scale.clamp(0.1, 8.0)
+        } else {
+            1.0
+        }
+    }
+
     pub fn light() -> Options {
         Options {
             theme: LIGHT,
@@ -92,7 +101,7 @@ impl Options {
     /// directory.
     fn same_layout(&self, other: &Options) -> bool {
         self.width == other.width
-            && (self.scale - other.scale).abs() < 0.001
+            && (self.layout_scale() - other.layout_scale()).abs() < 0.001
             && self.theme.key() == other.theme.key()
             && self.base_dir == other.base_dir
     }
@@ -332,7 +341,7 @@ impl DocumentRenderer {
     ) -> Option<std::rc::Rc<crate::image::DecodedImage>> {
         let options = self.options.as_ref()?;
         // The page's own raster: twice the device scale, so text stays sharp above it.
-        let scale = 2.0 * options.scale;
+        let scale = 2.0 * options.layout_scale();
         let dark = options.theme.name == "dark";
         // The page has it already; a click may ask for it again after the store let its pixels go.
         let (id, _) = self.store.mermaid(source, scale, dark, true);

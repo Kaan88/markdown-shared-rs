@@ -20,49 +20,79 @@ pub const MAX_PIXELS: u64 = 24_000_000;
 /// Resolve the local spelling without consulting the filesystem. Keep literal filenames (for
 /// example a wiki embed with a `%` or `#`) as the first choice, then try the URL spelling.
 pub(crate) fn local_paths(src: &str, base: Option<&Path>) -> impl Iterator<Item = PathBuf> {
+    resolve_local_paths(src, base).into_iter().flatten()
+}
+
+fn resolve_local_paths(src: &str, base: Option<&Path>) -> [Option<PathBuf>; 2] {
     let base = base.unwrap_or(Path::new(""));
+    // Check the caller's original spelling before joining or normalizing. On Unix,
+    // components() folds a leading double slash into the root of a local path.
+    let trusted_disk = verbatim_disk(base);
+    if has_host_prefix(base) && !trusted_disk {
+        return [None, None];
+    }
     let src = src.trim();
     let file_url = src
         .get(..5)
         .is_some_and(|s| s.eq_ignore_ascii_case("file:"));
-    let (literal, decoded) = match classify_image(src, base) {
-        ImageSource::Local(decoded) => {
-            let decoded = if file_url && decoded.is_relative() {
-                base.join(decoded)
-            } else {
-                decoded
-            };
-            // Check the resolved URL before considering the literal spelling. An encoded
-            // network path must not cause even a probe of a same-named literal.
-            if absolute_local(&decoded) {
-                let literal = (!file_url)
-                    .then(|| base.join(src))
-                    .filter(|p| *p != decoded && absolute_local(p));
-                (literal, Some(decoded))
-            } else {
-                (None, None)
-            }
-        }
-        _ => (None, None),
+    // classify_image rejects document-supplied host and device prefixes, including in
+    // decoded URLs. A verbatim-disk prefix may only survive resolution from the caller's base.
+    let ImageSource::Local(decoded) = classify_image(src, base) else {
+        return [None, None];
     };
-    literal.into_iter().chain(decoded)
+    let decoded = if file_url && decoded.is_relative() {
+        base.join(decoded)
+    } else {
+        decoded
+    };
+    if !absolute_local(&decoded, trusted_disk) {
+        return [None, None];
+    }
+    // Check the resolved URL before considering the literal spelling. An encoded
+    // network path must not cause even a probe of a same-named literal.
+    let literal = (!file_url)
+        .then(|| base.join(src))
+        .filter(|p| *p != decoded && absolute_local(p, trusted_disk));
+    [literal, Some(decoded)]
 }
 
-fn absolute_local(path: &Path) -> bool {
-    if !path.is_absolute() {
+fn has_host_prefix(path: &Path) -> bool {
+    let mut head = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_control());
+    let slash = |c| c == b'/' || c == b'\\';
+    head.next().is_some_and(slash) && head.next().is_some_and(slash)
+}
+
+#[cfg(windows)]
+pub(crate) fn verbatim_disk(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        )
+}
+
+#[cfg(not(windows))]
+fn verbatim_disk(_: &Path) -> bool {
+    false
+}
+
+fn absolute_local(path: &Path, trusted_disk: bool) -> bool {
+    if !path.is_absolute() || (has_host_prefix(path) && !(trusted_disk && verbatim_disk(path))) {
         return false;
     }
-    let name = path.as_os_str().to_string_lossy();
-    let mut head = name.chars().filter(|c| !c.is_control());
-    let slash = |c| c == '/' || c == '\\';
-    let host = head.next().is_some_and(slash) && head.next().is_some_and(slash);
     #[cfg(windows)]
     let device = path.components().any(|part| {
         matches!(part, std::path::Component::Normal(name) if device_name(&name.to_string_lossy()))
     });
     #[cfg(not(windows))]
     let device = false;
-    !host && !device
+    !device
 }
 
 /// Win32 still recognizes these names in ordinary drive paths, even with an extension.
@@ -416,6 +446,47 @@ mod tests {
             expected_probes.push((src, expected, expected));
         }
         assert_eq!(observed, expected_probes);
+    }
+
+    #[test]
+    fn host_base_is_rejected_before_any_path_can_be_probed() {
+        let base = Path::new("//example.invalid/share");
+        let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("picture.png");
+        assert!(local.is_absolute());
+        // The lexical policy refuses a host base before path resolution can erase its prefix,
+        // even when the source could otherwise be resolved without that base.
+        for src in ["picture.png", local.to_str().unwrap()] {
+            assert_eq!(local_paths(src, Some(base)).next(), None, "{src}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_disk_base_can_load_images_but_document_device_paths_are_refused() {
+        use std::path::{Component, Prefix};
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/md/assets")
+            .canonicalize()
+            .unwrap();
+        assert!(matches!(
+            base.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        ));
+        for src in ["badge.png", "badge%2Epng", "file:badge.png"] {
+            let path = local_paths(src, Some(&base))
+                .find(|path| path.is_file())
+                .expect("existing local image under a canonical disk base");
+            assert!(read(&path).is_some());
+        }
+        for src in [
+            r"\\?\C:\badge.png",
+            r"\\?\UNC\example.invalid\share\badge.png",
+            r"\\.\CON",
+            "NUL.png",
+            "%5c%5c%3f%5cC%3a%5cbadge.png",
+        ] {
+            assert!(local_paths(src, Some(&base)).next().is_none(), "{src}");
+        }
     }
 
     #[test]

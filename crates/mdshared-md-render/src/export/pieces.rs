@@ -203,7 +203,15 @@ pub(super) fn base64(bytes: &[u8]) -> String {
 /// A `file://` address for a path: it works on this machine only, which is what an image too
 /// large to embed gets.
 pub(super) fn file_url(path: &Path) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
+    let path_text = path.to_string_lossy();
+    // File URLs take a drive letter, not the Windows namespace used to open a canonical path.
+    #[cfg(windows)]
+    let path_text = if crate::image::verbatim_disk(path) {
+        &path_text[4..]
+    } else {
+        &path_text
+    };
+    let s = path_text.replace('\\', "/");
     let mut out = String::from("file://");
     if !s.starts_with('/') {
         out.push('/');

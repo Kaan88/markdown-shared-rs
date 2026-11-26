@@ -3036,7 +3036,7 @@ no change was made there. Linux and macOS were not run for this refresh.
 The Astra follow-up checks local image names before touching the filesystem, rejects
 relative names without an absolute document directory, and reads only regular file
 handles. Linux and macOS open first with `O_NONBLOCK` so a FIFO cannot wait for a writer.
-Default SVG options ignore external image references. Release builds look only beside
+Default SVG options ignore external image references. Applications look only beside
 the running executable or at an explicit absolute engine path. WebP stills and animation
 frames use a bounded header walk to check bitstream dimensions before decoding.
 
@@ -3072,3 +3072,17 @@ renderer (156 passed, including all eight unchanged goldens), and release previe
 (22 passed). Nine regression tests failed when their corresponding fixes were temporarily
 disabled. The FIFO test was cross-checked by Clippy for Linux and both macOS targets;
 it was not linked or run on Unix. No application visuals were reviewed by a person.
+
+Re-review follow-up: #1 now rejects a host base before normalization, including a
+double-slash spelling on Unix. On Windows a caller-supplied canonical local drive
+base is accepted; document-supplied device and UNC paths are still refused. For #3,
+only renderer unit tests search ancestors; shipping with debug assertions does not
+enable that search. The direct renderer uses one normalized scale for page margins,
+layout and hit tests. These four re-review items are closed; #10, #11, #13 and #15
+remain open.
+
+All four re-review regressions failed before the fixes and passed after them on Windows.
+Format, workspace Clippy with `host,a11y`, preview-server Clippy and the catalogue check
+passed. Release renderer tests passed (159 passed, two ignored), including all eight
+goldens, whose hashes did not change. Release preview-server tests passed (22 passed).
+Linux renderer Clippy passed with the `pkg-config` stub; Unix runtime behavior was not tested.

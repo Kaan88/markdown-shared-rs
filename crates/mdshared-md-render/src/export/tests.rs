@@ -286,6 +286,11 @@ fn file_urls_are_escaped_and_windows_paths_get_a_slash() {
         file_url(Path::new("C:\\x\\y z.png")),
         "file:///C:/x/y%20z.png"
     );
+    #[cfg(windows)]
+    assert_eq!(
+        file_url(Path::new(r"\\?\C:\x\y z.png")),
+        "file:///C:/x/y%20z.png"
+    );
 }
 
 #[test]

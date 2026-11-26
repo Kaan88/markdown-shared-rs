@@ -15,6 +15,30 @@ fn plain(width: f32) -> Options {
     }
 }
 
+#[test]
+fn page_margins_and_view_use_the_same_normalised_scale() {
+    let doc = mdshared_md_core::parse("The page has one paragraph.");
+    for (scale, normal) in [(f32::MAX, 8.0), (f32::NAN, 1.0), (0.0, 0.1)] {
+        let options = Options {
+            scale,
+            ..plain(360.0)
+        };
+        let expected = Options {
+            scale: normal,
+            ..options.clone()
+        };
+        let mut renderer = DocumentRenderer::new();
+        let layout = renderer.layout_exact(&doc, &options);
+        assert!(layout.total_height().is_finite());
+        assert_eq!(layout.blocks()[0].y, (36.0 * normal).round());
+        assert!(layout.matches(&expected));
+        let slice = renderer.view(&doc, &options, 0.0, 96.0);
+        let reference = mdshared_md_render::render_slice(&doc, &expected, 0.0, 96.0);
+        assert_eq!(slice.total_height, reference.total_height);
+        assert_eq!(slice.bitmap.pixels, reference.bitmap.pixels);
+    }
+}
+
 /// A `<details>` near the top, a remote image with no declared size, one with a declared size,
 /// and enough paragraphs (and a footnote) to scroll.
 fn long_doc() -> mdshared_md_core::Document {

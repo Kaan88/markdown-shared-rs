@@ -56,12 +56,13 @@ shared installation. If you need to override an inherited `MDV_ENGINE`, call
 1. The absolute path passed to `mdshared_md_render::set_engine_path`.
 2. The absolute path in the `MDV_ENGINE` environment variable.
 3. A sibling of the running executable.
-4. In debug builds and unit tests only: walking up from the executable directory, it checks for a binary
-   directly in each directory and in its `target/release`, at most six directories in all.
 
-An explicit path that does not exist does not fall back. `cargo test --workspace` builds
-the engine for the workspace tests. If testing only the renderer,
-build the engine first in the same Cargo target directory and profile.
+An invalid explicit path does not fall back. Debug builds and Cargo examples follow the
+same rules: if the engine is not a sibling of the example, set `MDV_ENGINE` to its absolute
+path. `cargo test --workspace` builds the engine for the workspace tests. Renderer unit
+tests may search parent directories; engine-dependent integration tests set the engine's
+absolute path from the Cargo profile directory. If testing only the renderer, build the
+engine first in that target directory and profile.
 
 ## Release settings
 

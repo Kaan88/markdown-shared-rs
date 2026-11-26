@@ -5,7 +5,7 @@
 //! deadline kills the process and forgets it, so the next job starts a fresh one. A broken or slow
 //! rasterizer therefore costs a placeholder, never the viewer.
 //!
-//! Release builds use the binary beside this executable or an explicit absolute override.
+//! Applications use the binary beside their executable or an explicit absolute override.
 
 use crate::image::{DecodedImage, MAX_BYTES, MAX_PIXELS};
 use mdshared_md_engine_proto::{
@@ -254,18 +254,13 @@ fn engine_path() -> Option<PathBuf> {
         .cloned()
         .or_else(|| std::env::var_os("MDV_ENGINE").map(PathBuf::from));
     let exe = std::env::current_exe().ok();
-    discover(
-        exe.as_deref(),
-        override_path,
-        cfg!(any(test, debug_assertions)),
-        Path::is_file,
-    )
+    discover(exe.as_deref(), override_path, cfg!(test), Path::is_file)
 }
 
 fn discover(
     exe: Option<&Path>,
     override_path: Option<PathBuf>,
-    development: bool,
+    unit_test: bool,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     if let Some(path) = override_path {
@@ -282,7 +277,7 @@ fn discover(
         if exists(&sibling) {
             return Some(sibling);
         }
-        if !development {
+        if !unit_test {
             break;
         }
         let target = directory.join("target").join("release").join(name);
@@ -321,7 +316,7 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn release_discovery_checks_only_the_sibling_or_an_absolute_override() {
+    fn production_discovery_checks_only_the_sibling_or_an_absolute_override() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let exe = root.join("install/viewer");
         let name = if cfg!(windows) {
