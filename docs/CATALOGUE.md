@@ -16,6 +16,7 @@ motion ([ANIMATION.md](ANIMATION.md)).
 - **Show a terminal:** [`termview`](#widgets-mdshared-ui) (feature `term`) draws the [`mdshared-term`](#terminal-mdshared-term) screen.
 - **Run a shell in a pseudo-terminal (PTY):** [`mdshared-pty`](#pseudo-terminal-mdshared-pty).
 - **Draw rich or styled text:** [`richtext` and `Painter::rich_text`](#painting-mdshared-ui-mdshared-text).
+- **Draw a laid-out document with bounded monochrome glyph masks:** [`mdshared_text::text`](#text-mdshared-text-mdshared-highlight).
 - **Draw text over premultiplied pixels in a frosted window:** [premultiplied text and `frost::finish_premultiplied`](#text-mdshared-text-mdshared-highlight).
 - **Edit text in a field:** [`textfield`](#widgets-mdshared-ui); a multi-line editor is not yet shared ([ROADMAP K9](ROADMAP.md#barbican-fast-track-2026-11-25)).
 - **Pick a colour:** [`colour_picker`](#widgets-mdshared-ui).
@@ -57,7 +58,7 @@ motion ([ANIMATION.md](ANIMATION.md)).
 
 | Module | For | Start at |
 |---|---|---|
-| `mdshared_text::text` | Laying out and rasterizing text for a document page: parley layouts drawn with subpixel masks, a byte-capped glyph cache. Monochrome outlines fit vertically to pixel rows without changing their horizontal coordinates or the layout | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
+| `mdshared_text::text` | Laying out and rasterizing text for a document page: parley layouts drawn with subpixel masks, a byte-capped glyph cache. Monochrome outlines fit vertically without changing X or the layout; a fit that exceeds the movement, bounds or mask limits uses the unhinted outline. Monochrome masks are capped at 4 MiB before rendering | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
 | `mdshared_text::text` (premultiplied glyphs) | Tinted text over premultiplied pixels, with grayscale coverage where the destination is translucent and the usual text drawing elsewhere. Over translucent pixels, Swash colour outlines keep their premultiplied RGB; colour bitmap strikes use straight RGB | `TextEngine::draw_layout_clipped_tinted_premultiplied`, `bitmap::blend_premultiplied`; before presenting with a frost key, `mdshared_ui::frost::finish_premultiplied` on the unmarked drawing region |
 | `mdshared_text::fonts` | One font enumeration per thread, fallback families, colour emoji runs | `shared_fonts`, `add_fallbacks`, `push_emoji_runs` |
 | `mdshared_highlight` | Highlighting a whole code block by language name | `tokens`, `Token` |
