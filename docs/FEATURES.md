@@ -1029,8 +1029,9 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   optional dependency.
 
 Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and
-corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases,
-regions with their own damage.
+corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases.
+(Regions with their own damage, named timers and a hidden-but-alive window came later; see the
+K1 section below.)
 
 Run: 34 unit tests of the pure parts with `host,a11y` (33 with `host`): the damage join
 against a plain min and max over random rectangles, the outward device rounding against fine
@@ -1907,7 +1908,7 @@ Added: `scrollarea::{ScrollArea, Scrolled, draw_bars, draw_bars_animated, LINE}`
 Page Up / Page Down, Home and End, with Tab moving the focus and the area revealing it when it
 moves. No existing signature, field or drawing changed.
 
-Tests (in `scrollarea.rs`, 19 and the ignored sheet). Model: content shorter than the view,
+Tests (in `scrollarea_tests.rs` since the split below, 19 and the ignored sheet). Model: content shorter than the view,
 exact fit and a pixel more (no scroll, no bars), a content that shrinks pulling the offset in,
 a wheel notch away from the user scrolling up and Shift turning it across, the page keys and
 Home/End, reveal above, below and taller than the view, `reveal_focus` only for the focused
@@ -1958,11 +1959,531 @@ Known limits for later:
   not revealed. Call `reveal` directly when the area reopens, or keep offering the controls
   while it is hidden (which costs nothing).
 
+The file was split when it passed the house limit: the test module (617 of its 1011 lines) moved
+to `scrollarea_tests.rs` beside it, in the `submenu_tests.rs` pattern, leaving the model and the
+two drawing functions in `scrollarea.rs` (397 lines). No test was edited: the body of the module
+moved out of its `mod tests` wrapper unchanged but for one level of indentation, and
+`cargo test -p mdshared-ui --lib scrollarea -- --list` gives the same 20 names before and after. Run on Windows 11: `cargo fmt --all --check`; the workspace clippy with
+`host` and `a11y`; and the workspace tests with `--skip explorer_tests`, 1139 passed and 34
+ignored in `mdshared-ui`. Not run on Linux or macOS.
+
 Left for later: momentum and rubber-banding at the ends; dragging a thumb and the bar's hover
 fade (`scroll::draw_scrollbar_animated` is ready for it, `draw_bars_animated` takes `active`
 from the caller); a scroll area that also reports how much is left to a screen reader (roadmap
 K12); and an application or Barbican screen using it, which is what would show it to a person
 first.
+
+## Escape closes the submenu, not the menu (`submenu::Cascade`, 2026-11-26, `fix/cascade-cancel-wait`, asked by mdview)
+
+A cascade whose submenu is open, with the pointer moved onto another row of the main menu (or
+onto its padding) less than `DELAY` ago, has a close waiting. `Cascade::key` made that waiting
+change first, before acting on the key, so Escape then found only the root open and returned
+`Outcome::Close`: the application closed the whole menu, where before `Cascade` its Escape
+closed only the submenu. Left lost the menu too, because the waiting close ran first and Left
+then fell through to `Outcome::Ignored`, which a menu bar takes as "move to the menu beside".
+
+Two additions, both opt-in; a caller that uses neither behaves exactly as before:
+
+- `Cascade::cancel_wait(&mut self) -> bool` drops the waiting pointer change without making
+  it: nothing opens or closes, and `deadline()` is `None`. It puts the menus back on the open
+  path: the pointer had lit the row it moved onto, though that row's submenu never opened, so
+  the row that opened each open submenu is lit again, and the keys go to the innermost open
+  menu. What is drawn changes when the pointer had lit another row, nothing else. Called before
+  forwarding Escape or Left, those keys then close only the innermost submenu. It returns true
+  when a wait was dropped, as `pointer` and `tick` return whether they changed anything, and
+  false when nothing was waiting, in which case nothing is touched at all.
+- `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` do exactly that for
+  Escape and Left (it calls the same `cancel_wait`), and has Left close the innermost open
+  submenu even when the keys are in the menu before it (where it is `Ignored` otherwise), so
+  Left means "back one level" before "the menu beside"; when either key closes a submenu, the
+  rows that opened the menus still open stay lit. Every other key still makes a waiting change
+  first.
+
+Known limit, with the switch on: where the keys land after Left depends on whether a wait was
+dropped. If one was, they go to the innermost open menu, where `cancel_wait` puts them; if not,
+they stay where the pointer put them, in the root. The same picture can therefore react
+differently to the Down that follows. The next pointer move resets this.
+
+Tests, in `submenu_tests.rs`:
+
+- `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`: from a cascade
+  with nothing waiting, `cancel_wait()` is false, the keys stay in the root and no lit row
+  moves; Down then acts in the root, not in the submenu.
+- `cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu` and
+  `cancel_wait_drops_a_waiting_close_from_the_padding_too`: submenu open, a close waiting from
+  a pointer onto another main-menu row (resp. onto the padding above the first row);
+  `cancel_wait()` lights the row that opened the submenu again and gives the keys back to the
+  submenu, then Escape closes the submenu only, the root stays open, and a second Escape is
+  `Close`.
+- `cancel_wait_then_left_closes_only_the_submenu_with_the_switch_off`: a context menu, the
+  switch off; after `cancel_wait()` Left is `Changed` (the keys are back in the submenu), the
+  submenu closes, the root lights Open recent, and with nothing open Left is `Ignored` again.
+- `cancel_wait_lights_the_open_path_of_a_deep_cascade`: at depth 3, `cancel_wait()` lights Open
+  recent and More (the rows that opened the open menus) and gives the keys to the innermost
+  menu; Escape closes only More's submenu and the path stays lit.
+- `with_the_switch_escape_drops_the_wait_by_itself` and
+  `with_the_switch_left_drops_the_wait_and_closes_only_the_submenu`: the switch alone, no
+  `cancel_wait` call.
+- `the_switch_closes_one_level_at_depth_three_and_leaves_the_open_path_lit`: with the switch,
+  Open recent then More open and the pointer on Print in the root; Left closes More's submenu
+  only, and Open recent and More stay lit.
+- `assert_path_lit` (a helper, not a test) checks the rule in each open menu: the lit row is the
+  row that opened the next one.
+- `without_the_wait_cancelled_the_pointer_change_runs_first_as_before`: the old behaviour kept
+  as a guard: Escape returns `Close` and takes the menu, Left returns `Ignored` after the
+  waiting close has run, and Down still makes the waiting change first with the switch off and
+  on.
+
+Fail-before evidence: in the first commit, with `key` restored to its old body (both methods
+kept, so the tests compile), the two switch tests failed, Left giving `Ignored` where `Changed`
+was expected and Escape giving `Close`; with `cancel_wait` made a no-op, the three tests that
+call it failed on `deadline()`. For the review's commit, with the production hunks reverted (the
+old `cancel_wait` body, the switch dropping the wait without `cancel_wait`, and neither closing
+arm re-lighting the path), seven tests failed and the guard passed; the first was `the lit row
+of menu 0 opened the next: left: Some(3), right: Some(1)` — Print lit while Open recent's
+submenu is still open, the defect the review found. With the early return removed from
+`cancel_wait`, `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`
+failed: it returned true and moved the keys into the submenu.
+
+Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
+test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests` (exit 0; mdshared-ui 1129 passed, 33 ignored; doctests pass). Not run: the
+release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
+feature clippy/test lines, Linux and macOS. Not seen by a person in a window.
+
+## Pictures kept at their drawn size (`mdshared_ui::picture`, 2026-11-26, `feat/k14-pictures`, roadmap K14, Barbican BT1)
+
+`Painter::image` squeezes a picture into its rectangle on every call. An avatar, an icon or a
+badge drawn every frame therefore averages the same source pixels again and again. A
+`Picture` does that once: it keeps the pixels of the last size it drew, at that device size,
+and a later draw at the same size, scale and corner radius only blends them.
+
+- **The model and the cache are one small struct.** `Picture` holds the source `Image`, one
+  prepared buffer and a counter the tests read. It is `Clone`, with a `Debug` that prints the
+  sizes rather than the pixels; the buffer is straight RGBA with the rounded corners already
+  folded into its alpha, so a draw needs a blend and no coverage test.
+- **What prepares again.** The key is `round(dst.w * scale)` by `round(dst.h * scale)`, the
+  display scale's bits and the device corner radius's bits. The prepared size is a property
+  of the rectangle, not of where it sits: `dev_rect` rounds the left and right edges
+  separately, so at 1.25 and 1.5 the placed device width can be a pixel different from the
+  same rectangle moved by one logical px. The blit is clipped to the placed rectangle, so a
+  placement a pixel narrower loses the cached picture's last column or row, and one a pixel
+  wider leaves that column or row unpainted: nothing is painted past `dst`, into the next
+  item of a row. A move, a clip change or an alpha change therefore does not prepare, even at
+  fractional scales. A size, scale or radius change replaces the one prepared size; there is
+  no cache of several sizes, which is the caller's decision if it wants one.
+- **The same scaler, not a second one.** The scaling that was inside `Painter::image` moved
+  to its own file, `gfx/painted.rs`, as `Scaled` (taps, the across pass and the down pass)
+  and `blend_pixel`. `image` still uses it, so its pixels are unchanged; `prepare_image`
+  uses the same sampling and folds `corner_cover` into alpha; `blit_rgba` reuses
+  `blend_pixel` at 1:1. `gfx/shapes.rs` no longer holds the picture code (it was already
+  over a thousand lines; it is 829 now, `painted.rs` is 511 and `picture.rs` is 619).
+- **A prepared draw matches `Painter::image`** at the same device size, within 2 levels a
+  channel: the difference is the 8-bit rounding of the prepared buffer, and the test checks
+  scales 1, 1.5 and 2, a rounded corner, half alpha and a cut-out. An infinite or NaN radius
+  rounds as far as half the smaller side, exactly as `Painter::image`'s `f32::min` chain
+  does, and is tested against it.
+- **Limits.** A target over 1024 device px a side or a million pixels is handed to
+  `Painter::image`, which allocates only the visible part; a huge finite target therefore
+  draws its visible corner and prepares nothing. A zero, negative, NaN or infinite rectangle
+  draws nothing; a zero or NaN alpha draws nothing; an infinite or NaN radius rounds fully;
+  a huge finite radius is cut to half the smaller side. `Scaled::take` does its arithmetic in
+  64-bit and refuses a side beyond `i32::MAX` device px, so an absurd rectangle cannot
+  overflow or ask for a buffer larger than the clip it draws into. The prepared buffer is at
+  most a few MiB, but `prepare_image` also allocates 16 bytes for every source row the
+  destination reads, so a tall source scaled down can take hundreds of MiB; the cap comment
+  in `picture.rs` says so.
+- **The decoder slot.** `Decoder` is a trait with one method, `decode(&[u8], Limits) ->
+  Option<Image>`; any `Fn(&[u8], Limits) -> Option<Image>` is one, so an application writes a
+  closure for GIF, WebP, ICO or SVG. The `Limits` are passed in so a decoder can read the
+  header and refuse before allocating, as the built-in decoders do. `Picture::load(bytes,
+  limits, Some(&slot))` reads PNG and JPEG through `mdshared_text::image::decode`; the slot
+  is asked only when that says `Unsupported`, never for a damaged PNG or JPEG. The call is
+  wrapped in `catch_unwind` (`AssertUnwindSafe`), so a panic in it is `Error::Damaged`, and
+  an `Image` whose pixels are not `width * height * 4` or whose side is zero is `Damaged`
+  too. A picture over the `Limits` is `TooLarge`. It is not a registry and there is no
+  global: the slot is passed to the call that uses it.
+- **New public API:** `picture::{Picture, Decoder}`; `Picture::{new, load, size, draw}`.
+  `Painter::blit_rgba` and `prepare_image` are crate-private. No existing signature, public
+  field or drawing changed.
+
+Tests, eleven in `picture::tests`:
+
+- `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (three scales, radius,
+  alpha and a cut-out, within 2 levels a channel).
+- `a_second_draw_at_the_same_size_does_not_prepare_again` (draw, redraw, move: one prepare).
+- `a_move_at_a_fractional_scale_does_not_prepare_again` (scales 1.25 and 1.5, whole and
+  fractional moves, one prepare).
+- `an_alpha_change_does_not_prepare_again` (the same size at alpha 1 and 0.35, one prepare).
+- `an_infinite_or_nan_radius_rounds_as_the_painter_does` (each matches `Painter::image`,
+  one prepare, the corner clear).
+- `a_size_or_scale_change_prepares_again` (a wider target, the same device size at another
+  scale, back again, a new radius: one prepare each).
+- `the_clip_and_the_offset_are_honoured` (the inked box is exactly the clip's intersection;
+  the clipped draw and the whole draw together prepare once; the offset moves them by whole
+  pixels without preparing again).
+- `a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (at scale 1.5 a placement one
+  device px narrower than the cached width leaves the pixel just past `dst` untouched).
+- `zero_nan_and_huge_sizes_neither_panic_nor_prepare` (zero, negative, NaN and infinite
+  rectangles and a zero, NaN alpha draw nothing; a huge finite target is not prepared but
+  draws its visible corner; huge, infinite and NaN radii all round fully and prepare once).
+- `the_decoder_slot_reads_a_format_the_toolkit_refuses` (a GIF-shaped closure; no slot gives
+  the built-in error; a damaged PNG does not reach a slot that would take anything; a slot
+  picture over the limits is `TooLarge`).
+- `a_slot_that_panics_or_returns_a_broken_image_is_damaged` (a panicking decoder, a picture
+  with one byte too few and one with a zero side are all `Damaged`).
+
+Every new item is new API, so the tests do not compile on the code before this branch: that is
+their fail-before evidence. Each behaviour was also checked by breaking it and watching the
+test fail. Making the key check always true (prepare on every draw) failed
+`a_second_draw_at_the_same_size_does_not_prepare_again`,
+`a_size_or_scale_change_prepares_again`, `the_clip_and_the_offset_are_honoured` and
+`zero_nan_and_huge_sizes_neither_panic_nor_prepare`. Keying on the placed device size, as the
+first commit did, failed `a_move_at_a_fractional_scale_does_not_prepare_again`. Removing the
+corner coverage from `prepare_image` failed
+`a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (by 253 levels). Removing
+the clip from `blit_rgba` failed `the_clip_and_the_offset_are_honoured`. Drawing the blit
+past the placed rectangle, as the first commit did, failed
+`a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (the pixel outside `dst`
+became the picture's). Making `load` never call the slot failed
+`the_decoder_slot_reads_a_format_the_toolkit_refuses`; removing the `catch_unwind` failed
+`a_slot_that_panics_or_returns_a_broken_image_is_damaged`.
+
+Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (exit 0;
+mdshared-ui 1131 passed, 33 ignored, doc-tests 5 passed and 1 ignored; the other crates all
+passed). Not run: release builds, the rest of the seventeen-command matrix, Linux and macOS
+(CI will). **Not seen in a real window**: no application or example draws a `Picture` yet, and
+no person has looked at it; the evidence is pixel tests against `Painter::image`.
+
+Known limits, for later: `Painter::dev_x`/`dev_y` saturate a product to `i32::MAX` and then
+add the painter's offset, which overflows in debug for a coordinate near 2.2e9. That was
+already true before this branch; `Picture` only inherits it. A tall source scaled down can
+still make `prepare_image` allocate hundreds of MiB, as above.
+
+## Named timers, a hidden window and separate damage regions (`mdshared_ui::host`, roadmap K1/BT3, 2026-11-26, `feat/k1-host-one-window`)
+
+Three additive pieces of the one-window host. Every existing public signature, `host::Event`
+and every other enum stayed as it was: the new behaviour is new methods on `Cx`, two new
+defaulted methods on `App`, and a new module. An application that changes nothing behaves
+exactly as before.
+
+- **Named timers.** `Cx::timer_at(name, at)` sets a timer under a name, or moves it when that
+  name already waits; `Cx::cancel_timer(name)` removes it and answers whether one was waiting.
+  When one is due the application gets `App::timer_fired(cx, name)`, a new defaulted trait
+  method (nothing by default). A turn takes a snapshot of the names due when it begins
+  (earliest first, set order at one instant) and fires each only while it is still waiting and
+  still due: a callback may cancel a sibling that was also due, or move it later, and that is
+  obeyed. Anything set during the turn, even at `now`, waits for the next turn, so a callback
+  that re-arms its own name at `now` fires once per turn instead of spinning the loop. They
+  join the one wake-up: the loop takes the earliest of the animator's deadline,
+  `Cx::wake_at` and every named timer, so any number of timers is still one
+  `ControlFlow::WaitUntil`. A timer set in the past is due at the next turn of the loop. The
+  model is `host/timers.rs` (`NamedTimers`: `set`, `cancel`, `at`, `next`, `len`,
+  `due_at`, `take_if_due`), pure and on passed instants; the turn's loop is
+  `run::fire_due_timers`, and the fold with the animator is `frame::next_wake`.
+- **A window hidden but alive.** `Cx::hide_window` hides the window for a close to a tray;
+  `Cx::show_window` asks the host to show it again; `Cx::hidden` answers whether the application
+  hid it. `Visibility` gained an `app` flag beside `occluded` and `minimized`, so every check
+  that reads `hidden()` (`frame`, `after`, `about_to_wait`, the redraw request) now also covers
+  an application-hidden window: no frame is drawn or presented, no redraw is asked of winit, but
+  the animator's deadline is dropped while timers, named timers and worker messages still come.
+  Hiding also clears `focused` (a window off screen has no keyboard). A `Resized` while
+  application-hidden is still delivered as `Event::Resize`, so the application can lay out
+  while away; while OS-minimized it is swallowed as before. Showing is done by the loop, after
+  the call: it draws the whole window and presents it while still hidden, then calls
+  `set_visible(true)` and presents again, so the client area is never seen undrawn (the same
+  path as the first show at launch). The keyboard is read again after showing, and
+  `Event::Focus` is sent when it differs; a window hidden in `App::start` is not focused. No
+  tray icon is provided: an application adds one with `crate::tray` (or a second launch, or a
+  shortcut) and calls `show_window` from it. The window keeps its place, size and state; it is
+  not minimized or closed. **On Wayland `hide_window` does nothing** and the flag is not set:
+  winit's `set_visible` is a no-op on a Wayland surface, so hiding would only freeze the
+  window; it keeps drawing and `hidden` stays false. On macOS, `orderOut` is likely reported as
+  `Occluded`, so a resize while application-hidden is then swallowed as OS-hidden and the
+  first frame after showing comes on `Occluded(false)`; this is not verified. On X11 the first
+  present may come before the map; an Expose heals it (also not verified here).
+
+Known limits on the platforms not run here: on X11 a re-show can flip focused → unfocused →
+focused, because focus arrives after the map; and `Focus(true)` can be delivered twice on a
+successful re-show, once from `reveal` and once from winit's buffered event.
+
+- **Regions with their own damage.** `App::damage_regions()`, a new defaulted method answering
+  false and read once before `App::start`, opts an application into one `draw` call per damage
+  rectangle instead of one for their union. An application that does not opt in keeps the old
+  O(1) union and allocates nothing: no pieces are collected at all. `Damage` keeps each
+  rectangle as a piece beside the union, joining overlaps as they are added (a join that grows
+  a piece restarts the scan, so pieces are pairwise disjoint in logical px) and capping the list
+  at 16; beyond that the union is drawn as one rectangle, so a long-hidden or minimized window
+  cannot grow it without bound. `Damage::pieces` rounds each piece outwards to device px on its
+  own; at a fractional scale two logical neighbours can round to share one device column, which
+  is copied twice (the same pixels). `present` copies and presents several device rectangles
+  with `present_with_damage`, so the gap between a caret's blink and a list's scroll is neither
+  drawn nor sent to the window. The animator's group is reset before each region's `draw`, as
+  `begin_frame` does for the one-call frame, so a group set in one does not leak into the next.
+  A frame with one piece, or an application that did not opt in, keeps the old one-call,
+  one-rectangle path exactly.
+
+New public API: `Cx::{timer_at, cancel_timer, hide_window, show_window, hidden}`,
+`App::{timer_fired, damage_regions}`. Everything else is private: `NamedTimers`, the pieces of
+`Damage`, `paint_regions`, `next_wake`, `can_hide` and `present`.
+
+Tests (all in `host_tests.rs` and the new `timers_tests.rs`): the earliest named timer wins; a
+name is moved rather than duplicated; a cancelled one is gone (and cancelling twice is false);
+a turn snapshots its due names in firing order and takes each once; a timer moved later
+mid-turn is not taken by that turn; a timer in the past is due at once and a later one waits;
+the loop's wake is the earliest of the animator and a named timer, and a hidden window drops
+only the animator's; the firing loop (`run::fire_due_timers`) fires a callback that re-arms
+itself at `now` once per turn and ends, obeys a callback that cancels a sibling, and fires a
+moved sibling once later; an application-hidden window is hidden until shown (also while
+covered) and `wants_frame` — the function both `after` and the loop use — says no draw while it
+is hidden, with timers still coming; two far-apart rectangles stay two pieces with the gap in
+the union but in neither piece; a growing join restarts the scan; random adds leave pairwise
+disjoint pieces; 10,000 disjoint rectangles stay at most 16 pieces and fall back to the union,
+while a non-opted-in application keeps no pieces; a whole window is one piece and pieces outside
+the bitmap are left out; and the host's region loop (`paint_regions`, the code `Host::frame`
+runs) paints two pieces into a bitmap with a real clip each, leaving the gap at the old frame.
+Each new or changed test was seen failing under a deliberately broken implementation before it
+passed: appending instead of moving, `next` answering the maximum, ignoring the application's
+hidden flag, `pieces` answering the union, no cap, the old non-restarting join, and the old
+open-ended firing loop (the re-arm test panicked on its iteration guard instead of hanging, so
+a re-armed timer was fired again and again in one turn). The files were restored afterwards.
+
+Run on Windows 11, `CARGO_TARGET_DIR=E:/mds-target/k1`: `cargo run -p mdshared-ui --features
+host --example host_regions -- --seconds 2` drew two full frames (the first, and the unfocused
+redraw), then at every 530 ms tick one *frame* whose two `draw` calls were `24,72 360x32` (the
+field's caret) and `24,136 480x260` (the list), printed by the application, and closed on the
+one-shot timer; the gap between the two rectangles was never drawn. `cargo fmt --all --check`,
+the workspace clippy and the workspace tests with `host,a11y` all passed (counts in the commit
+message). Not run on Linux or macOS, so `can_hide`'s Wayland branch is compiled only there and
+was not run. **Not seen by a person**: the window itself, the blink and the scroll, and the
+close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
+makes close-to-tray usable is out of scope and is the application's to add.
+
+## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
+
+An application that shapes its own text with parley can now hand that layout to the painter
+and get it drawn with a brush per run: a colour, a family, a size, a weight and the fourth byte
+of the brush (raised, lowered, marked) as the layout says them. The painter draws the layout's
+glyph runs through its own `TextEngine::draw_layout_clipped`, so the glyph cache, the subpixel
+masks and the antialiasing are the ones every other text draw uses, and nothing is shaped or
+rasterized twice. A spelling squiggle is one path, drawn under a run of the caller's choosing.
+
+API added, all of it additive:
+
+- `gfx::Brush` is public (it was a private alias in `gfx.rs`): red, green, blue and a fourth
+  byte that is 255 on the baseline or `mdshared_text::text::{RAISED, LOWERED, MARKED}`. It is
+  the same type as `mdshared_text::text::Brush`. `RAISED` and `LOWERED` move the run;
+  `MARKED` (a `<mark>`) only splits the run, so that a caller can find its box and draw a
+  highlight behind it. Nothing here draws that highlight.
+- `Painter::rich_text(&layout, x, y) -> Rect` draws the whole layout at a point in logical px,
+  at the painter's scale, offset and clip, and answers the rectangle the lines occupy in
+  logical px, so a caller can put a background, a caret or a squiggle against it without
+  measuring again.
+- `Painter::wavy_underline(band, thickness, wavelength, c, alpha)` draws a squiggle across the
+  whole width of `band` and fills its height.
+- New module `richtext`: `runs(&layout) -> Vec<RunBox>` gives every glyph run's byte range, the
+  box it was placed in and its line's baseline, in the layout's own units; `RunBox` (`#[non_exhaustive]`,
+  so a field can be added later); and `parley` and `Brush` re-exported, so an application names
+  one version of parley (the one this crate draws with) and needs no dependency of its own on
+  it.
+
+Decisions:
+
+- **The layout is in device units.** Parley is shaped at a size, so a caller shapes at
+  `size * scale`, as `Painter::paragraph` already does internally, and passes the place in
+  logical px. The returned rectangle is the union of the glyph runs' advance boxes (the same
+  rectangles `runs` gives), measured in logical px: the leftmost run's inline start (its
+  alignment offset) to the rightmost run's end. A centred or end-aligned line, a right-to-left
+  one and a justified one's added spacing are all in those places and widths, so the rectangle
+  covers them where they are drawn; it is the runs' advance box, not their ink, so a raised or
+  lowered run may reach past it. Earlier it was the layout's width from `x` (which left out
+  alignment and justification), then each line's `advance` (which leaves out justification);
+  the review found both, and the blocks' own widths are used now.
+- **The band is the squiggle's clip.** A round stroke end reaches half its thickness past the
+  path's end, so a squiggle that must not paint outside its band (the test's requirement, and a
+  spelling checker's) is drawn with the band intersected into the painter's clip for the one
+  call, and the clip is restored after it. Nothing else about the caller's clip changes. A
+  thickness more than the band's height is held to the band's height: the stroke would be cut
+  back to the band anyway, and the rasterizer would otherwise be asked for a mask far taller
+  than the band.
+- **The wave is one path of quadratics.** A whole number of equal half waves across the band
+  starts and ends it on the middle line whatever the width; each half wave is one quadratic
+  whose control point is twice the amplitude out, which puts its top exactly half the band's
+  height less half the stroke from the middle line. So the stroke fills the band edge to edge
+  and no later mark is needed to close a gap: the pixels of every column of the band are inked,
+  which is what "continuous under a run" means here. A wavelength that is zero, negative or not
+  a number gives one arch, as wide as the band (a half wave, not a whole one); a wavelength far
+  below a pixel is cut at a thousand half waves, since nothing on a display would show the
+  rest. A band with no width or height is refused before a path is built. Only the half waves
+  the clip can show are put in the path, widened by the stroke's thickness at each end and
+  taken as whole half waves: every join inside the clip is then the one the whole band draws,
+  the path's ends and their round caps are cut by the clip itself, and a band far wider than
+  the window costs a mask about as wide as the window, while the wave inside the clip is the
+  unclipped drawing pixel for pixel.
+- **Where `runs` gets a byte range.** Parley places glyph runs, split at style changes, but a
+  glyph run carries no byte range of its own: `Run::text_range` is the part of the shaped run on
+  that line, which a style change does not split. Parley groups by shaped cluster (atom), not by
+  grapheme, and a brush change is not a shaping change, so a ligature's second letter can carry
+  another style while belonging to the first letter's glyph. So the run's clusters are walked in
+  **logical** order and gathered into atoms: a cluster that is not a continuation opens one, and
+  continuations extend it; an atom takes the style of its first cluster and notes whether it has
+  glyphs. A right-to-left run's atoms are then turned round, because parley places that run's
+  glyph runs in visual order, and neighbouring atoms of one style are grouped. An atom with no
+  glyph of its own (a soft hyphen) makes no glyph run: its bytes join the group before it, or
+  wait for the one after it. A run of nothing but such atoms has no entry of its own and leaves
+  its bytes to the last run of the line before it that has glyphs (a line with no glyph run at
+  all keeps none of them); every byte of a run that has glyphs is in exactly one range — a
+  branch no font here reaches, which is why it has no test of its own. The k-th group is then
+  the k-th glyph run.
+  Walking *visual* clusters instead fails two ways: a ligature's continuation comes before the
+  cluster that starts it, so `لا` with the alef in another brush gave `2..4` and lost `0..2`, and
+  `بلا` with the alef alone blue gave `4..6` for a box covering the whole word. Both are in the
+  tests, which fail with that grouping.
+- **Mixed families need no code.** Each run's font, size and normalized coordinates come from
+  the layout, as `TextEngine` already reads them, so a run in the mono family is drawn with it;
+  the test checks that the pixels are the engine's own and that parley shaped the two runs in
+  two different fonts, and says so and passes where the machine has no family of another width
+  to show that with.
+- **For the owner: `parley` is part of the public API now.** `richtext` re-exports it, and
+  `Painter::rich_text` takes a `parley::Layout<Brush>`; a caller cannot draw a rich layout
+  without naming the type, so parley's version is in this crate's signature either way. A
+  later parley bump is therefore a change to a public path and type, and under "add, do not
+  change" it is a stop-and-ask, not a routine dependency bump. If the owner would rather not
+  re-export it, dropping the `pub use` costs nothing else; the signature stays as it is.
+
+Tests (`cargo test -p mdshared-ui --lib rich`), each of which is new and does not compile
+against the tree before this change; each assertion was also shown failing under a mutation:
+
+- `gfx::rich::tests::two_runs_are_drawn_in_their_own_colours`: two runs of one text in red and
+  blue; the strongest pixel inside each run's box is nearer that run's colour than the other's
+  and within 60 of it, and the whole drawing is the `TextEngine`'s own draw of the same layout
+  at the same place, pixel for pixel. Drawing every run in the first run's colour fails it with
+  "run 1 is [200, 30, 30], not near [20, 60, 220]".
+- `a_run_of_another_family_is_drawn_as_that_family_shaped_it`: the mono family on the second
+  half; `runs` reports two ranges, parley resolved two different fonts, and the pixels are the
+  engine's.
+- `a_ligature_across_a_brush_change_keeps_its_bytes_in_one_run`: two sets of cases. The Arabic
+  lam-alef is tried on every machine, in Cambria, Times and DejaVu/Noto Naskh Arabic, because
+  its ligature is not optional wherever Arabic is shaped; the Latin `find` with the `fi` halves
+  in two brushes is tried in Calibri, Georgia and DejaVu. The first family of each set that
+  shapes the ligature is used and its ranges asserted (`0..4` for the lam-alef, `0..2` and
+  `2..4` for `find`). If no Arabic font forms the lam-alef, or no font forms `fi`, the test
+  prints a note and goes on without that set, so it does not depend on the machine. With the
+  style-only grouping the Arabic case gives `[2..4]` and `find` gives `[0..1, 1..4]` — both seen
+  on this machine.
+- `richtext::tests::a_ligature_in_a_right_to_left_line_keeps_its_bytes` and
+  `a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole`: `لا` with the alef
+  in another brush is one run covering the whole text, and `بلا` with only the alef blue keeps
+  the ligature's bytes (`2..6`) in one run; both skip with a note where no Arabic font ligates.
+  With the visual-cluster grouping they fail with `2..4` and `4..6`.
+- `a_wavy_underline_is_continuous_across_its_band_and_stays_inside_it`: every device column of
+  the band has ink in it, nothing outside the band is touched, the crest and the trough reach
+  the band's first and last row, the two halves of one wavelength are on opposite sides of the
+  middle line, a band thinner than the stroke is a straight line filling it, a stroke a million
+  px thick on a four-px band inks exactly the band, and zero or negative thickness, alpha or
+  band, or a NaN of either or of a place, draw nothing. A straight line instead of a wave fails
+  it ("no crest").
+- `the_painter_clip_cuts_the_layout_and_the_wave`: outside the clip the bitmap is the page
+  before the draw; inside it every pixel is the unclipped drawing's, text and wave alike;
+  the text ink is on both sides of the clip's edge, the clipped one keeps its share and
+  some of the text was cut off. A `rich_text` that draws nothing fails it.
+- `a_line_placed_by_its_alignment_is_drawn_and_the_rect_covers_it`: `OK` broken at 300 and
+  aligned to the end sits at about 270, and a clip over only 150 to 320 keeps all of it; the
+  pixels inside the clip are the unclipped ones and nothing is drawn left of 150. The answered
+  rectangle is the line's own place, the same with and without the clip. It fails with the
+  earlier box taken from the layout's width ("the aligned line was not drawn inside the clip").
+- `a_justified_line_answers_the_width_its_words_were_spread_over`: a paragraph broken at 200 and
+  justified; the answered rectangle reaches past the widest line's `advance`, by the
+  justification's own spacing, and agrees with the runs. It fails with a rectangle measured from
+  the lines' `advance`.
+- `the_offset_moves_the_text_and_the_squiggle_by_whole_pixels`: with `Painter::offset(7, 9)` the
+  text and the wave are the un-offset drawing moved by seven across and nine down, whole
+  device pixels, and the answered rectangle does not move.
+- `the_scale_places_the_layout_and_keeps_the_wave_in_its_band`: at scale 1, 1.5 and 2, the
+  answered rectangle is the layout's size divided by the scale, the pixels are the engine's at
+  the device place the scale names, and the wave's ink box is exactly the band in device px
+  (120 by 10 at scale 2).
+- `richtext::tests::each_run_gives_its_text_and_the_box_it_was_placed_in`,
+  `a_colour_that_changes_back_makes_the_middle_word_a_run_of_its_own`,
+  `a_right_to_left_line_keeps_each_range_with_its_own_box`,
+  `a_right_to_left_line_split_between_two_fonts_reports_each_part`, and
+  `a_wrapped_layout_reports_its_runs_line_by_line` share one helper (`checked`) that asserts
+  what holds whatever fonts the machine has, since a fallback may split a line into more runs
+  by itself: the ranges tile the text in reading order, every brush boundary is a run boundary,
+  and the boxes of one line touch in visual order; the widths of the boxes add up to the same
+  line drawn in one colour, which is what "each range's box is where its text was drawn" means
+  here. The RTL test finds its boxes by the byte they start at and checks that the three-letter
+  range is the wide one and sits left of the one-letter range; the split test asks for the space
+  in the mono family so that a font fallback's own split (the shape a Mac gives of its own
+  accord) is exercised on every machine, and notes and passes where the machine has no mono
+  family to split with. All of them fail when `runs` reports the shaped run's own range (`0..11` three times, `0..10` for both halves); the RTL test also fails when the
+  atoms are not turned round for a right-to-left run (the boxes no longer touch and the narrow
+  range gets the wide box).
+
+Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+--features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
+--features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
+test binary passes; the `mdshared-ui` library alone ran 1138 tests with 34 ignored and 4
+filtered, and the doctests passed); and the sheet
+`cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
+`target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
+a marked word squiggled under, and raised and lowered runs). The agent that wrote it looked at
+both sheets; the owner has not. Not run on Linux or macOS. Not seen in a window: no application
+uses it yet.
+
+Reviewed; its ten findings are fixed in the second commit of the branch. The two blocking ones
+first: the skip that lost an end-aligned line is gone, and the returned rectangle now comes from
+the lines' own offsets; and `runs` keeps a ligature's bytes together, which the style-only
+grouping split (`find` gave `0..1` and `1..4`). Then: the squiggle's thickness is held to its
+band, the "one wave" wording became "one arch", the scale figure is 120 by 10, `Run::text_range`
+is described as the part of a run on its line, the wrapped test also checks that runs begin and
+end where the style does, the clip test asserts that some text was cut off, negative band,
+thickness and alpha joined the nonsense inputs, `MARKED` is written down as a split that draws
+no highlight, `RunBox` is `#[non_exhaustive]`, a `Painter::offset` test was added, and the
+parley re-export is recorded above as an owner decision.
+
+The re-review found two more blockers, fixed in the third commit of the branch. First, `runs`
+grouped clusters in visual order, which is right to left for an RTL run, so a ligature's
+continuation came before the cluster that starts it: `لا` with the alef in another brush lost
+`0..2`, and `بلا` with only the alef blue answered a box as wide as the alef. The grouping now
+walks the clusters in logical order into atoms, turns them round for a right-to-left run and
+folds an atom with no glyph into the group next to it, which is what parley's own glyph runs
+are; the two cases are tests, and both failed with the old grouping (`2..4`, `4..6`). Second,
+the ligature test made the Arabic case depend on the Latin fonts it tried first and failed the
+whole test on a machine without either; the Arabic lam-alef is now tried on every machine and
+the Latin `fi` cases are skipped with a note when no font forms them (as is the Arabic case
+when no Arabic font is there). From the non-blocking list: the answered rectangle now comes
+from the glyph runs, so a justified line's added spacing is in it (with a test); the drawing
+doc says what the engine really skips (lines above or below the clip, not beside it); the wave
+is built only over the half waves the clip can show, widened by the stroke at each end and taken
+whole, so a band far wider than the window costs a mask about as wide as the window while the
+pixels inside the clip are the unclipped drawing's; and this section's sentences about the
+Arabic fallback say what the test now does.
+
+A last pass made three small fixes. A run of nothing but atoms without glyphs used to keep its
+bytes in the grouping's waiting range and drop them; they now join the last run of the line
+before it that has glyphs (a branch no font here reaches, so it has no test of its own, and the
+doc says "every byte of a run that has glyphs"). An empty layout now answers
+`Rect(x, y, 0, layout.height() / scale)` rather than no height, so a caret or a field's
+background has its place (with a test). And the wave is now cut a stroke's thickness beyond the
+clip on each side and taken as whole half waves rather than shortened inside it, so the pixels
+inside the clip are exactly the unclipped drawing's and the clip test demands equality again.
+
+PR #38 then failed on both macOS runners: `a_right_to_left_line_keeps_each_range_with_its_own_box`
+expected two runs, and a Mac's font fallback splits `א אאא` into three (the space comes from
+another font), so the count and the exact ranges were a statement about the machine, not about
+`runs`. Every test that counted runs was rewritten to assert what holds on any font: the ranges
+tile the text, every brush boundary is a run boundary, the boxes of a line touch in visual
+order, and their widths add up to the same line drawn in one colour; boxes are found by the byte
+they start at, never by index. A new test pins the split shape on purpose — the space asked for
+in the mono family — so the three-run case is exercised on Windows and Linux too. The awkward
+half of this was that a single-atom run cannot show a range paired with the wrong box, which is
+what the RTL test is for; the split test therefore checks the split shape while the pairing test
+keeps its two runs (still three on a Mac, where the properties hold). Both still fail when the
+atoms are not turned round (the boxes stop touching and the narrow range gets the wide box).
 
 ## A folder's entries as a file manager's list (`mdshared_app::dirlist`, 2026-11-26, `feat/f1-dir-listing`, roadmap F1)
 
