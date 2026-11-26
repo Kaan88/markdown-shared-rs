@@ -223,8 +223,9 @@ Design decisions:
 - *Linux reduced motion never blocks*: read on a helper thread that stays to listen for the
   portal's `SettingChanged`; the last good answer is kept, a stale reading loses to a newer one,
   and `platform::watch_motion_reduced(wake)` signals changes (a wake given after the first answer
-  is called once at once). `system_is_dark` has the same blocking shape and was left alone, since
-  the Markdown applications call it (roadmap X10).
+  is called once at once). `system_is_dark` had the same blocking shape; it was given the same
+  treatment later (roadmap X9): the last answer is kept, only the first call waits (up to the old
+  500 ms), and `platform::watch_system_dark(wake)` signals changes.
 
 **Breaking changes for mdmix** (old form → new form):
 
@@ -1788,8 +1789,9 @@ has been seen only through the application that uses it.
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 
 `platform::system_is_dark` used to ask the settings portal on the calling thread with a 500 ms
-limit and cache `false` when it did not answer: a first frame could wait half a second and then
-settle for the wrong theme. It now has the shape `motion_reduced` was given.
+limit and cache `false` when it did not answer. It now keeps the last good answer in
+`platform::LastGood`, like `motion_reduced`, and only its first call waits (for the same 500 ms),
+so an application that reads the theme once at start still gets the portal's answer.
 
 - **The same state machine.** `platform::LastGood` (the last good answer, who is reading, who
   listens, the wake, and the stamp that drops a late answer) keeps the dark theme as it keeps
@@ -1797,11 +1799,21 @@ settle for the wrong theme. It now has the shape `motion_reduced` was given.
   `LastGood` it fills, the portal namespaces whose `SettingChanged` signals concern it, and a
   function that reads the setting from an open bus. `motion_reduced` and `system_is_dark` differ
   only in those three arguments.
-- **The call never blocks.** A new private `ask_in_background` takes the lock, claims a reading
-  when none is under way and none listens (at most once a second), starts the helper thread, and
-  gives the last answer at once: `false` before the first one, the last good answer after it. A
-  timeout is `None`, which `LastGood::answer` ignores, so a dark theme is never overwritten with
-  `false` because the portal was slow.
+- **The first call is the old call's shape.** The first `system_is_dark` in the process starts
+  the helper thread and waits on a condition variable for its first answer, up to 500 ms (the old
+  limit): mdview and mdedit, which call it once at start, behave as before. If no answer comes,
+  the call gives `false` and stores nothing, so a later answer still wins. `LastGood::take_first`
+  marks the one waiting call and `wait_first` does the waiting; neither is public.
+- **Every later call never blocks.** `start_reading` takes the lock, claims a reading when none is
+  under way and none listens (at most once a second), and starts the helper thread;
+  `ask_in_background` is that plus the last answer at once. A reading whose answer is `None` (no
+  bus, an error) changes nothing, so a dark theme is never overwritten with `false` because a
+  read failed.
+- **The reading itself has no timeout.** `read_dark` makes a blocking `zbus` call with no limit:
+  the first call stops waiting after 500 ms, but the helper thread's call keeps running, so a
+  portal that never answers leaves that thread blocked for good, and it never starts another
+  reading. This is the same trade the motion reading makes; no timeout was added, since the
+  blocking `zbus` API used here has no bounded call.
 - **The same listener.** The first reading stays subscribed to the portal's `SettingChanged`
   signal and reads `org.freedesktop.appearance` `color-scheme` again at each change; only that
   namespace's signals count. The last answer wakes the application.
@@ -1814,21 +1826,30 @@ settle for the wrong theme. It now has the shape `motion_reduced` was given.
   macOS behave exactly as they did. The old one-shot `imp::portal_prefers_dark` (500 ms limit)
   is now a test helper only and shares `read_dark` with the production path.
 
-Tests, none of which needs a D-Bus (`platform::dark_tests`):
-`platform::dark_tests::a_slow_or_absent_answer_does_not_block_and_returns_the_last_good_value`,
-`platform::dark_tests::a_timeout_does_not_overwrite_a_good_value_with_false` and
-`platform::dark_tests::a_later_answer_updates_the_value_and_wakes`. Each failed before the
-change because `ask_in_background` did not exist; renaming it made all three (and the production
-call site) fail with E0425.
+Tests, none of which needs a D-Bus (`platform::dark_tests`), five in all:
+`a_fast_first_answer_is_returned_by_the_first_call`,
+`a_slow_first_answer_gives_false_in_time_and_a_later_call_sees_it`,
+`a_slow_or_absent_answer_does_not_block_and_returns_the_last_good_value`,
+`a_timeout_does_not_overwrite_a_good_value_with_false` and
+`a_later_answer_updates_the_value_and_wakes`.
+
+Fail-before evidence: the tests are compile-level. Renaming `ask_in_background` (which did not
+exist before the first commit) made the three non-blocking tests and the production call site
+fail with E0425. The two first-call tests use `take_first`, `start_reading` and `wait_first`,
+which are new too, so they also do not compile on the old code; on Windows the old entry point
+reads the registry and would make any behavioural assertion pass, so a compile failure is the
+honest evidence. The second-reading check counts on a channel with a 100 ms timeout, and making
+`claim_reading` always return true made it fail.
 
 Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
-mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (mdshared-ui: 1118
-passed, 33 ignored; doctests pass; exit 0), and the three dark tests on their own. Earlier, the
-release workspace clippy and test, and the release clippy and tests of `recycle`,
-`media-session` and `notify` plus the `a11y` clippy, also passed. Not run: the release host,
-host+a11y and term clippy/test commands, the host example, the release `a11y` tests, and the
-rest of the matrix after that point. Linux: `cargo check -p mdshared-ui --all-targets --target
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (mdshared-ui: 1120
+passed, 33 ignored; doctests pass; exit 0), and the five dark tests on their own. Earlier, on the
+first commit of this work, the release workspace clippy and test, and the release clippy and
+tests of `recycle`, `media-session` and `notify` plus the `a11y` clippy, also passed; the second
+commit has only had the debug commands above. Not run: the release host, host+a11y and term
+clippy/test commands, the host example, the release `a11y` tests, and the rest of the matrix
+after that point. Linux: `cargo check -p mdshared-ui --all-targets --target
 x86_64-unknown-linux-gnu` type-checked with a stub `pkg-config` (exit 0); nothing was linked.
 **Not run on a real Linux desktop**: the portal thread, the `SettingChanged` listener and the
 wake are type-checked only, and Linux CI runs the rest. macOS was not compiled.

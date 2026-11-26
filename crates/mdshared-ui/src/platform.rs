@@ -1083,21 +1083,39 @@ mod imp {
     #[cfg(not(target_os = "macos"))]
     const THEME_EVERY: Duration = Duration::from_secs(1);
 
+    /// The longest the first call in the process waits for the portal's first answer: the limit
+    /// the old blocking read had.
+    #[cfg(not(target_os = "macos"))]
+    const THEME_FIRST_WAIT: Duration = Duration::from_millis(500);
+
     /// The namespaces of the settings portal that [`read_dark`] reads.
     #[cfg(not(target_os = "macos"))]
     const THEME_NAMESPACES: [&str; 1] = ["org.freedesktop.appearance"];
 
-    /// The desktop's colour scheme, as the settings portal last said it. It never waits for the
-    /// portal: it gives the last answer at once (false until there has been one) and, at most
-    /// once a second and only while no thread listens for changes, starts a helper thread that
-    /// asks again. A portal that is slow, hung or absent costs the caller nothing and leaves
-    /// the last answer standing.
+    /// The desktop's colour scheme, as the settings portal last said it. The first call in the
+    /// process starts a helper thread and waits for its first answer up to
+    /// [`THEME_FIRST_WAIT`], the old limit, so an application that reads once at start gets the
+    /// portal's answer as it did before. If none comes it gives false and keeps no answer, so a
+    /// later one still wins. Every later call gives the last answer at once and, at most once a
+    /// second and only while no thread listens for changes, starts a reading that stays to
+    /// listen. A portal that is slow, hung or absent costs no later caller anything.
     #[cfg(not(target_os = "macos"))]
     pub fn system_is_dark() -> bool {
         use std::time::Instant;
-        ask_in_background(&DARK, Instant::now(), THEME_EVERY, "mdshared-theme", || {
-            read_and_watch(&DARK, &THEME_NAMESPACES, read_dark)
-        })
+        let now = Instant::now();
+        let start = || {
+            start_reading(&DARK, now, THEME_EVERY, "mdshared-theme", || {
+                read_and_watch(&DARK, &THEME_NAMESPACES, read_dark)
+            })
+        };
+        if DARK.take_first() {
+            start();
+            DARK.wait_first(THEME_FIRST_WAIT)
+                .unwrap_or_else(|| DARK.get())
+        } else {
+            start();
+            DARK.get()
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1467,12 +1485,27 @@ pub fn watch_motion_reduced(wake: impl Fn() + Send + Sync + 'static) {
     imp::watch_motion_reduced(wake)
 }
 
-/// Asks `work` for a boolean setting on a helper thread when a reading is allowed, and gives
-/// the last good answer at once. `state` decides whether a reading may start (none is under
-/// way, no thread listens for changes, and `every` has passed since the last reading ended);
-/// `work` must store its answer with [`LastGood::answer`] and end the reading with
-/// [`LastGood::reading_done`]. A thread that cannot be started ends the reading at once, so a
-/// later call tries again.
+/// Starts `work` on a helper thread when `state` allows a reading: none is under way, no thread
+/// listens for changes, and `every` has passed since the last reading ended. `work` must store
+/// its answer with [`LastGood::answer`] and end the reading with [`LastGood::reading_done`]. A
+/// thread that cannot be started ends the reading at once, so a later call tries again.
+#[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
+fn start_reading(
+    state: &'static LastGood,
+    now: std::time::Instant,
+    every: Duration,
+    name: &'static str,
+    work: impl FnOnce() + Send + 'static,
+) {
+    if state.claim_reading(now, every) {
+        let spawned = std::thread::Builder::new().name(name.into()).spawn(work);
+        if spawned.is_err() {
+            state.reading_done(std::time::Instant::now());
+        }
+    }
+}
+
+/// [`start_reading`], then the last good answer at once, without waiting for the reading.
 #[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
 fn ask_in_background(
     state: &'static LastGood,
@@ -1481,12 +1514,7 @@ fn ask_in_background(
     name: &'static str,
     work: impl FnOnce() + Send + 'static,
 ) -> bool {
-    if state.claim_reading(now, every) {
-        let spawned = std::thread::Builder::new().name(name.into()).spawn(work);
-        if spawned.is_err() {
-            state.reading_done(std::time::Instant::now());
-        }
-    }
+    start_reading(state, now, every, name, work);
     state.get()
 }
 
@@ -1497,6 +1525,9 @@ fn ask_in_background(
 #[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
 struct LastGood {
     held: std::sync::Mutex<Held>,
+    /// Signalled when there is an answer or a reading has ended, so that the one call that
+    /// waits for the first answer (`system_is_dark`) can stop.
+    answered_ready: std::sync::Condvar,
 }
 
 #[cfg(any(test, all(not(windows), not(target_os = "macos"))))]
@@ -1511,6 +1542,8 @@ struct Held {
     watching: bool,
     /// There has been an answer.
     answered: bool,
+    /// The first call in the process has taken the wait for the first answer.
+    first_taken: bool,
     /// The number the last reading was given by [`stamp`](LastGood::stamp); 0 before any.
     issued: u64,
     /// The number of the reading whose answer `value` is; 0 before any.
@@ -1528,10 +1561,12 @@ impl LastGood {
                 read_at: None,
                 watching: false,
                 answered: false,
+                first_taken: false,
                 issued: 0,
                 newest: 0,
                 wake: None,
             }),
+            answered_ready: std::sync::Condvar::new(),
         }
     }
 
@@ -1560,7 +1595,7 @@ impl LastGood {
     /// last one calls the wake, after the lock is let go, so a wake that reads the value at
     /// once does not wait on itself.
     fn answer(&self, stamp: u64, answer: Option<bool>) {
-        let wake = {
+        let (wake, answered) = {
             let mut held = self.held();
             match answer {
                 Some(value) if stamp >= held.newest => {
@@ -1568,11 +1603,14 @@ impl LastGood {
                     held.answered = true;
                     let changed = value != held.value;
                     held.value = value;
-                    held.wake.clone().filter(|_| changed)
+                    (held.wake.clone().filter(|_| changed), true)
                 }
-                _ => None,
+                _ => (None, false),
             }
         };
+        if answered {
+            self.answered_ready.notify_all();
+        }
         if let Some(wake) = wake {
             wake();
         }
@@ -1597,6 +1635,43 @@ impl LastGood {
         let mut held = self.held();
         held.reading = false;
         held.read_at = Some(now);
+        drop(held);
+        // The first call may be waiting for this reading's answer: it should not have to wait
+        // out its whole time now that none is coming.
+        self.answered_ready.notify_all();
+    }
+
+    /// Whether this is the first call in the process: it should start a reading and wait for
+    /// its answer. Every later call gets false and reads the last answer at once.
+    fn take_first(&self) -> bool {
+        !std::mem::replace(&mut self.held().first_taken, true)
+    }
+
+    /// Waits up to `timeout` for the first answer, for the first call only. Gives the answer
+    /// when there is one, and `None` when the reading ended without one or the time passed (the
+    /// answer is then still to come, and later calls see it).
+    fn wait_first(&self, timeout: Duration) -> Option<bool> {
+        use std::time::Instant;
+        let deadline = Instant::now().checked_add(timeout);
+        let mut held = self.held();
+        loop {
+            if held.answered {
+                return Some(held.value);
+            }
+            if !held.reading {
+                return None;
+            }
+            let now = Instant::now();
+            let deadline = deadline?;
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _) = self
+                .answered_ready
+                .wait_timeout(held, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            held = guard;
+        }
     }
 
     /// Whether the caller should listen for changes: no thread does. When true the listening
@@ -1661,19 +1736,22 @@ pub fn note_recent_document(path: &Path) {
 /// `AppsUseLightTheme`, macOS's `AppleInterfaceStyle`, and Linux's settings portal
 /// (`org.freedesktop.appearance` `color-scheme`, where 1 is dark and 0 or 2 is not).
 ///
-/// It never blocks. On Windows and macOS the system answers at once. On Linux the portal is
-/// another process that may be slow, hung or not there, so it is asked on a helper thread and
-/// this call gives the last answer it gave (false before the first one), taking only a lock for
-/// a moment. The first call starts a reading that then stays to listen for the portal's
-/// `SettingChanged` signal, so a change of the setting is read when it is made. Only while
-/// nothing listens (no session bus, a portal without the signal) does a later call start
-/// another reading, at most once a second. A reading that fails or never ends leaves the last
-/// answer standing: a dark theme is not taken for light because the portal did not answer in
-/// time, and an answer that comes back after a newer one is dropped.
+/// It does not block after its first call. On Windows and macOS the system answers at once. On
+/// Linux the portal is another process that may be slow, hung or not there, so it is asked on a
+/// helper thread. The first call in the process waits for that thread's first answer, up to
+/// 500 ms, the limit the blocking read it replaced had: an application that reads the theme once
+/// at start gets the portal's answer as it did before. If the answer does not come in time the
+/// first call gives false and keeps no answer, so a later one still wins. Every call after the
+/// first gives the last answer at once (false before the first one), taking only a lock for a
+/// moment. The first reading then stays to listen for the portal's `SettingChanged` signal, so a
+/// change of the setting is read when it is made. Only while nothing listens (no session bus, a
+/// portal without the signal) does a later call start another reading, at most once a second. A
+/// reading that fails or never ends leaves the last answer standing: a dark theme is not taken
+/// for light because the portal did not answer in time, and an answer that comes back after a
+/// newer one is dropped.
 ///
-/// Because the first call on Linux comes before the first answer, an application that wants the
-/// right look from its first frame gives [`watch_system_dark`] a wake and reads again when
-/// woken.
+/// An application that wants a change of the setting to reach it without winit's `ThemeChanged`
+/// gives [`watch_system_dark`] a wake and reads again when woken.
 pub fn system_is_dark() -> bool {
     imp::system_is_dark()
 }
@@ -2298,10 +2376,13 @@ mod dark_tests {
     use std::time::Instant;
 
     // Each test owns its state, so they may run side by side. `ask_in_background` is the
-    // entry point `system_is_dark` uses on Linux.
+    // non-blocking entry point `system_is_dark` uses after its first call; `take_first`,
+    // `start_reading` and `wait_first` are its first call.
     static SLOW: LastGood = LastGood::new();
     static TIMED_OUT: LastGood = LastGood::new();
     static LATER: LastGood = LastGood::new();
+    static FIRST_FAST: LastGood = LastGood::new();
+    static FIRST_SLOW: LastGood = LastGood::new();
 
     #[test]
     fn a_slow_or_absent_answer_does_not_block_and_returns_the_last_good_value() {
@@ -2329,19 +2410,92 @@ mod dark_tests {
             "the call waited {took:?} for the reading"
         );
         // A second call starts no reading (one is under way) and still answers at once.
+        let (started, second_started) = mpsc::channel::<()>();
         let again = ask_in_background(
             &SLOW,
             Instant::now(),
             Duration::ZERO,
             "test-theme-slow",
-            || panic!("a second reading must not start while one is under way"),
+            move || {
+                _ = started.send(());
+            },
         );
         assert!(again);
+        assert!(
+            second_started
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a second reading started while one was under way"
+        );
         assert!(
             SLOW.get(),
             "the last good value stands while the reading runs"
         );
         drop(release);
+    }
+
+    #[test]
+    fn a_fast_first_answer_is_returned_by_the_first_call() {
+        assert!(FIRST_FAST.take_first(), "the first call takes the wait");
+        // The first call starts the reading, as system_is_dark does, and waits for the answer.
+        let worker = &FIRST_FAST;
+        start_reading(
+            &FIRST_FAST,
+            Instant::now(),
+            Duration::ZERO,
+            "test-theme-fast",
+            move || {
+                worker.answer(worker.stamp(), Some(true));
+                worker.reading_done(Instant::now());
+            },
+        );
+        assert_eq!(
+            FIRST_FAST.wait_first(Duration::from_millis(500)),
+            Some(true),
+            "the first call returns the portal's fast answer"
+        );
+        // Every later call is the non-blocking path: no wait, the last answer.
+        assert!(!FIRST_FAST.take_first(), "only the first call waits");
+        assert!(FIRST_FAST.get());
+    }
+
+    #[test]
+    fn a_slow_first_answer_gives_false_in_time_and_a_later_call_sees_it() {
+        assert!(FIRST_SLOW.take_first(), "the first call takes the wait");
+        let (release, wait) = mpsc::channel::<()>();
+        let (answered, seen) = mpsc::channel::<()>();
+        let worker = &FIRST_SLOW;
+        start_reading(
+            &FIRST_SLOW,
+            Instant::now(),
+            Duration::ZERO,
+            "test-theme-slow-first",
+            move || {
+                // The portal answers only after the first call has given up waiting.
+                _ = wait.recv();
+                worker.answer(worker.stamp(), Some(true));
+                worker.reading_done(Instant::now());
+                _ = answered.send(());
+            },
+        );
+        let start = Instant::now();
+        let first = FIRST_SLOW.wait_first(Duration::from_millis(500));
+        let took = start.elapsed();
+        assert_eq!(first, None, "no answer in time: the first call gives false");
+        assert!(
+            took >= Duration::from_millis(450) && took < Duration::from_secs(1),
+            "the first call waited {took:?}, not the old 500 ms limit"
+        );
+        assert!(!FIRST_SLOW.get(), "a timeout keeps no false answer");
+        assert!(!FIRST_SLOW.take_first(), "only the first call waits");
+        // The portal answers later: the answer is kept, and a later call sees it.
+        release.send(()).expect("the reading waits for its release");
+        seen.recv_timeout(Duration::from_secs(5))
+            .expect("the reading did not answer");
+        assert!(
+            FIRST_SLOW.get(),
+            "a later call sees the answer that came after the timeout"
+        );
     }
 
     #[test]
@@ -2415,17 +2569,26 @@ mod theme_tests {
         let took = start.elapsed();
         println!("portal says dark: {dark}, in {took:?}");
         assert!(took < Duration::from_millis(900));
-        // The entry point never waits for the portal: it answers from what it has and starts
-        // (or leaves) a helper reading.
+        // The first call in the process waits for the portal's first answer, as the old
+        // blocking read did, but no longer than the old 500 ms limit.
+        let start = std::time::Instant::now();
+        let first = system_is_dark();
+        let took = start.elapsed();
+        println!("first system_is_dark: {first}, in {took:?}");
+        assert!(
+            took < Duration::from_millis(900),
+            "the first call took {took:?}, over the old limit"
+        );
+        // Every call after it never waits for the portal.
         let start = std::time::Instant::now();
         for _ in 0..100 {
             _ = system_is_dark();
         }
         let took = start.elapsed();
-        println!("system_is_dark 100 times: {took:?}");
+        println!("system_is_dark 100 times after the first: {took:?}");
         assert!(
             took < Duration::from_millis(500),
-            "100 calls took {took:?}: the entry point waited for the portal"
+            "100 later calls took {took:?}: a later call waited for the portal"
         );
     }
 }
