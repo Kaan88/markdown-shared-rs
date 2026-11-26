@@ -1815,10 +1815,14 @@ Decisions:
   Ctrl to the content's top left and bottom right; Alt chords are left to menus. Deltas arrive
   in the caller's unit (`host::Event::Wheel` already gives pixels).
 - **The focus is passed in, not held.** `reveal_focus(&focus, id, at, extent)` reveals the
-  control when `focus::Focus` comes to it: the id is remembered (as its hash, since the model
-  holds no `K`), so giving the same focus again moves nothing and the wheel or a page key can
-  scroll inside a control taller than the view instead of being pinned back. The application
-  still draws the body with its own widgets.
+  control the frame says has the focus, the first time the focus comes to it; the focus it
+  last revealed is remembered (as the hash of `focus.focused()`, since the model holds no
+  `K`), so giving the same focus again moves nothing and the wheel or a page key can scroll
+  inside a control taller than the view instead of being pinned back. The application calls it
+  every frame for each control it lays out (or once, while the focus is outside), so the area
+  sees the focus leave and reveals the control again when it comes back. A resize or a
+  relayout of the same focus does not reveal again; an application calls `reveal` itself for
+  that. The body is still drawn by the application's own widgets.
 - **Drawing is two calls.** `draw_bars` draws only the bars that are needed (a bar `None` when
   the content fits that way), clear of the corner when both show; `draw_bars_animated` is the
   same with each bar's fade, and at rest is pixel for pixel `draw_bars`.
@@ -1831,15 +1835,17 @@ Added: `scrollarea::{ScrollArea, Scrolled, draw_bars, draw_bars_animated, LINE}`
 Page Up / Page Down, Home and End, with Tab moving the focus and the area revealing it when it
 moves. No existing signature, field or drawing changed.
 
-Tests (in `scrollarea.rs`, 18 and the ignored sheet). Model: content shorter than the view,
+Tests (in `scrollarea.rs`, 19 and the ignored sheet). Model: content shorter than the view,
 exact fit and a pixel more (no scroll, no bars), a content that shrinks pulling the offset in,
 a wheel notch away from the user scrolling up and Shift turning it across, the page keys and
-Home/End, reveal above, below and taller than the view, `reveal_focus` only for the focused id
-and only once (a page key and a wheel then leave the offset alone, even for a control taller
-than the view), `layout_column` keeping a flexible item at its natural size and the rectangles
-still in content pixels after a scroll, `layout_column` keeping the offset when the view and
-the content grow in one frame, points between content and area, a NaN component keeping its
-axis from a non-zero offset, and sizes, offsets and points that are not numbers. Drawing, in
+Home/End, reveal above, below and taller than the view, `reveal_focus` only for the focused
+id and only once (a page key and a wheel then leave the offset alone, even for a control taller
+than the view), and a focus that leaves the area for a control outside it and comes back being
+revealed again (the per-control calls see it leave), `layout_column` keeping a flexible item at
+its natural size and the rectangles still in content pixels after a scroll, `layout_column`
+keeping the offset when the view and the content grow in one frame, points between content and
+area, a NaN component keeping its axis from a non-zero offset, and sizes, offsets and points
+that are not numbers. Drawing, in
 both palettes where colour matters: the body draws nothing outside the area, everything inside
 it, and a mark at its translated place (so a missing move fails the test); a bar shows only on
 the axis that overflows (vertical, horizontal, both, and none) with the thumb's pixel differing
@@ -1847,17 +1853,18 @@ from the page and the corner both bars leave to each other left as the page; a f
 40 shows rows 2 to 5 and the page above and below; after `restore`, drawing outside the area is
 unclipped and in place; and `draw_bars_animated` at rest is `draw_bars` pixel for pixel with no
 frame asked for. Each new test was seen failing under its broken implementation: the old wheel
-sign, `reveal_focus` revealing every frame, `set_offset` without NaN keeping, `layout_column`'s
-two clamps, an empty `Scrolled::restore`, `scrolled` without the move, and a horizontal bar
-drawn unshortened — each failed its test, and the earlier round's mutations failed every model
-and drawing test (13 of 14 in one pass; the exact-fit test needed `scrolls` to answer `>=`
-instead of `>`, and failed then too). The file was restored afterwards.
+sign, `reveal_focus` revealing every frame, a focus that left and came back not revealing (the
+earlier id-keyed code), `set_offset` without NaN keeping, `layout_column`'s two clamps, an
+empty `Scrolled::restore`, `scrolled` without the move, and a horizontal bar drawn unshortened
+— each failed its test, and the earlier round's mutations failed every model and drawing test
+(13 of 14 in one pass; the exact-fit test needed `scrolls` to answer `>=` instead of `>`, and
+failed then too). The file was restored afterwards.
 
 The sheet `cargo test -p mdshared-ui --lib scrollarea_sheet -- --ignored` writes
 `target/specimen/scrollarea.png`: the dialog at the top and scrolled to row 6, light above and
 dark below; the writing agent looked at it.
 
-Run on Windows 11: `cargo test -p mdshared-ui --lib scrollarea::` (18 pass, the sheet ignored);
+Run on Windows 11: `cargo test -p mdshared-ui --lib scrollarea::` (19 pass, the sheet ignored);
 `cargo run -p mdshared-ui --features host --example scroll_dialog -- --seconds 2` opened the
 window, drew two frames at offset 0 and closed; `cargo fmt --all --check`, and the workspace
 clippy and test commands listed in AGENTS.md (results in the commit message). Not run on Linux

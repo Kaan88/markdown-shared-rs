@@ -64,8 +64,9 @@ pub const LINE: f64 = 24.0;
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ScrollArea {
     viewport: Viewport,
-    /// The hash of the focus id [`reveal_focus`](ScrollArea::reveal_focus) last brought into
-    /// view; `None` before the first. Kept so that giving the same focus again moves nothing.
+    /// The hash of the focus (`Option<K>`) whose control was last revealed: `None` before the
+    /// first reveal, and again once the focus is seen on something else. Kept so that the same
+    /// focus is not revealed every frame.
     revealed: Option<u64>,
 }
 
@@ -221,14 +222,19 @@ impl ScrollArea {
     }
 
     /// Reveals the control with `id` when `focus` holds it there, the first time the focus comes
-    /// to it: once that id has been revealed, giving it again while `focus` still holds it moves
-    /// nothing, so the wheel and the keys can scroll inside a control taller than the view
-    /// instead of being pinned back on the next frame. Another id reveals again. Returns whether
-    /// the offset changed.
+    /// to it: while the same control keeps the focus, giving it again moves nothing, so the wheel
+    /// and the keys can scroll inside a control taller than the view instead of being pinned
+    /// back. When the focus leaves for another control, the area sees it leave, and coming back
+    /// to this one reveals it again.
     ///
-    /// `at` and `extent` are in content pixels, as [`layout_column`](Self::layout_column) and
-    /// [`Flex::layout`] give them. The id is remembered as its hash, because [`ScrollArea`]
-    /// holds no `K`; so `K` must be `Hash` as well as `Copy + Eq`.
+    /// Call it every frame for each control the area lays out (or at least once a frame, with
+    /// any `id`, while the focus is outside): the area compares [`Focus::focused`] with the
+    /// focus it last revealed. That value is remembered as its hash, because [`ScrollArea`]
+    /// holds no `K`, so `K` must be `Hash` as well as `Copy + Eq`.
+    ///
+    /// It does not reveal again after only a resize or a relayout of the same focus; call
+    /// [`reveal`](Self::reveal) directly for that. `at` and `extent` are in content pixels, as
+    /// [`layout_column`](Self::layout_column) and [`Flex::layout`] give them.
     pub fn reveal_focus<K: Copy + Eq + Hash>(
         &mut self,
         focus: &Focus<K>,
@@ -236,13 +242,18 @@ impl ScrollArea {
         at: (f64, f64),
         extent: (f64, f64),
     ) -> bool {
-        if !focus.is_focused(id) {
-            return false;
-        }
+        let current = focus.focused();
         let mut h = DefaultHasher::new();
-        id.hash(&mut h);
+        current.hash(&mut h);
         let key = h.finish();
         if self.revealed == Some(key) {
+            // Already revealed for this focus: the wheel and the keys are not undone.
+            return false;
+        }
+        if current != Some(id) {
+            // The focus is on another control (or nowhere): the area has seen it leave, so the
+            // next time it comes to one of ours, that one is revealed again.
+            self.revealed = None;
             return false;
         }
         self.revealed = Some(key);
@@ -600,6 +611,40 @@ mod tests {
         focus.focus(1);
         assert!(a.reveal_focus(&focus, 1, (0.0, 100.0), (50.0, 20.0)));
         assert_eq!(a.offset(), (0.0, 100.0));
+    }
+
+    #[test]
+    fn a_focus_that_leaves_the_area_and_comes_back_to_a_control_is_revealed_again() {
+        fn offer(a: &mut ScrollArea, focus: &Focus<u32>, rows: &[(u32, (f64, f64))]) -> bool {
+            let mut moved = false;
+            for &(id, at) in rows {
+                moved |= a.reveal_focus(focus, id, at, (50.0, 30.0));
+            }
+            moved
+        }
+
+        let mut a = area();
+        let mut focus: Focus<u32> = Focus::new();
+        focus.begin_frame();
+        // 1 and 2 are controls the area lays out; 3 is a button outside it.
+        for id in [1, 2, 3] {
+            focus.add(id);
+        }
+        focus.end_frame();
+        let rows = [(1u32, (0.0, 900.0)), (2, (0.0, 1500.0))];
+        focus.focus(2);
+        assert!(offer(&mut a, &focus, &rows));
+        assert_eq!(a.offset(), (0.0, 1330.0));
+        // The person wheels to the top of the body.
+        a.set_offset((0.0, 0.0));
+        // Tab goes to the button outside the area: the area sees the focus leave.
+        focus.focus(3);
+        assert!(!offer(&mut a, &focus, &rows));
+        assert_eq!(a.offset(), (0.0, 0.0));
+        // Shift+Tab comes back to the last row: it is brought into view again.
+        focus.focus(2);
+        assert!(offer(&mut a, &focus, &rows));
+        assert_eq!(a.offset(), (0.0, 1330.0));
     }
 
     #[test]
