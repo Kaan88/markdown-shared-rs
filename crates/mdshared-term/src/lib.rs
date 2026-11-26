@@ -9,7 +9,8 @@
 //!   attributes, the cursor, the scrollback, the alternate screen, scroll regions, modes, the
 //!   rows that changed, and the replies owed to the program.
 //! - [`select`]: a [`Selection`] of cells over the scrollback and the screen, by cell, word or
-//!   line, as a stream or a block, and its text.
+//!   line, as a stream or a block, its text, and whether the cells under it still hold that text
+//!   after the program wrote to them.
 //! - [`input`]: keys, pastes, mouse events and focus changes as bytes for the program.
 //! - [`width`]: how many cells a character takes.
 //!
@@ -55,7 +56,6 @@
 //!   pixel positions (1016), not highlight tracking.
 //! - **Images**: sixel, the kitty and iTerm2 protocols. Device control strings are swallowed.
 //! - **Right-to-left text.**
-//! - **A selection does not know of rewrites**: see [`select`].
 //!
 //! Nor is anything here that needs the system: a pseudo-terminal (ConPTY, `openpty`), a child
 //! process, drawing a grid of glyphs, the bell's sound.

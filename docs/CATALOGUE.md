@@ -176,7 +176,7 @@ the kitty keyboard protocol, images).
 |---|---|---|
 | `screen` | The grid a program's output is written into: cells with colours and attributes, cursor, scrollback, alternate screen, scroll regions, modes, dirty rows, replies | `Screen::new(cols, rows, scrollback)`, `feed(bytes)`, `resize`, `cell`, `line`, `row_text`, `cursor`, `modes`, `take_dirty`, `take_reply`, `take_title`, `scrollback_line` |
 | `parse` | The VT byte-stream parser, apart from what the sequences mean | `Parser::feed(bytes, &mut impl Perform)`, `Params` |
-| `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block | `Selection::start(&screen, point, kind, clicks)`, `extend`, `contains`, `text` |
+| `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block; a word and a line run across a soft wrap (a row whose text went on in the next) and stop at a hard break; the selection holds the text it was made on, so it follows the screen after output (`follow`, `is_intact`) and is dropped when the program rewrote or erased it, or when its first line left the ring | `Selection::start(&screen, point, kind, clicks)`, `extend`, `span_on`, `contains`, `range`, `text`, `clip`, `is_intact`, `follow` |
 | `input` | Keys, pastes, mouse events and focus changes as the bytes a program expects | `encode_key(Key, Mods, &modes)`, `encode_paste`, `encode_mouse`, `encode_focus` |
 | `width` | How many cells a character takes | `char_width`, `str_width` |
 
