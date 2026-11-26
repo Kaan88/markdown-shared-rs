@@ -2872,12 +2872,15 @@ eventually found without constantly reading large or remote folders. It is off b
 on other platforms. `reconcile_interval(None)` or zero disables it; positive intervals
 below one second are rounded up to one second. The worker waits for the native owner to
 acknowledge its re-registration attempt before doing a strict directory read. It can still
-handle native events while waiting. On a reported restart failure, periodic scans continue
-without further restart attempts. A native restart that never returns cannot acknowledge the
-cycle. A slow read cannot stack up more reads. A pending native
-burst settles first, and a callback arriving during the read or diff discards that scan and
-triggers a retry after the burst settles. This lets a native rename transfer selection before
-an inferred removal or creation can replace the selected row.
+handle native events while waiting. On a reported restart failure or after two seconds
+without acknowledgement, the worker continues with scans only. A late acknowledgement
+does not schedule another restart. A slow read cannot stack up more reads. A pending native
+burst settles first. If callbacks arrive during the read or diff, the worker reconciles
+untouched paths and leaves the touched paths (both ends of a rename) to native events or
+a later scan. This lets a native rename transfer selection without hiding missed changes
+to unrelated paths. The event queue bounds how many paths can be tracked; overflow falls
+back to one plain `Rescan` without installing a racing snapshot. A full snapshot also waits
+behind a queued rename rather than replacing the selected row.
 
 With `initial_entries` from the caller's unfiltered list, the worker starts with that
 baseline and keeps it in step with the changes it reports. When it needs a new baseline,
@@ -2886,8 +2889,11 @@ Call `woken()` and `take_with_snapshot()` to drain both atomically; install the 
 for that `Rescan` and then apply later signals in order. As before, an unaccompanied `Rescan`
 requires an independent read. Legacy `take()` discards a supplied snapshot and returns a
 standalone `Rescan`; recovery does not assume that the independent read installed the worker's
-entries, and the next complete scan offers a fresh snapshot. Once a baseline is shared,
-later reads report removals, creations and metadata changes through `Changed`. No rename
+entries, and the next complete scan offers a fresh snapshot. That can mean two directory
+reads every interval even when nothing changed: the worker's scan and the caller's reread.
+Use `take_with_snapshot()` to avoid the second read when a snapshot is available.
+Once a baseline is shared, later reads report removals, creations and metadata changes
+through `Changed`. No rename
 identity is inferred from a snapshot.
 An incomplete read is never used as a snapshot. If opening the root says it no longer
 exists or is not a directory, the worker reports `Lost`. Native notification failures are
@@ -3004,6 +3010,12 @@ ignored, Linux x86-64 Clippy with the stub, and the catalogue check). Fake-clock
 channel-gated regressions failed when scan ordering, snapshot invalidation, the shared
 permit, or restart acknowledgement was disabled. Linux was type-checked only; macOS and
 real Windows restart failures, overflows and blocked network calls were not exercised.
+
+Third re-review: all six checks passed on Rust 1.99.1, including 658 Windows tests
+(one ignored) and Linux x86-64 Clippy with the `pkg-config` stub. The fake-clock tests
+reproduced busy-scan starvation, the missing overflow reset, and the hung restart
+before the fixes. No native hung restart or continuously changing directory was
+reproduced; Linux tests were not run and macOS was not checked.
 
 ## X13. The Markdown page renderer
 

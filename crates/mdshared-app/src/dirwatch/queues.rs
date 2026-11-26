@@ -1,14 +1,16 @@
 //! Bounded queues on either side of the metadata worker. A backlog that can no longer
 //! be represented as changes becomes a rescan. Loss of the watch takes precedence.
 
-use super::{Entry, RawChange, Signal};
-use std::collections::VecDeque;
+use super::{Change, Entry, RawChange, Signal};
+use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 pub(super) const LIMIT: usize = 4_096;
 pub(super) type Batch = VecDeque<(RawChange, Instant, Option<usize>)>;
+pub(super) type RestartAck = (bool, Instant);
 
 #[derive(Default)]
 pub(super) struct Inbox {
@@ -20,7 +22,7 @@ pub(super) struct Inbox {
 struct InboxState {
     events: Batch,
     stop: bool,
-    restarted: Option<bool>,
+    restarted: Option<RestartAck>,
 }
 
 impl Inbox {
@@ -52,7 +54,10 @@ impl Inbox {
 
     /// Detaches events before the worker processes them. An expired deadline may return an
     /// empty batch; shutdown returns `None`.
-    pub(super) fn wait_for_work(&self, deadline: Option<Instant>) -> Option<(Batch, Option<bool>)> {
+    pub(super) fn wait_for_work(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<(Batch, Option<RestartAck>)> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if state.stop {
@@ -82,33 +87,87 @@ impl Inbox {
     }
 
     pub(super) fn restart_finished(&self, succeeded: bool) {
+        self.record_restart(succeeded, Instant::now());
+    }
+
+    pub(super) fn record_restart(&self, succeeded: bool, at: Instant) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.stop {
-            state.restarted = Some(succeeded);
+            state.restarted = Some((succeeded, at));
             self.ready.notify_one();
         }
     }
 
-    pub(super) fn scan_is_clear(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.stop && state.events.is_empty()
-    }
-
-    /// The mailbox is not drained during a scan. Check it again under the same lock
-    /// used by callbacks, so even an event arriving during diff preparation wins.
+    /// The mailbox is not drained during a scan. Filter against it under the callback lock,
+    /// including both endpoints of queued renames. If the paths are unknown or an exact
+    /// snapshot raced callbacks, fall back to a plain reset instead of installing stale data.
+    /// Returns whether an exact snapshot was published, or `None` if publication is unsafe.
     pub(super) fn publish_scan(
         &self,
         shared: &Shared,
         epoch: u64,
-        signals: Vec<Signal>,
-        snapshot: Option<Vec<Entry>>,
+        signals: &mut Vec<Signal>,
+        mut snapshot: Option<Vec<Entry>>,
         wake: &dyn Fn(),
-    ) -> bool {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stop || !state.events.is_empty() {
-            return false;
+    ) -> Option<bool> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stop || matches!(state.events.front(), Some((RawChange::Lost, ..))) {
+            return None;
         }
-        shared.deliver_checked(Some(epoch), signals, snapshot, wake)
+        let overflow = matches!(state.events.front(), Some((RawChange::Rescan, ..)));
+        if snapshot.is_some()
+            && state.events.iter().any(|(change, _, _)| {
+                matches!(
+                    change,
+                    RawChange::Renamed { .. } | RawChange::RenamedFrom(_) | RawChange::RenamedTo(_)
+                )
+            })
+        {
+            // A full reset cannot omit individual paths. Don't put it ahead of a
+            // valid rename; retry after the native changes have settled.
+            return None;
+        }
+        if overflow || (snapshot.is_some() && !state.events.is_empty()) {
+            *signals = vec![Signal::Rescan];
+            snapshot = None;
+        } else if !state.events.is_empty() {
+            let mut touched = HashSet::<&Path>::new();
+            for (change, _, _) in &state.events {
+                match change {
+                    RawChange::Created(path)
+                    | RawChange::Removed(path)
+                    | RawChange::Modified(path)
+                    | RawChange::RenamedFrom(path)
+                    | RawChange::RenamedTo(path) => {
+                        touched.insert(path);
+                    }
+                    RawChange::Renamed { from, to } => {
+                        touched.insert(from);
+                        touched.insert(to);
+                    }
+                    RawChange::Lost | RawChange::Rescan => unreachable!("standalone marker"),
+                }
+            }
+            signals.retain(|signal| match signal {
+                Signal::Changed(Change::Created(entry) | Change::Modified(entry)) => {
+                    !touched.contains(entry.path.as_path())
+                }
+                Signal::Changed(Change::Removed(path)) => !touched.contains(path.as_path()),
+                Signal::Changed(Change::Renamed { from, to }) => {
+                    !touched.contains(from.as_path()) && !touched.contains(to.path.as_path())
+                }
+                Signal::Lost | Signal::Rescan => true,
+            });
+        }
+        let exact = snapshot.is_some();
+        if !shared.deliver_checked(Some(epoch), signals.clone(), snapshot, wake) {
+            return None;
+        }
+        if overflow {
+            // The reset just published is also the notification for the raw overflow.
+            state.events.clear();
+        }
+        Some(exact)
     }
 
     pub(super) fn stop(&self) {

@@ -15,6 +15,7 @@ pub(super) const DEFAULT_INTERVAL: Option<Duration> = if cfg!(windows) {
     None
 };
 pub(super) const MIN_INTERVAL: Duration = Duration::from_secs(1);
+const RESTART_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) type Snapshot = BTreeMap<PathBuf, Entry>;
 pub(super) type Scan = io::Result<Option<Snapshot>>;
@@ -59,9 +60,7 @@ impl Periodic {
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
-        (self.stage != Stage::Waiting)
-            .then_some(self.deadline)
-            .flatten()
+        self.deadline
     }
 
     #[cfg(test)]
@@ -90,26 +89,39 @@ impl Periodic {
         }
     }
 
-    pub(super) fn restart_finished(&mut self, succeeded: bool) {
+    pub(super) fn restart_finished(&mut self, succeeded: bool, at: Instant) {
         if self.stage == Stage::Waiting {
-            self.stage = if succeeded {
-                Stage::Read
+            if self.deadline.is_some_and(|deadline| at >= deadline) {
+                self.stage = Stage::ScanOnly;
             } else {
-                Stage::ScanOnly
-            };
+                self.deadline = Some(at);
+                self.stage = if succeeded {
+                    Stage::Read
+                } else {
+                    Stage::ScanOnly
+                };
+            }
         }
     }
 
     /// Returns whether a read is due. On the first call for a cycle, request a restart
-    /// and suspend the deadline until the owner acknowledges it.
+    /// and wait for its acknowledgement, but not beyond the restart deadline.
     pub(super) fn ready(&mut self, now: Instant, restart: impl FnOnce()) -> bool {
         if self.deadline().is_none_or(|deadline| now < deadline) {
             return false;
         }
-        if self.stage == Stage::Start {
-            self.stage = Stage::Waiting;
-            restart();
-            return false;
+        match self.stage {
+            Stage::Start => {
+                if let Some(deadline) = now.checked_add(RESTART_TIMEOUT) {
+                    self.deadline = Some(deadline);
+                    self.stage = Stage::Waiting;
+                    restart();
+                    return false;
+                }
+                self.stage = Stage::ScanOnly;
+            }
+            Stage::Waiting => self.stage = Stage::ScanOnly,
+            Stage::Read | Stage::ScanOnly => {}
         }
         true
     }
@@ -139,10 +151,19 @@ impl Periodic {
         }
     }
 
-    /// Only a report that made it into the queue can advance the baseline and timer.
-    pub(super) fn committed(&mut self, result: Scan, end: Instant) {
-        if let Ok(Some(current)) = result {
-            self.known = Some(current);
+    /// Only what was published can advance the baseline. The excluded paths remain
+    /// as last reported until native changes settle, or a later scan can correct them.
+    pub(super) fn committed(
+        &mut self,
+        result: Scan,
+        signals: &[Signal],
+        exact: bool,
+        end: Instant,
+    ) {
+        if exact {
+            self.known = result.ok().flatten();
+        } else {
+            self.observe(signals);
         }
         self.deadline = end.checked_add(self.interval);
         if self.stage == Stage::Read {
@@ -247,12 +268,12 @@ mod tests {
             if periodic.stage != Stage::Waiting {
                 return Vec::new();
             }
-            periodic.restart_finished(true);
+            periodic.restart_finished(true, now);
             assert!(periodic.ready(now, || panic!("started a second restart")));
         }
         let result = scan();
-        let (signals, _) = periodic.report(&result);
-        periodic.committed(result, end);
+        let (signals, reset) = periodic.report(&result);
+        periodic.committed(result, &signals, reset.is_some(), end);
         signals
     }
 

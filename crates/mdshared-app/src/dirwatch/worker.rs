@@ -1,7 +1,7 @@
 //! One metadata worker serializes incremental reads and periodic scans. Its inbox
 //! wait ends at either deadline, so a silent backend does not prevent recovery.
 
-use super::queues::{Batch, Inbox, LIMIT, Shared};
+use super::queues::{Batch, Inbox, LIMIT, RestartAck, Shared};
 use super::reconcile::{self, Periodic, Scan};
 use super::resolve::{Identity, lost_signal, signal_of};
 use super::{Coalescer, RawChange, Read, Signal, Verdict};
@@ -60,12 +60,12 @@ impl Worker {
 
     fn cycle(
         &mut self,
-        (batch, restarted): (Batch, Option<bool>),
+        (batch, restarted): (Batch, Option<RestartAck>),
         seen: &mut usize,
         io: &Cycle<'_>,
     ) -> bool {
-        if let (Some(periodic), Some(succeeded)) = (&mut self.periodic, restarted) {
-            periodic.restart_finished(succeeded);
+        if let (Some(periodic), Some((succeeded, at))) = (&mut self.periodic, restarted) {
+            periodic.restart_finished(succeeded, at);
         }
         feed_batch(&mut self.coalescer, batch, seen);
         let verdicts = self.coalescer.flush((io.now)());
@@ -82,7 +82,7 @@ impl Worker {
             }
         }
         if self.coalescer.is_idle()
-            && self.inbox.scan_is_clear()
+            && !self.inbox.stopped()
             && let Some(periodic) = &mut self.periodic
             && periodic.ready((io.now)(), io.restart)
         {
@@ -90,14 +90,13 @@ impl Worker {
             periodic.sync_epoch(epoch);
             let result = (io.scan)(self);
             let periodic = self.periodic.as_mut().unwrap();
-            let (signals, snapshot) = periodic.report(&result);
-            let lost = signals.first() == Some(&Signal::Lost);
-            if self
-                .inbox
-                .publish_scan(&self.shared, epoch, signals, snapshot, io.wake)
+            let (mut signals, snapshot) = periodic.report(&result);
+            if let Some(exact) =
+                self.inbox
+                    .publish_scan(&self.shared, epoch, &mut signals, snapshot, io.wake)
             {
-                periodic.committed(result, (io.now)());
-                if lost {
+                periodic.committed(result, &signals, exact, (io.now)());
+                if signals.first() == Some(&Signal::Lost) {
                     self.inbox.stop();
                     return false;
                 }
@@ -168,7 +167,7 @@ pub(super) fn feed_batch(coalescer: &mut Coalescer, batch: Batch, seen: &mut usi
 mod tests {
     use super::super::reconcile::Snapshot;
     use super::*;
-    use crate::dirlist::{Entry, Kind, Listing};
+    use crate::dirlist::{Change, Entry, Kind, Listing};
     use std::cell::Cell;
     use std::time::Duration;
 
@@ -209,7 +208,7 @@ mod tests {
 
     fn tick(worker: &mut Worker, seen: &mut usize, io: &Cycle<'_>, ack: Option<bool>) {
         if let Some(ack) = ack {
-            worker.inbox.restart_finished(ack);
+            worker.inbox.record_restart(ack, (io.now)());
         }
         let work = worker.inbox.wait_for_work(Some(Instant::now())).unwrap();
         assert!(worker.cycle(work, seen, io));
@@ -255,8 +254,8 @@ mod tests {
             tick(&mut worker, &mut seen, &io, None);
             assert_eq!(
                 scans.get(),
-                1 + usize::from(while_scanning),
-                "scan retried after settling"
+                1,
+                "a scan that excluded both rename endpoints is not repeated immediately"
             );
 
             let mut listing = Listing::new();
@@ -356,6 +355,108 @@ mod tests {
         );
         clock.set(start + Duration::from_secs(1));
         tick(&mut worker, &mut seen, &io, None);
+        assert_eq!(scans.get(), 2);
+        assert_eq!(restarts.get(), 1);
+    }
+
+    #[test]
+    fn every_scan_can_touch_b_without_hiding_a_missed_change_to_a() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let size = Cell::new(2);
+        let mut worker = worker(start, Some(vec![entry("a"), entry("b")]));
+        let io = Cycle {
+            wake: &|| {},
+            restart: &|| {},
+            scan: &|worker| {
+                worker
+                    .inbox
+                    .push(RawChange::Modified(path("b")), clock.get(), None);
+                let mut a = entry("a");
+                a.size = size.get();
+                let mut b = entry("b");
+                b.size = 99; // This observation must not overwrite the native path.
+                Ok(Some([(a.path.clone(), a), (b.path.clone(), b)].into()))
+            },
+            now: &|| clock.get(),
+        };
+        let mut seen = 0;
+        for round in 0..3 {
+            let at = start + Duration::from_secs(round);
+            clock.set(at);
+            size.set(round + 2);
+            tick(&mut worker, &mut seen, &io, None);
+            tick(&mut worker, &mut seen, &io, Some(true));
+            let mut a = entry("a");
+            a.size = size.get();
+            assert_eq!(worker.shared.take(), [Signal::Changed(Change::Modified(a))]);
+            clock.set(at + Duration::from_millis(100));
+            tick(&mut worker, &mut seen, &io, None);
+            assert_eq!(
+                worker.shared.take(),
+                [Signal::Changed(Change::Modified(entry("b")))]
+            );
+        }
+    }
+
+    #[test]
+    fn scan_event_overflow_requests_one_reset_without_installing_a_racing_snapshot() {
+        let now = Instant::now();
+        let mut worker = worker(now, Some(vec![entry("a")]));
+        let io = Cycle {
+            wake: &|| {},
+            restart: &|| {},
+            scan: &|worker| {
+                for i in 0..=LIMIT {
+                    worker
+                        .inbox
+                        .push(RawChange::Modified(path(&i.to_string())), now, None);
+                }
+                Ok(Some(snapshot("b")))
+            },
+            now: &|| now,
+        };
+        let mut seen = 0;
+        tick(&mut worker, &mut seen, &io, None);
+        tick(&mut worker, &mut seen, &io, Some(true));
+        assert_eq!(
+            worker.shared.take_with_snapshot(),
+            (vec![Signal::Rescan], None)
+        );
+    }
+
+    #[test]
+    fn a_restart_timeout_allows_scans_and_a_late_ack_does_not_restart_the_backend() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let restarts = Cell::new(0);
+        let scans = Cell::new(0);
+        let mut worker = worker(start, Some(vec![entry("a")]));
+        let io = Cycle {
+            wake: &|| {},
+            restart: &|| restarts.set(restarts.get() + 1),
+            scan: &|_| {
+                scans.set(scans.get() + 1);
+                Ok(Some(snapshot("b")))
+            },
+            now: &|| clock.get(),
+        };
+        let mut seen = 0;
+        tick(&mut worker, &mut seen, &io, None);
+        let timeout = Duration::from_secs(2);
+        assert_eq!(
+            worker.periodic.as_ref().unwrap().deadline(),
+            Some(start + timeout)
+        );
+        clock.set(start + timeout - Duration::from_millis(1));
+        tick(&mut worker, &mut seen, &io, None);
+        assert_eq!(scans.get(), 0);
+        clock.set(start + timeout);
+        tick(&mut worker, &mut seen, &io, None);
+        assert_eq!(scans.get(), 1);
+        assert_eq!(worker.shared.take().len(), 2);
+        clock.set(start + timeout + Duration::from_secs(1));
+        tick(&mut worker, &mut seen, &io, Some(true));
         assert_eq!(scans.get(), 2);
         assert_eq!(restarts.get(), 1);
     }

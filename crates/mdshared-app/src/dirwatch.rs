@@ -862,9 +862,11 @@ impl DirWatcher {
     /// The settled reports waiting, in the order they were settled, and forgets them.
     ///
     /// A pending rescan supersedes incremental changes; a lost watch supersedes both.
-    /// This method discards any attached snapshot; recovery will not assume an
-    /// independent reread installed the same entries. Use [`Self::take_with_snapshot`]
-    /// to install the exact snapshot and continue with incremental recovery.
+    /// This method discards any attached snapshot; recovery cannot assume an independent
+    /// reread installed the same entries. With periodic recovery, that can mean reading the
+    /// folder twice every interval, once by the worker and once by the caller in response to
+    /// `Rescan`, even when nothing changed. Use [`Self::take_with_snapshot`] to install the
+    /// worker's snapshot directly and continue with incremental recovery.
     ///
     /// Call [`woken`](Self::woken) before this, as [`FileWatcher::woken`](crate::watch::FileWatcher::woken)
     /// is called, so a report settled during the call wakes again instead of being missed.
