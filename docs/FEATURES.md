@@ -23,6 +23,12 @@ Segoe UI (`segoeui.ttf`, `0x001B`) and Segoe UI Variable (`SegUIVar.ttf`, `0x000
 this bit. The glyph cache keys the exact size so a nearby whole and fractional size
 cannot reuse each other's masks.
 
+What that means with the default UI font: hinting happens only at whole device sizes. At 100%,
+12 to 14 px text is hinted. At 125% and 150%, 13 px (16.25 and 19.5 device px) and 14 px at
+125% (17.5) are never hinted and draw as before this change; 12 px at 125% and 150% (15 and
+18) and 14 px at 150% (21) are hinted. Rounding the device size (ROADMAP TS2) is the way to
+get hinting at those scales.
+
 On Windows, the 13 px Segoe UI `H` test verifies that the cap and crossbar sit on whole rows,
 its X coordinates match the unhinted outline bit for bit, and the actual glyph mask changes.
 That test failed with the vertical fit bypassed. The fractional-size raster tests compare
@@ -40,12 +46,19 @@ change from the pre-fix render.
 
 **Left open for review:**
 
-- **3b.** The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only
-  runs on Windows. The UI asks for Segoe UI Variable Text first.
-- **4.** Outline-matching fallback happens glyph by glyph and is not counted.
-- **5.** A cold eligible miss scales the outline twice and runs the hinter. Swash caches
-  eight hinting instances per outline format; a busy page can make it rebuild them.
-  Cold-cache cost has not been measured.
+- The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only runs on
+  Windows; the UI asks for Segoe UI Variable Text first. All the hinting tests, including the
+  cache-key test that needs no Segoe UI, are `cfg(windows)`, so Linux and macOS CI check none
+  of this.
+- Outline-matching fallback happens glyph by glyph and is not counted.
+- A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
+  hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
+  has not been measured.
+- The exact-size cache key also drops the old 1/64 px bucketing for unhinted glyphs, so sizes
+  that differ only by float noise no longer share masks (fewer hits, not wrong pixels). Keying
+  on "hinted or not" plus the old bucket would keep the old hit rate.
+- `fract() == 0.0` is exact: a computed 16.000002 counts as fractional and stays unhinted.
+  Treating sizes within 1/128 px of a whole number as whole would be safe.
 
 Windows verification: formatting, workspace Clippy and tests with `host,a11y` (the tests
 excluded `explorer_tests`), `term` Clippy and `termview` tests, and the UI ignored tests
