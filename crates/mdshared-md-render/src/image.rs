@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use mdshared_md_core::links::{ImageSource, classify_image};
 
+mod local_file;
 pub(crate) mod webp;
 
 pub const MAX_BYTES: u64 = 12 * 1024 * 1024;
@@ -133,8 +134,8 @@ pub(crate) fn read(path: &Path) -> Option<Vec<u8>> {
     if substitute_probe() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_BYTES {
+    let (file, len) = local_file::open(path)?;
+    if len > MAX_BYTES {
         return None;
     }
     // Capped again at the read, so a file that grows after the check still cannot exceed the limit.
