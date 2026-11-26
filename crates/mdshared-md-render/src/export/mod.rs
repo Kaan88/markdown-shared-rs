@@ -29,6 +29,7 @@ use crate::theme::{Color, Theme};
 use mdshared_md_core::model::{
     Align, BlockKind, Dir, Document, ImageAlign, ImageInfo, Length, ListMarker, NONE, SpanKind,
 };
+use mdshared_md_core::rich::SpanChildren;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -521,20 +522,18 @@ impl<'a> Writer<'a> {
 
     fn inline(&mut self, i: u32) {
         let b = self.doc.blocks[i as usize];
-        self.run(b.spans.start, b.spans.end, NONE, b.text.start, b.text.end);
+        let children = SpanChildren::new(&self.doc.spans, b.spans.start..b.spans.end);
+        self.run(&children, NONE, b.text.start, b.text.end);
     }
 
-    /// Text `from..to` of a block with the spans among `ss..se` whose parent is `parent`.
-    fn run(&mut self, ss: u32, se: u32, parent: u32, from: u32, to: u32) {
+    /// Text `from..to` of a block with the direct children of `parent`.
+    fn run(&mut self, children: &SpanChildren, parent: u32, from: u32, to: u32) {
         let doc = self.doc;
         let mut at = from;
-        for s in ss..se {
+        for s in children.children(parent) {
+            #[cfg(test)]
+            tests::count_inline_visit();
             let span = doc.spans[s as usize];
-            // A span with no parent in this block is at its top, whatever it was carried from.
-            let top = parent == NONE && !(ss..se).contains(&span.parent);
-            if span.parent != parent && !top {
-                continue;
-            }
             let atom = matches!(
                 span.kind,
                 SpanKind::Image(_) | SpanKind::Checkbox { .. } | SpanKind::FootnoteRef(_)
@@ -552,10 +551,9 @@ impl<'a> Writer<'a> {
             // A span with no text of its own is written when it holds a picture: a link around
             // an image alone.
             let holds_atom = cs == ce
-                && (ss..se).any(|k| {
-                    let inner = doc.spans[k as usize];
-                    inner.parent == s && matches!(inner.kind, SpanKind::Image(_))
-                });
+                && children
+                    .children(s)
+                    .any(|k| matches!(doc.spans[k as usize].kind, SpanKind::Image(_)));
             if (cs >= ce && !holds_atom) || cs < at {
                 continue;
             }
@@ -580,7 +578,7 @@ impl<'a> Writer<'a> {
             match span.kind {
                 // A formula that is not drawn is its source, as code.
                 SpanKind::Math { .. } => self.text(cs, ce),
-                _ => self.run(ss, se, s, cs, ce),
+                _ => self.run(children, s, cs, ce),
             }
             self.out.push_str(&close);
         }
