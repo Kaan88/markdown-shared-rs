@@ -1856,3 +1856,81 @@ matrix after that point. Linux: `cargo check -p mdshared-ui --all-targets --targ
 x86_64-unknown-linux-gnu` type-checked with a stub `pkg-config` (exit 0); nothing was linked.
 **Not run on a real Linux desktop**: the portal thread, the `SettingChanged` listener and the
 wake are type-checked only, and Linux CI runs the rest. macOS was not compiled.
+
+## Pictures kept at their drawn size (`mdshared_ui::picture`, 2026-11-26, `feat/k14-pictures`, roadmap K14, Barbican BT1)
+
+`Painter::image` squeezes a picture into its rectangle on every call. An avatar, an icon or a
+badge drawn every frame therefore averages the same source pixels again and again. A
+`Picture` does that once: it keeps the pixels of the last size it drew, at that device size,
+and a later draw at the same size, scale and corner radius only blends them.
+
+- **The model and the cache are one small struct.** `Picture` holds the source `Image`, one
+  prepared buffer and a counter the tests read. It is `Clone` and `Debug`; the buffer is
+  straight RGBA with the rounded corners already folded into its alpha, so a draw needs a
+  blend and no coverage test.
+- **What prepares again.** The key is the device width and height, the display scale's bits
+  and the device corner radius's bits. A move (a different rectangle of the same size), a
+  clip change or an alpha change does not prepare. A size, scale or radius change replaces
+  the one prepared size; there is no cache of several sizes, which is the caller's decision
+  if it wants one.
+- **The same scaler, not a second one.** The scaling that was inside `Painter::image` moved
+  to its own file, `gfx/painted.rs`, as `Scaled` (taps, the across pass and the down pass)
+  and `blend_pixel`. `image` still uses it, so its pixels are unchanged; `prepare_image`
+  uses the same sampling and folds `corner_cover` into alpha; `blit_rgba` reuses
+  `blend_pixel` at 1:1. `gfx/shapes.rs` no longer holds the picture code (it was already
+  over a thousand lines; it is 832 now, and `painted.rs` is 513).
+- **A prepared draw matches `Painter::image`** at the same device size, within 2 levels a
+  channel: the difference is the 8-bit rounding of the prepared buffer, and the test checks
+  scales 1, 1.5 and 2, a rounded corner, half alpha and a cut-out.
+- **Limits.** A target over 1024 device px a side or a million pixels is handed to
+  `Painter::image`, which allocates only the visible part; a huge finite target therefore
+  draws its visible corner and prepares nothing. A zero, negative, NaN or infinite rectangle
+  draws nothing; a non-finite alpha draws nothing; an infinite or NaN radius is no rounding;
+  a huge finite radius is cut to half the smaller side. `Scaled::take` does its arithmetic in
+  64-bit and refuses a side beyond `i32::MAX` device px, so an absurd rectangle cannot
+  overflow or ask for a buffer larger than the clip it draws into.
+- **The decoder slot.** `Decoder` is a trait with one method, `decode(&[u8]) ->
+  Option<Image>`; any `Fn(&[u8]) -> Option<Image>` is one, so an application writes a closure
+  for GIF, WebP, ICO or SVG. `Picture::load(bytes, limits, Some(&slot))` reads PNG and JPEG
+  through `mdshared_text::image::decode`; the slot is asked only when that says
+  `Unsupported`, never for a damaged PNG or JPEG. What the slot returns is held to the same
+  `Limits` (`TooLarge` when over them). It is not a registry and there is no global: the slot
+  is passed to the call that uses it.
+- **New public API:** `picture::{Picture, Decoder}`; `Picture::{new, load, size, draw}`.
+  `Painter::blit_rgba` and `prepare_image` are crate-private. No existing signature, public
+  field or drawing changed.
+
+Tests, six in `picture::tests`:
+
+- `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (three scales, radius,
+  alpha and a cut-out, within 2 levels a channel).
+- `a_second_draw_at_the_same_size_does_not_prepare_again` (draw, redraw, move: one prepare).
+- `a_size_or_scale_change_prepares_again` (a wider target, the same device size at another
+  scale, back again, a new radius: one prepare each).
+- `the_clip_and_the_offset_are_honoured` (the clipped draw is the whole draw's pixels inside
+  the clip; the offset moves them by whole pixels without preparing again).
+- `zero_nan_and_huge_sizes_neither_panic_nor_prepare` (zero, negative, NaN and infinite
+  rectangles and a zero, NaN radius with zero alpha draw nothing; a huge finite target is not
+  prepared; huge, infinite and NaN radii on a finite rectangle are cut or dropped).
+- `the_decoder_slot_reads_a_format_the_toolkit_refuses` (a GIF-shaped closure; no slot gives
+  the built-in error; a damaged PNG does not reach a slot that would take anything; a slot
+  picture over the limits is `TooLarge`).
+
+Every new item is new API, so the tests do not compile on the code before this branch: that is
+their fail-before evidence. Each behaviour was also checked by breaking it and watching the
+test fail. Making the key check always true (prepare on every draw) failed
+`a_second_draw_at_the_same_size_does_not_prepare_again`,
+`a_size_or_scale_change_prepares_again`, `the_clip_and_the_offset_are_honoured` and
+`zero_nan_and_huge_sizes_neither_panic_nor_prepare`. Removing the corner coverage from
+`prepare_image` failed `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size`
+(by 253 levels). Removing the clip from `blit_rgba` failed
+`the_clip_and_the_offset_are_honoured`. Making `load` never call the slot failed
+`the_decoder_slot_reads_a_format_the_toolkit_refuses`.
+
+Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (exit 0;
+mdshared-ui 1126 passed, 33 ignored, doc-tests 5 passed and 1 ignored; the other crates all
+passed). Not run: release builds, the rest of the seventeen-command matrix, Linux and macOS
+(CI will). **Not seen in a real window**: no application or example draws a `Picture` yet, and
+no person has looked at it; the evidence is pixel tests against `Painter::image`.
