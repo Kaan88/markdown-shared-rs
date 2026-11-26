@@ -11,6 +11,7 @@
 //! Everything here is in device pixels, touches only the rectangle and does integer arithmetic:
 //! a cross-fade is three multiplies a byte, a push is a copy.
 
+use crate::frost::{Key, MARK, avoid_mark};
 use mdshared_text::Bitmap;
 
 /// The pixels of a rectangle of a bitmap, as they were when it was taken.
@@ -40,11 +41,35 @@ fn mix(old: u8, new: u8, a: u32) -> u8 {
 /// from two premultiplied inputs.
 fn mix_alpha(old: u8, new: u8, a: u32) -> u8 {
     let alpha = mix(old, new, a);
-    if old == crate::frost::MARK || new == crate::frost::MARK {
+    if old == MARK || new == MARK {
         alpha
     } else {
-        crate::frost::avoid_mark(alpha)
+        avoid_mark(alpha)
     }
+}
+
+/// Mixes only unlike kinds of pixel after decoding chrome. Two chrome pixels stay marked
+/// (and keep the legacy colour mix), and the endpoints are always copied exactly.
+fn mix_pixel(mut old: [u8; 4], mut new: [u8; 4], a: u32, key: Option<&Key>) -> [u8; 4] {
+    if a == 0 {
+        return old;
+    }
+    if a == 256 {
+        return new;
+    }
+    let (was, now) = (old[3] == MARK, new[3] == MARK);
+    let decoded = key.filter(|_| was != now);
+    let alpha = if let Some(key) = decoded {
+        let marked = if was { &mut old } else { &mut new };
+        *marked = key.apply(u32::from_le_bytes(*marked)).to_le_bytes();
+        // A decoded chrome pixel can have alpha 254; the intermediate result must not.
+        avoid_mark(mix(old[3], new[3], a))
+    } else {
+        mix_alpha(old[3], new[3], a)
+    };
+    let channel =
+        |i: usize| mix(old[i], new[i], a).min(if decoded.is_some() { alpha } else { 255 });
+    [channel(0), channel(1), channel(2), alpha]
 }
 
 /// A fraction as parts of 256.
@@ -167,7 +192,7 @@ impl Snapshot {
     /// mix and the mark stays; where neither is, this is `crossfade`. With no key it is
     /// `crossfade`. A pixel written with its own alpha is premultiplied: draw nothing over it
     /// before the frame is presented (the next frame draws the region again from the back).
-    pub fn crossfade_keyed(&self, bmp: &mut Bitmap, t: f32, key: Option<&crate::frost::Key>) {
+    pub fn crossfade_keyed(&self, bmp: &mut Bitmap, t: f32, key: Option<&Key>) {
         let Some(key) = key else {
             return self.crossfade(bmp, t);
         };
@@ -175,17 +200,6 @@ impl Snapshot {
         if a == 256 || a == 0 || !self.fits(bmp) {
             return self.crossfade(bmp, t);
         }
-        let mark = crate::frost::MARK;
-        // A pixel as the compositor takes it: alpha, red, green, blue, premultiplied.
-        let shown = |px: &[u8]| -> [u32; 4] {
-            if px[3] == mark {
-                let v = key.apply(u32::from_le_bytes([px[0], px[1], px[2], px[3]]));
-                [v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]
-            } else {
-                [px[3] as u32, px[2] as u32, px[1] as u32, px[0] as u32]
-            }
-        };
-        let mixed = |o: u32, n: u32| (o * (256 - a) + n * a + 128) >> 8;
         let n = self.w as usize * 4;
         for row in 0..self.h {
             let o = self.at(bmp, row);
@@ -197,22 +211,7 @@ impl Snapshot {
                 .iter_mut()
                 .zip(old.as_chunks::<4>().0)
             {
-                let (was, now) = (s[3] == mark, d[3] == mark);
-                if was == now {
-                    for i in 0..3 {
-                        d[i] = mix(s[i], d[i], a);
-                    }
-                    d[3] = if was { mark } else { mix_alpha(s[3], d[3], a) };
-                    continue;
-                }
-                let (os, ns) = (shown(&s[..]), shown(&d[..]));
-                let out: [u32; 4] = std::array::from_fn(|i| mixed(os[i], ns[i]));
-                // 254 would be taken for chrome and keyed again; one step more is opaque enough.
-                let alpha = u32::from(crate::frost::avoid_mark(out[0] as u8));
-                d[0] = out[3].min(alpha) as u8;
-                d[1] = out[2].min(alpha) as u8;
-                d[2] = out[1].min(alpha) as u8;
-                d[3] = alpha as u8;
+                *d = mix_pixel(*s, *d, a, Some(key));
             }
         }
     }
@@ -224,10 +223,21 @@ impl Snapshot {
     /// as a padded page's is, shows no seam. With no offset this is
     /// [`crossfade`](Self::crossfade).
     pub fn slide_fade(&self, bmp: &mut Bitmap, dx: i32, dy: i32, t: f32) {
+        self.slide_fade_keyed(bmp, dx, dy, t, None);
+    }
+
+    pub(super) fn slide_fade_keyed(
+        &self,
+        bmp: &mut Bitmap,
+        dx: i32,
+        dy: i32,
+        t: f32,
+        key: Option<&Key>,
+    ) {
         if dx == 0 && dy == 0 {
-            return self.crossfade(bmp, t);
+            return self.crossfade_keyed(bmp, t, key);
         }
-        self.moved(bmp, dx, dy, parts(t), false);
+        self.moved(bmp, dx, dy, parts(t), false, key);
     }
 
     /// The present content of the rectangle moved by `dx, dy` device px, with the snapshot moved
@@ -238,13 +248,13 @@ impl Snapshot {
         if dx == 0 && dy == 0 {
             return;
         }
-        self.moved(bmp, dx, dy, 256, true);
+        self.moved(bmp, dx, dy, 256, true, None);
     }
 
     /// The shared loop of [`slide_fade`](Self::slide_fade) and [`push`](Self::push). The rows
     /// are walked away from the direction of the move, so the row a row reads from has not been
     /// written yet, and each source row is copied out before its own row is written.
-    fn moved(&self, bmp: &mut Bitmap, dx: i32, dy: i32, a: u32, push: bool) {
+    fn moved(&self, bmp: &mut Bitmap, dx: i32, dy: i32, a: u32, push: bool, key: Option<&Key>) {
         if !self.fits(bmp) {
             return;
         }
@@ -270,9 +280,14 @@ impl Snapshot {
             let ahead = self.row(if inside { row } else { from.rem_euclid(h) });
             let o = self.at(bmp, row);
             let dst = &mut bmp.pixels[o..o + n];
-            for col in 0..w {
-                let from = col - dx;
-                let d = col as usize * 4;
+            for (col, (dst, old)) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(old.as_chunks::<4>().0)
+                .enumerate()
+            {
+                let from = col as i32 - dx;
                 let px: [u8; 4] = if (0..w).contains(&from) || !push {
                     let s = from.clamp(0, w - 1) as usize * 4;
                     [source[s], source[s + 1], source[s + 2], source[s + 3]]
@@ -280,10 +295,7 @@ impl Snapshot {
                     let s = from.rem_euclid(w) as usize * 4;
                     [ahead[s], ahead[s + 1], ahead[s + 2], ahead[s + 3]]
                 };
-                for i in 0..3 {
-                    dst[d + i] = mix(old[d + i], px[i], a);
-                }
-                dst[d + 3] = mix_alpha(old[d + 3], px[3], a);
+                *dst = mix_pixel(*old, px, a, key);
             }
         }
     }
