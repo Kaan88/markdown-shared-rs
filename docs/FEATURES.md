@@ -1868,12 +1868,14 @@ then fell through to `Outcome::Ignored`, which a menu bar takes as "move to the 
 
 Two additions, both opt-in; a caller that uses neither behaves exactly as before:
 
-- `Cascade::cancel_wait(&mut self)` drops the waiting pointer change without making it:
-  nothing opens or closes, and `deadline()` is `None`. It puts the menus back on the open path:
-  the pointer had lit the row it moved onto, though that row's submenu never opened, so the row
-  that opened each open submenu is lit again, and the keys go to the innermost open menu. What
-  is drawn changes when the pointer had lit another row, nothing else. Called before forwarding
-  Escape or Left, those keys then close only the innermost submenu.
+- `Cascade::cancel_wait(&mut self) -> bool` drops the waiting pointer change without making
+  it: nothing opens or closes, and `deadline()` is `None`. It puts the menus back on the open
+  path: the pointer had lit the row it moved onto, though that row's submenu never opened, so
+  the row that opened each open submenu is lit again, and the keys go to the innermost open
+  menu. What is drawn changes when the pointer had lit another row, nothing else. Called before
+  forwarding Escape or Left, those keys then close only the innermost submenu. It returns true
+  when a wait was dropped, as `pointer` and `tick` return whether they changed anything, and
+  false when nothing was waiting, in which case nothing is touched at all.
 - `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` do exactly that for
   Escape and Left (it calls the same `cancel_wait`), and has Left close the innermost open
   submenu even when the keys are in the menu before it (where it is `Ignored` otherwise), so
@@ -1881,8 +1883,16 @@ Two additions, both opt-in; a caller that uses neither behaves exactly as before
   rows that opened the menus still open stay lit. Every other key still makes a waiting change
   first.
 
+Known limit, with the switch on: where the keys land after Left depends on whether a wait was
+dropped. If one was, they go to the innermost open menu, where `cancel_wait` puts them; if not,
+they stay where the pointer put them, in the root. The same picture can therefore react
+differently to the Down that follows. The next pointer move resets this.
+
 Tests, in `submenu_tests.rs`:
 
+- `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`: from a cascade
+  with nothing waiting, `cancel_wait()` is false, the keys stay in the root and no lit row
+  moves; Down then acts in the root, not in the submenu.
 - `cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu` and
   `cancel_wait_drops_a_waiting_close_from_the_padding_too`: submenu open, a close waiting from
   a pointer onto another main-menu row (resp. onto the padding above the first row);
@@ -1915,11 +1925,13 @@ call it failed on `deadline()`. For the review's commit, with the production hun
 old `cancel_wait` body, the switch dropping the wait without `cancel_wait`, and neither closing
 arm re-lighting the path), seven tests failed and the guard passed; the first was `the lit row
 of menu 0 opened the next: left: Some(3), right: Some(1)` — Print lit while Open recent's
-submenu is still open, the defect the review found.
+submenu is still open, the defect the review found. With the early return removed from
+`cancel_wait`, `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`
+failed: it returned true and moved the keys into the submenu.
 
 Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
 test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
-explorer_tests` (exit 0; mdshared-ui 1128 passed, 33 ignored; doctests pass). Not run: the
+explorer_tests` (exit 0; mdshared-ui 1129 passed, 33 ignored; doctests pass). Not run: the
 release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
 feature clippy/test lines, Linux and macOS. Not seen by a person in a window.

@@ -713,7 +713,7 @@ fn cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu() {
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
     assert_eq!(c.deadline(), Some(t0 + ms(50) + DELAY));
-    c.cancel_wait();
+    assert!(c.cancel_wait(), "a close was waiting");
     assert_eq!(c.deadline(), None);
     assert_eq!(
         (c.depth(), hover(&c, 0), c.focus()),
@@ -729,7 +729,7 @@ fn cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu() {
     );
     assert_eq!(c.key(&KeyName::Escape), Outcome::Close);
     // Nothing waiting, nothing to drop: the keys stay where they are.
-    c.cancel_wait();
+    assert!(!c.cancel_wait(), "nothing was waiting");
     assert_eq!((c.deadline(), c.focus()), (None, 0));
 }
 
@@ -746,7 +746,7 @@ fn cancel_wait_drops_a_waiting_close_from_the_padding_too() {
     assert!(!c.menu(0).unwrap().row_rect(0).contains(x, y));
     c.pointer(x, y, t0 + ms(50));
     assert_eq!((c.focus(), c.deadline()), (0, Some(t0 + ms(50) + DELAY)));
-    c.cancel_wait();
+    assert!(c.cancel_wait(), "a close was waiting");
     assert_eq!(c.deadline(), None);
     assert_eq!((c.depth(), c.focus()), (2, 1), "nothing was applied");
     assert_path_lit(&c);
@@ -763,7 +763,7 @@ fn cancel_wait_then_left_closes_only_the_submenu_with_the_switch_off() {
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
     assert_eq!(hover(&c, 0), Some(3), "the pointer lit Print");
-    c.cancel_wait();
+    assert!(c.cancel_wait(), "a close was waiting");
     assert_path_lit(&c);
     assert_eq!(hover(&c, 0), Some(1), "Open recent is lit again");
     assert_eq!(c.focus(), 1, "the keys are back in the submenu");
@@ -781,7 +781,7 @@ fn cancel_wait_lights_the_open_path_of_a_deep_cascade() {
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
     assert_eq!(hover(&c, 0), Some(3));
-    c.cancel_wait();
+    assert!(c.cancel_wait(), "a close was waiting");
     assert_path_lit(&c);
     assert_eq!((hover(&c, 0), hover(&c, 1)), (Some(1), Some(2)));
     assert_eq!(c.focus(), 2, "the keys are back in the innermost menu");
@@ -790,6 +790,26 @@ fn cancel_wait_lights_the_open_path_of_a_deep_cascade() {
     assert_eq!((c.depth(), c.path()), (2, &[1][..]));
     assert_eq!((hover(&c, 0), hover(&c, 1)), (Some(1), Some(2)));
     assert_path_lit(&c);
+}
+
+#[test]
+fn cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    // Open recent's submenu open, the pointer resting on its row, nothing waiting.
+    let mut c = recent_open(t0);
+    assert_eq!((c.depth(), c.focus(), c.deadline()), (2, 0, None));
+    let lit = (hover(&c, 0), hover(&c, 1));
+    assert!(!c.cancel_wait(), "nothing was waiting");
+    assert_eq!((c.depth(), c.focus(), c.deadline()), (2, 0, None));
+    assert_eq!(
+        (hover(&c, 0), hover(&c, 1)),
+        lit,
+        "the keys stay in the root and no lit row moves"
+    );
+    // Down acts in the root, where the keys still are: the submenu closes and the root steps.
+    assert_eq!(c.key(&KeyName::Down), Outcome::Changed);
+    assert_eq!((c.depth(), c.focus(), hover(&c, 0)), (1, 0, Some(2)));
 }
 
 #[test]

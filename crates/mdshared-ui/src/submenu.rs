@@ -442,14 +442,11 @@ impl<T: Clone> Cascade<T> {
 
     /// Whether Escape and Left act on what is open now instead of on what the pointer last
     /// asked for; off by default. On, [`key`](Self::key) does for those two keys what
-    /// [`cancel_wait`](Self::cancel_wait) does (drops the wait, lights the open path again,
-    /// gives the keys to the innermost menu), and Left closes the innermost open submenu even
+    /// [`cancel_wait`](Self::cancel_wait) does, and Left closes the innermost open submenu even
     /// when the keys are in the menu before it, where it is [`Outcome::Ignored`] otherwise;
-    /// either key leaves the rows that opened the menus still open lit.
-    ///
-    /// For an application whose Escape closes only the submenu: with the switch off, a close
-    /// the pointer asked for less than [`DELAY`] ago runs first, and Escape then finds the root
-    /// alone open and is [`Outcome::Close`], which takes the whole menu.
+    /// either key leaves the rows that opened the menus still open lit. With the switch off, a
+    /// close the pointer asked for less than [`DELAY`] ago runs first, and Escape then finds
+    /// the root alone open and is [`Outcome::Close`], which takes the whole menu.
     pub fn keys_cancel_wait(mut self, on: bool) -> Self {
         self.keys_cancel_wait = on;
         self
@@ -521,7 +518,9 @@ impl<T: Clone> Cascade<T> {
     }
 
     /// Drops a change the pointer asked for that still waits, without making it: nothing is
-    /// opened or closed, and [`deadline`](Self::deadline) is `None` afterwards.
+    /// opened or closed, and [`deadline`](Self::deadline) is `None` afterwards. Returns true
+    /// when something was waiting and is dropped, false when nothing was waiting, in which
+    /// case nothing at all is touched.
     ///
     /// The menus go back onto their open path: the pointer had lit the row it moved onto,
     /// though that row's submenu never opened, so the row that opened each open submenu is lit
@@ -537,13 +536,14 @@ impl<T: Clone> Cascade<T> {
     /// submenu only.
     ///
     /// [`keys_cancel_wait`](Self::keys_cancel_wait) has `key` do this itself for those two keys.
-    pub fn cancel_wait(&mut self) {
+    pub fn cancel_wait(&mut self) -> bool {
         if self.pending.take().is_none() {
-            return;
+            return false;
         }
         let last = self.menus.len() - 1;
         self.hold_path(last);
         self.focus = last;
+        true
     }
 
     /// Whether `x`, `y` is in any open menu (as last placed).
