@@ -57,7 +57,7 @@ stall or a minute minimised, what was in flight goes on from where it was and do
 | `Periodic` | A cycle with its settings: a period, `.ping_pong()`, `.still_at(phase)` for reduced motion; `.phase(anim, id)`, and `.at(elapsed)` for the arithmetic alone |
 | `fluent` | The Windows 11 timings and curves, and motions made of them (below) |
 | `Snapshot` | A saved rectangle of the bitmap, and its `crossfade`, `slide_fade` and `push` with what was drawn there since. It is blended only into a bitmap of the size it was taken from |
-| `PageTransition` | A page or tab switch of a region, driven by a `Snapshot` of the old page. It ends at once if the bitmap's size, the scale or the region changes under it |
+| `PageTransition` | A page or tab switch of a region, driven by a `Snapshot` of the old page. It ends at once if the bitmap's size, the scale or the region changes under it, unless the old page is drawn again at the new size and handed to `rebase` |
 | `Transient<T>` | A slot for a thing that comes and goes, which keeps it while its exit plays |
 | `pop` | Draws anything faded as a whole and moved into place: the entrance and exit of a popup |
 | `unfold` | Draws anything cut off below a line that runs down it, from `UNFOLD_FROM` (0.6) opaque to whole: a menu hanging from its control |
@@ -257,6 +257,14 @@ its background (it repeats that edge behind the moving page); `Push { from }` mo
 and mixes nothing. An application whose bitmap no longer holds the old page at that moment draws
 the old page once more, takes `p.snapshot(content_rect)` and passes it to `begin_with`.
 
+A switch can also go on through a resize. `page_switch.fits(&bitmap)` says whether the saved old
+page is still of the bitmap's size; when it is not (the window was resized), the application
+draws the old page again, laid out at the new size, takes `p.snapshot(new_region)` of it, and
+gives that to `page_switch.rebase(&mut anim, old, scale)` in that same frame, before drawing the
+new page and calling `apply`: the switch keeps its progress instead of starting its time again.
+The effect and the timing stay; a `rebase` with nothing running does nothing, and an empty
+snapshot or reduced motion ends the switch.
+
 Smooth scrolling. `scroll::SmoothScroll` stands in for the bare offset:
 
 ```rust
@@ -417,7 +425,9 @@ steps smaller than an `f32` has there and end exactly on target; an `Id` reads t
 name reads; an `Rgb` spring stops at most two frames after the colour read stops changing; the
 checked bezier refuses six kinds of wrong curve and the constant form never gives a value that
 is not a number; a page switch under a resize, a new scale or a moved region ends with the frame
-equal to the new page drawn plainly, for all three effects; the example above as a doc-test;
+equal to the new page drawn plainly, for all three effects, and one given the old page again at
+the new size (`fits`, `rebase`) goes on with its progress and matches a switch that began at that
+size, pixel for pixel; the example above as a doc-test;
 `cycle`, `Periodic` (against a second way of computing it, on 2000 times from a fixed-seed LCG)
 and `blink` (150 frames for a minute of blinking, each deadline at the next change); the spinner
 and the busy bar at a phase pixel for pixel as a copy of the old code drew them; and the logic of
