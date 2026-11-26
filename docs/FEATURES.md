@@ -4,6 +4,69 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Vertical-only text hinting (`mdshared_text::text`)
+
+On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
+skrifa to preserve linear metrics, but that is not a guarantee of bit-identical X coordinates:
+the hinted draw can use different scaling precision. Skrifa can return a rounded TrueType
+advance from that draw; swash uses only the outline and discards the returned metrics. The
+rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
+commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
+rather than risking a bad point match. The existing quarter-pixel X phases, subpixel offsets,
+colour glyph sources, and blending are unchanged. Parley still supplies all positions and
+advances; no API or dependency was added.
+
+At fractional device sizes, the fitter first checks bit 3 of the font's OpenType
+`head.flags`. If it is set (or cannot be read), the fitter skips hinting: skrifa's
+TrueType hinter can otherwise supply Y coordinates from a rounded size. Both installed
+Segoe UI (`segoeui.ttf`, `0x001B`) and Segoe UI Variable (`SegUIVar.ttf`, `0x000B`) set
+this bit. The glyph cache keys the exact size so a nearby whole and fractional size
+cannot reuse each other's masks.
+
+What that means with the default UI font: hinting happens only at whole device sizes. At 100%,
+12 to 14 px text is hinted. At 125% and 150%, 13 px (16.25 and 19.5 device px) and 14 px at
+125% (17.5) are never hinted and draw as before this change; 12 px at 125% and 150% (15 and
+18) and 14 px at 150% (21) are hinted. Rounding the device size (ROADMAP TS2) is the way to
+get hinting at those scales.
+
+On Windows, the 13 px Segoe UI `H` test verifies that the cap and crossbar sit on whole rows,
+its X coordinates match the unhinted outline bit for bit, and the actual glyph mask changes.
+That test failed with the vertical fit bypassed. The fractional-size raster tests compare
+every glyph of a word and its superscript, at four X phases, against swash's unhinted
+masks and placements. They failed before the fix at 16.25 and 19.5 device px. A cache test
+also failed before the fix when 16 and 16 + 1/128 px reused a mask. The former layout test
+was removed: drawing borrows an immutable layout and comparing it with itself or a fresh
+layout supplied no independent baseline. The UI sheet's 18 measured widths per scale
+are byte-identical across the unhinted, pre-fix and fixed renders.
+
+The review PNGs at 100%, 125%, and 150% show 12, 13 and 14 px UI labels and the `termview`
+grid in both themes. See `E:/mds-target/vhint/shots/review/{unhinted,before,after}/`.
+The review fix changed 143 pixels on the 125% UI sheet; the other five sheets did not
+change from the pre-fix render.
+
+**Left open for review:**
+
+- The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only runs on
+  Windows; the UI asks for Segoe UI Variable Text first. All the hinting tests, including the
+  cache-key test that needs no Segoe UI, are `cfg(windows)`, so Linux and macOS CI check none
+  of this.
+- Outline-matching fallback happens glyph by glyph and is not counted.
+- A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
+  hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
+  has not been measured.
+- The exact-size cache key also drops the old 1/64 px bucketing for unhinted glyphs, so sizes
+  that differ only by float noise no longer share masks (fewer hits, not wrong pixels). Keying
+  on "hinted or not" plus the old bucket would keep the old hit rate.
+- `fract() == 0.0` is exact: a computed 16.000002 counts as fractional and stays unhinted.
+  Treating sizes within 1/128 px of a whole number as whole would be safe.
+
+Windows verification: formatting, workspace Clippy and tests with `host,a11y` (the tests
+excluded `explorer_tests`), `term` Clippy and `termview` tests, and the UI ignored tests
+without a specimen directory override passed. No existing pixel test expectation needed
+updating. The full release CI matrix was not run.
+The sheets have not been judged by a person or checked in a running application. Linux and
+macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
+
 ## Vue and Svelte highlighting (`mdshared-highlight`)
 
 `.vue` and `.svelte` files, and the fence names `vue` and `svelte`, are highlighted by a line
@@ -1786,6 +1849,67 @@ reviewing session, not by the owner), the speed test (`termview_speed`, release)
 `cargo clippy -p mdshared-ui --features term --all-targets -- -D warnings`, and
 `cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
 has been seen only through the application that uses it.
+
+## A translucent terminal background (`mdshared_ui::termview`, feature `term`, roadmap CS1)
+
+Enable Mica or Acrylic with `Cx::set_backdrop`, then use `draw_screen_with_background` or
+`draw_rows_with_background` with `BackgroundOpacity::new(0.65).with_padding(true)`. Padding
+is opaque by default. Redraw the whole area when changing the opacity or padding option;
+otherwise the rows call still works with damage bands. To blink the cursor, use
+`cursor_blinks_on` to decide what to pass to `View::cursor_shown`. The old draw calls and
+opacity `1.0` give the same opaque pixels as before.
+
+On Windows the host asks DWM for per-pixel alpha through the blur-behind setup, and for Mica
+or Acrylic through the system backdrop attribute. It copies damaged BGRA pixels into
+softbuffer's Win32 DIB, keys out alpha-254 chrome, and softbuffer copies the DIB to the window
+with `BitBlt`. The terminal does not use that chrome key colour or its veil. Each affected row
+replaces its background with premultiplied pixels. Over translucent pixels, glyphs use
+grayscale coverage instead of subpixel colour masks. Partial coverage of glyphs, colour emoji,
+box edges and shades blends both colour and alpha, leaving the uncovered fraction for DWM to
+composite. Fully covered ink, explicit backgrounds, inverse cells, selection and a filled block
+cursor stay opaque. The row's finish and the animation blends avoid producing alpha 254 from
+premultiplied pixels, so the chrome key does not key them out. There is no separate surface,
+mask buffer, or change to the present path.
+
+The floor keeps the nominal ink at least 4.5:1 against the default background in the 8-bit
+composite if it already had that contrast when opaque. Black and white bound the possible
+composited background in each channel, so checking the near bound in luminance covers
+intermediate desktop colours too. Ink that starts below 4.5:1 (for example dim ANSI colours)
+keeps its original opaque background instead of being recoloured. This can make individual
+`ls --color` cells look like solid rectangles; that is expected and avoids making those
+colours harder to read. This is a floor for the foreground colour, not a contrast claim for
+every antialiased sample or colour-emoji palette.
+
+The stock host uses the opaque path when the backdrop is off, unavailable or refused, when
+the window loses focus, under high contrast, and on Linux and macOS. If an application owns
+its own loop, only give the painter a frost key while its present path supports premultiplied
+alpha and a backdrop is active. These pixels are ready to present: do not pass the terminal
+area through the chrome's `Cx::frost`. Ordinary scrollbars (including animated and horizontal
+variants) and `Painter::text` for IME or search labels are not safe directly over these pixels.
+Reserve an opaque gutter or fill an opaque backing under the full overlay bounds, including
+its antialiased edges. Repaint the terminal when removing the overlay.
+
+Verified on Windows: requested debug lint and test commands, the release lint and test
+matrix (the workspace runs skipped `explorer_tests`), the two-second host example,
+fail-before checks with the new paths disabled, and `terminal_backdrop_sheet` (simulated
+desktops, light and dark, at 1 and 1.5). The two-second `term_backdrop` runs logged the
+backdrop active while focused for Acrylic and Mica, and inactive with `--off` and on focus
+loss. No compositor screenshot or human visual approval; high contrast was not toggled
+live. Linux and macOS were not run.
+
+The review fix was checked with the Windows debug commands, the specimen, and two-second
+terminal runs with Acrylic, Mica and the backdrop off. Pixel regressions check the edges
+over black and white, the frost marker throughout a fade, and repeat repaint of an already
+translucent row. The release matrix was not rerun for the review fix.
+
+Left open from the re-review:
+- No test pins the subpixel path on opaque pixels while a backdrop is active. A glyph on an
+  explicit background, compared pixel for pixel with `draw_screen`, would cover it.
+- The repaint test is a regression guard: it also passes on the commit before the fix.
+- Overlays are documented only. `scroll::draw_scrollbar` (0.55 and 0.85 alpha) still lets the
+  desktop show through for an app that skips the gutter. Possible guards: a `debug_assert!` on
+  a destination alpha below 255 that is not the chrome value, or an opaque-backing option on
+  the scrollbar.
 
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 

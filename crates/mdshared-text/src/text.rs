@@ -1,7 +1,8 @@
 //! CPU text: parley shapes and lays out, swash rasterizes, this module blends. Ported from the
 //! Phase 0 text spike (`spikes/text`), which the user accepted after the subpixel fix. The glyph
 //! cache is byte-capped, and text uses subpixel masks in the order [`Subpixel`] names (RGB by
-//! default), or greyscale coverage with `Subpixel::None`.
+//! default), or greyscale coverage with `Subpixel::None`. Only the height of an outline is
+//! grid-fitted; its horizontal geometry and parley's layout are left alone.
 
 use crate::bitmap::Bitmap;
 use parley::{FontData, Layout, PositionedLayoutItem};
@@ -11,6 +12,9 @@ use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Format, Vector};
 use swash::{CacheKey, FontRef};
+
+mod vertical;
+use vertical::{Vertical, can_hint_at_size};
 
 pub type Brush = [u8; 4];
 
@@ -98,6 +102,7 @@ struct Key {
     font: u64,
     index: u32,
     glyph: u16,
+    /// Exact device-size bits: a whole-pixel size and a nearby fraction can hint differently.
     size: u32,
     sub: u8,
     coords: u64,
@@ -181,6 +186,7 @@ impl CacheStats {
 
 pub struct TextEngine {
     scaler: ScaleContext,
+    vertical: Vertical,
     fonts: HashMap<(u64, u32), (FontData, u32, CacheKey)>,
     map: GlyphMap,
     tick: u64,
@@ -196,6 +202,7 @@ impl TextEngine {
     pub fn new(cap: usize) -> Self {
         TextEngine {
             scaler: ScaleContext::new(),
+            vertical: Vertical::default(),
             fonts: HashMap::new(),
             map: GlyphMap::default(),
             tick: 0,
@@ -227,7 +234,7 @@ impl TextEngine {
         &mut self,
         key: Key,
         font: &FontData,
-        coords: impl Iterator<Item = i16>,
+        coords: impl Iterator<Item = i16> + Clone,
         size: f32,
     ) -> Entry {
         let cache_key = (font.data.id(), font.index);
@@ -240,21 +247,42 @@ impl TextEngine {
             offset: *offset,
             key: *font_key,
         };
-        let mut scaler = self
+        let mut unhinted = self
             .scaler
             .builder(font_ref)
             .size(size)
             .hint(false)
-            .normalized_coords(coords)
+            .normalized_coords(coords.clone())
             .build();
-        let image = Render::new(&[
+        let format = self.subpixel.format();
+        let offset = Vector::new(key.sub as f32 / 4.0, 0.0);
+        // Keep colour sources as they were. Only the monochrome fallback uses fitted outlines.
+        let color = Render::new(&[
             Source::ColorOutline(0),
             Source::ColorBitmap(StrikeWith::BestFit),
-            Source::Outline,
         ])
-        .format(self.subpixel.format())
-        .offset(Vector::new(key.sub as f32 / 4.0, 0.0))
-        .render(&mut scaler, key.glyph);
+        .format(format)
+        .offset(offset)
+        .render(&mut unhinted, key.glyph);
+        let image = if color.is_some() {
+            color
+        } else if unhinted.scale_outline_into(key.glyph, &mut self.vertical.linear) {
+            if can_hint_at_size(font_ref, size) {
+                let mut hinted = self
+                    .scaler
+                    .builder(font_ref)
+                    .size(size)
+                    .hint(true)
+                    .normalized_coords(coords)
+                    .build();
+                if hinted.scale_outline_into(key.glyph, &mut self.vertical.hinted) {
+                    self.vertical.fit();
+                }
+            }
+            Some(self.vertical.render(format, offset))
+        } else {
+            None
+        };
         let tick = self.tick;
         let Some(image) = image else {
             return Entry {
@@ -337,7 +365,7 @@ impl TextEngine {
         oy: f32,
         clip: (i32, i32, i32, i32),
     ) {
-        self.draw_runs(fb, layout, ox, oy, clip, None);
+        self.draw_runs(fb, layout, (ox, oy), clip, None, false);
     }
 
     /// [`draw_layout_clipped`](Self::draw_layout_clipped) with every glyph in the colour `rgb`
@@ -355,7 +383,24 @@ impl TextEngine {
         clip: (i32, i32, i32, i32),
         rgb: [u8; 3],
     ) {
-        self.draw_runs(fb, layout, ox, oy, clip, Some(rgb));
+        self.draw_runs(fb, layout, (ox, oy), clip, Some(rgb), false);
+    }
+
+    /// Draws tinted glyphs as [`Self::draw_layout_clipped_tinted`] does on opaque pixels.
+    /// On a premultiplied translucent destination, blends ink with a single coverage for
+    /// all three channels so the edge composites correctly over an unknown backdrop. Colour
+    /// glyphs use their own colours and alpha. Pixels with zero coverage are left alone.
+    #[allow(clippy::too_many_arguments)] // same coordinates and tint as the existing draw
+    pub fn draw_layout_clipped_tinted_premultiplied(
+        &mut self,
+        fb: &mut Bitmap,
+        layout: &Layout<Brush>,
+        ox: f32,
+        oy: f32,
+        clip: (i32, i32, i32, i32),
+        rgb: [u8; 3],
+    ) {
+        self.draw_runs(fb, layout, (ox, oy), clip, Some(rgb), true);
     }
 
     /// The drawing of both: each run's brush, or `tint` in its place.
@@ -363,10 +408,10 @@ impl TextEngine {
         &mut self,
         fb: &mut Bitmap,
         layout: &Layout<Brush>,
-        ox: f32,
-        oy: f32,
+        (ox, oy): (f32, f32),
         clip: (i32, i32, i32, i32),
         tint: Option<[u8; 3]>,
+        premultiplied: bool,
     ) {
         let clip = (
             clip.0.max(0),
@@ -408,7 +453,7 @@ impl TextEngine {
                         font: font.data.id(),
                         index: font.index,
                         glyph: glyph.id as u16,
-                        size: (size * 64.0) as u32,
+                        size: size.to_bits(),
                         sub,
                         coords: coord_hash,
                     };
@@ -417,7 +462,15 @@ impl TextEngine {
                     if let Some(entry) = self.map.get_mut(&key) {
                         entry.last_used = tick;
                         self.stats.hits += 1;
-                        blit(fb, clip, entry, floor_x as i32, y as i32, brush, &self.lut);
+                        blit(
+                            fb,
+                            clip,
+                            entry,
+                            (floor_x as i32, y as i32),
+                            brush,
+                            &self.lut,
+                            premultiplied,
+                        );
                         continue;
                     }
                     self.stats.misses += 1;
@@ -430,7 +483,15 @@ impl TextEngine {
                     let Some(entry) = self.map.get(&key) else {
                         continue;
                     };
-                    blit(fb, clip, entry, floor_x as i32, y as i32, brush, &self.lut);
+                    blit(
+                        fb,
+                        clip,
+                        entry,
+                        (floor_x as i32, y as i32),
+                        brush,
+                        &self.lut,
+                        premultiplied,
+                    );
                 }
             }
         }
@@ -442,10 +503,10 @@ fn blit(
     fb: &mut Bitmap,
     clip: (i32, i32, i32, i32),
     entry: &Entry,
-    gx: i32,
-    gy: i32,
+    (gx, gy): (i32, i32),
     brush: Brush,
     lut: &Lut,
+    premultiplied: bool,
 ) {
     if entry.w == 0 || entry.h == 0 {
         return;
@@ -480,6 +541,10 @@ fn blit(
                 if a == 0 {
                     continue;
                 }
+                if premultiplied && d[3] < 255 {
+                    crate::bitmap::blend_premultiplied(d, [s[0], s[1], s[2]], s[3]);
+                    continue;
+                }
                 let ia = 255 - a;
                 // swash emits straight-alpha RGBA; the framebuffer is BGRA.
                 d[0] = ((s[2] as u32 * a + d[0] as u32 * ia + 127) / 255) as u8;
@@ -501,6 +566,12 @@ fn blit(
                     lg[s[1] as usize] as u32,
                     lb[s[2] as usize] as u32,
                 );
+                if premultiplied && d[3] < 255 {
+                    // Collapse the effective subpixel mask; LCD fringes assume a known ground.
+                    let a = ((ar + ag + ab + 1) / 3) as u8;
+                    crate::bitmap::blend_premultiplied(d, [brush[0], brush[1], brush[2]], a);
+                    continue;
+                }
                 d[0] = ((brush[2] as u32 * ab + d[0] as u32 * (255 - ab) + 127) / 255) as u8;
                 d[1] = ((brush[1] as u32 * ag + d[1] as u32 * (255 - ag) + 127) / 255) as u8;
                 d[2] = ((brush[0] as u32 * ar + d[2] as u32 * (255 - ar) + 127) / 255) as u8;
@@ -532,6 +603,57 @@ mod tests {
 
     const SAMPLE: &str = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen \
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
+
+    #[test]
+    fn partial_glyph_coverage_composites_over_black_and_white_without_a_halo() {
+        let lut = Lut(Box::new(std::array::from_fn(|_| {
+            std::array::from_fn(|i| if i == 1 { 0 } else { i as u8 })
+        })));
+        let ink = [220, 200, 180];
+        for (color, data, a) in [
+            (false, vec![1, 1, 1, 32, 64, 96], 64),
+            (true, vec![0, 0, 0, 0, 220, 200, 180, 64], 64),
+        ] {
+            let entry = Entry {
+                left: 0,
+                top: 0,
+                w: 2,
+                h: 1,
+                color,
+                data: data.into_boxed_slice(),
+                last_used: 0,
+            };
+            let mut bmp = Bitmap::new(2, 1);
+            bmp.pixels
+                .copy_from_slice(&[21, 21, 21, 179, 21, 21, 21, 179]);
+            blit(
+                &mut bmp,
+                (0, 0, 2, 1),
+                &entry,
+                (0, 0),
+                [ink[0], ink[1], ink[2], 255],
+                &lut,
+                true,
+            );
+            assert_eq!(&bmp.pixels[..4], &[21, 21, 21, 179]);
+            assert_eq!(
+                bmp.pixels[7],
+                179 + (76.0 * f64::from(a) / 255.0).round() as u8
+            );
+            for (bgr, fg) in ink.into_iter().rev().enumerate() {
+                for desktop in [0.0, 255.0] {
+                    let actual = f64::from(bmp.pixels[4 + bgr])
+                        + f64::from(255 - bmp.pixels[7]) * desktop / 255.0;
+                    let back = 21.0 + 76.0 * desktop / 255.0;
+                    let expected = back + (f64::from(fg) - back) * f64::from(a) / 255.0;
+                    assert!(
+                        (actual - expected).abs() <= 1.0,
+                        "{color}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_clipped_draw_is_the_unclipped_draw_cropped() {

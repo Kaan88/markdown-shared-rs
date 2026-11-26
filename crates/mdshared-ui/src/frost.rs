@@ -30,6 +30,11 @@ use mdshared_text::Bitmap;
 /// The alpha byte of a chrome pixel that [`key_out`] may make transparent.
 pub const MARK: u8 = 254;
 
+/// Alpha 254 belongs to chrome, not to an already composited pixel.
+pub(crate) fn avoid_mark(alpha: u8) -> u8 {
+    if alpha == MARK { 255 } else { alpha }
+}
+
 /// The colour the chrome counts as "nothing drawn": the darkest of the title row, bar and pane
 /// colours in a dark palette and the lightest in a light one, so the other two become a faint
 /// lightening or darkening of the backdrop and keep their difference from it.

@@ -52,13 +52,13 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 
 | Phase | What | Items |
 |---|---|---|
+| B | **Barbican first** (the owner, 2026-11-26: "put barbican top, we'll resume that later"): ahead of every other phase once work on it resumes, which the owner will say; fast-tracked since 2026-11-25; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
 | P | **Purge fast track** (the owner, 2026-11-25), ahead of the rest: merge `feat/anim` to `main`, then W8 (Windows UIA at Purge's scope), W1 (one window), W5b, X8, P1-P7, P8 last and optional; the consumer is `examples/purge_shape.rs`; the checks C1-C3 below | W8, W1, W5b, X8, P1-P8 |
 | 0 | The animation module's review fixes | done on `feat/anim` (`6027946..bc8fa9f`); the breaking changes for mdmix are listed in [FEATURES.md](FEATURES.md), "The review's fixes" |
 | 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens; then the menu's look, which mdplay's mockup asked for (the owner, 2026-11-24), and the look as a user setting | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5, L11, L12 |
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
-| B | **Barbican fast track** (the owner, 2026-11-25): after the md and Purge items, or whenever it is convenient; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
 | CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around, when convenient; CS1 and CS2 first (below) | CS1-CS15 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
@@ -129,6 +129,18 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | done: `select` keeps its text (`follow`, `is_intact`) and words and lines cross a soft wrap (write-up in `docs/FEATURES.md`) |
 | T7 | **Colour schemes and IME at the cursor.** The 16 colours and the default pair as a scheme (with the palette's light and dark), and the IME composition window placed at the terminal's cursor with the preedit drawn in the cells | M | medium | none | T1, `textfield::Preedit`, winit `set_ime_cursor_area` | open |
 | T8 | **Run the Unix pseudo-terminal.** `mdshared-pty` on Linux and macOS was compiled and linted from Windows and never run: start a shell, type, resize (`SIGWINCH`), exit status and signal, a background child holding the terminal open, `SIGHUP` on drop | S | medium | none | `mdshared-pty` | open |
+
+## Text sharpness
+
+These are candidates for later review, not part of vertical-only hinting.
+
+| Id | What | Size | Risk | Deps | Builds on | Status |
+|---|---|---|---|---|---|---|
+| TS2 | **Round the final device font size at fractional scales.** For example, 13 px at 125% is 16.25 device px; compare using 16 px instead. | S | medium | owner decides | `gfx`, `mdshared_text::text` | open |
+| TS3 | **Whole-pixel glyph positions.** Try them for small UI text (under about 14 px at 100%) and use them throughout the terminal grid. Keep quarter-pixel positioning for body text. | M | medium | owner decides | `gfx`, `termview`, `mdshared_text::text` | open |
+| TS4 | **Small light text on dark backgrounds.** Compare stem darkening with a separate gamma for this case. | M | medium | owner decides | `mdshared_text::text` masks and blend tables | open |
+| TS5 | **Follow system ClearType settings.** Respect on/off, contrast and stripe order rather than assuming RGB. The Windows UI already reads on/off and stripe order when `Gfx` is created; review contrast and coverage across text entry points. | M | medium | owner decides | `platform::subpixel_order`, `mdshared_text::text` | open |
+| TS6 | **DirectWrite rasterization on Windows.** Match the native Windows look. This is the largest change, and the rendered look would differ by platform. | XL | high | owner decides | `mdshared_text::text`, `platform` | open |
 
 ## Purge (fast track, 2026-11-25)
 
@@ -268,8 +280,8 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
-| CS1 | **A translucent terminal background** [15]. `termview` draws the default background (and, if asked, the padding round the grid) at a chosen opacity over the window backdrop (Mica, Acrylic, frost), while glyphs, explicit cell backgrounds, the selection and the cursor stay opaque; a contrast floor keeps text readable on any desktop colour. The host's frost has one window-wide key and veil today, and keying the finished grid would key out glyph pixels | M | high | `termview`, `Painter::set_frost_key`, X11 | open |
-| CS2 | **A cursor shape the application chooses** [16]. A renderer-side override on `termview::View` (block, bar, underline; blink on or off), used while the program has not set a shape with DECSCUSR and giving way when it has; visibility and wide-character coverage stay right. No escape sequences fed into the grid | S | low | `termview`, `mdshared_term::Screen` | implemented (`feat/cs2-cursor-shape`) |
+| CS1 | **A translucent terminal background** [15]. `termview` draws the default background (and, if asked, the padding round the grid) at a chosen opacity over the window backdrop (Mica, Acrylic, frost), while glyphs, explicit cell backgrounds, the selection and the cursor stay opaque; a contrast floor keeps text readable on any desktop colour | M | high | `termview`, `Painter::set_frost_key`, X11 | done on `feat/cs1-translucent-bg`: per-pixel alpha independent of the chrome veil; opaque fallback; Windows smoke and pixel tests, not visually inspected in a live window |
+| CS2 | **A cursor shape the application chooses** [16]. A renderer-side override on `termview::View` (block, bar, underline; blink on or off), used while the program has not set a shape with DECSCUSR and giving way when it has; visibility and wide-character coverage stay right. No escape sequences fed into the grid | S | low | `termview`, `mdshared_term::Screen` | done (PR #46, 2d40e07) |
 | CS3 | **Insert and F13-F24 in `keys::KeyName`** [10]; `mdshared_term::input::Key` has them already. Added keys only (the enum's rules in AGENTS.md apply) | S | low | `keys`, `host` | open |
 | CS4 | **The wheel in lines** [13]. `Event::Wheel` gives pixels only, and Shift+wheel arrives as `dx`: say whether the system sent lines or pixels, and the lines | S | medium | `host`, W1 | open |
 | CS5 | **`chrome::draw_tab` that can be placed and styled** [8]: a y not fixed to the title row, a chosen icon, a tab with no close button, and a fill other than `pal.bar` (the app passes a whole palette per tab today) | S | low | `chrome` | open |
