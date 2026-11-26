@@ -2637,3 +2637,49 @@ Known behaviours and limits for later:
   memory.
 - F2, the watcher that says what changed, is still open, and an application's list view is what
   would show this to a person first.
+
+## X13. The Markdown page renderer
+
+Copied without history from `markdown-viewer-rs` at `01f67b2`. `mdshared-md-core` carries
+the parser, document model, rich selection, limits, selection, task boxes, find and links,
+with their autolink, emoji, front matter, HTML and slug helpers. `mdshared-md-render` carries
+the headless page layout, drawing, images and HTML export. `mdshared-md-engine` carries the
+SVG, TeX and Mermaid rasterizer, still shipped as `mdview-engine`; `mdshared-md-engine-proto`
+carries its versionless wire format. `mdshared-md-preview` carries the `MDVPREVIEW7` wire
+format with no default features, plus the rendering loop behind `server`. Both wire
+implementations are byte-identical copies, with independent fixed-byte tests.
+
+The viewer keeps the session, updater, watcher, commands, status, file loading, window
+placement, link previews, single-instance handling and slides, along with their app-only
+tests and the `mdv-bench` and `mdv-app` binaries. The parser uses the toolkit's byte decoder
+directly; mdview's file module had only re-exported it. Switching mdview and mdedit to the new
+packages is mdapps' step. The [renderer README](../crates/mdshared-md-render/README.md)
+explains aliases, release profiles and how to ship the engine.
+
+Core disables `mdshared-app` defaults and builds only `notes`, `wikilink`, `files` and
+`paths`, with zero third-party dependencies from that crate. The default `full` feature
+preserves the old API and dependency set: `notify` 8.2.1 everywhere (inotify on Linux,
+FSEvents on macOS and ReadDirectoryChangesW on Windows), plus direct `windows-sys` 0.59.0
+on Windows. A protocol-only preview client has no dependencies; the renderer and preview
+server talk to the separate engine and do not depend on the engine crate.
+
+The new direct registry dependencies are `pulldown-cmark` 0.13.6, `unicase` 2.10.0,
+`gif` 0.14.2, `image-webp` 0.2.4, `resvg` 0.47.0, `ratex-layout`, `ratex-parser` and
+`ratex-svg` 0.1.15, `ratex-types` 0.1.16 and `merman` 0.9.3 (the source manifest's exact
+registry pin, not a git revision), with the source's 31 diagram features and `svg`.
+The already-locked `memchr`, `regex-syntax`, `serde_json` (test-only), `parley`, `png` and
+`zune-jpeg` are reused. No new CI system package is needed; Linux already installs Fontconfig.
+
+The copied suites include parser specs/fuzzing, fixed Windows pixel goldens, raster jobs
+and preview server tests. Fixtures live in `fixtures/md`: 21 top-level Markdown fixtures,
+eight images, eight goldens and two spec files. Windows debug format, workspace Clippy
+(`host,a11y`), and workspace tests (`host,a11y`, excluding the four `explorer_tests`) passed.
+The moved suites and new wire tests, including the separate `server` run, account for
+388 passing tests, zero failures and five upstream ignored tests. Windows release
+workspace Clippy and tests (same Explorer exclusion) and all seven UI feature Clippy/test
+pairs also passed. Locally, the cold release workspace build took 19m 36s at two jobs;
+the Markdown test executables accounted for about 71s of test time, including 62s of fuzz
+tests. No before/after CI build-time comparison was measured. Linux (with the cross-target
+`pkg-config` stub) and both macOS targets passed Clippy, including the opt-in preview server;
+compiled, not linked or run there. The output was pixel-tested on Windows, not seen by a
+person in an application.

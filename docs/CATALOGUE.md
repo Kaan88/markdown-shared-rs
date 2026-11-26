@@ -36,6 +36,22 @@ motion ([ANIMATION.md](ANIMATION.md)).
 | `mdshared_highlight::incremental` | Highlighting line by line for an editor, with checkpoints and limits | `LineHighlighter`, `Language::for_path` / `by_token`, `Limits`, `Span` |
 | `mdshared_highlight::scan`, `sfc` | The hand-written scanners behind the above (Kotlin, Swift, PowerShell, TypeScript, Vue, Svelte, ...) | `scan::Lang` |
 
+## Markdown pages (`mdshared-md-*`)
+
+**I want to show a Markdown page:** parse it with `mdshared_md_core::parse`, then render
+it with `mdshared_md_render::render` or keep a `DocumentRenderer` for a view that scrolls.
+See the [Markdown renderer README](../crates/mdshared-md-render/README.md) for dependencies,
+engine shipping and editor previews. The renderer does not run a window loop.
+
+| Module or crate | For | Start at |
+|---|---|---|
+| `mdshared_md_core`, `model`, `limits` | Parse Markdown into the document model with bounded input and wiki-link resolution supplied by the caller | `parse`, `parse_bytes`, `parse_wiki_embeds`, `Document`, `limits::notes_config` |
+| `mdshared_md_core::{autolink, emoji, frontmatter, html, slug}` | Recognise bare links, shortcodes, front matter and HTML, and make heading anchors | `find_links`, `replace`, `take`, `Tokenizer`, `Slugger` |
+| `mdshared_md_core::{find, links, rich, select, tasks}` | Search the page, classify links and pictures, copy selected text as HTML and find or toggle task marks | `find`, `classify_link`, `classify_image`, `selection_html`, `word_range`, `document_boxes`, `toggle` |
+| `mdshared_md_render` | Page layout, bitmap drawing, animated images and export, with no window system | `DocumentRenderer`, `Options`, `render`, `render_slice`, `decode_image`, `export_html`, `set_engine_path` |
+| `mdshared_md_engine_proto`, `mdshared_md_engine` | Request and reply frames for a separate process that draws SVG, TeX and Mermaid | `write_request`, `read_reply`; `mdview-engine` binary |
+| `mdshared_md_preview::wire` and crate root | Version 7 editor preview frames; `server` opts into the drawing loop | `Request`, `Update`, `wire::MAGIC`, `Server`, `serve` |
+
 ## Widgets (`mdshared-ui`)
 
 Each is geometry plus drawing; the application records hits and handles the keyboard unless
@@ -148,6 +164,8 @@ The only modules that call the system. Each fails soft where the system lacks th
 ## Application plumbing (`mdshared-app`, `mdshared-fetch`)
 
 No window system. All of it is usable from a test with a temporary folder.
+`mdshared-app` defaults to `full`; with default features off it builds only `notes`,
+`wikilink`, `files` and `paths`, with no third-party dependencies.
 
 | Module | For | Start at |
 |---|---|---|

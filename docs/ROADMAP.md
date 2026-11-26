@@ -299,6 +299,7 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 | X10 | **A page switch that survives a resize.** Redraw the old page at the new size and `begin_with` it | S | low | W1, `anim::PageTransition` | done: `PageTransition::fits` and `rebase` (feat/x10-page-resize); not seen in a real window (no application or example drives `PageTransition`), pixel-tested |
 | X11 | **A veil strength for the backdrop.** The veil over Mica and Acrylic is fixed (Mica 0, Acrylic 150); Purge, whose Mica and Acrylic strength is a setting, re-keys the frost itself. A setter on the host or a veil on `frost::Key`, opt-in. Asked for by Purge, 2026-11-25, not blocking | S | low | `frost`, `host` | done: `Frost::set_veil` and `Cx::set_backdrop_veil(Option<u8>)`, f94d1b6 (PR #27); not seen on a frosted window |
 | X12 | **Faster region blends.** `anim::region::Snapshot::crossfade` and `moved` work one pixel at a time on one core: 3.5-6 ms for an 860k-pixel region on Purge's machine. Whole words at once and bands of rows across cores would bring it to about 1-1.5 ms, and Purge could go back to `PageTransition` from its own transitions; `PageEffect` could also gain Scale and Depth. Pixel-identical to today's blends. Asked for by Purge, 2026-11-25, not blocking | M | medium | `anim::region`, `anim::PageTransition`, `pool` | open |
+| X13 | **Share mdview's Markdown page renderer.** | M | medium | mdview `01f67b2` | done on `feat/md-renderer`: five `mdshared-md-*` crates; switching mdview and mdedit over is mdapps' step |
 
 ## The owner's numbering
 

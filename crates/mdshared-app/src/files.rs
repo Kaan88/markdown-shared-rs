@@ -219,7 +219,7 @@ pub fn create_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 /// Writes `bytes` over the file at `path`, or makes it when it is not there: the write for a
 /// file of the owner's (a rewrite, its undo, a library file, a moved note), where
-/// [`crate::settings::write_atomic`] is the write for the app's own settings files.
+/// With the `full` feature, `settings::write_atomic` is the write for the app's own settings files.
 ///
 /// The bytes go to a temporary name of this function's own beside the file (`name.part`, or a
 /// name with the process id in it), made with `create_new`, so a file of the owner's called
