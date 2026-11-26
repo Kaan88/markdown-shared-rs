@@ -345,6 +345,20 @@ fn a_programs_explicit_default_looking_block_wins_over_the_cursor_preference() {
 }
 
 #[test]
+fn out_of_range_cursor_styles_leave_the_apps_preferred_bar_visible() {
+    let mut s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    for invalid in [b"\x1b[7 q".as_slice(), b"\x1b[12 q"] {
+        s.feed(invalid);
+        f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+        assert_eq!(px(&f.bmp, 0, 9), scheme.cursor);
+        assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+    }
+}
+
+#[test]
 fn a_program_reset_gives_the_cursor_preference_back() {
     let mut s = screen(2, 1, b"\x1b[2 q");
     let mut f = Frame::new(18, 18);

@@ -569,9 +569,10 @@ impl Screen {
         }
     }
 
-    /// Whether the program has chosen a cursor shape and blink with a nonzero DECSCUSR
-    /// parameter. Zero (including an omitted parameter) and a full terminal reset return to
-    /// the default. [`Self::cursor`] still reports the built-in blinking block at that default.
+    /// Whether the program has chosen a cursor shape and blink with DECSCUSR values 1 through 6.
+    /// Zero (including an omitted parameter) and a full terminal reset return to the default.
+    /// Larger values are ignored. [`Self::cursor`] still reports the built-in blinking block at
+    /// the default.
     pub fn cursor_style_is_explicit(&self) -> bool {
         self.cursor_style_is_explicit
     }

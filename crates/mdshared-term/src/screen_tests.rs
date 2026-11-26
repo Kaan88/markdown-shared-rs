@@ -513,6 +513,21 @@ fn an_explicit_cursor_style_is_distinct_from_the_default_and_dirties_its_row() {
 }
 
 #[test]
+fn out_of_range_cursor_styles_leave_the_cursor_and_dirty_rows_unchanged() {
+    let mut s = Screen::new(10, 3, 0);
+    for setup in [b"".as_slice(), b"\x1b[4 q", b"\x1b[5 q"] {
+        s.feed(setup);
+        let before = (s.cursor(), s.cursor_style_is_explicit());
+        s.take_dirty();
+        for invalid in [b"\x1b[7 q".as_slice(), b"\x1b[12 q", b"\x1b[65535 q"] {
+            s.feed(invalid);
+            assert_eq!((s.cursor(), s.cursor_style_is_explicit()), before);
+            assert!(s.take_dirty().is_empty());
+        }
+    }
+}
+
+#[test]
 fn modes_title_bell_and_cursor_shape() {
     let mut s = Screen::new(10, 3, 10);
     assert_eq!(s.modes(), Modes::default());

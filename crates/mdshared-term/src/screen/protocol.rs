@@ -157,6 +157,9 @@ impl Screen {
             (0, [b'!'], b'p') => self.soft_reset(),
             (0, [b' '], b'q') => {
                 let style = p.get(0);
+                if style > 6 {
+                    return;
+                }
                 self.cursor_style_is_explicit = style != 0;
                 self.shape = match style {
                     3 | 4 => CursorShape::Underline,
