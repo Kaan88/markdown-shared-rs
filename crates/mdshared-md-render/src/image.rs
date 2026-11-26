@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use mdshared_md_core::links::{ImageSource, classify_image};
 
+pub(crate) mod webp;
+
 pub const MAX_BYTES: u64 = 12 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 24_000_000;
 
@@ -331,12 +333,11 @@ fn decode_gif(bytes: &[u8]) -> Option<DecodedImage> {
 /// Static lossy or lossless WebP, with alpha when the file has it; the first frame (already
 /// composited by the decoder) for an animated one.
 fn decode_webp(bytes: &[u8]) -> Option<DecodedImage> {
-    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut decoder = webp::decoder(bytes, MAX_PIXELS)?;
     let (width, height) = decoder.dimensions();
     if !fits(width, height) {
         return None;
     }
-    decoder.set_memory_limit(MAX_PIXELS as usize * 8);
     let mut buffer = vec![0u8; decoder.output_buffer_size()?];
     decoder.read_image(&mut buffer).ok()?;
     let rgba = if decoder.has_alpha() {
