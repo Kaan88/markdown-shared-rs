@@ -34,8 +34,6 @@ pub(super) struct Shared {
     /// What the last frame said was in motion.
     pub(super) animated: Damage,
     pub(super) deadlines: Deadlines,
-    /// The application's named timers ([`Cx::timer_at`]).
-    pub(super) timers: NamedTimers,
     pub(super) cursor: Cursor,
     pub(super) snap: Option<Rect>,
     pub(super) backdrop: Backdrop,
@@ -59,6 +57,8 @@ pub(super) struct Shared {
 pub struct Cx<'a, M: 'static> {
     pub(super) window: &'a Window,
     pub(super) anim: &'a mut Animator,
+    /// The application's named timers ([`Cx::timer_at`]).
+    pub(super) timers: &'a mut NamedTimers,
     pub(super) proxy: &'a Proxy<M>,
     pub(super) st: &'a mut Shared,
     pub(super) now: Instant,
@@ -129,18 +129,20 @@ impl<M: 'static> Cx<'_, M> {
     /// repeating timer. Named timers are folded into the same one wake-up as
     /// [`wake_at`](Self::wake_at) and the animator's deadline, so several of them (a caret's
     /// blink, an autosave, a toast's end) still cost one `WaitUntil`; the loop sleeps until the
-    /// earliest. An instant already past is due at the next turn of the loop.
+    /// earliest. An instant already past is due at the next turn of the loop, even when set
+    /// from [`App::timer_fired`](super::App::timer_fired): a timer set during a turn waits for
+    /// the next one, so re-arming at [`now`](Self::now) cannot spin the loop.
     ///
     /// A name is just a string the application chooses; setting it twice moves that one timer.
     /// Timers keep running while the window is hidden ([`hide_window`](Self::hide_window)).
     pub fn timer_at(&mut self, name: &str, at: Instant) {
-        self.st.timers.set(name, at);
+        self.timers.set(name, at);
     }
 
     /// Cancels the named timer `name`; true when one was waiting. A timer that has already
     /// come is not cancelled (it is gone).
     pub fn cancel_timer(&mut self, name: &str) -> bool {
-        self.st.timers.cancel(name)
+        self.timers.cancel(name)
     }
 
     /// Hides the window but keeps the loop alive (close to tray): timers and worker messages
@@ -160,6 +162,7 @@ impl<M: 'static> Cx<'_, M> {
         }
         if !self.st.vis.app_hidden() {
             self.st.vis.set_app_hidden(true);
+            self.st.show = false;
             self.window.set_visible(false);
             // A window that is not on screen has no keyboard.
             self.st.focused = false;

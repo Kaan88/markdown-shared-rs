@@ -279,10 +279,10 @@ pub trait App: 'static {
     }
 
     /// The named timer `name`, set with [`Cx::timer_at`], came due. It is gone: ask for another
-    /// with [`Cx::timer_at`] for a repeating timer. Timers due in the same turn come one at a
-    /// time, earliest first and in the order they were set at one instant: cancelling or moving
-    /// a sibling from here is obeyed, and the loop looks again after every call. Nothing by
-    /// default.
+    /// with [`Cx::timer_at`] for a repeating timer. The turn's due names were taken as a
+    /// snapshot when it began (earliest first, set order at one instant), and each fires only
+    /// while it is still waiting and still due: cancelling or moving a sibling here is obeyed.
+    /// A timer set here, even at [`Cx::now`], waits for the next turn. Nothing by default.
     fn timer_fired(&mut self, cx: &mut Cx<'_, Self::Message>, name: &str) {
         let _ = (cx, name);
     }
@@ -300,7 +300,8 @@ pub trait App: 'static {
     /// device column, which is copied twice (the same pixels). At most sixteen pieces are kept;
     /// beyond that the union is drawn as one rectangle, so a long-hidden window cannot grow the
     /// list without bound. Drawing the whole scene in every call is correct (the clip cuts it);
-    /// draw only the rectangle to save the work. Read once, when the host starts, not per frame.
+    /// draw only the rectangle to save the work. Read once before [`App::start`](Self::start),
+    /// not per frame.
     fn damage_regions(&self) -> bool {
         false
     }

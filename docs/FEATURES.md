@@ -1975,15 +1975,17 @@ exactly as before.
 - **Named timers.** `Cx::timer_at(name, at)` sets a timer under a name, or moves it when that
   name already waits; `Cx::cancel_timer(name)` removes it and answers whether one was waiting.
   When one is due the application gets `App::timer_fired(cx, name)`, a new defaulted trait
-  method (nothing by default). Timers due in one turn are taken one at a time, earliest first
-  and in set order at the same instant, with the loop looking again after each callback: a
-  callback may cancel a sibling that was also due, or move it later, and that is obeyed. They
+  method (nothing by default). A turn takes a snapshot of the names due when it begins
+  (earliest first, set order at one instant) and fires each only while it is still waiting and
+  still due: a callback may cancel a sibling that was also due, or move it later, and that is
+  obeyed. Anything set during the turn, even at `now`, waits for the next turn, so a callback
+  that re-arms its own name at `now` fires once per turn instead of spinning the loop. They
   join the one wake-up: the loop takes the earliest of the animator's deadline,
   `Cx::wake_at` and every named timer, so any number of timers is still one
   `ControlFlow::WaitUntil`. A timer set in the past is due at the next turn of the loop. The
   model is `host/timers.rs` (`NamedTimers`: `set`, `cancel`, `at`, `next`, `len`,
-  `take_earliest_due`), pure and on passed instants; the fold with the animator is
-  `frame::next_wake`.
+  `due_at`, `take_if_due`), pure and on passed instants; the turn's loop is
+  `run::fire_due_timers`, and the fold with the animator is `frame::next_wake`.
 - **A window hidden but alive.** `Cx::hide_window` hides the window for a close to a tray;
   `Cx::show_window` asks the host to show it again; `Cx::hidden` answers whether the application
   hid it. `Visibility` gained an `app` flag beside `occluded` and `minimized`, so every check
@@ -2001,9 +2003,12 @@ exactly as before.
   shortcut) and calls `show_window` from it. The window keeps its place, size and state; it is
   not minimized or closed. **On Wayland `hide_window` does nothing** and the flag is not set:
   winit's `set_visible` is a no-op on a Wayland surface, so hiding would only freeze the
-  window; it keeps drawing and `hidden` stays false.
+  window; it keeps drawing and `hidden` stays false. On macOS, `orderOut` is likely reported as
+  `Occluded`, so a resize while application-hidden is then swallowed as OS-hidden and the
+  first frame after showing comes on `Occluded(false)`; this is not verified. On X11 the first
+  present may come before the map; an Expose heals it (also not verified here).
 - **Regions with their own damage.** `App::damage_regions()`, a new defaulted method answering
-  false and read once when the host starts, opts an application into one `draw` call per damage
+  false and read once before `App::start`, opts an application into one `draw` call per damage
   rectangle instead of one for their union. An application that does not opt in keeps the old
   O(1) union and allocates nothing: no pieces are collected at all. `Damage` keeps each
   rectangle as a piece beside the union, joining overlaps as they are added (a join that grows
@@ -2024,10 +2029,12 @@ New public API: `Cx::{timer_at, cancel_timer, hide_window, show_window, hidden}`
 
 Tests (all in `host_tests.rs` and the new `timers_tests.rs`): the earliest named timer wins; a
 name is moved rather than duplicated; a cancelled one is gone (and cancelling twice is false);
-timers due together come one at a time in set order; cancelling a sibling from a callback stops
-it, and moving a sibling makes it fire once later; a timer in the past is due at once and a
-later one waits; the loop's wake is the earliest of the animator and a named timer, and a hidden
-window drops only the animator's; an application-hidden window is hidden until shown (also while
+a turn snapshots its due names in firing order and takes each once; a timer moved later
+mid-turn is not taken by that turn; a timer in the past is due at once and a later one waits;
+the loop's wake is the earliest of the animator and a named timer, and a hidden window drops
+only the animator's; the firing loop (`run::fire_due_timers`) fires a callback that re-arms
+itself at `now` once per turn and ends, obeys a callback that cancels a sibling, and fires a
+moved sibling once later; an application-hidden window is hidden until shown (also while
 covered) and `wants_frame` — the function both `after` and the loop use — says no draw while it
 is hidden, with timers still coming; two far-apart rectangles stay two pieces with the gap in
 the union but in neither piece; a growing join restarts the scan; random adds leave pairwise
@@ -2036,9 +2043,10 @@ while a non-opted-in application keeps no pieces; a whole window is one piece an
 the bitmap are left out; and the host's region loop (`paint_regions`, the code `Host::frame`
 runs) paints two pieces into a bitmap with a real clip each, leaving the gap at the old frame.
 Each new or changed test was seen failing under a deliberately broken implementation before it
-passed: appending instead of moving, taking all due timers at once, `next` answering the
-maximum, ignoring the application's hidden flag, `pieces` answering the union, no cap, and the
-old non-restarting join. The files were restored afterwards.
+passed: appending instead of moving, `next` answering the maximum, ignoring the application's
+hidden flag, `pieces` answering the union, no cap, the old non-restarting join, and the old
+open-ended firing loop (the re-arm test panicked on its iteration guard instead of hanging, so
+a re-armed timer was fired again and again in one turn). The files were restored afterwards.
 
 Run on Windows 11, `CARGO_TARGET_DIR=E:/mds-target/k1`: `cargo run -p mdshared-ui --features
 host --example host_regions -- --seconds 2` drew two full frames (the first, and the unfocused

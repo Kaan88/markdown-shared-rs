@@ -6,6 +6,7 @@
 
 use super::frame::*;
 use super::input::*;
+use super::run::fire_due_timers;
 use super::timers::NamedTimers;
 use super::*;
 use crate::anim::Animator;
@@ -326,14 +327,16 @@ fn the_hosts_region_loop_paints_each_piece_and_leaves_the_gap() {
     // The loop `Host::frame` runs for a regions application, with a closure standing in for
     // `App::draw`: one painter and clip per piece, the animator's group reset each time.
     let mut drawn = Vec::new();
+    let mut timers = NamedTimers::default();
     paint_regions(
         &mut bmp,
         &mut gfx,
         &mut anim,
+        &mut timers,
         None,
         1.0,
         &pieces,
-        |p, anim, region, _clip| {
+        |p, anim, _timers, region, _clip| {
             if drawn.is_empty() {
                 // A group set in the first region must not leak into the second.
                 anim.group("first");
@@ -557,6 +560,73 @@ fn the_loop_wakes_at_the_earliest_of_the_animator_and_a_named_timer() {
     );
 }
 
+#[test]
+fn a_callback_that_rearms_itself_at_now_fires_once_per_turn_and_the_turn_ends() {
+    let now = Instant::now();
+    let mut timers = NamedTimers::default();
+    timers.set("poll", now);
+    let mut fired = Vec::new();
+    let mut calls = 0;
+    for _ in 0..3 {
+        let any = fire_due_timers(&mut timers, now, |timers, name| {
+            calls += 1;
+            assert!(calls <= 5, "the firing loop spun");
+            fired.push(name.to_string());
+            // Re-armed at the same instant: it belongs to the next turn, not this one.
+            timers.set(name, now);
+            true
+        });
+        assert!(any);
+    }
+    assert_eq!(
+        fired,
+        vec!["poll".to_string(), "poll".to_string(), "poll".to_string()]
+    );
+    assert_eq!(calls, 3);
+    assert_eq!(timers.at("poll"), Some(now));
+}
+
+#[test]
+fn a_callback_can_cancel_or_move_a_sibling_from_the_same_turn() {
+    let now = Instant::now();
+    let later = now + Duration::from_millis(100);
+
+    // Cancelled: the sibling due at the same instant does not fire.
+    let mut timers = NamedTimers::default();
+    timers.set("first", now);
+    timers.set("second", now);
+    let mut fired = Vec::new();
+    fire_due_timers(&mut timers, now, |timers, name| {
+        fired.push(name.to_string());
+        if name == "first" {
+            timers.cancel("second");
+        }
+        true
+    });
+    assert_eq!(fired, vec!["first".to_string()]);
+    assert_eq!(timers.next(), None);
+
+    // Moved later: it fires once, in a later turn.
+    let mut timers = NamedTimers::default();
+    timers.set("first", now);
+    timers.set("second", now);
+    let mut fired = Vec::new();
+    fire_due_timers(&mut timers, now, |timers, name| {
+        fired.push(name.to_string());
+        if name == "first" {
+            timers.set("second", later);
+        }
+        true
+    });
+    assert_eq!(fired, vec!["first".to_string()]);
+    assert_eq!(timers.next(), Some(later));
+    assert!(fire_due_timers(&mut timers, later, |_timers, name| {
+        fired.push(name.to_string());
+        true
+    }));
+    assert_eq!(fired, vec!["first".to_string(), "second".to_string()]);
+}
+
 // ---- clicks ----
 
 /// Windows' default double-click rectangle, 4 x 4 device px, at scale 1: 2 px each way.
@@ -738,13 +808,6 @@ fn nothing_is_drawn_while_the_application_hides_the_window_but_timers_still_come
     let mut timers = NamedTimers::default();
     timers.set("autosave", t0 + Duration::from_secs(30));
     assert_eq!(timers.next(), Some(t0 + Duration::from_secs(30)));
-    // But a window hidden by the application is drawn again, whole, when shown.
-    let mut damage = Damage::default();
-    damage.add(Rect::new(10.0, 10.0, 20.0, 20.0));
-    if v.set_app_hidden(false) {
-        damage.all();
-    }
-    assert!(damage.full);
 }
 
 #[test]

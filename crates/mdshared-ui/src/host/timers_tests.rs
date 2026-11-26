@@ -1,6 +1,6 @@
 //! The named timers' arithmetic on fixed instants: the earliest wins, a name is moved rather
-//! than added twice, a cancelled timer is gone, timers due together come one at a time (so a
-//! callback can cancel or move a sibling), and an instant in the past is due at once.
+//! than added twice, a cancelled timer is gone, a turn snapshots its due names in firing order,
+//! and an instant in the past is due at once.
 
 use std::time::{Duration, Instant};
 
@@ -54,16 +54,19 @@ fn a_cancelled_timer_is_gone_and_cancelling_it_again_answers_false() {
 }
 
 #[test]
-fn two_timers_due_at_once_come_one_at_a_time_in_the_order_they_were_set() {
+fn a_turn_snapshots_its_due_names_in_firing_order_and_takes_each_once() {
     let t0 = Instant::now();
     let now = t0 + Duration::from_millis(10);
     let mut t = NamedTimers::default();
     t.set("b", now);
     t.set("a", now);
-    assert_eq!(t.take_earliest_due(now), Some("b".to_string()));
-    assert_eq!(t.take_earliest_due(now), Some("a".to_string()));
-    assert_eq!(t.take_earliest_due(now), None);
-    assert_eq!(t.next(), None);
+    t.set("later", now + Duration::from_millis(5));
+    assert_eq!(t.due_at(now), vec!["b".to_string(), "a".to_string()]);
+    assert!(t.take_if_due("b", now));
+    assert!(t.take_if_due("a", now));
+    assert!(!t.take_if_due("a", now));
+    assert!(!t.take_if_due("later", now), "not due yet");
+    assert_eq!(t.next(), Some(now + Duration::from_millis(5)));
 }
 
 #[test]
@@ -73,10 +76,26 @@ fn a_timer_set_in_the_past_is_due_at_once_and_a_later_one_waits() {
     t.set("late", t0 - Duration::from_secs(5));
     t.set("soon", t0 + Duration::from_secs(5));
     assert_eq!(t.next(), Some(t0 - Duration::from_secs(5)));
-    assert_eq!(t.take_earliest_due(t0), Some("late".to_string()));
+    assert_eq!(t.due_at(t0), vec!["late".to_string()]);
+    assert!(t.take_if_due("late", t0));
     assert_eq!(t.at("late"), None);
     assert_eq!(t.next(), Some(t0 + Duration::from_secs(5)));
-    assert_eq!(t.take_earliest_due(t0), None);
+    assert!(t.due_at(t0).is_empty());
+}
+
+#[test]
+fn a_timer_moved_later_mid_turn_is_not_taken_by_that_turn() {
+    let t0 = Instant::now();
+    let now = t0 + Duration::from_millis(10);
+    let later = now + Duration::from_millis(100);
+    let mut t = NamedTimers::default();
+    t.set("a", now);
+    t.set("b", now);
+    assert_eq!(t.due_at(now), vec!["a".to_string(), "b".to_string()]);
+    t.set("b", later);
+    assert!(t.take_if_due("a", now));
+    assert!(!t.take_if_due("b", now), "moved later since the snapshot");
+    assert_eq!(t.next(), Some(later));
 }
 
 #[test]
@@ -84,49 +103,12 @@ fn a_timer_that_is_not_yet_due_is_kept() {
     let t0 = Instant::now();
     let mut t = NamedTimers::default();
     t.set("later", t0 + Duration::from_millis(500));
-    assert_eq!(t.take_earliest_due(t0), None);
+    assert!(t.due_at(t0).is_empty());
+    assert!(!t.take_if_due("later", t0));
     assert_eq!(t.next(), Some(t0 + Duration::from_millis(500)));
     assert_eq!(
-        t.take_earliest_due(t0 + Duration::from_millis(500)),
-        Some("later".to_string())
+        t.due_at(t0 + Duration::from_millis(500)),
+        vec!["later".to_string()]
     );
-}
-
-#[test]
-fn cancelling_a_sibling_from_a_callback_stops_it_from_firing() {
-    let t0 = Instant::now();
-    let now = t0 + Duration::from_millis(10);
-    let mut t = NamedTimers::default();
-    t.set("first", now);
-    t.set("second", now);
-    // The loop's shape: take one, call the application, look again.
-    let mut fired = Vec::new();
-    while let Some(name) = t.take_earliest_due(now) {
-        fired.push(name.clone());
-        if name == "first" {
-            t.cancel("second");
-        }
-    }
-    assert_eq!(fired, vec!["first".to_string()]);
-}
-
-#[test]
-fn moving_a_sibling_from_a_callback_makes_it_fire_once_later() {
-    let t0 = Instant::now();
-    let now = t0 + Duration::from_millis(10);
-    let later = now + Duration::from_millis(100);
-    let mut t = NamedTimers::default();
-    t.set("first", now);
-    t.set("second", now);
-    let mut fired = Vec::new();
-    while let Some(name) = t.take_earliest_due(now) {
-        fired.push(name.clone());
-        if name == "first" {
-            t.set("second", later);
-        }
-    }
-    assert_eq!(fired, vec!["first".to_string()]);
-    assert_eq!(t.next(), Some(later));
-    assert_eq!(t.take_earliest_due(now), None);
-    assert_eq!(t.take_earliest_due(later), Some("second".to_string()));
+    assert!(t.take_if_due("later", t0 + Duration::from_millis(500)));
 }

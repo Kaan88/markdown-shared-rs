@@ -43,6 +43,8 @@ struct Host<A: App> {
     win: Option<Win>,
     gfx: Gfx,
     anim: Animator,
+    /// The application's named timers ([`Cx::timer_at`]).
+    timers: NamedTimers,
     st: Shared,
     cursor: CursorState,
     frost: Frost,
@@ -99,7 +101,6 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         damage: Damage::with_pieces(collect),
         animated: Damage::with_pieces(collect),
         deadlines: Deadlines::default(),
-        timers: NamedTimers::default(),
         cursor: Cursor::Default,
         snap: None,
         backdrop: Backdrop::Off,
@@ -118,6 +119,7 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         win: None,
         gfx: Gfx::new(),
         anim: Animator::new(),
+        timers: NamedTimers::default(),
         st,
         cursor: CursorState::new(),
         frost: Frost::default(),
@@ -203,14 +205,16 @@ fn region_rect(d: (u32, u32, u32, u32), scale: f32) -> Rect {
 /// the painter, the animator, the piece in logical px and its device clip. The animator's group
 /// is reset before each call, as `begin_frame` does for the one-call frame, so a group set in
 /// one region's draw does not leak into the next.
+#[allow(clippy::too_many_arguments)] // a drawing loop: bitmap, animator, timers and pieces
 pub(super) fn paint_regions(
     bmp: &mut Bitmap,
     gfx: &mut Gfx,
     anim: &mut Animator,
+    timers: &mut NamedTimers,
     key: Option<crate::frost::Key>,
     scale: f32,
     pieces: &[(u32, u32, u32, u32)],
-    mut draw: impl FnMut(&mut Painter, &mut Animator, Rect, (i32, i32, i32, i32)),
+    mut draw: impl FnMut(&mut Painter, &mut Animator, &mut NamedTimers, Rect, (i32, i32, i32, i32)),
 ) {
     for &dev in pieces {
         let clip = (dev.0 as i32, dev.1 as i32, dev.2 as i32, dev.3 as i32);
@@ -219,8 +223,32 @@ pub(super) fn paint_regions(
         let mut p = Painter::new(bmp, gfx, scale);
         p.set_frost_key(key);
         p.clip(region);
-        draw(&mut p, anim, region, clip);
+        draw(&mut p, anim, timers, region, clip);
     }
+}
+
+/// Fires the named timers of one turn: the names due when the turn began (earliest first, set
+/// order at one instant), each only while it is still waiting and still due — a callback may
+/// have cancelled or moved it. Anything set during the turn, even at `now`, is not in the
+/// snapshot and waits for the next turn, so a callback that re-arms itself cannot spin the
+/// loop. `fire` answers whether to go on (false stops, for an application that exited). True
+/// when at least one timer fired.
+pub(super) fn fire_due_timers(
+    timers: &mut NamedTimers,
+    now: Instant,
+    mut fire: impl FnMut(&mut NamedTimers, &str) -> bool,
+) -> bool {
+    let mut fired = false;
+    for name in timers.due_at(now) {
+        if !timers.take_if_due(&name, now) {
+            continue;
+        }
+        fired = true;
+        if !fire(timers, &name) {
+            break;
+        }
+    }
+    fired
 }
 
 /// Whether the window can be hidden with `set_visible` and drawn again later. On Wayland a
@@ -228,7 +256,7 @@ pub(super) fn paint_regions(
 /// would only freeze it: [`Cx::hide_window`](super::cx::Cx::hide_window) does nothing and the
 /// window keeps drawing.
 pub(super) fn can_hide(w: &Window) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         return !matches!(
@@ -236,7 +264,7 @@ pub(super) fn can_hide(w: &Window) -> bool {
             Ok(RawWindowHandle::Wayland(_))
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(unix), target_os = "macos"))]
     {
         let _ = w;
         true
@@ -262,6 +290,7 @@ impl<A: App> Host<A> {
         let mut cx = Cx {
             window: &win.window,
             anim: &mut self.anim,
+            timers: &mut self.timers,
             proxy: &self.proxy,
             st: &mut self.st,
             now,
@@ -303,6 +332,11 @@ impl<A: App> Host<A> {
     fn reveal(&mut self, now: Instant) {
         let first = !self.st.shown;
         self.st.shown = true;
+        // Shown again, assume the system activates it, as launch does: the chrome is drawn
+        // frosted from the first presented frame instead of flipping once the focus arrives.
+        let was = self.st.focused;
+        let assumed = if first { was } else { true };
+        self.st.focused = assumed;
         self.st.damage.all();
         self.frame(now);
         if first {
@@ -316,22 +350,12 @@ impl<A: App> Host<A> {
             return;
         };
         let has = win.window.has_focus();
-        if first {
-            // The system decides about the focus; if the window did not get it, the frame
-            // drawn focused is drawn again (winit sends no `Focused(false)` for a focus it
-            // never gave).
-            if self.st.focused && !has {
-                self.st.focused = false;
-                if self.st.backdrop != Backdrop::Off {
-                    self.st.damage.all();
-                }
-                self.call(now, |app, cx| app.event(cx, Event::Focus(false)));
-            }
-        } else if has != self.st.focused {
-            self.st.focused = has;
-            if self.st.backdrop != Backdrop::Off {
-                self.st.damage.all();
-            }
+        self.st.focused = has;
+        if has != assumed {
+            // The frame drew the other focus, and the chrome may look different by it.
+            self.st.damage.all();
+        }
+        if has != was {
             self.call(now, |app, cx| app.event(cx, Event::Focus(has)));
         }
     }
@@ -392,6 +416,7 @@ impl<A: App> Host<A> {
         let mut cx = Cx {
             window,
             anim: &mut self.anim,
+            timers: &mut self.timers,
             proxy: &self.proxy,
             st: &mut self.st,
             now: Instant::now(),
@@ -530,10 +555,14 @@ impl<A: App> Host<A> {
             }
             return;
         };
-        let pieces = damage.pieces(scale, w, h);
+        let pieces = if damage.collects() {
+            damage.pieces(scale, w, h)
+        } else {
+            Vec::new()
+        };
         // One call per rectangle only when the application asked for it and there is more than
         // one; otherwise the old one-call frame with the union, unchanged.
-        let regioned = pieces.len() > 1 && damage.collects();
+        let regioned = pieces.len() > 1;
         self.st.animated.reset();
         let Some(win) = self.win.as_mut() else {
             return;
@@ -550,13 +579,15 @@ impl<A: App> Host<A> {
                 bmp,
                 &mut self.gfx,
                 &mut self.anim,
+                &mut self.timers,
                 key,
                 scale,
                 &pieces,
-                |p, anim, region, clip| {
+                |p, anim, timers, region, clip| {
                     let mut cx = Cx {
                         window,
                         anim: &mut *anim,
+                        timers: &mut *timers,
                         proxy,
                         st: &mut *st,
                         now,
@@ -580,6 +611,7 @@ impl<A: App> Host<A> {
             let mut cx = Cx {
                 window,
                 anim: &mut self.anim,
+                timers: &mut self.timers,
                 proxy: &self.proxy,
                 st: &mut self.st,
                 now,
@@ -938,14 +970,35 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         if due.timer {
             self.call(now, |app, cx| app.event(cx, Event::Wake(now)));
         }
-        // Named timers come whether or not the window is seen. One at a time, earliest first,
-        // looking again after each callback: a callback may cancel or move a sibling that was
-        // due in the same turn.
-        while let Some(name) = self.st.timers.take_earliest_due(now) {
-            if self.st.exit {
-                break;
-            }
-            self.call(now, |app, cx| app.timer_fired(cx, &name));
+        // Named timers come whether or not the window is seen: the names due when the turn
+        // begins, each still waiting and due when its turn comes. Anything set meanwhile,
+        // even at `now`, waits for the next turn, so re-arming from a callback cannot spin.
+        let fired = if let Some(win) = self.win.as_ref() {
+            let window = &win.window;
+            let st = &mut self.st;
+            let anim = &mut self.anim;
+            let proxy = &self.proxy;
+            let app = &mut self.app;
+            fire_due_timers(&mut self.timers, now, |timers, name| {
+                {
+                    let mut cx = Cx {
+                        window,
+                        anim: &mut *anim,
+                        timers: &mut *timers,
+                        proxy,
+                        st: &mut *st,
+                        now,
+                        drawing: None,
+                    };
+                    app.timer_fired(&mut cx, name);
+                }
+                !st.exit
+            })
+        } else {
+            false
+        };
+        if fired {
+            self.after();
         }
         if self.st.exit {
             el.exit();
@@ -960,7 +1013,7 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
             self.requested = true;
             win.window.request_redraw();
         }
-        let next = next_wake(&self.st.deadlines, &self.st.timers, hidden);
+        let next = next_wake(&self.st.deadlines, &self.timers, hidden);
         el.set_control_flow(match next {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,

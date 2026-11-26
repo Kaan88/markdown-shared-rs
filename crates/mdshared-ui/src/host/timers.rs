@@ -2,10 +2,11 @@
 //! into the loop's one wake-up with the animator's deadline.
 //!
 //! A timer is set, moved or cancelled by its name: setting a name that is already there moves
-//! it, so one name is one timer. The names due by a given instant are taken together and in
-//! the order they were set, so an application that asks for two timers at the same instant is
-//! told about both in one turn. Nothing here reads a clock: the caller passes `now`, so the
-//! arithmetic is tested on fixed instants.
+//! it, so one name is one timer. When a turn begins its due names are taken as a snapshot, in
+//! firing order (earliest first, set order at one instant); each then fires only if it is
+//! still waiting and still due when its turn comes, so a callback may cancel or move a
+//! sibling. A timer set during the turn waits for the next one, even at `now`. Nothing here
+//! reads a clock: the caller passes `now`, so the arithmetic is tested on fixed instants.
 //!
 //! Deliberately not here: repeating timers (an application asks again from
 //! [`App::timer_fired`](super::App::timer_fired)), a timer's value or payload, and a clock.
@@ -58,19 +59,32 @@ impl NamedTimers {
         self.timers.len()
     }
 
-    /// Takes the earliest timer due at or before `now`, if any. One at a time, so an
-    /// application that cancels or moves a sibling from [`App::timer_fired`](super::App::timer_fired)
-    /// is obeyed: the loop looks again after each callback. Timers due at the same instant come
-    /// in the order they were set.
-    pub(super) fn take_earliest_due(&mut self, now: Instant) -> Option<String> {
-        let i = self
+    /// The names due at or before `now`, in firing order: earliest first, and at one instant
+    /// the order they were set. Taken when a turn begins: a timer set during the turn is not
+    /// here and waits for the next one.
+    pub(super) fn due_at(&self, now: Instant) -> Vec<String> {
+        let mut due: Vec<(Instant, usize, &String)> = self
             .timers
             .iter()
             .enumerate()
             .filter(|(_, (_, at))| *at <= now)
-            .min_by_key(|(_, (_, at))| *at)
-            .map(|(i, _)| i)?;
-        Some(self.timers.remove(i).0)
+            .map(|(i, (name, at))| (*at, i, name))
+            .collect();
+        due.sort_by_key(|(at, i, _)| (*at, *i));
+        due.into_iter().map(|(_, _, name)| name.clone()).collect()
+    }
+
+    /// Takes `name` only if it is still waiting and still due at or before `now`: a callback
+    /// may have cancelled it or moved it later since the turn began. True when it was taken.
+    pub(super) fn take_if_due(&mut self, name: &str, now: Instant) -> bool {
+        let Some(i) = self.timers.iter().position(|(n, _)| n == name) else {
+            return false;
+        };
+        if self.timers[i].1 > now {
+            return false;
+        }
+        self.timers.remove(i);
+        true
     }
 }
 
