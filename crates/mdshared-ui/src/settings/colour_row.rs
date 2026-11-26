@@ -26,6 +26,10 @@
 //! when that differs from the last text reported, it is reported. The wheel does nothing while
 //! it is open, so the row it hangs from stays where it is.
 //!
+//! A row marked with [`Form::show_as_colour_with_confirmation`] instead stages changes in
+//! the picker. Apply, Enter or a press outside saves them; Cancel and Escape discard them.
+//! The outside press is consumed, just as it is for an open dropdown.
+//!
 //! No timer and no clock: the picker moves only on events, and an idle form with the picker
 //! open does nothing. The square and the strip are kept as bitmaps between frames (see
 //! [`colour_picker::Cache`]).
@@ -40,7 +44,10 @@
 //!   its picker opens on a mid grey.
 
 use super::{Drag, Form, Outcome, Row, Value};
-use crate::colour_picker::{self, Cache, Layout, Look, Part, Picker, parse_hex};
+use crate::colour_picker::{
+    self, Cache, Confirmation, ConfirmationLayout, ConfirmationLook, Layout, Look, Part, Picker,
+    parse_hex,
+};
 use crate::flyout::Flyout;
 use crate::gfx::{Painter, Rect, Rgb, mix};
 use crate::keys::{KeyName, Mods};
@@ -58,6 +65,7 @@ const FALLBACK: Rgb = [128, 128, 128];
 #[derive(Default)]
 pub(super) struct Colours {
     ids: Vec<u32>,
+    confirmed: Vec<u32>,
     open: Option<Open>,
     pressed: Option<usize>,
     hover: Option<usize>,
@@ -69,7 +77,7 @@ struct Open {
     row: usize,
     picker: Picker,
     flyout: Flyout,
-    layout: Layout,
+    confirms: bool,
     /// The row's text when the picker opened: what a cancel puts back.
     original: String,
     /// The text last reported in an [`Outcome::Changed`] (or set by the application).
@@ -78,6 +86,19 @@ struct Open {
     ring: bool,
     /// A press in the hex field is selecting text.
     text_drag: bool,
+}
+
+impl Open {
+    fn confirmation(&self) -> Option<ConfirmationLayout> {
+        self.confirms.then(|| ConfirmationLayout::new(&self.flyout))
+    }
+
+    fn layout(&self) -> Layout {
+        match self.confirmation() {
+            Some(confirmation) => confirmation.picker,
+            None => Layout::new(self.flyout.content_rect()),
+        }
+    }
 }
 
 impl Form {
@@ -94,6 +115,17 @@ impl Form {
         self.rows
             .iter()
             .any(|r| matches!(r, Row::Text { id: k, secret: false, .. } if *k == id))
+    }
+
+    /// Marks a text row as a colour like [`Self::show_as_colour`], but its next picker stages
+    /// edits until Apply, Enter or a press outside the popover. Only a changed value reports
+    /// [`Outcome::Changed`]. Escape and Cancel leave the row untouched. The mark survives
+    /// [`Self::set_rows`] and the return value says whether an eligible text row exists now.
+    pub fn show_as_colour_with_confirmation(&mut self, id: u32) -> bool {
+        if !self.colours.confirmed.contains(&id) {
+            self.colours.confirmed.push(id);
+        }
+        self.show_as_colour(id)
     }
 
     /// The colour in the text row `id`: its text read as six hex digits with or without `#`
@@ -128,7 +160,13 @@ impl Form {
     /// The parts of the open picker as last placed (the square, the strip, the swatches and
     /// the hex field), or `None`.
     pub fn picker_layout(&self) -> Option<Layout> {
-        self.colours.open.as_ref().map(|o| o.layout)
+        self.colours.open.as_ref().map(Open::layout)
+    }
+
+    /// The open picker's controls, including Apply and Cancel, or `None` if no picker with
+    /// confirmation is open.
+    pub fn picker_confirmation_layout(&self) -> Option<ConfirmationLayout> {
+        self.colours.open.as_ref()?.confirmation()
     }
 
     /// The swatch of colour row `i`: the left end of its [`control_rect`](Self::control_rect).
@@ -166,18 +204,24 @@ impl Form {
 
     /// Opens the picker of colour row `i`; `ring` when the keyboard opened it.
     fn open_colour(&mut self, i: usize, ring: bool) {
-        let Some(Row::Text { value, .. }) = self.rows.get(i) else {
+        let Some(Row::Text { id, value, .. }) = self.rows.get(i) else {
             return;
         };
         let text = value.clone();
+        let confirms = self.colours.confirmed.contains(id);
+        let anchor = self.control_rect(i);
         self.menu = None;
         self.drag = Drag::None;
         self.focus = Some(i);
         self.colours.open = Some(Open {
             row: i,
             picker: Picker::from_text(&text, FALLBACK),
-            flyout: colour_picker::flyout(self.control_rect(i)),
-            layout: Layout::default(),
+            flyout: if confirms {
+                colour_picker::confirmation_flyout(anchor)
+            } else {
+                colour_picker::flyout(anchor)
+            },
+            confirms,
             original: text.clone(),
             reported: text,
             ring,
@@ -196,7 +240,6 @@ impl Form {
         if let Some(o) = &mut self.colours.open {
             o.flyout.set_anchor(anchor);
             o.flyout.place_in(window);
-            o.layout = Layout::new(o.flyout.content_rect());
         }
     }
 
@@ -269,6 +312,28 @@ impl Form {
         }
     }
 
+    fn finish_colour_confirmation(&mut self, answer: Confirmation) -> Outcome {
+        if answer == Confirmation::Open {
+            return Outcome::Redraw;
+        }
+        let Some(o) = self.colours.open.take() else {
+            return Outcome::None;
+        };
+        if let Confirmation::Applied(rgb) = answer
+            && let Some(Row::Text { id, value, .. }) = self.rows.get(o.row)
+            && parse_hex(value) != Some(rgb)
+        {
+            let id = *id;
+            let value = o.picker.form().format(rgb);
+            self.put_colour_text(o.row, &value);
+            return Outcome::Changed {
+                id,
+                value: Value::Text(value),
+            };
+        }
+        Outcome::Redraw
+    }
+
     /// A key, before the form's own: all of them while a picker is open; Enter, F4 and
     /// Alt+Down on a colour row open its picker. `None` leaves the key to the form.
     pub(super) fn colour_key(
@@ -279,6 +344,10 @@ impl Form {
     ) -> Option<Outcome> {
         if let Some(o) = &mut self.colours.open {
             o.ring = true;
+            if o.confirms {
+                let answer = o.picker.key_with_confirmation(key, mods, typed);
+                return Some(self.finish_colour_confirmation(answer));
+            }
             let answer = o.picker.key(key, mods, typed);
             return Some(self.colour_outcome(answer));
         }
@@ -296,8 +365,8 @@ impl Form {
         Some(Outcome::Redraw)
     }
 
-    /// A press, before the form's own: inside an open picker it is the picker's, outside it
-    /// cancels; on a colour row's swatch it waits for the release. `None` leaves it to the form.
+    /// A press, before the form's own: an open picker consumes it, including outside presses.
+    /// A press on a closed colour row's swatch waits for release. `None` leaves it to the form.
     pub(super) fn colour_press(
         &mut self,
         x: f32,
@@ -310,12 +379,25 @@ impl Form {
             o.ring = false;
             // A selection whose release was lost does not outlive the press.
             o.text_drag = false;
-            if !o.flyout.contains(x, y) {
-                return Some(self.close_colour_picker(false));
-            }
-            let answer = o.picker.press(&o.layout, x, y);
-            let hex = o.layout.hex;
-            if o.picker.focus() == Part::Hex && hex.contains(x, y) {
+            let (answer, hex) = if let Some(confirmation) = o.confirmation() {
+                let answer = o.picker.press_with_confirmation(&confirmation, x, y);
+                if answer != Confirmation::Open {
+                    return Some(self.finish_colour_confirmation(answer));
+                }
+                (colour_picker::Outcome::Redraw, confirmation.picker.hex)
+            } else {
+                if !o.flyout.contains(x, y) {
+                    return Some(self.close_colour_picker(false));
+                }
+                let layout = o.layout();
+                (o.picker.press(&layout, x, y), layout.hex)
+            };
+            if hex.w > 0.0
+                && hex.h > 0.0
+                && o.picker.confirmation_focus().is_none()
+                && o.picker.focus() == Part::Hex
+                && hex.contains(x, y)
+            {
                 let rel = x - (hex.x + 10.0);
                 let stops = self.colours.cache.hex_stops().to_vec();
                 let field = o.picker.field_mut();
@@ -353,6 +435,10 @@ impl Form {
     pub(super) fn colour_release(&mut self, x: f32, y: f32) -> Option<Outcome> {
         if let Some(o) = &mut self.colours.open {
             o.text_drag = false;
+            if let Some(confirmation) = o.confirmation() {
+                let answer = o.picker.release_with_confirmation(&confirmation, x, y);
+                return Some(self.finish_colour_confirmation(answer));
+            }
             if o.picker.release() {
                 return Some(self.colour_report());
             }
@@ -372,13 +458,17 @@ impl Form {
     pub(super) fn colour_move(&mut self, x: f32, y: f32) -> Option<bool> {
         let o = self.colours.open.as_mut()?;
         if o.text_drag {
-            let rel = x - (o.layout.hex.x + 10.0);
+            let rel = x - (o.layout().hex.x + 10.0);
             let field = o.picker.field_mut();
             let before = field.caret();
             field.drag(rel, self.colours.cache.hex_stops());
             return Some(field.caret() != before);
         }
-        let answer = o.picker.drag(&o.layout, x, y);
+        if let Some(confirmation) = o.confirmation() {
+            return Some(o.picker.pointer_with_confirmation(&confirmation, x, y));
+        }
+        let layout = o.layout();
+        let answer = o.picker.drag(&layout, x, y);
         if answer == colour_picker::Outcome::Colour {
             self.picked();
         }
@@ -389,6 +479,13 @@ impl Form {
     /// picker open.
     pub(super) fn colour_pointer(&mut self, x: f32, y: f32) -> Option<Outcome> {
         let moved = self.colour_move(x, y)?;
+        if self.colours.open.as_ref().is_some_and(|o| o.confirms) {
+            return Some(if moved {
+                Outcome::Redraw
+            } else {
+                Outcome::None
+            });
+        }
         Some(match self.colour_report() {
             Outcome::Redraw if !moved => Outcome::None,
             o => o,
@@ -464,6 +561,7 @@ impl Form {
             return;
         }
         self.place_colour();
+        let high_contrast = self.high_contrast;
         let Colours { open, cache, .. } = &mut self.colours;
         let Some(o) = open else {
             return;
@@ -472,14 +570,29 @@ impl Form {
             ring: o.ring,
             caret_on,
         };
-        colour_picker::draw_picker(
-            p,
-            pal,
-            o.flyout.rect(),
-            &o.layout,
-            &mut o.picker,
-            cache,
-            look,
-        );
+        if let Some(layout) = o.confirmation() {
+            colour_picker::draw_picker_with_confirmation(
+                p,
+                pal,
+                &layout,
+                &mut o.picker,
+                cache,
+                ConfirmationLook {
+                    picker: look,
+                    high_contrast,
+                },
+            );
+        } else {
+            let layout = o.layout();
+            colour_picker::draw_picker(
+                p,
+                pal,
+                o.flyout.rect(),
+                &layout,
+                &mut o.picker,
+                cache,
+                look,
+            );
+        }
     }
 }

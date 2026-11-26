@@ -9,6 +9,9 @@
 //! the card's content rectangle, passes a press, a drag, a release and the keys in, and acts on
 //! the [`Outcome`] (a new colour, accepted, cancelled). [`draw_picker`] draws a picker and
 //! changes nothing in it but its text field's scroll (as every text field's drawing does).
+//! For a popup with Apply and Cancel buttons, use [`confirmation_flyout`],
+//! [`ConfirmationLayout`] and the `*_with_confirmation` methods. They return a
+//! [`Confirmation`] so the caller can keep edits local until the picker is applied.
 //!
 //! The colour is kept as HSV, and the hex is made from it, never the other way round while the
 //! user works: so a drag through grey or black keeps the hue (and through black the saturation)
@@ -50,6 +53,12 @@ use crate::keys::{KeyName, Mods};
 use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette;
 use mdshared_text::Bitmap;
+
+mod confirmation;
+pub use confirmation::{
+    Button, Confirmation, ConfirmationLayout, ConfirmationLook, confirmation_flyout,
+    draw_picker_with_confirmation,
+};
 
 // ---- colours ---------------------------------------------------------------------------------
 
@@ -348,6 +357,9 @@ pub struct Picker {
     focus: Part,
     held: Option<Part>,
     field: TextField,
+    button_focus: Option<Button>,
+    button_held: Option<Button>,
+    button_hover: Option<Button>,
 }
 
 impl Picker {
@@ -364,6 +376,9 @@ impl Picker {
             focus: Part::Square,
             held: None,
             field,
+            button_focus: None,
+            button_held: None,
+            button_hover: None,
         }
     }
 
