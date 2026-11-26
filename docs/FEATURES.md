@@ -3021,3 +3021,14 @@ The review follow-up ran Windows debug format, workspace Clippy and workspace te
 again (2,364 passed, zero failed, four Explorer tests excluded). Clippy also passed for
 preview with `server` (20 tests passed) and app without default features (41 tests passed).
 The catalogue check exited zero. Release and other platforms were not rerun locally.
+
+After #49 (vertical-only text hinting), all eight Windows page goldens were refreshed.
+With the fit temporarily bypassed, all eight PNG files matched the old files byte for
+byte. With the fit on, only glyph pixels changed. Removing the text paints gave identical
+pages in both runs; dimensions, 518 line records (including source ranges and metrics)
+and 74 image-placement records also matched. No check tolerance or renderer code changed.
+On Windows with the CI-pinned Rust 1.99.1, format and workspace Clippy passed, as did
+workspace tests (2,370 passed, four Explorer tests filtered), release render (148 passed)
+and release preview with `server` (20 passed). The catalogue check passed. On local
+Rust 1.100.0, Clippy additionally flagged an unrelated range loop in `sections_tests.rs`;
+no change was made there. Linux and macOS were not run for this refresh.
