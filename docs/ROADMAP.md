@@ -32,6 +32,7 @@ something that cannot be tested headless).
 
 | Question | Answer |
 |---|---|
+| Markdown viewing (X13) | 2026-11-26: “markdown viewing is useful for many apps. shared it is.” Move the page renderer into this toolkit. |
 | JPEG and other decoders (F6, M5, F5) | `zune-jpeg =0.5.15`, pure Rust, behind the image module's decoder slot |
 | Accessibility (W8) | AccessKit: `accesskit` + `accesskit_winit`, behind an opt-in feature `a11y` |
 | WinRT for the media session (M1) and notifications (W7) | The `windows` crate at `=0.62.2` (already in `Cargo.lock` through fontique) with the WinRT features, behind opt-in features (`media-session`, `notify`); on macOS `objc2-media-player` and `objc2-user-notifications` 0.3 (the objc2 0.6 family); on Linux MPRIS and `org.freedesktop.Notifications` over zbus, which is there |
@@ -287,6 +288,7 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
+| X13 | **Share the Markdown page renderer.** From [mdview `01f67b2`](https://github.com/Kaan88/markdown-viewer-rs/tree/01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99): `mdshared-md-core` (parser, document model, find, selection and task marks), `mdshared-md-render` (headless layout and paint), `mdshared-md-preview` (wire format and render loop), `mdshared-md-engine` (SVG, TeX and Mermaid; binary still `mdview-engine`), and `mdshared-md-engine-proto` (helper wire format). Keep mdview's window, commands, tabs, session and presentation mode in the app; use existing `mdshared-app` plumbing for files, watching, single instance and updates. | M | medium | `mdshared-text`, `mdshared-highlight`, `mdshared-app` | In progress on `feat/md-renderer`. mdview must switch to the toolkit copy and move its toolkit pin with it. |
 | X1 | **See the animations in a window.** mdmix runs the motion (the owner has seen it and likes it); still unseen: the spinner and bar on `cycle`, a caret on `blink`, a page switch cut short by a resize | S | medium | `docs/ANIMATION.md` | open |
 | X2 | **Check the Linux reduced-motion reading on a real desktop.** KDE Plasma and GNOME: the three portal keys, the `SettingChanged` signal, the wake | S | low | `platform`, LINUX.md | open |
 | X3 | **Motion for the rest.** `notice` bars, the command palette, the tree's disclosure, the tab strip, a menu's hover row | M | medium | `anim`, each widget | done, on main, and the tree's disclosure on main (`Painter::icon_rotated`, `glyph::draw_disclosure`, `disclosure_turn`, `draw_disclosure_animated`, and the opt-in `expander::draw_expander_turning`; each the plain `RIGHT` or `DOWN` icon at rest; not seen by a person in an application): `Menu::draw_in_animated` (the hover row fades; at once under high contrast), `Palette::draw_presence` and `presence_bounds`, `notice::draw_sliding` and `bar_height`; the tab strip's hover is D4. Pixel-tested: each is its plain draw at rest |
