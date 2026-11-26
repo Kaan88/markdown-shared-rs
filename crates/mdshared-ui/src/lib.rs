@@ -5,7 +5,8 @@
 //! lists and toggle switches ([`dropdown`], [`toggle`]), a colour picker ([`colour_picker`]),
 //! expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
-//! of lists, grids and selections, the keyboard focus over the widgets a frame declares
+//! of lists, grids and selections, a scroll area ([`scrollarea`]), the keyboard focus over the
+//! widgets a frame declares
 //! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), and with the
 //! feature `a11y` an accessibility tree built from the same models (`a11y`). No window loop; the
 //! application owns that, or hands it for one window to `host` (feature `host`).
@@ -58,6 +59,7 @@ pub mod plan;
 pub mod platform;
 pub mod rows;
 pub mod scroll;
+pub mod scrollarea;
 pub mod sections;
 pub mod seek;
 pub mod segments;
