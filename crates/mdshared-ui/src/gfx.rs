@@ -15,6 +15,7 @@ mod covered;
 #[cfg(test)]
 pub(crate) use covered::WHOLE_SHADOW;
 mod painted;
+mod rich;
 mod rounding;
 mod shapes;
 pub(crate) use painted::prepare_image;
@@ -24,7 +25,12 @@ mod turned;
 pub use soft::{LIGHT_SHADOW, Shade, soft_bounds};
 
 pub type Rgb = [u8; 3];
-type Brush = [u8; 4];
+/// One run's brush, as [`TextEngine`] reads it and as [`crate::richtext`] wants it: red, green
+/// and blue, and a fourth byte that is 255 for text on the baseline. `mdshared_text`'s
+/// `RAISED` and `LOWERED` raise or lower the run; `MARKED` (a `<mark>`) only gives the run a
+/// glyph run of its own, so a caller can find its box and draw a highlight behind it — no call
+/// here draws that highlight. The same type as `mdshared_text::text::Brush`.
+pub type Brush = [u8; 4];
 
 pub const fn rgb(hex: u32) -> Rgb {
     [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
