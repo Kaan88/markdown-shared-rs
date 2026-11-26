@@ -8,6 +8,7 @@ use winit::window::Window;
 
 use super::Proxy;
 use super::frame::{Damage, Deadlines, Visibility};
+use super::timers::NamedTimers;
 use crate::anim::Animator;
 use crate::corners::Corners;
 use crate::cursor::Cursor;
@@ -33,6 +34,8 @@ pub(super) struct Shared {
     /// What the last frame said was in motion.
     pub(super) animated: Damage,
     pub(super) deadlines: Deadlines,
+    /// The application's named timers ([`Cx::timer_at`]).
+    pub(super) timers: NamedTimers,
     pub(super) cursor: Cursor,
     pub(super) snap: Option<Rect>,
     pub(super) backdrop: Backdrop,
@@ -111,6 +114,55 @@ impl<M: 'static> Cx<'_, M> {
     /// tooltip's delay, a toast's end, a `--seconds` limit.
     pub fn wake_at(&mut self, at: Instant) {
         self.st.deadlines.wake_at(at);
+    }
+
+    /// Sets the timer called `name` to `at`, or moves it when one of that name is already
+    /// waiting. When it comes the application gets
+    /// [`App::timer_fired`](super::App::timer_fired) with its name, once: ask again for a
+    /// repeating timer. Named timers are folded into the same one wake-up as
+    /// [`wake_at`](Self::wake_at) and the animator's deadline, so several of them (a caret's
+    /// blink, an autosave, a toast's end) still cost one `WaitUntil`; the loop sleeps until the
+    /// earliest. An instant already past is due at the next turn of the loop.
+    ///
+    /// A name is just a string the application chooses; setting it twice moves that one timer.
+    /// Timers keep running while the window is hidden ([`hide_window`](Self::hide_window)).
+    pub fn timer_at(&mut self, name: &str, at: Instant) {
+        self.st.timers.set(name, at);
+    }
+
+    /// Cancels the named timer `name`; true when one was waiting. A timer that has already
+    /// come is not cancelled (it is gone).
+    pub fn cancel_timer(&mut self, name: &str) -> bool {
+        self.st.timers.cancel(name)
+    }
+
+    /// Hides the window but keeps the loop alive (close to tray): timers and worker messages
+    /// still come, and the application still gets every call, but no frame is drawn or
+    /// presented until [`show_window`](Self::show_window). The window is not minimized and not
+    /// closed: its place, size and state stay as they were. This needs no tray icon of its
+    /// own; showing the window again is the application's (a tray icon, a second launch, a
+    /// global shortcut), which the host does not provide.
+    pub fn hide_window(&mut self) {
+        if !self.st.vis.app_hidden() {
+            self.st.vis.set_app_hidden(true);
+            self.window.set_visible(false);
+        }
+    }
+
+    /// Shows a window hidden by [`hide_window`](Self::hide_window) again. It is drawn whole, as
+    /// the window may have been covered or resized while it was away. Nothing when it was not
+    /// hidden by the application.
+    pub fn show_window(&mut self) {
+        if self.st.vis.app_hidden() {
+            self.st.vis.set_app_hidden(false);
+            self.window.set_visible(true);
+            self.st.damage.all();
+        }
+    }
+
+    /// Whether the application hid the window with [`hide_window`](Self::hide_window).
+    pub fn hidden(&self) -> bool {
+        self.st.vis.app_hidden()
     }
 
     /// The time the host read for this call (a frame's time during a draw): what a model is

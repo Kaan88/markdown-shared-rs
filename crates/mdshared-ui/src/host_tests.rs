@@ -6,6 +6,7 @@
 
 use super::frame::*;
 use super::input::*;
+use super::timers::NamedTimers;
 use super::*;
 use crate::anim::Animator;
 use crate::anim::{Clock, ManualClock, Motion};
@@ -162,6 +163,101 @@ fn merging_joins_the_rectangles_and_keeps_a_whole_window() {
     assert!(a.full);
     a.merge(Damage::default());
     assert!(a.full);
+}
+
+// ---- regions of damage ----
+
+#[test]
+fn two_far_apart_rectangles_stay_two_pieces_with_the_gap_between_them() {
+    let a = Rect::new(10.0, 10.0, 20.0, 10.0);
+    let b = Rect::new(200.0, 100.0, 20.0, 10.0);
+    let mut d = Damage::default();
+    d.add(a);
+    d.add(b);
+    assert_eq!(d.regions(), &[a, b][..]);
+    assert_eq!(
+        d.pieces(1.0, 400, 300),
+        vec![(10, 10, 30, 20), (200, 100, 220, 110)]
+    );
+    // The union is one rectangle from one corner to the other, holding the gap; neither piece
+    // does, so a frame that drew the union would paint {the gap} that nothing changed.
+    assert_eq!(d.device(1.0, 400, 300), Some((10, 10, 220, 110)));
+    for &(x0, y0, x1, y1) in &d.pieces(1.0, 400, 300) {
+        assert!(
+            !(x0 <= 120 && 120 < x1 && y0 <= 50 && 50 < y1),
+            "piece holds the gap"
+        );
+    }
+}
+
+#[test]
+fn overlapping_rectangles_join_into_one_piece_and_touching_ones_do_not() {
+    let mut d = Damage::default();
+    d.add(Rect::new(0.0, 0.0, 20.0, 20.0));
+    d.add(Rect::new(10.0, 10.0, 20.0, 20.0));
+    assert_eq!(d.regions(), &[Rect::new(0.0, 0.0, 30.0, 30.0)][..]);
+    assert_eq!(d.pieces(1.0, 100, 100), vec![(0, 0, 30, 30)]);
+
+    let mut touching = Damage::default();
+    touching.add(Rect::new(0.0, 0.0, 10.0, 10.0));
+    touching.add(Rect::new(10.0, 0.0, 10.0, 10.0));
+    assert_eq!(
+        touching.pieces(1.0, 100, 100),
+        vec![(0, 0, 10, 10), (10, 0, 20, 10)]
+    );
+}
+
+#[test]
+fn a_whole_window_is_one_piece_and_pieces_outside_the_bitmap_are_left_out() {
+    let mut d = Damage::default();
+    d.add(Rect::new(1.0, 1.0, 2.0, 2.0));
+    d.all();
+    assert!(d.regions().is_empty());
+    assert_eq!(d.pieces(1.0, 100, 80), vec![(0, 0, 100, 80)]);
+
+    let mut far = Damage::default();
+    far.add(Rect::new(5000.0, 5000.0, 10.0, 10.0));
+    far.add(Rect::new(2.0, 3.0, 4.0, 5.0));
+    assert_eq!(far.pieces(1.0, 100, 80), vec![(2, 3, 6, 8)]);
+    assert!(Damage::default().pieces(1.0, 0, 0).is_empty());
+}
+
+#[test]
+fn two_damage_regions_are_painted_without_the_union_between_them() {
+    use crate::gfx::{Gfx, Painter};
+    use mdshared_text::Bitmap;
+
+    let px = |bmp: &Bitmap, x: u32, y: u32| {
+        let i = ((y * bmp.width + x) * 4) as usize;
+        [bmp.pixels[i + 2], bmp.pixels[i + 1], bmp.pixels[i]]
+    };
+    let base = [10u8, 20, 30];
+    let hot = [200u8, 10, 10];
+    let mut bmp = Bitmap::new(240, 120);
+    let mut gfx = Gfx::new();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), base);
+    }
+    let mut d = Damage::default();
+    d.add(Rect::new(10.0, 10.0, 20.0, 10.0));
+    d.add(Rect::new(200.0, 80.0, 20.0, 10.0));
+    let pieces = d.pieces(1.0, 240, 120);
+    assert_eq!(pieces.len(), 2);
+    // The host's regioned frame: one painter and clip per piece.
+    for &(x0, y0, x1, y1) in &pieces {
+        let region = Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.clip(region);
+        p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), hot);
+    }
+    for (x, y) in [(15, 15), (205, 85)] {
+        assert_eq!(px(&bmp, x, y), hot, "a changed region at ({x}, {y})");
+    }
+    // The gap inside the union but in neither piece still holds the old frame.
+    for (x, y) in [(120, 50), (15, 85), (205, 15)] {
+        assert_eq!(px(&bmp, x, y), base, "the gap at ({x}, {y})");
+    }
 }
 
 // ---- deadlines ----
@@ -326,6 +422,34 @@ fn a_timer_asked_of_the_animator_comes_back_as_its_deadline() {
     );
 }
 
+#[test]
+fn named_timers_are_moved_cancelled_and_two_due_together_come_together() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut t = NamedTimers::default();
+    t.set("caret", t0 + ms(500));
+    t.set("autosave", t0 + ms(200));
+    assert_eq!(t.next(), Some(t0 + ms(200)));
+    // Moving one by name keeps one timer of that name.
+    t.set("autosave", t0 + ms(900));
+    assert_eq!(t.next(), Some(t0 + ms(500)));
+    assert_eq!(t.at("autosave"), Some(t0 + ms(900)));
+    // A timer set in the past is due at the next turn.
+    t.set("late", t0 - ms(1));
+    assert_eq!(t.take_due(t0), vec!["late".to_string()]);
+    // Two due at once: both, in the order they were set.
+    t.set("a", t0 + ms(10));
+    t.set("b", t0 + ms(10));
+    assert_eq!(
+        t.take_due(t0 + ms(10)),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    // Cancelling one leaves the other.
+    assert!(t.cancel("caret"));
+    assert_eq!(t.next(), Some(t0 + ms(900)));
+    assert!(!t.cancel("caret"));
+}
+
 // ---- clicks ----
 
 /// Windows' default double-click rectangle, 4 x 4 device px, at scale 1: 2 px each way.
@@ -464,6 +588,55 @@ fn a_covered_or_minimized_window_is_hidden_until_both_are_over() {
     assert!(!v.hidden());
     // A repeat of the same word changes nothing.
     assert!(!v.set_occluded(false));
+}
+
+#[test]
+fn a_window_the_application_hides_is_hidden_until_it_is_shown_again() {
+    let mut v = Visibility::default();
+    assert!(!v.app_hidden());
+    assert!(!v.set_app_hidden(true));
+    assert!(v.hidden());
+    assert!(v.app_hidden());
+    // A repeat changes nothing.
+    assert!(!v.set_app_hidden(true));
+    // Shown: seen again once, which redraws everything.
+    assert!(v.set_app_hidden(false));
+    assert!(!v.hidden());
+    assert!(!v.set_app_hidden(false));
+    // Hidden by the application while covered stays hidden when the cover goes.
+    v.set_app_hidden(true);
+    v.set_occluded(true);
+    v.set_app_hidden(false);
+    assert!(v.hidden());
+    v.set_occluded(false);
+    assert!(!v.hidden());
+}
+
+#[test]
+fn nothing_is_drawn_while_the_application_hides_the_window_but_timers_still_come() {
+    let t0 = Instant::now();
+    let mut v = Visibility::default();
+    let mut damage = Damage::default();
+    damage.add(Rect::new(10.0, 10.0, 20.0, 20.0));
+    assert!(wants_frame(v.hidden(), &damage));
+    v.set_app_hidden(true);
+    assert!(!wants_frame(v.hidden(), &damage));
+    // The animator's deadline is dropped while hidden; the named and one-shot timers are not.
+    let d = Deadlines {
+        anim: Some(t0 + Duration::from_millis(16)),
+        timer: Some(t0 + Duration::from_secs(1)),
+    };
+    assert_eq!(d.next(v.hidden()), Some(t0 + Duration::from_secs(1)));
+    let mut timers = NamedTimers::default();
+    timers.set("autosave", t0 + Duration::from_secs(30));
+    assert_eq!(timers.next(), Some(t0 + Duration::from_secs(30)));
+    // But a window hidden by the application is drawn again, whole, when shown.
+    let mut damage = Damage::default();
+    damage.add(Rect::new(10.0, 10.0, 20.0, 20.0));
+    if v.set_app_hidden(false) {
+        damage.all();
+    }
+    assert!(damage.full);
 }
 
 #[test]

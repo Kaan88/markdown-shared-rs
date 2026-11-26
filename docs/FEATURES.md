@@ -1029,8 +1029,9 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   optional dependency.
 
 Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and
-corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases,
-regions with their own damage.
+corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases.
+(Regions with their own damage, named timers and a hidden-but-alive window came later; see the
+K1 section below.)
 
 Run: 34 unit tests of the pure parts with `host,a11y` (33 with `host`): the damage join
 against a plain min and max over random rectangles, the outward device rounding against fine
@@ -1964,3 +1965,68 @@ from the caller); a scroll area that also reports how much is left to a screen r
 K12); and an application or Barbican screen using it, which is what would show it to a person
 first.
 
+## Named timers, a hidden window and separate damage regions (`mdshared_ui::host`, roadmap K1/BT3, 2026-11-26, `feat/k1-host-one-window`)
+
+Three additive pieces of the one-window host. Every existing public signature, `host::Event`
+and every other enum stayed as it was: the new behaviour is new methods on `Cx`, two new
+defaulted methods on `App`, and a new module. An application that changes nothing behaves
+exactly as before.
+
+- **Named timers.** `Cx::timer_at(name, at)` sets a timer under a name, or moves it when that
+  name already waits; `Cx::cancel_timer(name)` removes it and answers whether one was waiting.
+  When one is due the application gets `App::timer_fired(cx, name)`, a new defaulted trait
+  method (nothing by default); several due at the same instant arrive as one call per name, in
+  the order the timers were set. They join the one wake-up: the loop takes the earliest of the
+  animator's deadline, `Cx::wake_at` and every named timer, so any number of timers is still one
+  `ControlFlow::WaitUntil`. A timer set in the past is due at the next turn of the loop. The
+  model is `host/timers.rs` (`NamedTimers`: `set`, `cancel`, `at`, `next`, `len`, `take_due`),
+  pure and on passed instants.
+- **A window hidden but alive.** `Cx::hide_window` hides the window for a close to a tray;
+  `Cx::show_window` shows it again, drawn whole; `Cx::hidden` answers whether the application
+  hid it. `Visibility` gained an `app` flag beside `occluded` and `minimized`, so every check
+  that reads `hidden()` (`frame`, `after`, `about_to_wait`, the redraw request) now also covers
+  an application-hidden window: no frame is drawn or presented, no redraw is asked of winit, but
+  the animator's deadline is dropped while timers, named timers and worker messages still come.
+  Hiding in `App::start` (a launch to the tray) suppresses the first frame and the show that
+  follows it. No tray icon is provided: an application adds one with `crate::tray` (or a second
+  launch, or a shortcut) and calls `show_window` from it. The window keeps its place, size and
+  state; it is not minimized or closed.
+- **Regions with their own damage.** `App::damage_regions()`, a new defaulted method answering
+  false, opts an application into one `draw` call per damage rectangle instead of one for their
+  union. `Damage` now keeps each rectangle as a piece (overlapping pieces are joined as they are
+  added, so no pixel is drawn twice; touching or far-apart ones stay separate) beside the union
+  it already kept, and `Damage::pieces` rounds each piece outwards to device px on its own.
+  `present` copies and presents several device rectangles with `present_with_damage`, so the gap
+  between a caret's blink and a list's scroll is neither drawn nor sent to the window. A frame
+  with one piece, or an application that did not opt in, keeps the old one-call, one-rectangle
+  path exactly.
+
+New public API: `Cx::{timer_at, cancel_timer, hide_window, show_window, hidden}`,
+`App::{timer_fired, damage_regions}`. Everything else is private: `NamedTimers`, the pieces of
+`Damage`, the new `present`.
+
+Tests (all in `host_tests.rs` and the new `timers_tests.rs`): the earliest named timer wins; a
+name is moved rather than duplicated; a cancelled one is gone (and cancelling twice is false);
+two due together come together in set order; a timer in the past is due at once and a later one
+waits; an application-hidden window is hidden until shown (also while covered); nothing is
+drawn while hidden but the animator's deadline is dropped and named/one-shot timers still come;
+two far-apart rectangles stay two pieces with the gap in the union but in neither piece;
+overlapping rectangles join and touching ones do not; a whole window is one piece and pieces
+outside the bitmap are left out; and a pixel test paints two pieces into a bitmap and checks
+both changed while the gap inside their union kept the old frame. Each was seen failing under a
+deliberately broken implementation before it passed: `set` appending instead of moving,
+`take_due` taking only the first due, `next` answering the latest instead of the earliest,
+`hidden` ignoring the application's flag, and `pieces` answering the union — 9 of the new
+tests failed that way, and the earliest test failed on its own when `next` took the maximum.
+The files were restored afterwards.
+
+Run on Windows 11, `CARGO_TARGET_DIR=E:/mds-target/k1`: `cargo run -p mdshared-ui --features
+host --example host_regions -- --seconds 2` drew two full frames (the first, and the unfocused
+redraw), then at every 530 ms tick one *frame* whose two `draw` calls were `24,72 360x32` (the
+field's caret) and `24,136 480x260` (the list), printed by the application, and closed on the
+one-shot timer; the gap between the two rectangles was never drawn. `cargo fmt --all --check`,
+the workspace clippy and the workspace tests with `host,a11y` all passed (counts in the commit
+message). Not run on Linux or macOS. **Not seen by a person**: the window itself, the blink and
+the scroll, and the close-to-tray show/hide path (only the pure hidden-window state was
+tested). The tray icon that makes close-to-tray usable is out of scope and is the application's
+to add.
