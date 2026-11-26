@@ -215,12 +215,11 @@ fn submit(kind: u32, payload: Vec<u8>) -> Option<mdshared_md_engine_proto::Reply
 }
 
 fn decode(reply: Reply) -> Option<DecodedImage> {
+    let area = u64::from(reply.width) * u64::from(reply.height);
     if reply.status != STATUS_OK
-        || reply.width == 0
-        || reply.height == 0
+        || !(1..=MAX_PIXELS).contains(&area)
         || reply.rgba.len() as u64 > MAX_REPLY
-        || reply.rgba.len() != reply.width as usize * reply.height as usize * 4
-        || reply.width as u64 * reply.height as u64 > MAX_PIXELS
+        || reply.rgba.len() as u64 != area * 4
     {
         return None;
     }
@@ -343,6 +342,24 @@ mod tests {
                 "relative path was probed"
             )),
             None
+        );
+    }
+
+    fn badge() -> &'static [u8] {
+        include_bytes!("../../../fixtures/md/assets/badge.svg")
+    }
+
+    #[test]
+    fn engine_reply_dimensions_are_bounded_before_multiplying_by_four() {
+        assert!(
+            decode(Reply {
+                status: STATUS_OK,
+                width: u32::MAX,
+                height: u32::MAX,
+                baseline: 0,
+                rgba: vec![],
+            })
+            .is_none()
         );
     }
 
