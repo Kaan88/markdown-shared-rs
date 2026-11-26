@@ -55,32 +55,28 @@ checkouts or worktrees of this repository than the one you were given.
 
 ## Build, test, lint
 
-CI (`.github/workflows/ci.yml`, described in [docs/CI.md](docs/CI.md)) runs these on Linux,
-Windows and two Macs, with Rust 1.99.1, and nothing may fail or be skipped:
+CI (`.github/workflows/ci.yml`) runs these on Linux, Windows and Apple Silicon with Rust 1.99.1.
+The Intel Mac runs only on pushes to `main`. New runs cancel superseded runs of the same PR,
+but pushes have distinct concurrency groups, so no push to `main` supersedes another.
 
 ```sh
 cargo fmt --all --check
 cargo clippy --release --workspace --all-targets -- -D warnings
 cargo test --release --workspace            # --no-fail-fast on Windows and macOS
-cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
-cargo test --release -p mdshared-ui --features recycle recycle
-cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
-cargo test --release -p mdshared-ui --features media-session media_session
-cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
-cargo test --release -p mdshared-ui --features notify notify
-cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
-cargo test --release -p mdshared-ui --features a11y a11y
+cargo clippy --release -p mdshared-ui --all-targets --features recycle,media-session,notify,a11y,host,term -- -D warnings
+cargo test --release -p mdshared-ui --features recycle,media-session,notify,a11y,host,term recycle -- media_session notify a11y host:: termview
 cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
 cargo test --release -p mdshared-ui --features host host::
-cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-cargo test --release -p mdshared-ui --features host,a11y host::
-cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
-cargo test --release -p mdshared-ui --features term termview
+cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
+cargo test --release -p mdshared-md-preview --features server
+cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
 ```
 
-Run all seventeen before you say a change is done. The Windows job of CI also runs the host's
-example for two seconds (`cargo run --release -p mdshared-ui --features host,a11y --example host
--- --seconds 2`): run it too after a change to `host`. While working, the debug forms are faster
+Run all ten before you say a code change is done. Keep `host` without `a11y` for the host's
+non-accessibility build, and keep the preview server and no-defaults `mdshared-app` checks
+separate so the UI build cannot turn on `mdshared-app`'s default features. The Windows job also
+runs the host's example for two seconds (`cargo run --release -p mdshared-ui --features host,a11y
+--example host -- --seconds 2`): run it too after a change to `host`. The debug forms are faster
 (`cargo test -p mdshared-ui --lib <module>::`, `cargo clippy -p mdshared-ui --all-targets -- -D
 warnings`). Two traps:
 
