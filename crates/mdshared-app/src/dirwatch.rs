@@ -27,9 +27,8 @@
 //!   [`Instant`] they happened at, and it answers [`Verdict`]s that name paths, so it can be
 //!   tested with nothing but numbers and lists;
 //! - [`DirWatcher`] is the edge. It watches one folder with `notify`, feeds the coalescer on its
-//!   own thread, reads each changed path's details with [`Entry::at`](crate::dirlist::Entry::at),
-//!   and wakes the application the way [`FileWatcher`](crate::watch::FileWatcher) does: one
-//!   [`wake`](DirWatcher::new) call per settled report, and none again until
+//!   own thread, reads each changed path's details there, and wakes the application the way
+//!   [`FileWatcher`](crate::watch::FileWatcher) does: once, and none again until
 //!   [`woken`](DirWatcher::woken) is called.
 //!
 //! The root the OS watcher is given is worked out once, at start (`std::path::absolute` on
@@ -75,18 +74,20 @@
 //! - no clock read inside [`Coalescer`], and no disk read inside it either; the watcher is what
 //!   reads the clock and the disk.
 
+mod backend;
 mod order;
 mod resolve;
 mod translate;
 
 use crate::dirlist::{Change, Entry};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{RecursiveMode, Watcher as _};
 use order::{Item, settled};
 use resolve::{read_from_root, signal_of};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use translate::{Translator, translation};
@@ -771,7 +772,7 @@ impl Shared {
     }
 }
 
-/// Reads one path's entry; `Entry::at` in a real watcher, a made-up disk in a test.
+/// Reads a path's entry, keeping filesystem errors for the worker.
 type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
 
 /// Watches one folder and reports what changed in it, settled, as [`Signal`]s.
@@ -783,16 +784,13 @@ type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
 /// (once, until [`woken`](Self::woken) is called) and the application takes the report with
 /// [`take`](Self::take).
 ///
-/// Dropping the watcher does not wait for the thread: the thread may be in the middle of a read
-/// on a share that never answers, and the application's thread must not wait for it. The drop
-/// tells the thread to stop, and the thread ends by itself after the read it is in returns,
-/// without reading anything else or reporting anything.
+/// Dropping the watcher signals both threads without waiting: a metadata read or native watcher
+/// teardown may be blocked on a share. The metadata worker exits after any in-flight read
+/// returns, without reading another entry or delivering its result.
 pub struct DirWatcher {
     folder: PathBuf,
-    /// What the OS watcher was given and what its events are built from.
-    root: PathBuf,
-    /// The OS watcher; dropping it stops its callbacks.
-    watcher: RecommendedWatcher,
+    /// Disconnects the native watcher's owner after `Drop` stops the inbox.
+    _backend: Sender<()>,
     inbox: Arc<Inbox>,
     shared: Arc<Shared>,
 }
@@ -838,8 +836,7 @@ impl DirWatcher {
         )
     }
 
-    /// Starts the watcher with the reader given: [`Entry::at`](crate::dirlist::Entry::at) in a
-    /// real watcher, and a made-up disk in a test of this module.
+    /// Starts the watcher with the reader given, which tests may replace.
     fn start(
         folder: PathBuf,
         root: PathBuf,
@@ -851,17 +848,21 @@ impl DirWatcher {
         let shared = Arc::new(Shared::default());
         let names = Translator::new(folder.clone(), root.clone());
         let for_events = Arc::clone(&inbox);
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let at = Instant::now();
-            for (change, cookie) in translation(event, &names) {
-                for_events.push(change, at, cookie);
-            }
-        })
-        .ok()?;
-        let mut watcher = watcher;
-        if watcher.watch(&root, RecursiveMode::NonRecursive).is_err() {
-            return None;
-        }
+        let watch_root = root.clone();
+        let backend = backend::start(move || {
+            let mut watcher =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    let at = Instant::now();
+                    for (change, cookie) in translation(event, &names) {
+                        for_events.push(change, at, cookie);
+                    }
+                })
+                .ok()?;
+            watcher
+                .watch(&watch_root, RecursiveMode::NonRecursive)
+                .ok()?;
+            Some(watcher)
+        })?;
         let identity = identity(&root);
         let coalescer = Coalescer::new(folder.clone(), debounce);
         let for_work = Arc::clone(&inbox);
@@ -884,8 +885,7 @@ impl DirWatcher {
             .ok()?;
         Some(DirWatcher {
             folder,
-            root,
-            watcher,
+            _backend: backend,
             inbox,
             shared,
         })
@@ -912,10 +912,7 @@ impl DirWatcher {
 
 impl Drop for DirWatcher {
     fn drop(&mut self) {
-        // Stop the OS watch first, so its callback pushes nothing more, then tell the thread to
-        // stop and do not wait for it: it may be inside a read on a share that never answers,
-        // and this drop runs on the thread that draws.
-        _ = self.watcher.unwatch(&self.root);
+        // Ignore further callbacks before the owner's channel disconnects and starts teardown.
         self.inbox.stop();
     }
 }

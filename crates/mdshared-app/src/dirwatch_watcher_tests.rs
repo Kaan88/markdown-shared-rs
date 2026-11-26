@@ -108,7 +108,7 @@ fn entry_at(path: PathBuf) -> Entry {
     }
 }
 
-/// Abandons the watcher while the reader is blocked, and measures the drop.
+/// Abandons the watcher while the reader is blocked, before opening the gate.
 #[test]
 fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
     let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-drop-{}", std::process::id()));
@@ -117,7 +117,7 @@ fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
     let dir = dir.canonicalize().unwrap();
 
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let release = std::sync::Mutex::new(release_rx);
     let read: Arc<Read> = Arc::new(move |path: &Path| {
         started_tx.send(()).ok();
@@ -136,31 +136,63 @@ fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
     )
     .expect("the watcher starts");
 
-    std::fs::write(dir.join("a.txt"), "x").unwrap();
+    watcher
+        .inbox
+        .push(RawChange::Created(dir.join("a.txt")), Instant::now(), None);
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the report is being read");
 
-    // Release the read a little after the drop, from another thread, so a drop that joins
-    // would be measured waiting for it.
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        release_tx.send(()).ok();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let dropping = std::thread::spawn(move || {
+        drop(watcher);
+        done_tx.send(()).ok();
     });
-    let before = Instant::now();
-    drop(watcher);
-    let waited = before.elapsed();
-    release.join().ok();
-
-    assert!(
-        waited < Duration::from_millis(300),
-        "the drop waited {waited:?} for the read"
-    );
-    assert!(
-        wake_rx.try_recv().is_err(),
-        "nothing is reported after the watcher is dropped"
+    let done = done_rx.recv_timeout(Duration::from_secs(5));
+    drop(release_tx);
+    done.expect("dropping returns while the read is still blocked");
+    dropping.join().unwrap();
+    assert_eq!(
+        wake_rx.recv_timeout(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the worker exits without waking"
     );
     _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    struct GatedBackend(Sender<()>, Receiver<()>);
+    impl Drop for GatedBackend {
+        fn drop(&mut self) {
+            self.0.send(()).ok();
+            self.1.recv().ok();
+        }
+    }
+
+    let (started, teardown) = channel();
+    let (release, gate) = channel();
+    let backend = backend::start(move || Some(GatedBackend(started, gate))).unwrap();
+    let inbox = Arc::new(Inbox::default());
+    let watcher = DirWatcher {
+        folder: folder(),
+        _backend: backend,
+        inbox: Arc::clone(&inbox),
+        shared: Arc::new(Shared::default()),
+    };
+    let (done, dropped) = channel();
+    let dropping = std::thread::spawn(move || {
+        drop(watcher);
+        done.send(()).ok();
+    });
+    teardown.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = dropped.recv_timeout(Duration::from_secs(5));
+    drop(release);
+    result.expect("dropping returns without waiting for native teardown");
+    assert!(inbox.stopped());
+    dropping.join().unwrap();
 }
 
 /// The thread reads no path after the watcher is dropped, even when a report had several.
@@ -178,7 +210,7 @@ fn a_stopped_watcher_reads_no_more_paths() {
     let coalescer = Coalescer::new(folder(), Duration::from_millis(10));
 
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&reads);
     let release = std::sync::Mutex::new(release_rx);
@@ -191,14 +223,19 @@ fn a_stopped_watcher_reads_no_more_paths() {
     let wake = || {};
     let for_work = Arc::clone(&inbox);
     let for_report = Arc::clone(&shared);
-    std::thread::spawn(move || run(for_work, for_report, coalescer, &wake, read, folder(), None));
+    let (done, exited) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        run(for_work, for_report, coalescer, &wake, read, folder(), None);
+        done.send(()).ok();
+    });
 
     started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("the first read starts");
     inbox.stop();
-    release_tx.send(()).ok();
-    std::thread::sleep(Duration::from_millis(200));
+    drop(release_tx);
+    exited.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
 
     assert_eq!(
         reads.load(Ordering::Acquire),
@@ -263,14 +300,6 @@ fn a_folder_on_disk_reports_creates_renames_and_removes_that_apply_to_the_listin
     listing.set_folder(Some(dir.0.clone()));
     listing.set_entries(read(&dir.0, &|| false));
 
-    // Let anything the watch saw before this point drain away.
-    let settle_end = std::time::Instant::now() + Duration::from_millis(300);
-    while std::time::Instant::now() < settle_end {
-        watcher.woken();
-        _ = watcher.take();
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
     std::fs::write(dir.0.join("made.txt"), "made").unwrap();
     std::fs::rename(dir.0.join("moving.txt"), dir.0.join("moved.txt")).unwrap();
     std::fs::rename(dir.0.join("keep.txt"), dir.0.join("kept.txt")).unwrap();
@@ -281,18 +310,10 @@ fn a_folder_on_disk_reports_creates_renames_and_removes_that_apply_to_the_listin
     let mut saw_rename = false;
     let mut saw_remove = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut quiet_since = std::time::Instant::now();
-    while std::time::Instant::now() < deadline {
+    let expected = ["kept.txt", "made.txt", "moved.txt"];
+    loop {
         watcher.woken();
         let signals = watcher.take();
-        if signals.is_empty() {
-            if quiet_since.elapsed() > Duration::from_millis(600) {
-                break;
-            }
-            _ = receive.recv_timeout(Duration::from_millis(25));
-            continue;
-        }
-        quiet_since = std::time::Instant::now();
         for signal in signals {
             match signal {
                 Signal::Changed(change) => {
@@ -308,6 +329,13 @@ fn a_folder_on_disk_reports_creates_renames_and_removes_that_apply_to_the_listin
                 Signal::Rescan => panic!("a small burst of changes is not an overflow"),
                 Signal::Lost => panic!("the folder is still there"),
             }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if (saw_create && saw_rename && saw_remove && names(&listing) == expected)
+            || remaining.is_zero()
+            || receive.recv_timeout(remaining).is_err()
+        {
+            break;
         }
     }
 
@@ -325,14 +353,7 @@ fn a_folder_on_disk_reports_creates_renames_and_removes_that_apply_to_the_listin
         applied, reread,
         "applying the report gives the same list as reading the folder again"
     );
-    assert_eq!(
-        names(&listing),
-        vec![
-            "kept.txt".to_string(),
-            "made.txt".to_string(),
-            "moved.txt".to_string()
-        ]
-    );
+    assert_eq!(names(&listing), expected);
 
     drop(watcher);
 }
