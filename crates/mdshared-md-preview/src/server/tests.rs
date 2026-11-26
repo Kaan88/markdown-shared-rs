@@ -490,6 +490,26 @@ fn a_view_larger_than_a_frame_can_carry_is_drawn_at_the_largest_one() {
     assert_eq!(f.pixels.len(), wire::MAX_SIDE as usize * 12 * 4);
 }
 
+#[test]
+fn a_narrow_preview_allocates_the_requested_width_even_at_extreme_scale() {
+    for scale in [1.0, 1.5, f32::MAX] {
+        let mut s = Server::new();
+        s.apply(Request::Text {
+            text: "Narrow text".into(),
+            base_dir: None,
+        });
+        s.apply(Request::View {
+            width: 39,
+            height: 47,
+            scale,
+            dark: false,
+        });
+        let f = s.frame().expect("drawn");
+        assert_eq!((f.width, f.height), (39, 47));
+        assert_eq!(f.pixels.len(), 39 * 47 * 4);
+    }
+}
+
 /// Audit 4, E7: a tick and a new text in the same batch (the reader clicked a box while the
 /// editor sent what was typed): the tick's offset was into the old text, so it is not
 /// answered, and the page follows the caret for the new text instead of staying still.

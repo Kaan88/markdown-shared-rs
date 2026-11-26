@@ -10,6 +10,34 @@ use crate::bitmap::Bitmap;
 use mdshared_md_core::model::Document;
 use std::collections::HashMap;
 
+const MAX_WIDTH: u32 = 8192;
+
+pub(super) fn layout_size(options: &Options) -> (f32, f32) {
+    let scale = if options.scale.is_finite() {
+        options.scale.clamp(0.1, 8.0)
+    } else {
+        1.0
+    };
+    (
+        options.width.max(120.0).min(MAX_WIDTH as f32 / scale),
+        scale,
+    )
+}
+
+fn layout_device_width(options: &Options) -> u32 {
+    let (logical_width, scale) = layout_size(options);
+    (logical_width * scale).round() as u32
+}
+
+/// Cap the bytes passed to `Bitmap::new`, including on 32-bit hosts. Page renders can be
+/// taller than a viewport, so height is bounded by the remaining byte budget, not the width cap.
+pub(super) fn raster_size(width: u32, rows: u32) -> (u32, u32) {
+    const MAX_RASTER_BYTES: u32 = 256 * 1024 * 1024;
+    let width = width.clamp(1, MAX_WIDTH);
+    let stride = width.checked_mul(4).expect("bounded width");
+    (width, rows.clamp(1, MAX_RASTER_BYTES / stride))
+}
+
 impl DocumentRenderer {
     /// Draws the viewport into a frame kept between calls. When the new view still overlaps the last
     /// one, those rows are shifted in place and only the band that came into view is painted.
@@ -24,15 +52,40 @@ impl DocumentRenderer {
         top: f32,
         height: f32,
     ) -> &Frame {
+        let width = layout_device_width(options);
+        self.view_frame_inner(doc, options, top, width, height)
+    }
+
+    /// Draws a kept viewport frame at an explicit device-pixel size. The width used to lay out
+    /// text may be larger than the bitmap, in which case the drawing is clipped. Empty
+    /// dimensions become one pixel; excessive dimensions are reduced to fit the raster budget.
+    pub fn view_frame_sized(
+        &mut self,
+        doc: &Document,
+        options: &Options,
+        top: f32,
+        size: (u32, u32),
+    ) -> &Frame {
+        self.view_frame_inner(doc, options, top, size.0, size.1 as f32)
+    }
+
+    fn view_frame_inner(
+        &mut self,
+        doc: &Document,
+        options: &Options,
+        top: f32,
+        width: u32,
+        height: f32,
+    ) -> &Frame {
+        let (width, rows) = raster_size(width, height.ceil() as u32);
+        let height = height.clamp(1.0, rows as f32).max(1.0);
         self.ensure_layout(doc, options);
-        let height = height.max(1.0);
         self.store.begin_frame();
         self.set_top(top);
         self.view.height = height;
         let top = self.settle_view(doc, height).round();
         self.set_top(top);
         let stale = std::mem::take(&mut self.view.stale);
-        let rows = height.ceil().max(1.0) as u32;
         // Rows an animated image changed, cut to this viewport.
         let repaint = self.view.repaint.take().and_then(|(y0, y1)| {
             let (a, b) = (y0.max(top).floor(), y1.min(top + rows as f32).ceil());
@@ -50,7 +103,6 @@ impl DocumentRenderer {
             &self.details,
             self.gap,
         );
-        let width = pager.width.round().max(1.0) as u32;
         let same_size = self
             .frame
             .as_ref()
@@ -114,7 +166,8 @@ impl DocumentRenderer {
             let frame = self.frame.as_mut().expect("frame");
             pager.draw(&mut frame.bitmap, frame_top, &mut self.engine)
         } else {
-            let mut band_bitmap = Bitmap::new(width, band.1.ceil().max(1.0) as u32);
+            let band_rows = (band.1.ceil() as u32).clamp(1, rows);
+            let mut band_bitmap = Bitmap::new(width, band_rows);
             band_bitmap.clear(background);
             let stats = pager.draw(&mut band_bitmap, band.0, &mut self.engine);
             let frame = self.frame.as_mut().expect("frame");
@@ -138,8 +191,9 @@ impl DocumentRenderer {
     /// Renders one viewport slice into a fresh bitmap, reusing the contexts and glyph cache. Like
     /// a frame, it measures what it shows and moves the anchor to `top`.
     pub fn view(&mut self, doc: &Document, options: &Options, top: f32, height: f32) -> Slice {
+        let (_, rows) = raster_size(layout_device_width(options), height.ceil() as u32);
         self.ensure_layout(doc, options);
-        let height = height.max(1.0);
+        let height = height.clamp(1.0, rows as f32).max(1.0);
         self.store.begin_frame();
         self.set_top(top);
         self.view.height = height;
@@ -159,6 +213,14 @@ impl DocumentRenderer {
         collect(page, &self.cache, &self.floats, &mut pager, top, height);
         pager.finish_slice(top, height, total_height, &mut self.engine)
     }
+}
+
+#[cfg(test)]
+#[test]
+fn bitmap_dimensions_are_bounded_before_allocating() {
+    assert_eq!(raster_size(u32::MAX, u32::MAX), (8192, 8192));
+    assert_eq!(raster_size(1000, u32::MAX), (1000, 67_108));
+    assert_eq!(raster_size(0, 0), (1, 1));
 }
 
 /// The first and last block index a frame at `top` with `rows` rows shows.

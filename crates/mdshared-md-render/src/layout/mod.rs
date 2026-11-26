@@ -53,11 +53,11 @@ pub struct Options {
     pub width: f32,
     pub scale: f32,
     pub theme: Theme,
-    /// Stop laying out past this many logical px. The bitmap is clipped to it. Only
-    /// [`DocumentRenderer::page`] honours it; the scrolling path lays out what is shown.
+    /// Clip the bitmap and stop laying out past this many logical px (at least one device row).
+    /// Only [`DocumentRenderer::page`] honours it; the scrolling path lays out what is shown.
     pub max_height: Option<f32>,
-    /// The directory the document came from, so relative image paths resolve. `None` leaves
-    /// images as placeholders.
+    /// The absolute directory the document came from. Without it, relative images are
+    /// placeholders, not looked up in the working directory.
     pub base_dir: Option<PathBuf>,
 }
 
@@ -440,6 +440,11 @@ impl DocumentRenderer {
             &self.details,
             self.gap,
         );
+        let requested = options
+            .max_height
+            .map_or(u32::MAX, |h| (h * pager.scale).ceil() as u32);
+        let (_, rows) = frame::raster_size(pager.width as u32, requested);
+        pager.max_y = rows as f32;
         pager.page();
         pager.finish(&mut self.engine)
     }

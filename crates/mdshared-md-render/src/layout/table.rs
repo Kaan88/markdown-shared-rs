@@ -55,10 +55,31 @@ impl<'a, 'b> Pager<'a, 'b> {
         };
         let mut rows = Vec::new();
         let mut captions = Vec::new();
+        let pad_y = self.px(8.0);
+        let hr = self.hair();
+        let row_step = 2.0 * pad_y + hr;
+        let mut least_bottom = self.y;
+        let mut clipped = false;
         for row in self.doc.children(b) {
+            #[cfg(test)]
+            ROWS_VISITED.with(|n| n.set(n.get() + 1));
+            if least_bottom >= self.max_y {
+                clipped = true;
+                break;
+            }
             match caption_of(row) {
-                Some(caption) => captions.push(caption),
-                None => rows.push(row),
+                Some(caption) => {
+                    captions.push(caption);
+                    // Empty captions take no space but must not remove the work bound.
+                    least_bottom += self.px(8.0).max(1.0);
+                }
+                None => {
+                    rows.push(row);
+                    least_bottom += match self.doc.attrs_of(row).and_then(|a| a.height) {
+                        Some(Length::Px(px)) => (2.0 * pad_y).max(self.px(px as f32)) + hr,
+                        _ => row_step,
+                    };
+                }
             }
         }
         let table_attrs = self.doc.attrs_of(b).copied();
@@ -70,6 +91,7 @@ impl<'a, 'b> Pager<'a, 'b> {
         let mut cells: Vec<Cell> = Vec::new();
         // `taken[r]` holds the columns of row `r` already covered by a cell from above.
         let mut taken: Vec<Vec<bool>> = vec![Vec::new(); row_count];
+        let mut crosses: Vec<Vec<bool>> = vec![Vec::new(); row_count.saturating_sub(1)];
         let mut columns = 0usize;
         for (r, row) in rows.iter().enumerate() {
             let header = matches!(
@@ -113,6 +135,12 @@ impl<'a, 'b> Pager<'a, 'b> {
                     }
                     row[col..col + colspan].fill(true);
                 }
+                for row in crosses.iter_mut().skip(r).take(rowspan - 1) {
+                    if row.len() < col + colspan {
+                        row.resize(col + colspan, false);
+                    }
+                    row[col..col + colspan].fill(true);
+                }
                 columns = columns.max(col + colspan);
                 if rowspan == 1
                     && let Some(Length::Px(px)) = cell_attrs.and_then(|a| a.height)
@@ -144,11 +172,12 @@ impl<'a, 'b> Pager<'a, 'b> {
         if columns == 0 || row_count == 0 {
             self.clear_floats(left, full);
             self.captions(&captions, left, full, left + full / 2.0);
+            if clipped {
+                self.y = self.y.max(self.max_y + row_step);
+            }
             return;
         }
         let pad_x = self.px(13.0);
-        let pad_y = self.px(8.0);
-        let hr = self.hair();
         let text_size = 15.0;
         let txt_of = |cell: &Cell, max: Option<f32>, color: Color| Txt {
             size: text_size,
@@ -383,18 +412,14 @@ impl<'a, 'b> Pager<'a, 'b> {
         }
         col_x.push(cx);
         // Row separators stop where a cell spans past them.
-        for ri in 0..row_count.saturating_sub(1) {
+        for (ri, blocked) in crosses.iter().enumerate() {
             let y = y0 + row_y[ri] + heights[ri];
+            if y >= self.max_y {
+                break;
+            }
             let mut c = 0;
             while c < columns {
-                let covered = |c: usize| {
-                    cells.iter().any(|cell| {
-                        cell.col <= c
-                            && c < cell.col + cell.colspan
-                            && cell.row <= ri
-                            && ri + 1 < cell.row + cell.rowspan
-                    })
-                };
+                let covered = |c: usize| blocked.get(c).copied().unwrap_or(false);
                 if covered(c) {
                     c += 1;
                     continue;
@@ -440,6 +465,35 @@ impl<'a, 'b> Pager<'a, 'b> {
             );
         }
         self.y = y0 + total_h + self.px(16.0);
+        if clipped {
+            self.y = self.y.max(self.max_y + row_step);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[test]
+fn a_clipped_page_bounds_both_table_rows_visited_and_bitmap_bytes() {
+    let options = super::Options {
+        width: 240.0,
+        scale: 1.5,
+        max_height: Some(96.0),
+        ..Default::default()
+    };
+    for rows in [200, 400] {
+        let doc =
+            mdshared_md_core::parse(&format!("| Head |\n| --- |\n{}", "| Row |\n".repeat(rows)));
+        ROWS_VISITED.set(0);
+        let page = super::render(&doc, &options);
+        assert_eq!((page.bitmap.width, page.bitmap.height), (360, 144));
+        assert_eq!(page.bitmap.pixels.len(), 360 * 144 * 4);
+        assert!(page.content_height > 144.0);
+        assert_eq!(ROWS_VISITED.get(), 5);
     }
 }
 
@@ -448,6 +502,9 @@ impl<'a, 'b> Pager<'a, 'b> {
     /// as the room from `left` over `width` allows, and wrapped only at that room's width.
     fn captions(&mut self, captions: &[u32], left: f32, width: f32, centre: f32) {
         for &caption in captions {
+            if self.y >= self.max_y {
+                break;
+            }
             let inline = self.cell_inline(caption);
             if inline.text.trim().is_empty() && inline.boxes.is_empty() {
                 continue;
