@@ -19,6 +19,43 @@ fn p(name: &str) -> PathBuf {
 
 // The wake contract shared with the application.
 
+/// A folder that is still the same folder is not lost: the events were confused, so re-read.
+#[test]
+fn a_folder_that_is_still_there_is_not_lost() {
+    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-still-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let started = identity(&dir);
+    assert_eq!(lost_signal(&dir, started), Signal::Rescan);
+    _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A folder that is gone is lost.
+#[test]
+fn a_folder_that_is_gone_is_lost() {
+    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-gone-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(lost_signal(&dir, None), Signal::Lost);
+}
+
+/// A folder made again under the same name is not the folder that was watched, so it is lost.
+#[cfg(unix)]
+#[test]
+fn a_folder_made_again_under_the_same_name_is_lost() {
+    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-again-{}", std::process::id()));
+    let other =
+        std::env::temp_dir().join(format!("mdshared-dirwatch-again-o-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    _ = std::fs::remove_dir_all(&other);
+    std::fs::create_dir_all(&dir).unwrap();
+    let started = identity(&dir);
+    std::fs::rename(&dir, &other).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(lost_signal(&dir, started), Signal::Lost);
+    _ = std::fs::remove_dir_all(&dir);
+    _ = std::fs::remove_dir_all(&other);
+}
+
 #[test]
 fn a_burst_of_reports_wakes_once_until_woken() {
     let wakes = AtomicBool::new(false);
@@ -152,7 +189,7 @@ fn a_stopped_watcher_reads_no_more_paths() {
     let wake = || {};
     let for_work = Arc::clone(&inbox);
     let for_report = Arc::clone(&shared);
-    std::thread::spawn(move || run(for_work, for_report, coalescer, &wake, read));
+    std::thread::spawn(move || run(for_work, for_report, coalescer, &wake, read, folder(), None));
 
     started_rx
         .recv_timeout(Duration::from_secs(5))

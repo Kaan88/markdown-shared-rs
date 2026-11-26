@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::dirlist::Kind;
-use notify::event::{CreateKind, Flag, RemoveKind};
+use notify::EventKind;
+use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
 
 /// The folder every pure test watches.
 fn folder() -> PathBuf {
@@ -353,6 +354,25 @@ fn nothing_is_reported_before_the_quiet_period_ends() {
 }
 
 #[test]
+fn a_burst_that_cancels_out_leaves_no_stale_wait() {
+    let t = Instant::now();
+    let mut c = Coalescer::with_max_wait(
+        folder(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    );
+    // A creation and its removal are nothing at all; the burst is over.
+    push(&mut c, t, 0, RawChange::Created(p("a.txt")));
+    push(&mut c, t, 10, RawChange::Removed(p("a.txt")));
+    assert!(c.is_idle());
+    assert_eq!(c.deadline(), None);
+    // A later event must get its own quiet period, not the old burst's longest wait.
+    push(&mut c, t, 500, RawChange::Created(p("b.txt")));
+    assert_eq!(c.deadline(), Some(t + Duration::from_millis(550)));
+    assert_eq!(settle(&mut c, t, 549), Vec::new(), "still its own burst");
+}
+
+#[test]
 fn a_zero_quiet_period_settles_at_the_next_flush() {
     let t = Instant::now();
     let mut c = Coalescer::new(folder(), Duration::ZERO);
@@ -375,6 +395,58 @@ fn a_report_names_each_path_once_in_a_stable_order() {
             Verdict::Removed(p("b.txt")),
             Verdict::Modified(p("c.txt"))
         ]
+    );
+}
+
+#[test]
+fn only_the_renames_in_a_cycle_are_broken_into_removals_and_modifications() {
+    let t = Instant::now();
+    let mut c = coalescer();
+    // A swap through a temporary name is a cycle: a->t, b->a, t->b.
+    push(&mut c, t, 0, RawChange::RenamedFrom(p("a")));
+    push(&mut c, t, 1, RawChange::RenamedTo(p("t")));
+    push(&mut c, t, 2, RawChange::RenamedFrom(p("b")));
+    push(&mut c, t, 3, RawChange::RenamedTo(p("a")));
+    push(&mut c, t, 4, RawChange::RenamedFrom(p("t")));
+    push(&mut c, t, 5, RawChange::RenamedTo(p("b")));
+    // An unrelated rename must stay a rename, so the selection can follow it.
+    push(&mut c, t, 6, RawChange::RenamedFrom(p("c")));
+    push(&mut c, t, 7, RawChange::RenamedTo(p("d")));
+    let verdicts = settle(&mut c, t, 1_000);
+    assert!(
+        verdicts.contains(&Verdict::Renamed {
+            from: p("c"),
+            to: p("d")
+        }),
+        "an unrelated rename is not broken: {verdicts:?}"
+    );
+    assert!(
+        !verdicts.contains(&Verdict::Modified(p("d"))),
+        "and it is not read from the disk either: {verdicts:?}"
+    );
+}
+
+#[test]
+fn twenty_thousand_removals_and_renames_settle_well_under_a_second() {
+    let t = Instant::now();
+    let mut c = Coalescer::with_max_wait(
+        folder(),
+        Duration::from_secs(3_600),
+        Duration::from_secs(7_200),
+    );
+    for i in 0..10_000u64 {
+        let at = t + Duration::from_millis(i);
+        c.push(RawChange::RenamedFrom(p(&format!("a{i}"))), at);
+        c.push(RawChange::RenamedTo(p(&format!("b{i}"))), at);
+        c.push(RawChange::Removed(p(&format!("c{i}"))), at);
+    }
+    let before = Instant::now();
+    let verdicts = c.flush(t + Duration::from_secs(7_200));
+    let elapsed = before.elapsed();
+    assert_eq!(verdicts.len(), 20_000);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the report took {elapsed:?}, which is not well under a second"
     );
 }
 
@@ -537,7 +609,7 @@ fn a_rescan_is_a_rescan() {
 /// The translation of one event for the pure folder `/watched`; it exists in no file system, so
 /// the translator compares paths lexically.
 fn translate(event: &notify::Event) -> Vec<RawChange> {
-    Translator::new(&folder()).translate(event)
+    Translator::new(folder(), folder()).translate(event)
 }
 
 /// A `notify` result that is an error.
@@ -638,7 +710,7 @@ fn an_event_about_the_folder_itself_is_a_lost_watch() {
 
 #[test]
 fn an_error_from_the_os_watcher_is_a_rescan() {
-    let names = Translator::new(&folder());
+    let names = Translator::new(folder(), folder());
     assert_eq!(translation(error(), &names), vec![RawChange::Rescan]);
 }
 
@@ -657,43 +729,36 @@ fn an_access_or_untyped_event_says_nothing() {
 
 #[test]
 fn an_event_path_is_rewritten_as_the_callers_folder() {
-    // A real folder, so the parent can be canonicalised; the path is given the way another
-    // spelling of the same folder would (through `sub/..`).
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-names-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    let dir = dir.canonicalize().unwrap();
-    let names = Translator::new(&dir);
-    let roundabout = dir.join("sub").join("..").join("a.txt");
-    let event = notify::Event::new(EventKind::Create(CreateKind::File)).add_path(roundabout);
+    // The root is what the OS watcher was given and the folder is what the caller named, so
+    // this needs no disk at all: nothing here exists.
+    let names = Translator::new(PathBuf::from("/given"), PathBuf::from("/root"));
+    let event = notify::Event::new(EventKind::Create(CreateKind::File))
+        .add_path(PathBuf::from("/root/a.txt"));
     assert_eq!(
         names.translate(&event),
-        vec![RawChange::Created(dir.join("a.txt"))],
+        vec![RawChange::Created(PathBuf::from("/given/a.txt"))],
         "the path is the folder given, joined with the event's own name"
     );
+    // The caller's spelling is not what the watcher reports: a path under it is not the folder.
+    let under_given = notify::Event::new(EventKind::Create(CreateKind::File))
+        .add_path(PathBuf::from("/given/a.txt"));
+    assert_eq!(names.translate(&under_given), Vec::new());
     let outside = notify::Event::new(EventKind::Create(CreateKind::File))
-        .add_path(std::env::temp_dir().join("elsewhere.txt"));
+        .add_path(PathBuf::from("/elsewhere.txt"));
     assert_eq!(names.translate(&outside), Vec::new());
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn the_watched_folder_canonicalised_still_matches_the_folder_given() {
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-canon-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let given = dir.clone();
-    let names = Translator::new(&given);
-    // What a platform that canonicalises its paths (macOS) would report.
-    let canonical = dir.canonicalize().unwrap();
-    let event =
-        notify::Event::new(EventKind::Create(CreateKind::File)).add_path(canonical.join("a.txt"));
+fn the_folder_given_is_what_a_canonicalised_root_reports() {
+    // macOS reports the canonical path; the report still names the caller's folder.
+    let names = Translator::new(PathBuf::from("/var/x"), PathBuf::from("/private/var/x"));
+    let event = notify::Event::new(EventKind::Create(CreateKind::File))
+        .add_path(PathBuf::from("/private/var/x/a.txt"));
     assert_eq!(
         names.translate(&event),
-        vec![RawChange::Created(given.join("a.txt"))],
+        vec![RawChange::Created(PathBuf::from("/var/x/a.txt"))],
         "the folder given is what the report names"
     );
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
