@@ -18,6 +18,7 @@ fn phase(sub: u8) -> Vector {
     Vector::new(sub as f32 / 4.0, 0.0)
 }
 
+#[cfg(windows)]
 fn legacy_mask(scaler: &mut Scaler<'_>, glyph: u16, sub: u8) -> Image {
     legacy_mask_in(scaler, glyph, sub, Format::Alpha)
 }
