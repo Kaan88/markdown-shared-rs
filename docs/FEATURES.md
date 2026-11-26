@@ -1907,7 +1907,7 @@ Added: `scrollarea::{ScrollArea, Scrolled, draw_bars, draw_bars_animated, LINE}`
 Page Up / Page Down, Home and End, with Tab moving the focus and the area revealing it when it
 moves. No existing signature, field or drawing changed.
 
-Tests (in `scrollarea.rs`, 19 and the ignored sheet). Model: content shorter than the view,
+Tests (in `scrollarea_tests.rs` since the split below, 19 and the ignored sheet). Model: content shorter than the view,
 exact fit and a pixel more (no scroll, no bars), a content that shrinks pulling the offset in,
 a wheel notch away from the user scrolling up and Shift turning it across, the page keys and
 Home/End, reveal above, below and taller than the view, `reveal_focus` only for the focused
@@ -1957,6 +1957,14 @@ Known limits for later:
   the focus leave; when it reopens with the focus still on the same control, that control is
   not revealed. Call `reveal` directly when the area reopens, or keep offering the controls
   while it is hidden (which costs nothing).
+
+The file was split when it passed the house limit: the test module (617 of its 1011 lines) moved
+to `scrollarea_tests.rs` beside it, in the `submenu_tests.rs` pattern, leaving the model and the
+two drawing functions in `scrollarea.rs` (397 lines). No test was edited: the body of the module
+moved out of its `mod tests` wrapper unchanged but for one level of indentation, and
+`cargo test -p mdshared-ui --lib scrollarea -- --list` gives the same 20 names before and after. Run on Windows 11: `cargo fmt --all --check`; the workspace clippy with
+`host` and `a11y`; and the workspace tests with `--skip explorer_tests`, 1139 passed and 34
+ignored in `mdshared-ui`. Not run on Linux or macOS.
 
 Left for later: momentum and rubber-banding at the ends; dragging a thumb and the bar's hover
 fade (`scroll::draw_scrollbar_animated` is ready for it, `draw_bars_animated` takes `active`
