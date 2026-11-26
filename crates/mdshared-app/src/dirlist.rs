@@ -126,10 +126,14 @@ impl Entry {
     /// [`Listing::apply`]. It reads the disk, so it belongs off the thread that draws; a single
     /// entry's details are quick, but a dead network path answers slowly.
     pub fn at(path: impl AsRef<Path>) -> Option<Entry> {
-        let path = path.as_ref();
-        let meta = fs::symlink_metadata(path).ok()?;
+        Self::at_checked(path.as_ref()).ok()
+    }
+
+    /// Like `at`, without losing the reason a metadata read failed.
+    pub(crate) fn at_checked(path: &Path) -> io::Result<Entry> {
+        let meta = fs::symlink_metadata(path)?;
         let name = name_of(path);
-        Some(entry_of(path.to_path_buf(), name, &meta.file_type(), &meta))
+        Ok(entry_of(path.to_path_buf(), name, &meta.file_type(), &meta))
     }
 }
 
@@ -189,9 +193,13 @@ fn is_hidden(name: &str, meta: &Metadata) -> bool {
 /// Nothing here follows a link: [`DirEntry::metadata`](fs::DirEntry::metadata) reports the link
 /// itself, which on Windows costs no extra read because the folder scan already carried it.
 fn read_entry(item: &fs::DirEntry) -> Option<Entry> {
-    let file_type = item.file_type().ok()?;
-    let meta = item.metadata().ok()?;
-    Some(entry_of(
+    read_entry_checked(item).ok()
+}
+
+pub(crate) fn read_entry_checked(item: &fs::DirEntry) -> io::Result<Entry> {
+    let file_type = item.file_type()?;
+    let meta = item.metadata()?;
+    Ok(entry_of(
         item.path(),
         item.file_name().to_string_lossy().into_owned(),
         &file_type,

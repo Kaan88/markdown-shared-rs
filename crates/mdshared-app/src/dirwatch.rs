@@ -27,9 +27,8 @@
 //!   [`Instant`] they happened at, and it answers [`Verdict`]s that name paths, so it can be
 //!   tested with nothing but numbers and lists;
 //! - [`DirWatcher`] is the edge. It watches one folder with `notify`, feeds the coalescer on its
-//!   own thread, reads each changed path's details with [`Entry::at`](crate::dirlist::Entry::at),
-//!   and wakes the application the way [`FileWatcher`](crate::watch::FileWatcher) does: one
-//!   [`wake`](DirWatcher::new) call per settled report, and none again until
+//!   own thread, reads each changed path's details there, and wakes the application the way
+//!   [`FileWatcher`](crate::watch::FileWatcher) does: once, and none again until
 //!   [`woken`](DirWatcher::woken) is called.
 //!
 //! The root the OS watcher is given is worked out once, at start (`std::path::absolute` on
@@ -47,20 +46,20 @@
 //! removal of the name that went and a creation of the name that arrived: an unpaired old name
 //! is a [`Change::Removed`](crate::dirlist::Change::Removed) when the quiet period ends, and an
 //! unpaired new name is a [`Change::Created`](crate::dirlist::Change::Created) at once. macOS
-//! reports a rename as one path with no side; that path is read as a modification, and the disk
-//! says whether it is still there.
+//! reports a rename as one path with no side; it requests a rescan so the list uses the actual
+//! names in the directory, even on case-insensitive volumes.
 //!
-//! When the OS watcher reports an overflow or asks for a rescan, [`Signal::Rescan`] is emitted
-//! instead of the changes, because some events were lost and only a fresh read of the folder can
-//! be trusted. When the watched folder itself is deleted or renamed, the callback only says the
+//! An overflow, ambiguous rename, or unreadable entry can yield [`Signal::Rescan`] instead of
+//! changes. A fresh read of the directory is needed then. When the watched folder itself is
+//! deleted or renamed, the callback only says the
 //! folder may be gone; the worker confirms it (the folder is not there, or on Unix is not the
 //! same folder) before [`Signal::Lost`] is emitted, and a folder that is still the same one is
-//! a [`Signal::Rescan`] instead. (notify's Windows backend does not report that error at all: it
-//! silently stops its watch, so a deleted folder is noticed there only by the next full read.)
+//! a [`Signal::Rescan`] instead. On Windows, notify 8.2.1 can silently fail to start or continue
+//! a watch, and can miss overflows without asking for a rescan. Periodic full reads and
+//! re-registration recover the current listing without depending on a native event.
 //!
-//! A report is settled after [`DEBOUNCE`] without a new event, but never later than
-//! [`MAX_WAIT`] after its first event: one file written without pause cannot hold the rest of
-//! the report back.
+//! A burst is eligible to settle after [`DEBOUNCE`] without a new event, or at [`MAX_WAIT`]
+//! after its first callback. This bounds the coalescer's wait, not the OS or disk read.
 //!
 //! Only entries directly inside the watched folder are reported. A rename out of the folder is
 //! its removal, a rename into it its creation, and an event about any other path (a file's
@@ -75,25 +74,34 @@
 //! - no clock read inside [`Coalescer`], and no disk read inside it either; the watcher is what
 //!   reads the clock and the disk.
 
+mod backend;
 mod order;
+mod queues;
+mod reconcile;
+mod resolve;
 mod translate;
+mod worker;
 
 use crate::dirlist::{Change, Entry};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{RecursiveMode, Watcher as _};
 use order::{Item, settled};
-use std::collections::{HashMap, VecDeque};
+use queues::{Inbox, Shared};
+use reconcile::{DEFAULT_INTERVAL, Periodic};
+#[cfg(test)]
+use resolve::{lost_signal, signal_of};
+use resolve::{read_from_root, register};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use translate::Translator;
+use translate::{Translator, translation};
 
 /// How long the coalescer waits for the events of one operation to stop before it reports them,
 /// unless the caller asks for another quiet period with [`DirWatcher::with_debounce`].
 pub const DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// The longest a report is held back, from its first event to its flush, even while more events
-/// keep arriving: one file written without pause cannot starve the rest of the report.
+/// The longest the coalescer defers eligibility to flush, even while more events keep arriving.
 pub const MAX_WAIT: Duration = Duration::from_secs(1);
 
 /// One raw event, as a platform watcher saw it, before the quiet period settles it.
@@ -161,10 +169,10 @@ pub enum Signal {
     /// One settled change in the watched folder, to hand to
     /// [`Listing::apply`](crate::dirlist::Listing::apply).
     Changed(Change),
-    /// Some events were lost. The application must read the folder again in full, as with
+    /// Incremental changes are not reliable. The application must read the folder again, as with
     /// [`read`](crate::dirlist::read) and
     /// [`Listing::set_entries`](crate::dirlist::Listing::set_entries), because the changes that
-    /// were lost cannot be guessed.
+    /// were missed or could not be resolved cannot be guessed.
     Rescan,
     /// The watch is over: the folder itself was deleted or renamed (confirmed by the worker),
     /// or the OS watcher failed. The application should drop the watcher and read the folder
@@ -228,9 +236,12 @@ pub struct Coalescer {
     paths: HashMap<PathBuf, Track>,
     /// Renames whose old name has been seen and whose new name has not, oldest first.
     open: VecDeque<OpenFrom>,
-    /// Rename pairs already made from the two halves, so the platform's pair carrying both
-    /// names is recognised as the same move.
-    paired: Vec<(PathBuf, PathBuf)>,
+    /// Tracked halves are independent of the public, untracked FIFO.
+    tracked: HashMap<usize, OpenFrom>,
+    /// Compatibility for callers that echo an untracked pair immediately after its halves.
+    last_pair: Option<(PathBuf, PathBuf)>,
+    /// Only pairs made from untracked halves can have a redundant complete event.
+    split_pairs: HashSet<(PathBuf, PathBuf)>,
     /// The time of the most recent accepted event; `None` when nothing is pending.
     last_at: Option<Instant>,
     /// The time of the first accepted event since the last flush.
@@ -264,7 +275,9 @@ impl Coalescer {
             max_wait,
             paths: HashMap::new(),
             open: VecDeque::new(),
-            paired: Vec::new(),
+            tracked: HashMap::new(),
+            last_pair: None,
+            split_pairs: HashSet::new(),
             last_at: None,
             first_at: None,
             rescan: false,
@@ -284,7 +297,13 @@ impl Coalescer {
     /// [`flush`](Self::flush) reports the rescan, because the events that follow may be
     /// duplicates of what the fresh read will find anyway; a [`RawChange::Lost`] replaces
     /// whatever was pending, and needs no events after it.
+    /// A complete rename that might be a delayed echo of untracked halves requests a rescan.
     pub fn push(&mut self, change: RawChange, at: Instant) {
+        self.push_tracked(change, at, None);
+    }
+
+    fn push_tracked(&mut self, change: RawChange, at: Instant, cookie: Option<usize>) {
+        let last_pair = self.last_pair.take();
         if self.lost {
             return;
         }
@@ -293,7 +312,8 @@ impl Coalescer {
             self.rescan = false;
             self.paths.clear();
             self.open.clear();
-            self.paired.clear();
+            self.tracked.clear();
+            self.split_pairs.clear();
             self.touch(at);
             return;
         }
@@ -306,7 +326,8 @@ impl Coalescer {
                 self.rescan = true;
                 self.paths.clear();
                 self.open.clear();
-                self.paired.clear();
+                self.tracked.clear();
+                self.split_pairs.clear();
                 self.touch(at);
             }
             RawChange::Created(path) => {
@@ -329,13 +350,13 @@ impl Coalescer {
             }
             RawChange::RenamedFrom(path) => {
                 if self.inside(&path) {
-                    self.from(path);
+                    self.from(path, cookie);
                     self.touch(at);
                 }
             }
             RawChange::RenamedTo(path) => {
                 if self.inside(&path) {
-                    self.to(path);
+                    self.to(path, cookie);
                     self.touch(at);
                 }
             }
@@ -343,17 +364,24 @@ impl Coalescer {
                 let inside_from = self.inside(&from);
                 let inside_to = self.inside(&to);
                 if inside_from && inside_to {
-                    if self.paired.contains(&(from.clone(), to.clone())) {
-                        // The platform reported this rename as a pair and as two sides; the
-                        // sides already paired, and this is the same move a second time.
-                        return;
+                    let pair = (from, to);
+                    if self.split_pairs.contains(&pair) {
+                        let source_absent =
+                            matches!(self.paths.get(&pair.0), None | Some(Track::Removed));
+                        if last_pair.as_ref() != Some(&pair) || !source_absent {
+                            self.push(RawChange::Rescan, at);
+                        }
+                    } else {
+                        let (from, to) = pair;
+                        let origin = self.depart(&from);
+                        self.land(to, origin);
+                        self.touch(at);
                     }
-                    self.from(from);
-                    self.to(to);
+                    return;
                 } else if inside_from {
-                    self.from(from);
+                    self.removed(from);
                 } else if inside_to {
-                    self.to(to);
+                    self.land(to, Origin::Fresh);
                 } else {
                     return;
                 }
@@ -370,7 +398,7 @@ impl Coalescer {
     /// this is the last event's own time, so the burst is reported at once rather than never.
     pub fn deadline(&self) -> Option<Instant> {
         let last = self.last_at?;
-        if !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty() {
+        if self.is_idle() {
             return None;
         }
         let mut deadline = last.checked_add(self.debounce).unwrap_or(last);
@@ -401,7 +429,8 @@ impl Coalescer {
         }
         self.last_at = None;
         self.first_at = None;
-        self.paired.clear();
+        self.last_pair = None;
+        self.split_pairs.clear();
         if self.lost {
             self.lost = false;
             self.paths.clear();
@@ -418,7 +447,7 @@ impl Coalescer {
         // The map has no order of its own; sorting keeps the report the same for the same
         // events in every run.
         named.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut items: Vec<Item> = Vec::with_capacity(named.len() + self.open.len());
+        let mut items = Vec::with_capacity(named.len() + self.open.len() + self.tracked.len());
         for (path, track) in named {
             let verdict = match track {
                 Track::Created => Verdict::Created(path),
@@ -430,7 +459,13 @@ impl Coalescer {
             };
             items.push(Item::new(verdict));
         }
-        for open in self.open.drain(..) {
+        let mut tracked: Vec<_> = self.tracked.drain().collect();
+        tracked.sort_unstable_by(|(a, left), (b, right)| left.path.cmp(&right.path).then(a.cmp(b)));
+        for open in self
+            .open
+            .drain(..)
+            .chain(tracked.into_iter().map(|(_, open)| open))
+        {
             // A rename whose new name never arrived: the old name is gone. When its old name
             // was itself the destination of an earlier rename, the entry is gone under that
             // first name too, and the list may still hold it.
@@ -446,7 +481,11 @@ impl Coalescer {
 
     /// Whether nothing is pending.
     pub fn is_idle(&self) -> bool {
-        !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty()
+        !self.rescan
+            && !self.lost
+            && self.paths.is_empty()
+            && self.open.is_empty()
+            && self.tracked.is_empty()
     }
 
     /// Whether `path` is directly inside the folder, as the folder spells it.
@@ -470,6 +509,7 @@ impl Coalescer {
         if self.is_idle() {
             self.last_at = None;
             self.first_at = None;
+            self.split_pairs.clear();
         }
     }
 
@@ -528,42 +568,62 @@ impl Coalescer {
     }
 
     /// A rename left `path`.
-    fn from(&mut self, path: PathBuf) {
+    fn from(&mut self, path: PathBuf, cookie: Option<usize>) {
+        if let Some(cookie) = cookie {
+            if !self.tracked.contains_key(&cookie) {
+                let origin = self.depart(&path);
+                self.tracked.insert(cookie, OpenFrom { path, origin });
+            }
+            return;
+        }
         // Some platforms repeat an old name; it is the same move.
         if self.open.iter().any(|open| open.path == path) {
             return;
         }
-        let track = self.paths.remove(&path);
-        let origin = match track {
+        let origin = self.depart(&path);
+        self.open.push_back(OpenFrom { path, origin });
+    }
+
+    fn depart(&mut self, path: &Path) -> Origin {
+        match self.paths.remove(path) {
             // A name a rename landed on, or a creation, is vacated: the list may still hold the
             // entry that was at this name before the burst, so this name is removed too. The
             // collapsed rename no longer names it (a chain keeps only its first and last names,
             // and a creation moved on becomes a creation at the destination).
             Some(Track::Landed { from }) => {
-                self.paths.insert(path.clone(), Track::Removed);
+                self.paths.insert(path.to_owned(), Track::Removed);
                 from.map(Origin::Moved).unwrap_or(Origin::Fresh)
             }
             Some(Track::Created) | Some(Track::Removed) => {
-                self.paths.insert(path.clone(), Track::Removed);
+                self.paths.insert(path.to_owned(), Track::Removed);
                 Origin::Fresh
             }
-            Some(Track::Modified) | None => Origin::Moved(path.clone()),
-        };
-        self.open.push_back(OpenFrom { path, origin });
+            Some(Track::Modified) | None => Origin::Moved(path.to_owned()),
+        }
     }
 
     /// A rename arrived at `path`.
-    fn to(&mut self, path: PathBuf) {
-        let origin = match self.open.pop_front() {
+    fn to(&mut self, path: PathBuf, cookie: Option<usize>) {
+        let open = match cookie {
+            Some(cookie) => self.tracked.remove(&cookie),
+            None => self.open.pop_front(),
+        };
+        let origin = match open {
             Some(open) => {
-                // Remember the pair, so the platform's event carrying both names is known to be
-                // the same move.
-                self.paired.push((open.path, path.clone()));
+                if cookie.is_none() {
+                    let pair = (open.path, path.clone());
+                    self.split_pairs.insert(pair.clone());
+                    self.last_pair = Some(pair);
+                }
                 open.origin
             }
             // No old name waiting: the entry was renamed into the folder from outside.
             None => Origin::Fresh,
         };
+        self.land(path, origin);
+    }
+
+    fn land(&mut self, path: PathBuf, origin: Origin) {
         let track = match origin {
             Origin::Fresh => Track::Landed { from: None },
             Origin::Moved(from) => Track::Landed { from: Some(from) },
@@ -586,215 +646,115 @@ impl Coalescer {
     }
 }
 
-/// Reads one verdict into a signal, with `read` standing in for the disk.
-///
-/// A created entry that cannot be read is not reported: it is gone again, and the list never
-/// saw it. A modified entry that cannot be read is removed, because the path it names is not
-/// there any more. A rename whose new name cannot be read is a removal of the old name, for the
-/// same reason.
-fn signal_of(verdict: Verdict, read: &dyn Fn(&Path) -> Option<Entry>) -> Option<Signal> {
-    match verdict {
-        Verdict::Created(path) => read(&path).map(|entry| Signal::Changed(Change::Created(entry))),
-        Verdict::Modified(path) => Some(Signal::Changed(match read(&path) {
-            Some(entry) => Change::Modified(entry),
-            None => Change::Removed(path),
-        })),
-        Verdict::Removed(path) => Some(Signal::Changed(Change::Removed(path))),
-        Verdict::Renamed { from, to } => Some(Signal::Changed(match read(&to) {
-            Some(entry) => Change::Renamed { from, to: entry },
-            None => Change::Removed(from),
-        })),
-        Verdict::Rescan => Some(Signal::Rescan),
-        Verdict::Lost => Some(Signal::Lost),
-    }
-}
-
-/// One `notify` result as raw changes: an error means events may have been lost, so a rescan.
-fn translation(result: notify::Result<notify::Event>, names: &Translator) -> Vec<RawChange> {
-    match result {
-        Ok(event) => names.translate(&event),
-        Err(_) => vec![RawChange::Rescan],
-    }
-}
-
 /// What the OS watcher is given, and what its events are built from: the folder made absolute
 /// without touching a disk (Windows and Linux report the path it was given), and canonicalised
 /// on macOS, where FSEvents reports the canonical path.
-fn notify_root(folder: &Path) -> Option<PathBuf> {
+fn notify_root(folder: &Path) -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::fs::canonicalize(folder).ok()
+        std::fs::canonicalize(folder)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        std::path::absolute(folder).ok()
+        std::path::absolute(folder)
     }
 }
 
-/// What a folder was, so the worker can tell a report about it from a report about a folder
-/// that was deleted and made again under the same name.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
-struct Identity {
-    dev: u64,
-    ino: u64,
+/// Reads a path's entry, keeping filesystem errors for the worker.
+type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
+
+/// Settings for a new [`DirWatcher`]. Use [`DirWatcher::builder`] to start.
+pub struct DirWatcherBuilder {
+    folder: PathBuf,
+    debounce: Duration,
+    interval: Option<Duration>,
+    initial: Option<Vec<Entry>>,
 }
 
-/// What a folder was; Windows has no identity the watcher can compare.
-#[cfg(not(unix))]
-#[derive(Clone, Copy, Debug)]
-struct Identity;
-
-/// The identity of `path`, where the platform has one to compare.
-fn identity(path: &Path) -> Option<Identity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Identity {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// Confirms a folder-loss report in the worker, where a disk read is allowed.
-///
-/// `Lost` only when the folder is not there or is not the same folder that was watched; a
-/// folder that is still the same one means the events were confused, and a full read (`Rescan`)
-/// is the safe answer.
-fn lost_signal(root: &Path, started: Option<Identity>) -> Signal {
-    let meta = match std::fs::symlink_metadata(root) {
-        Ok(meta) => meta,
-        Err(_) => return Signal::Lost,
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Some(started) = started
-            && (meta.dev() != started.dev || meta.ino() != started.ino)
-        {
-            return Signal::Lost;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = (meta, started);
-    Signal::Rescan
-}
-
-/// Raw events waiting for the watcher's thread, and the signal that stops it.
-#[derive(Default)]
-struct Inbox {
-    state: Mutex<InboxState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct InboxState {
-    /// Events in arrival order, each with the time it was seen.
-    events: VecDeque<(RawChange, Instant)>,
-    /// The watcher was dropped; the thread must end without reporting anything more.
-    stop: bool,
-}
-
-impl Inbox {
-    /// Queues one event, unless the watcher is being dropped.
-    fn push(&self, change: RawChange, at: Instant) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stop {
-            return;
-        }
-        state.events.push_back((change, at));
-        self.ready.notify_one();
+impl DirWatcherBuilder {
+    /// Sets the quiet period before reporting native events, as in [`DirWatcher::with_debounce`].
+    pub fn debounce(mut self, quiet: Duration) -> Self {
+        self.debounce = quiet;
+        self
     }
 
-    /// Tells the thread to end.
-    fn stop(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.stop = true;
-        self.ready.notify_all();
+    /// Sets the time between the end of a full read and the next recovery cycle.
+    ///
+    /// The default is 30 seconds on Windows, to catch missed events without constantly
+    /// enumerating large or remote directories. Other platforms default to disabled.
+    /// `None` or a zero duration disables recovery; positive durations below one second
+    /// are rounded up to one second.
+    pub fn reconcile_interval(mut self, interval: Option<Duration>) -> Self {
+        self.interval = interval.filter(|duration| !duration.is_zero());
+        self
     }
 
-    /// Whether the watcher has been dropped, so the thread must end without reporting anything
-    /// more.
-    fn stopped(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).stop
+    /// Supplies the caller's current full listing as the first comparison baseline.
+    ///
+    /// Use unfiltered entries with paths under the folder spelling passed to the builder.
+    /// Without a baseline, the first successful recovery scan provides a snapshot through
+    /// [`DirWatcher::take_with_snapshot`].
+    /// This setting has no effect when recovery is disabled.
+    pub fn initial_entries(mut self, entries: Vec<Entry>) -> Self {
+        self.initial = Some(entries);
+        self
+    }
+
+    /// Registers the watcher and starts its worker. Unlike [`DirWatcher::new`], this returns
+    /// an error with details, including `WouldBlock` when 64 watcher worker pairs are outstanding.
+    pub fn start(self, wake: impl Fn() + Send + Sync + 'static) -> io::Result<DirWatcher> {
+        let root = notify_root(&self.folder)?;
+        let read_root = root.clone();
+        let periodic = self
+            .interval
+            .map(|interval| Periodic::new(interval, Instant::now(), self.initial))
+            .transpose()?;
+        DirWatcher::start(
+            self.folder,
+            root,
+            self.debounce,
+            wake,
+            Arc::new(move |path| read_from_root(&read_root, path)),
+            periodic,
+        )
     }
 }
-
-/// The settled reports waiting for the application, and whether a wake has been sent for them.
-#[derive(Default)]
-struct Shared {
-    /// Signals not taken yet, in the order they were settled.
-    signals: Mutex<Vec<Signal>>,
-    /// A wake has been sent and the application has not called [`DirWatcher::woken`] yet.
-    pending: AtomicBool,
-}
-
-impl Shared {
-    /// Adds a settled report and wakes once for it, as [`FileWatcher`](crate::watch::FileWatcher)
-    /// does: further reports do not wake again until `woken`.
-    fn deliver(&self, signals: Vec<Signal>, wake: &dyn Fn()) {
-        if signals.is_empty() {
-            return;
-        }
-        self.signals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(signals);
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            wake();
-        }
-    }
-
-    /// Resets the wake flag: the next report wakes again.
-    fn woken(&self) {
-        self.pending.store(false, Ordering::Release);
-    }
-
-    /// Takes the reports that are waiting, leaving none.
-    fn take(&self) -> Vec<Signal> {
-        std::mem::take(&mut *self.signals.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-}
-
-/// Reads one path's entry; `Entry::at` in a real watcher, a made-up disk in a test.
-type Read = dyn Fn(&Path) -> Option<Entry> + Send + Sync;
 
 /// Watches one folder and reports what changed in it, settled, as [`Signal`]s.
 ///
-/// [`DirWatcher::new`] starts the OS watcher and a thread of its own. That thread is the only
-/// one that touches the [`Coalescer`], and it reads each changed path's details there with
-/// [`Entry::at`](crate::dirlist::Entry::at), so neither the drawing thread nor the OS watcher's
-/// callback ever waits for a disk. When a report is ready the thread calls the wake it was given
+/// [`DirWatcher::new`] waits for registration. After that, a metadata worker owns the
+/// [`Coalescer`] and reads changed entries, so neither the drawing thread nor the callback
+/// performs that I/O. When a report is ready the worker calls the wake it was given
 /// (once, until [`woken`](Self::woken) is called) and the application takes the report with
 /// [`take`](Self::take).
 ///
-/// Dropping the watcher does not wait for the thread: the thread may be in the middle of a read
-/// on a share that never answers, and the application's thread must not wait for it. The drop
-/// tells the thread to stop, and the thread ends by itself after the read it is in returns,
-/// without reading anything else or reporting anything.
+/// Dropping the watcher signals both threads without waiting: a metadata read or native watcher
+/// teardown may be blocked on a share. The metadata worker exits after any in-flight read
+/// returns, without reading another entry or delivering its result.
 pub struct DirWatcher {
     folder: PathBuf,
-    /// What the OS watcher was given and what its events are built from.
-    root: PathBuf,
-    /// The OS watcher; dropping it stops its callbacks.
-    watcher: RecommendedWatcher,
+    /// Disconnects the native watcher's owner after `Drop` stops the inbox.
+    _backend: backend::Owner,
     inbox: Arc<Inbox>,
     shared: Arc<Shared>,
 }
 
 impl DirWatcher {
+    /// Configures a new watcher. This does not start threads or access the filesystem.
+    pub fn builder(folder: impl Into<PathBuf>) -> DirWatcherBuilder {
+        DirWatcherBuilder {
+            folder: folder.into(),
+            debounce: DEBOUNCE,
+            interval: DEFAULT_INTERVAL,
+            initial: None,
+        }
+    }
+
     /// Watches `folder` with a [`DEBOUNCE`] quiet period, calling `wake` when a report is ready.
     ///
-    /// `None` when the OS watcher cannot start or cannot watch the folder (no inotify instances
-    /// left, or the folder cannot be opened); the application then falls back to reading the
-    /// folder again on a slow poll. `wake` runs on the watcher's own thread: it must be cheap,
+    /// `None` on a reported startup error; use [`Self::builder`] for the reason. Windows
+    /// enables periodic reconciliation for silent native failures by default.
+    /// `wake` runs on the metadata worker: it must be cheap,
     /// must not block on anything the application holds, and must not panic.
     ///
     /// Every path in the report is this folder joined with the entry's own name, so the list's
@@ -811,69 +771,84 @@ impl DirWatcher {
     /// [`new`](Self::new), with a quiet period of the caller's choosing.
     ///
     /// A shorter period reports sooner and splits one operation into more reports; a longer one
-    /// settles a save that writes several files. The report is settled at most [`MAX_WAIT`] after
-    /// its first event whatever the quiet period.
+    /// settles a save that writes several files. [`MAX_WAIT`] caps the coalescer's deadline
+    /// regardless of the quiet period, not the time needed to read metadata or deliver a report.
     pub fn with_debounce(
         folder: impl Into<PathBuf>,
         debounce: Duration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Option<DirWatcher> {
-        DirWatcher::start(
-            folder.into(),
-            debounce,
-            wake,
-            Arc::new(|path: &Path| Entry::at(path)),
-        )
+        Self::builder(folder).debounce(debounce).start(wake).ok()
     }
 
-    /// Starts the watcher with the reader given: [`Entry::at`](crate::dirlist::Entry::at) in a
-    /// real watcher, and a made-up disk in a test of this module.
+    /// Starts the watcher with the reader given, which tests may replace.
     fn start(
         folder: PathBuf,
+        root: PathBuf,
         debounce: Duration,
         wake: impl Fn() + Send + Sync + 'static,
         read: Arc<Read>,
-    ) -> Option<DirWatcher> {
-        let root = notify_root(&folder)?;
+        periodic: Option<Periodic>,
+    ) -> io::Result<DirWatcher> {
         let inbox = Arc::new(Inbox::default());
         let shared = Arc::new(Shared::default());
         let names = Translator::new(folder.clone(), root.clone());
         let for_events = Arc::clone(&inbox);
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let at = Instant::now();
-            for change in translation(event, &names) {
-                for_events.push(change, at);
-            }
-        })
-        .ok()?;
-        let mut watcher = watcher;
-        if watcher.watch(&root, RecursiveMode::NonRecursive).is_err() {
-            return None;
-        }
-        let identity = identity(&root);
-        let coalescer = Coalescer::new(folder.clone(), debounce);
-        let for_work = Arc::clone(&inbox);
-        let for_report = Arc::clone(&shared);
-        let for_missing = root.clone();
-        // The handle is dropped at once: the thread is not waited for. See `DirWatcher`.
-        _ = std::thread::Builder::new()
-            .name("mdshared-dirwatch".to_string())
-            .spawn(move || {
-                run(
-                    for_work,
-                    for_report,
-                    coalescer,
-                    &wake,
-                    read,
-                    for_missing,
-                    identity,
-                )
-            })
-            .ok()?;
-        Some(DirWatcher {
-            folder,
+        let watch_root = root.clone();
+        let restart_root = root.clone();
+        let (backend, identity, permit) = backend::start(
+            move || {
+                let mut watcher =
+                    notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                        let at = Instant::now();
+                        for (change, cookie) in translation(event, &names) {
+                            for_events.push(change, at, cookie);
+                        }
+                    })
+                    .map_err(io::Error::other)?;
+                let (watcher, identity) = register(&watch_root, || {
+                    watcher
+                        .watch(&watch_root, RecursiveMode::NonRecursive)
+                        .map_err(io::Error::other)?;
+                    Ok(watcher)
+                })?;
+                Ok(((watcher, identity), identity))
+            },
+            move |(watcher, original)| {
+                #[cfg(unix)]
+                if resolve::identity(&restart_root) != *original {
+                    return Err(io::Error::other("watched directory changed before restart"));
+                }
+                #[cfg(not(unix))]
+                let _ = original;
+                // A backend that silently unwatched may legitimately return WatchNotFound.
+                _ = watcher.unwatch(&restart_root);
+                watcher
+                    .watch(&restart_root, RecursiveMode::NonRecursive)
+                    .map_err(io::Error::other)
+            },
+        )?;
+        let worker = worker::Worker {
+            inbox: Arc::clone(&inbox),
+            shared: Arc::clone(&shared),
+            coalescer: Coalescer::new(folder.clone(), debounce),
+            read,
             root,
-            watcher,
+            started: identity,
+            periodic,
+        };
+        let restart = backend.restart_handle();
+        // The handle is dropped at once: the thread is not waited for. See `DirWatcher`.
+        let for_ack = Arc::clone(&inbox);
+        _ = permit.spawn(move || {
+            worker.run(&wake, || {
+                let for_ack = Arc::clone(&for_ack);
+                restart.request(move |result| for_ack.restart_finished(result.is_ok()));
+            });
+        })?;
+        Ok(DirWatcher {
+            folder,
+            _backend: backend,
             inbox,
             shared,
         })
@@ -886,10 +861,30 @@ impl DirWatcher {
 
     /// The settled reports waiting, in the order they were settled, and forgets them.
     ///
+    /// A pending rescan can supersede incremental changes. A rescan deferred for a
+    /// native rename follows that rename in the report instead. A lost watch supersedes both.
+    /// This method discards any attached snapshot; recovery cannot assume an independent
+    /// reread installed the same entries. With periodic recovery, that can mean reading the
+    /// folder twice every interval, once by the worker and once by the caller in response to
+    /// `Rescan`, even when nothing changed. Use [`Self::take_with_snapshot`] to install the
+    /// worker's snapshot directly and continue with incremental recovery.
+    ///
     /// Call [`woken`](Self::woken) before this, as [`FileWatcher::woken`](crate::watch::FileWatcher::woken)
     /// is called, so a report settled during the call wakes again instead of being missed.
     pub fn take(&self) -> Vec<Signal> {
         self.shared.take()
+    }
+
+    /// Drains reports and any exact directory snapshot attached to the first `Rescan`.
+    ///
+    /// Call [`Self::woken`] first. If entries are present, install them with
+    /// [`crate::dirlist::Listing::set_entries`] instead of rereading for that first signal.
+    /// Then apply the subsequent signals in order. `Some` with no entries means the folder
+    /// was empty; `None` means there is no snapshot and a `Rescan` still needs a full read.
+    /// The watcher compares future changes with the entries returned by this call, so
+    /// install them before applying or taking any later reports.
+    pub fn take_with_snapshot(&self) -> (Vec<Signal>, Option<Vec<Entry>>) {
+        self.shared.take_with_snapshot()
     }
 
     /// Says the reports taken so far have been dealt with, so the next one wakes again.
@@ -900,75 +895,8 @@ impl DirWatcher {
 
 impl Drop for DirWatcher {
     fn drop(&mut self) {
-        // Stop the OS watch first, so its callback pushes nothing more, then tell the thread to
-        // stop and do not wait for it: it may be inside a read on a share that never answers,
-        // and this drop runs on the thread that draws.
-        _ = self.watcher.unwatch(&self.root);
+        // Ignore further callbacks before the owner's channel disconnects and starts teardown.
         self.inbox.stop();
-    }
-}
-
-/// The watcher's thread: feed the coalescer, wait for the quiet period, read, report.
-///
-/// It waits on the inbox's condition variable until either an event arrives or the open burst's
-/// deadline passes; the wait is for a duration, never a poll, so an idle folder costs nothing.
-/// Once the watcher is dropped it ends without reading anything more or reporting anything.
-fn run(
-    inbox: Arc<Inbox>,
-    shared: Arc<Shared>,
-    mut coalescer: Coalescer,
-    wake: &(dyn Fn() + Sync),
-    read: Arc<Read>,
-    root: PathBuf,
-    started: Option<Identity>,
-) {
-    let mut state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if state.stop {
-            return;
-        }
-        while let Some((change, at)) = state.events.pop_front() {
-            coalescer.push(change, at);
-        }
-        let now = Instant::now();
-        let Some(deadline) = coalescer.deadline() else {
-            state = inbox.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-            continue;
-        };
-        if deadline <= now {
-            let verdicts = coalescer.flush(now);
-            // The disk is read without the inbox held, so events keep arriving.
-            drop(state);
-            let mut signals = Vec::with_capacity(verdicts.len());
-            for verdict in verdicts {
-                // A read can be slow; stop between two of them rather than after the last.
-                if inbox.stopped() {
-                    return;
-                }
-                let signal = match verdict {
-                    // The callback only says the folder may be gone; the worker, which may
-                    // touch a disk, confirms it before the application is told the watch ended.
-                    Verdict::Lost => Some(lost_signal(&root, started)),
-                    other => signal_of(other, &*read),
-                };
-                if let Some(signal) = signal {
-                    signals.push(signal);
-                }
-            }
-            // Check the stop with the lock held, so a drop cannot land between the check and
-            // the wake: the drop takes this lock to set the flag.
-            state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stop {
-                return;
-            }
-            shared.deliver(signals, wake);
-            continue;
-        }
-        state = inbox
-            .ready
-            .wait_timeout(state, deadline - now)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
     }
 }
 

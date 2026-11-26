@@ -2789,7 +2789,7 @@ then fails). The files were restored afterwards. The earlier round's mutations (
 `File`, hidden always false, plain `cmp`, filter and switch ignored, and so on) still fail their
 tests.
 
-Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+Initial checks on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, and `cargo test
 --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
 explorer_tests`. On Linux the crate is type-checked only: `cargo clippy --target
@@ -2850,68 +2850,96 @@ verdicts form a cycle — two renames that swap their names through a temporary 
 renames in the cycle are broken into a removal and a modification, and the disk decides whether
 each name is there; an unrelated rename stays a rename, so the selection can follow it. The
 order is the same for the same events: among the verdicts that can go next, the first one seen
-goes. The puts are indexed by path once and the next verdict comes from a heap, so a report of
-twenty thousand verdicts is ordered in about `n log n` (a test flushes 20,000 removals and
-renames and holds the report to a few seconds in a debug build).
+goes. The puts are indexed by path and the next verdict comes from a heap. A pure test checks
+that a report preserves 20,000 removals and renames; it does not assert a runtime.
 
-Rename pairing keeps each path's state in a map and the old names still waiting for a new one in
-a queue, oldest first. Windows reports the two names as separate events; inotify on Linux also
-reports a pair carrying both names, which is remembered as the same move and ignored the second
-time, including when the chain passes through a name (a repeated `Both(b, c)` after `a` to `b`
-to `c` is the same chain). An old name still waiting when the quiet period ends is a `Removed`,
-and a new name with no old one waiting is a `Created`: the unpaired fallback, a removal plus a
-creation. A name a rename landed on, and a created name that then moved on, are removed as well
-as the entry moved: a removal of an unlisted name does nothing, and leaving it out would leave
-a stale entry. macOS reports a rename as one path with no side; that path is read as a
-modification, and the disk says whether it is still there. A rename out of the folder is a
-removal and one into it a creation; an event about any other path is dropped.
+Windows reports separate, untracked rename halves, paired oldest first. The Linux adapter keeps
+inotify's cookies and ignores the redundant tracked `Both` notification from notify 8.2.1.
+A tracked half never pairs with a different cookie or an untracked half. An old name still
+waiting at flush is removed; a new name without its old name is created. An explicit complete
+rename does not consume a waiting old name. The public coalescer ignores an immediate echo
+of just-paired untracked halves if nothing has brought the old name back. An ambiguous match
+later in the same burst requests a rescan instead of guessing which names to remove. Repeated
+complete renames without untracked halves are processed in order. FSEvents can report
+a rename without saying which side it is. That requests a rescan, so a case-only rename is
+resolved using directory names, not two successful metadata lookups.
 
-**The watcher.** `DirWatcher::new(folder, wake)` starts the OS watcher and one thread, which is
-the only user of the coalescer. `notify`'s callback translates each event and queues it under a
-mutex, the thread waits on a condition variable until an event or the deadline arrives (never a
-poll, so an idle folder costs nothing), reads each pending path's details there with `Entry::at`
-(the disk is never touched on the drawing thread), and queues `Signal`s. Waking is
-`FileWatcher`'s: one `wake` call, then none until `woken()`. `take()` drains the reports and
-`woken()` is called before it. `with_debounce` takes a quiet period of the caller's choice; the
-report is never held longer than `MAX_WAIT` (one second) after its first event, so a file
-written without pause cannot starve the rest.
+**The watcher.** `DirWatcher::new(folder, wake)` waits for registration. A backend owner holds
+the native watcher; a separate worker waits on a condition variable, detaches batches before
+coalescing them, reads metadata, and publishes signals. Each queue and the worker's accumulated
+burst have a limit of 4,096 items. Overflow collapses to a rescan; a lost watch supersedes a
+pending rescan. Waking is `FileWatcher`'s: call `woken()` before `take()` to re-arm it.
+`with_debounce` takes a quiet period of the caller's choice; `MAX_WAIT` (one second) caps the
+coalescer's deadline from the first callback, not OS delivery or filesystem I/O.
 
 The root the OS watcher is given is worked out once, at start: `std::path::absolute` on Windows
 and Linux, `canonicalize` on macOS. Every event path is compared against that root as it is and
 rewritten as the caller's folder joined with the event's own file name, so the list's exact
 matching works where the platform spells paths another way (macOS FSEvents reports
-`/private/var/...` for a folder given as `/var/...`), and the callback touches no disk at all:
-a hung mount cannot make it, or the drop that waits for the callback, wait. A path whose parent
-is not the root is dropped. An entry's name is the platform's own; on Windows it can come back
-in 8.3 short form, which is a different path to the list.
+`/private/var/...` for a folder given as `/var/...`). The callback does no disk I/O. The worker
+reads under the captured root and rewrites only the reported path, so changing the working
+directory cannot redirect its metadata reads. A path whose parent is not the root is dropped.
 
-Dropping the watcher does not wait for its thread: the thread may be inside a read on a share
-that never answers, and the drop runs on the thread that draws. The drop tells the thread to
-stop; the thread checks between two reads and before reporting, so it ends after the read it is
-in without touching the disk again or waking the application. A `Created` whose path cannot be
-read when the report is made is dropped (it went again), a `Modified` or a rename whose path is
-gone becomes a `Removed`.
+Drop stops delivery, then signals native teardown without waiting for either thread. A
+filesystem call already in progress may keep its thread occupied. At most 64 watcher worker
+pairs may be outstanding per process. Each pair keeps its slot until **both** the backend
+owner and the metadata worker exit, including after drop. The builder returns
+`WouldBlock` at the limit; the older constructors still return `None`. Only `NotFound` counts as
+absence in a metadata read: a creation that vanished is dropped, and a modification or rename
+whose destination vanished becomes a removal. Other errors invalidate the incremental batch
+and request a rescan.
 
 The watched folder itself being deleted or renamed is a lost watch: Linux reports it on the
 folder's own path (`DELETE_SELF`, `MOVE_SELF`). The callback only says the folder may be gone;
 the worker confirms it before the application hears anything — the folder is not there, or it
-is not the same folder on Unix (`symlink_metadata`'s device and inode) — and reports
-`Signal::Lost`. A folder that is still the same one means the events were confused, and a full
-read (`Rescan`) is the safe answer. notify's Windows backend does not report that error at all —
-it silently stops its watch — and it does not report a queue overflow either (an empty buffer
-gives nothing), so on Windows a deleted folder or lost events are noticed only by a full read;
-this is a limit of notify 8.2.1, documented rather than worked around. The stop a drop sets is
-checked with the queue's lock held before a report is delivered, so a drop cannot land between
-the check and the wake.
+is not the same folder on Unix (the device and inode of the followed directory, checked on
+both sides of registration) — and reports `Signal::Lost`. The application can drop that
+watcher and start a fresh one if the folder is available again. If the original folder is
+still present, a rescan is the fallback. Without periodic reconciliation this is event-driven.
 
-**Public API.** `DirWatcher` (`new`, `with_debounce`, `folder`, `take`, `woken`), `Signal`
+**Periodic reconciliation.** On Windows the default is 30 seconds: missed changes are
+eventually found without constantly reading large or remote folders. It is off by default
+on other platforms. `reconcile_interval(None)` or zero disables it; positive intervals
+below one second are rounded up to one second. The worker waits for the native owner to
+acknowledge its re-registration attempt before doing a strict directory read. It can still
+handle native events while waiting. On a reported restart failure or after two seconds
+without acknowledgement, the worker continues with scans only. A late acknowledgement
+does not schedule another restart. A slow read cannot stack up more reads. A pending native
+burst settles first. If callbacks arrive during the read or diff, the worker reconciles
+untouched paths and leaves the touched paths (both ends of a rename) to native events or
+a later scan. This lets a native rename transfer selection without hiding missed changes
+to unrelated paths. The event queue bounds how many paths can be tracked; overflow falls
+back to one plain `Rescan` without installing a racing snapshot. Confirmed `Lost` takes
+precedence over that reset. When an exact snapshot races a rename, the worker reports the
+settled native changes followed by a plain `Rescan`, without waiting for a rename-free scan.
+
+With `initial_entries` from the caller's unfiltered list, the worker starts with that
+baseline and keeps it in step with the changes it reports. When it needs a new baseline,
+the first complete read queues `Rescan` with the exact entries used for comparison.
+Call `woken()` and `take_with_snapshot()` to drain both atomically; install the snapshot
+for that `Rescan` and then apply later signals in order. As before, an unaccompanied `Rescan`
+requires an independent read. Legacy `take()` discards a supplied snapshot and returns a
+standalone `Rescan`; recovery does not assume that the independent read installed the worker's
+entries, and the next complete scan offers a fresh snapshot. That can mean two directory
+reads every interval even when nothing changed: the worker's scan and the caller's reread.
+Use `take_with_snapshot()` to avoid the second read when a snapshot is available.
+Once a baseline is shared, later reads report removals, creations and metadata changes
+through `Changed`. No rename
+identity is inferred from a snapshot.
+An incomplete read is never used as a snapshot. If opening the root says it no longer
+exists or is not a directory, the worker reports `Lost`. Native notification failures are
+still not observable as such, and snapshots cannot recover changes that happen and undo
+themselves between reads.
+
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `builder`, `folder`, `take`,
+`take_with_snapshot`, `woken`),
+`DirWatcherBuilder` (`debounce`, `reconcile_interval`, `initial_entries`, `start`), `Signal`
 (`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
-`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. Everything is
-additive: no existing signature, field or variant changed, and `Signal` is new, so its variants
-are new before any application sees them.
+`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. No existing public
+signature, field or variant changed.
 
-Tests: `dirwatch_tests.rs` (53), `dirwatch_model_tests.rs` (10) and
-`dirwatch_watcher_tests.rs` (8). The pure tests cover every coalescing rule, the debounce and
+Tests: `dirwatch_tests.rs`, `dirwatch_model_tests.rs` and
+`dirwatch_watcher_tests.rs`. The pure tests cover the coalescing rules, the debounce and
 the longest wait, a burst that cancels out leaving no stale wait, order and deduplication,
 unpaired renames, a name created where another was renamed away, two renames onto one name, a
 cycle beside an unrelated rename, the folder itself, paths outside the folder, lost and rescan,
@@ -2926,17 +2954,14 @@ then removed, an inotify rename onto an existing name that moves again, a chain 
 folder, and a random model: 2,000 seeds per style with the operations of create, remove,
 modify, rename, swap, backup, chain, move in and move out on a made-up disk; each run advances
 a clock so reports are split by the quiet period and the longest wait; Windows reports the
-removal of an overwritten name, inotify reports its pairs, and macOS reports every touched path
-as a modification; every verdict is resolved through the disk, applied to a `Listing`, and the
-list must equal the disk in names and generations after every report and at the end. Three
-further tests hold the thread down: one abandons the watcher while the reader is blocked and
-times the drop, one stops the watcher after the first read of a report and requires the second
-path not to be read, and three check that a folder-loss report is confirmed (still there → a
-rescan, gone → lost, made again under the same name on Unix → lost). The real-disk test on
-Windows (create, two renames and a remove, a bounded poll, compare with a fresh read) remains,
-and passed 10 of 10 runs before this round.
+removal of an overwritten name, the legacy untracked path can receive echoes, and the model
+also exercises modifications of touched paths; every verdict is resolved through the made-up
+disk and applied to a `Listing`. The list must equal the disk in names and generations. Separate
+synthetic adapter tests cover tracked inotify moves and ambiguous spellings. Channel gates
+check teardown and metadata-worker shutdown, and the Windows real-disk test waits for the
+expected listing until its outer deadline, then compares with a fresh read.
 
-Fail-before evidence, each test seen failing under a change, one at a time, with the file
+Initial implementation's fail-before evidence, each test seen failing under a change with the file
 restored afterwards. Before the ordering fix, the model's first seed, backup, rotation and swap
 failed; before the displaced-name fix, the rename-onto-then-removed and chain tests failed; the
 inotify chain test requires the chain's verdict shape. Under mutations of this round: no
@@ -2961,31 +2986,67 @@ Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --wor
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, `cargo test
 --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
 explorer_tests`, and `cargo clippy --target x86_64-unknown-linux-gnu -p mdshared-app
---all-targets -- -D warnings`. On Linux and macOS nothing was run: the inotify pairing (the
-`Both` event and its cookie), the FSEvents single-path rename, the folder's own
-`DELETE_SELF`/`MOVE_SELF`, and the Unix side of the thread are compiled, not run. Nothing here
-was seen by a person or used by an application yet.
+--all-targets -- -D warnings`.
 
 Known behaviours and limits for later:
 
 - A rename that happens entirely outside the folder, or into it from outside, is seen by one
   side only and reported as a creation or a removal, as the platform allows.
-- On macOS a rename cannot be paired: FSEvents reports both the old and the new path as a
-  modification, so the list converges (the old entry is removed, the new one inserted or
-  changed), but the two are not tied together, so a selection does not follow the entry through
-  a rename.
-- On Windows notify 8.2.1 reports neither a queue overflow nor a watch error; the watcher can
-  only report what notify hands it. A folder deleted there is noticed by the next full read,
-  not by a signal.
-- A name inside the folder may come back in 8.3 short form on Windows, which the list, matching
-  paths exactly, does not know.
-- A file's contents change is reported for every save, coalesced within the quiet period and
-  the longest wait; a caller that only re-reads changed entries is expected.
+- On macOS a side-less rename requests a rescan, not a pair that transfers selection.
+- On Windows notify 8.2.1 can return success even when the initial `ReadDirectoryChangesW` call
+  fails. Zero-byte overflows and terminal read failures can also go unreported. `DirWatcher`
+  cannot distinguish these from a quiet watch. The periodic full read and watch restart work
+  around those failures without changing notify.
 - The watcher reads each changed path's details on its own thread; a dead network path can hold
   that thread for as long as the system takes to answer, but it never holds the window, and the
   drop does not wait for it.
 - No subfolders are watched. An entry's change of kind (a file becoming a folder) is read as a
   change of its details, which `Listing::apply` replaces in place.
+
+### Left open from the Astra review (2026-11-26)
+
+- **#9 — Fixed.** Relative paths are resolved under the captured root before restoring the
+  caller's path spelling.
+- **#10 — Mitigated by periodic recovery.** Native notifications with 8.3 short names can still
+  produce a duplicate or leave the long-name row stale until a complete read corrects the list.
+  The native path does not expand a removed alias.
+- **#11 — Open.** `dirlist::read_checked` skips errors after enumeration opens. Reconciliation
+  now has a private strict scan; the caller-facing best-effort API and manual `Rescan` recovery
+  are unchanged.
+- **#12 — Fixed.** The worker tests use gates and observe exit, the disk test waits for the
+  expected listing, and the 20,000-verdict test checks correctness rather than wall time.
+
+Astra follow-up verification: Windows fmt, workspace Clippy and workspace tests (`host,a11y`,
+skip `explorer_tests`) passed under Rust 1.99.1; the catalogue check passed. The workspace
+suite passed 2,379 tests (45 ignored, four filtered out). The default Rust 1.100.0 instead
+flagged an unchanged `needless_range_loop` in `sections_tests.rs`. Synthetic regressions for
+ambiguous renames, wrong cookie pairing, repeated complete renames, metadata errors and queue
+overflow failed before their fixes; a synchronous teardown mutation failed the gated drop
+test. The `mdshared-app` tests type-checked for Linux x86-64 and macOS ARM64, but were not
+ run there. No disconnected share or Windows backend failure was reproduced, and no
+application was tested.
+
+Re-review verification: Windows Rust 1.99.1 fmt and both Clippy checks passed (workspace with
+`host,a11y`, and `mdshared-app` with no default features). The Windows all-features
+`mdshared-app` tests passed (650 passed, one ignored); the catalogue check passed. The
+delayed-echo and temp-collision tests failed before their fixes. Removing the periodic wake
+deadline or the owner cap failed the corresponding fake-backend test. Linux x86-64 Clippy
+passed with the `pkg-config` stub on Rust 1.100.0, without linking or running anything for
+Linux. The reconciliation test uses a silent fake backend; it does not reproduce a native
+overflow or stalled SMB share. macOS was not checked in this round.
+
+Second re-review: all six checks passed (Windows Rust 1.99.1 fmt, workspace and
+no-default-features Clippy, all-features `mdshared-app` tests with 655 passed and one
+ignored, Linux x86-64 Clippy with the stub, and the catalogue check). Fake-clock or
+channel-gated regressions failed when scan ordering, snapshot invalidation, the shared
+permit, or restart acknowledgement was disabled. Linux was type-checked only; macOS and
+real Windows restart failures, overflows and blocked network calls were not exercised.
+
+Third re-review: all six checks passed on Rust 1.99.1, including 658 Windows tests
+(one ignored) and Linux x86-64 Clippy with the `pkg-config` stub. The fake-clock tests
+reproduced busy-scan starvation, the missing overflow reset, and the hung restart
+before the fixes. No native hung restart or continuously changing directory was
+reproduced; Linux tests were not run and macOS was not checked.
 
 ## X13. The Markdown page renderer
 
