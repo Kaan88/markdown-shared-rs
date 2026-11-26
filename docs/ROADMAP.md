@@ -32,6 +32,7 @@ something that cannot be tested headless).
 
 | Question | Answer |
 |---|---|
+| Reject partial vertical hinting (TS1) | 2026-11-26: use `skrifa = "=0.44.0"` directly in `mdshared-text` for pedantic glyph draws. Match the version already resolved for swash; do not add a second version. |
 | Markdown viewing (X13) | 2026-11-26: “markdown viewing is useful for many apps. shared it is.” Move the page renderer into this toolkit. |
 | JPEG and other decoders (F6, M5, F5) | `zune-jpeg =0.5.15`, pure Rust, behind the image module's decoder slot |
 | Accessibility (W8) | AccessKit: `accesskit` + `accesskit_winit`, behind an opt-in feature `a11y` |
