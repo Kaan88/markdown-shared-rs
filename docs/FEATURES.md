@@ -1996,8 +1996,10 @@ link to itself cannot stall the read of the folder or send it anywhere else. A j
 be told from a symbolic link without asking what it points at — the scan and the link's own
 metadata both call it a link — and that question is the follow this refuses, so no link is ever
 a `Kind::Folder`; it is listed, with the link's own hidden flag and times, which is what makes a
-hidden junction such as `C:\Documents and Settings` come out hidden. The junction test sets the
-attribute on the link itself and checks that it is listed, hidden and Other.
+hidden junction such as `C:\Documents and Settings` come out hidden. An application that opens a
+link to a folder therefore follows it itself, off the thread that draws, as it would follow any
+slow path. The junction test sets the attribute on the link itself and checks that it is listed,
+hidden and Other.
 
 **What an entry holds.** Name, kind, size, modified and created times, and the hidden flag: the
 `FILE_ATTRIBUTE_HIDDEN` attribute on Windows, a leading dot elsewhere. The times are
@@ -2007,9 +2009,13 @@ the system reports for it, usually zero — its contents are never added up.
 **Paths are compared exactly**, as the platform spelled them: no case folding and no tidying of
 separators. Two names that differ only in case are two entries where the file system tells them
 apart; on Windows they cannot both exist, and the disk test says so and skips, while a model
-test with two such paths runs everywhere. Folder membership is `Path::parent` against the
-folder, so a change for a path outside the folder is ignored: a rename out of it is a removal,
-a rename into it a creation, and the folder itself is not one of its entries.
+test with two such paths runs everywhere. That puts one rule on the watcher: it must report
+paths in the folder's own spelling — no `\\?\` prefix and no 8.3 short name, which can name
+the same entry another way on Windows, and on macOS `/private/var` and `/var` are two paths —
+because `apply` matches exactly and a path spelled otherwise is one the list does not hold.
+Folder membership is `Path::parent` against the folder, so a change for a path outside the
+folder is ignored: a rename out of it is a removal, a rename into it a creation, and the folder
+itself is not one of its entries.
 
 **Sorting.** Folders come first whatever the column and the direction; names use
 `fmt::natural_cmp`, so `"file2"` comes before `"file10"`; times sort with "unknown" before any
@@ -2059,6 +2065,10 @@ Tests, `dirlist_tests.rs` (20) and one in `mdshared-ui`'s `select`:
   folder or path gives nothing;
 - two paths that differ only in case are two entries, and a change moves one of them (the disk
   test of the same is skipped where the file system folds case);
+- a remap answers `None` for a row past the list's old end, and for the end of `usize`;
+- a filter narrows and widens without losing the sorted order, and a hundred filter changes on
+  100,000 entries stay inside the test's four-second bound because none of them sorts (a re-sort
+  each time would not);
 - 1,000 changes on 100,000 entries finish well inside the test's two-second bound: 17 ms of
   applies in a debug build on Windows 11;
 - in `mdshared-ui`, a selection follows its entry through a re-sort, a rename and a removal.
@@ -2068,10 +2078,13 @@ with `fs::metadata` (failing both the link test and the junction test), no folde
 name and path tiebreak removed (failing both the sort test and the applied-equals-re-read test),
 the hand-named rows ignored (failing both the replace test and the rename-onto test), keys
 case-folded, the cancel flag ignored by the read, a cancelled worker handing its entries over,
-`read_checked` swallowing the folder's error, an unreadable entry not skipped, and a full
-re-sort added to every change (which the 100,000-entry test then fails). The file was restored
-afterwards. The earlier round's mutations (kind always `File`, hidden always false, plain `cmp`,
-filter and switch ignored, and so on) still fail their tests.
+`read_checked` swallowing the folder's error, an unreadable entry not skipped (and an injected
+step that skips nothing, which fails the order-independent test), the remap's guard for a row
+past the end removed, a re-sort put back into every filter change (which the filter test's
+bound then fails), and a full re-sort added to every change (which the 100,000-entry apply test
+then fails). The files were restored afterwards. The earlier round's mutations (kind always
+`File`, hidden always false, plain `cmp`, filter and switch ignored, and so on) still fail their
+tests.
 
 Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, and `cargo test
@@ -2091,11 +2104,15 @@ Known behaviours and limits for later:
   `Vec<Entry>` (in `set_entries`, or when a cancelled or stale read is dropped) releases its
   paths and names on the window's thread. A folder of a million entries should be handed to a
   worker to drop if that pause is ever measured to matter.
-- A new sort, filter or show-hidden switch is O(n log n) and its remap one answer per old row;
-  `set_entries` rebuilds the index and the lower-case keys, O(n), and sorts, O(n log n). A change
-  is O(log n) plus the rows' own move, which is `Vec::insert`/`remove` and so up to O(n) bytes
-  copied, and the `Remap` it returns is lazy. `row_of` is a hash lookup and a binary search.
-  The index keeps one hash per entry and no copied path; the lower-case name of every entry is
-  kept beside it, so a folder costs about its names again in memory.
+- A new sort is O(n log n) and its remap one answer per old row. A filter keystroke or a
+  show-hidden switch is O(n) and sorts nothing: every entry is kept in the sort's order, and
+  the rows shown are chosen out of it, so a keystroke only walks the entries; the remap stays
+  exact, one answer per old row. `set_entries` rebuilds the index, the lower-case keys and the
+  order, O(n) and O(n log n) for the sort. A change is O(log n) plus the rows' own move, which
+  is `Vec::insert`/`remove` and so up to O(n) bytes copied, in both the order and the rows, and
+  the `Remap` it returns is lazy. `row_of` is a hash lookup and a binary search. The index keeps
+  one hash per entry and no copied path; the lower-case name of every entry is kept beside it,
+  and the sorted order is one `usize` per entry, so a folder costs about its names again in
+  memory.
 - F2, the watcher that says what changed, is still open, and an application's list view is what
   would show this to a person first.
