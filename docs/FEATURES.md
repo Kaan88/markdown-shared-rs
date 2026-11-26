@@ -2484,3 +2484,156 @@ half of this was that a single-atom run cannot show a range paired with the wron
 what the RTL test is for; the split test therefore checks the split shape while the pairing test
 keeps its two runs (still three on a Mac, where the properties hold). Both still fail when the
 atoms are not turned round (the boxes stop touching and the narrow range gets the wide box).
+
+## A folder's entries as a file manager's list (`mdshared_app::dirlist`, 2026-11-26, `feat/f1-dir-listing`, roadmap F1)
+
+The model behind a files list: what a folder holds, sorted, filtered and kept in step with the
+disk without reading it all again, plus a remap that keeps the selection on its entries.
+
+**Where it lives, and why.** It reads files and runs a worker, and it draws nothing, so it is in
+`mdshared-app` ([NEW-MODULE.md](NEW-MODULE.md)). That places it below `mdshared-ui`, which is why
+it has its own `Column` and `Sort` rather than borrowing `table::Sort`: `mdshared-app` cannot
+depend on the toolkit. The application maps a header hit to `Listing::toggle_sort(Column::...)`,
+and a click on a column already sorted the same way turns the direction round, as `Table` does.
+
+**Reading, off the window thread.** `read(dir, cancel)` lists the entries in the folder's own
+order and asks `cancel` before each one; an entry it cannot read (deleted between being listed
+and being asked for, a name the system will not open) is skipped, and the read goes on.
+`read_checked` is the same read with the folder's own error kept, so the application can tell a
+folder it may not open from an empty one; `read` keeps its old shape and answers nothing for one
+that cannot be opened. `FolderRead::start(dir, wake)` runs the read on a `job::Job` — one long
+read per folder is what a job is for, while the pool is for many short pieces — and `take` or
+`take_checked` hands the folder and its entries over once, after the wake. Cancelling, by
+`FolderRead::cancel` or by dropping the handle, delivers nothing: the take drops what a
+cancelled read had read instead of handing it over half read. A cancel is seen between entries
+and cannot interrupt a system call, so a dead network path keeps its worker thread where it is;
+the window is never in that call.
+
+**Links are never followed.** `read` uses the scan's own `DirEntry::file_type` and
+`DirEntry::metadata` (on Windows both come from the folder scan, so neither costs another
+read), and `Entry::at` uses `symlink_metadata`. A symbolic link or a Windows junction is
+`Kind::Other` whatever it points at, so a link to a dead share, a link to another folder or a
+link to itself cannot stall the read of the folder or send it anywhere else. A junction cannot
+be told from a symbolic link without asking what it points at — the scan and the link's own
+metadata both call it a link — and that question is the follow this refuses, so no link is ever
+a `Kind::Folder`; it is listed, with the link's own hidden flag and times, which is what makes a
+hidden junction such as `C:\Documents and Settings` come out hidden. An application that opens a
+link to a folder therefore follows it itself, off the thread that draws, as it would follow any
+slow path. The junction test sets the attribute on the link itself and checks that it is listed,
+hidden and Other.
+
+**What an entry holds.** Name, kind, size, modified and created times, and the hidden flag: the
+`FILE_ATTRIBUTE_HIDDEN` attribute on Windows, a leading dot elsewhere. The times are
+`Option<SystemTime>` because a file system may not have a birth time. A folder's size is what
+the system reports for it, usually zero — its contents are never added up.
+
+**Paths are compared exactly**, as the platform spelled them: no case folding and no tidying of
+separators. Two names that differ only in case are two entries where the file system tells them
+apart; on Windows they cannot both exist, and the disk test says so and skips, while a model
+test with two such paths runs everywhere. That puts one rule on the watcher: it must report
+paths in the folder's own spelling — no `\\?\` prefix and no 8.3 short name, which can name
+the same entry another way on Windows, and on macOS `/private/var` and `/var` are two paths —
+because `apply` matches exactly and a path spelled otherwise is one the list does not hold.
+Folder membership is `Path::parent` against the folder, so a change for a path outside the
+folder is ignored: a rename out of it is a removal, a rename into it a creation, and the folder
+itself is not one of its entries.
+
+**Sorting.** Folders come first whatever the column and the direction; names use
+`fmt::natural_cmp`, so `"file2"` comes before `"file10"`; times sort with "unknown" before any
+time. Ties are broken by the name in natural order and then by the path's bytes, so the order is
+total: an applied change and a fresh read agree under every column and both directions. Each
+entry's lower-case name is made once when it comes in, and is the key for both the name column
+and the filter, so no pass lower-cases a name again.
+
+**Changes without a re-read.** `Change::{Created, Removed, Renamed { from, to }, Modified}` is
+what a watcher (F2) will report; `apply` finds the entry through a hash index of its path (no
+path is copied into the index), removes it from the sorted rows by binary search, changes it and
+inserts it again by binary search — no sort runs for a change. A `Modified` for a path the list
+does not hold inserts it, because a save the watcher reports as a change may be a file it never
+reported being created. A `Renamed` carries the entry read at its new path (`Entry::at`).
+
+**The selection.** Every call that changes the rows returns a `Remap`: for each old row, its new
+row or `None`, handed over as `selection.remap(remap.mapping())`. A change describes itself with
+a handful of row edits (one removed, one inserted) and a few rows named by hand, so a change on
+a list of a million entries builds no per-row table; a new sort or filter has no such
+description and keeps one answer per old row. A rename needs the hand-named row: the old path is
+gone, so `apply` maps the old row of `from` to the new row of `to`, and the selection stays on
+the entry under its new name. A replaced entry does the same for its own row.
+
+Tests, `dirlist_tests.rs` (20) and one in `mdshared-ui`'s `select`:
+
+- reading a temporary folder gives the right entries, kinds, size and row lookups;
+- the system's way of hiding a file is read (attribute on Windows via `attrib +h`, a dot
+  elsewhere), and a hidden junction on Windows is listed and hidden (skipped with a note where
+  `mklink /J` is not available);
+- a link to a folder, a dead link and a link to itself are all listed as `Kind::Other` and the
+  folder is still read to its end (skipped with a note where the machine will not make links),
+  and a junction is Other as well;
+- every column sorts with the folders first, the name sort is natural, the direction turns, the
+  name then the path settle every tie, and a click turns a column round;
+- the filter and the hidden switch narrow the list, together, and their remap says what went;
+- create, remove, rename, modify (and a change of kind on disk) applied one by one give the same
+  list as a full re-read under every column and both directions, with equal sizes in play;
+- a rename onto a name already listed replaces it, and the row follows;
+- a change outside the folder is ignored, and a rename across the folder's edge is a removal or
+  a creation by its direction;
+- a cancelled read reads nothing, a cancel part way stops the read at that entry, and a
+  cancelled worker hands nothing over even when its thread finished;
+- a folder read on a worker hands its entries over once, and a folder that cannot be opened is
+  an error through `take_checked`;
+- an entry that cannot be read is skipped without a panic (the skip step is checked directly on
+  Unix, where the disk is asked again, and through an injected step elsewhere), and a missing
+  folder or path gives nothing;
+- two paths that differ only in case are two entries, and a change moves one of them (the disk
+  test of the same is skipped where the file system folds case);
+- a remap answers `None` for a row past the list's old end, and for the end of `usize`;
+- a filter narrows and widens without losing the sorted order, and a hundred filter changes on
+  100,000 entries stay inside the test's four-second bound because none of them sorts (a re-sort
+  each time would not);
+- 1,000 changes on 100,000 entries finish well inside the test's two-second bound: 17 ms of
+  applies in a debug build on Windows 11;
+- in `mdshared-ui`, a selection follows its entry through a re-sort, a rename and a removal.
+
+Each test was seen failing under a mutation of the implementation, one at a time: links followed
+with `fs::metadata` (failing both the link test and the junction test), no folder check, the
+name and path tiebreak removed (failing both the sort test and the applied-equals-re-read test),
+the hand-named rows ignored (failing both the replace test and the rename-onto test), keys
+case-folded, the cancel flag ignored by the read, a cancelled worker handing its entries over,
+`read_checked` swallowing the folder's error, an unreadable entry not skipped (and an injected
+step that skips nothing, which fails the order-independent test), the remap's guard for a row
+past the end removed, a re-sort put back into every filter change (which the filter test's
+bound then fails), and a full re-sort added to every change (which the 100,000-entry apply test
+then fails). The files were restored afterwards. The earlier round's mutations (kind always
+`File`, hidden always false, plain `cmp`, filter and switch ignored, and so on) still fail their
+tests.
+
+Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, and `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests`. On Linux the crate is type-checked only: `cargo clippy --target
+x86_64-unknown-linux-gnu -p mdshared-app --all-targets -- -D warnings` passes, and nothing was
+run there — the Unix hidden flag, the link creation and the skip of a vanished entry in
+`read_entry` were compiled, not run. Nothing here was seen by a person or used by an application:
+it is a model with no drawing.
+
+Known behaviours and limits for later:
+
+- A filter change drops the selection of every row it hides, and clearing the filter does not
+  bring that selection back: `Selection::remap` is told those rows are gone, so the application
+  would have to remember them itself if a filtered selection must survive.
+- Freeing a large result happens on the thread that replaces it: dropping a folder's
+  `Vec<Entry>` (in `set_entries`, or when a cancelled or stale read is dropped) releases its
+  paths and names on the window's thread. A folder of a million entries should be handed to a
+  worker to drop if that pause is ever measured to matter.
+- A new sort is O(n log n) and its remap one answer per old row. A filter keystroke or a
+  show-hidden switch is O(n) and sorts nothing: every entry is kept in the sort's order, and
+  the rows shown are chosen out of it, so a keystroke only walks the entries; the remap stays
+  exact, one answer per old row. `set_entries` rebuilds the index, the lower-case keys and the
+  order, O(n) and O(n log n) for the sort. A change is O(log n) plus the rows' own move, which
+  is `Vec::insert`/`remove` and so up to O(n) bytes copied, in both the order and the rows, and
+  the `Remap` it returns is lazy. `row_of` is a hash lookup and a binary search. The index keeps
+  one hash per entry and no copied path; the lower-case name of every entry is kept beside it,
+  and the sorted order is one `usize` per entry, so a folder costs about its names again in
+  memory.
+- F2, the watcher that says what changed, is still open, and an application's list view is what
+  would show this to a person first.
