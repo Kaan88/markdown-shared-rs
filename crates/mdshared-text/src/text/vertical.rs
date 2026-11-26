@@ -5,6 +5,24 @@ use swash::scale::Source;
 use swash::scale::image::{Content, Image};
 use swash::scale::outline::Outline;
 use swash::zeno::{Format, Mask, Origin, Scratch, Vector};
+use swash::{FontRef, tag_from_bytes};
+
+#[cfg(all(test, windows))]
+#[path = "vertical_tests.rs"]
+mod tests;
+
+/// The TrueType hinter rounds fractional ppem to a whole pixel when `head.flags` bit 3 is set.
+/// In that case keep the unhinted outline for every glyph at the requested fractional size.
+/// A missing or truncated `head` cannot establish that fractional hinting is safe.
+pub(super) fn can_hint_at_size(font: FontRef<'_>, size: f32) -> bool {
+    size.is_finite()
+        && size > 0.0
+        && (size.fract() == 0.0
+            || font
+                .table(tag_from_bytes(b"head"))
+                .and_then(|head| head.get(16..18))
+                .is_some_and(|flags| u16::from_be_bytes([flags[0], flags[1]]) & (1 << 3) == 0))
+}
 
 #[derive(Default)]
 pub(super) struct Vertical {

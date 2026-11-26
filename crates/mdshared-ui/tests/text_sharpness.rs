@@ -1,5 +1,6 @@
 //! A headless specimen of small interface text on both toolkit palettes.
-//! The caller supplies a directory; the test also records the measured widths as float bits.
+//! The test writes to `target/specimen` unless the caller supplies `TEXT_SHARPNESS_SHOTS`.
+//! It also records the measured widths as float bits.
 
 use mdshared_text::Bitmap;
 use mdshared_ui::gfx::{Face, Gfx, Painter, Rect};
@@ -9,9 +10,11 @@ use std::path::PathBuf;
 #[test]
 #[ignore]
 fn small_ui_text_sheet() {
-    let out = PathBuf::from(std::env::var_os("TEXT_SHARPNESS_SHOTS").expect("specimen directory"));
+    let out = std::env::var_os("TEXT_SHARPNESS_SHOTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen"));
     std::fs::create_dir_all(&out).unwrap();
-    for (scale, suffix) in [(1.0, ""), (1.5, "-150")] {
+    for (scale, suffix) in [(1.0, ""), (1.25, "-125"), (1.5, "-150")] {
         let mut bitmap = Bitmap::new((640.0 * scale) as u32, (204.0 * scale) as u32);
         let mut gfx = Gfx::new();
         let mut p = Painter::new(&mut bitmap, &mut gfx, scale);

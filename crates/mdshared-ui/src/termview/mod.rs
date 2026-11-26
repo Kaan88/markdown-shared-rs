@@ -77,8 +77,8 @@
 //! # Tests
 //!
 //! `cargo test -p mdshared-ui --features term termview`. The sheet: `cargo test -p mdshared-ui
-//! --features term termview_sheet -- --ignored`, then open `target/specimen/termview.png` and
-//! `termview-150.png`. The speed of a full 200 by 60 frame: `cargo test --release -p
+//! --features term termview_sheet -- --ignored`, then open `target/specimen/termview.png`,
+//! `termview-125.png`, and `termview-150.png`. The speed of a full 200 by 60 frame: `cargo test --release -p
 //! mdshared-ui --features term termview_speed -- --ignored --nocapture`.
 
 mod boxes;
