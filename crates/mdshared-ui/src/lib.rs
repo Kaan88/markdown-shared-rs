@@ -40,6 +40,7 @@ pub mod host;
 pub mod infobar;
 pub mod keys;
 pub mod knob;
+pub mod layout;
 pub mod link;
 pub mod media_session;
 pub mod menu;
