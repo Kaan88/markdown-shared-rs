@@ -49,17 +49,16 @@
 //! reports a rename as one path with no side; it requests a rescan so the list uses the actual
 //! names in the directory, even on case-insensitive volumes.
 //!
-//! When the OS watcher reports an overflow or asks for a rescan, [`Signal::Rescan`] is emitted
-//! instead of the changes, because some events were lost and only a fresh read of the folder can
-//! be trusted. When the watched folder itself is deleted or renamed, the callback only says the
+//! An overflow, ambiguous rename, or unreadable entry can yield [`Signal::Rescan`] instead of
+//! changes. A fresh read of the directory is needed then. When the watched folder itself is
+//! deleted or renamed, the callback only says the
 //! folder may be gone; the worker confirms it (the folder is not there, or on Unix is not the
 //! same folder) before [`Signal::Lost`] is emitted, and a folder that is still the same one is
-//! a [`Signal::Rescan`] instead. (notify's Windows backend does not report that error at all: it
-//! silently stops its watch, so a deleted folder is noticed there only by the next full read.)
+//! a [`Signal::Rescan`] instead. On Windows, notify 8.2.1 can silently fail to start or continue
+//! a watch, and can miss overflows without asking for a rescan.
 //!
-//! A report is settled after [`DEBOUNCE`] without a new event, but never later than
-//! [`MAX_WAIT`] after its first event: one file written without pause cannot hold the rest of
-//! the report back.
+//! A burst is eligible to settle after [`DEBOUNCE`] without a new event, or at [`MAX_WAIT`]
+//! after its first callback. This bounds the coalescer's wait, not the OS or disk read.
 //!
 //! Only entries directly inside the watched folder are reported. A rename out of the folder is
 //! its removal, a rename into it its creation, and an event about any other path (a file's
@@ -84,7 +83,7 @@ use crate::dirlist::{Change, Entry};
 use notify::{RecursiveMode, Watcher as _};
 use order::{Item, settled};
 use queues::{Batch, Inbox, LIMIT, Shared};
-use resolve::{read_from_root, signal_of};
+use resolve::{Identity, lost_signal, read_from_root, register, signal_of};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,8 +96,7 @@ use translate::{Translator, translation};
 /// unless the caller asks for another quiet period with [`DirWatcher::with_debounce`].
 pub const DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// The longest a report is held back, from its first event to its flush, even while more events
-/// keep arriving: one file written without pause cannot starve the rest of the report.
+/// The longest the coalescer defers eligibility to flush, even while more events keep arriving.
 pub const MAX_WAIT: Duration = Duration::from_secs(1);
 
 /// One raw event, as a platform watcher saw it, before the quiet period settles it.
@@ -166,10 +164,10 @@ pub enum Signal {
     /// One settled change in the watched folder, to hand to
     /// [`Listing::apply`](crate::dirlist::Listing::apply).
     Changed(Change),
-    /// Some events were lost. The application must read the folder again in full, as with
+    /// Incremental changes are not reliable. The application must read the folder again, as with
     /// [`read`](crate::dirlist::read) and
     /// [`Listing::set_entries`](crate::dirlist::Listing::set_entries), because the changes that
-    /// were lost cannot be guessed.
+    /// were missed or could not be resolved cannot be guessed.
     Rescan,
     /// The watch is over: the folder itself was deleted or renamed (confirmed by the worker),
     /// or the OS watcher failed. The application should drop the watcher and read the folder
@@ -641,71 +639,14 @@ fn notify_root(folder: &Path) -> Option<PathBuf> {
     }
 }
 
-/// What a folder was, so the worker can tell a report about it from a report about a folder
-/// that was deleted and made again under the same name.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
-struct Identity {
-    dev: u64,
-    ino: u64,
-}
-
-/// What a folder was; Windows has no identity the watcher can compare.
-#[cfg(not(unix))]
-#[derive(Clone, Copy, Debug)]
-struct Identity;
-
-/// The identity of `path`, where the platform has one to compare.
-fn identity(path: &Path) -> Option<Identity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Identity {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-/// Confirms a folder-loss report in the worker, where a disk read is allowed.
-///
-/// `Lost` only when the folder is not there or is not the same folder that was watched; a
-/// folder that is still the same one means the events were confused, and a full read (`Rescan`)
-/// is the safe answer.
-fn lost_signal(root: &Path, started: Option<Identity>) -> Signal {
-    let meta = match std::fs::symlink_metadata(root) {
-        Ok(meta) => meta,
-        Err(_) => return Signal::Lost,
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Some(started) = started
-            && (meta.dev() != started.dev || meta.ino() != started.ino)
-        {
-            return Signal::Lost;
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = (meta, started);
-    Signal::Rescan
-}
-
 /// Reads a path's entry, keeping filesystem errors for the worker.
 type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
 
 /// Watches one folder and reports what changed in it, settled, as [`Signal`]s.
 ///
-/// [`DirWatcher::new`] starts the OS watcher and a thread of its own. That thread is the only
-/// one that touches the [`Coalescer`], and it reads each changed path's details there with
-/// [`Entry::at`](crate::dirlist::Entry::at), so neither the drawing thread nor the OS watcher's
-/// callback ever waits for a disk. When a report is ready the thread calls the wake it was given
+/// [`DirWatcher::new`] waits for registration. After that, a metadata worker owns the
+/// [`Coalescer`] and reads changed entries, so neither the drawing thread nor the callback
+/// performs that I/O. When a report is ready the worker calls the wake it was given
 /// (once, until [`woken`](Self::woken) is called) and the application takes the report with
 /// [`take`](Self::take).
 ///
@@ -723,9 +664,9 @@ pub struct DirWatcher {
 impl DirWatcher {
     /// Watches `folder` with a [`DEBOUNCE`] quiet period, calling `wake` when a report is ready.
     ///
-    /// `None` when the OS watcher cannot start or cannot watch the folder (no inotify instances
-    /// left, or the folder cannot be opened); the application then falls back to reading the
-    /// folder again on a slow poll. `wake` runs on the watcher's own thread: it must be cheap,
+    /// `None` on a reported startup error. The application can fall back to reading the folder
+    /// on a slow poll. On Windows, a successful return does not rule out silent failures inside
+    /// the native backend. `wake` runs on the metadata worker: it must be cheap,
     /// must not block on anything the application holds, and must not panic.
     ///
     /// Every path in the report is this folder joined with the entry's own name, so the list's
@@ -742,8 +683,8 @@ impl DirWatcher {
     /// [`new`](Self::new), with a quiet period of the caller's choosing.
     ///
     /// A shorter period reports sooner and splits one operation into more reports; a longer one
-    /// settles a save that writes several files. The report is settled at most [`MAX_WAIT`] after
-    /// its first event whatever the quiet period.
+    /// settles a save that writes several files. [`MAX_WAIT`] caps the coalescer's deadline
+    /// regardless of the quiet period, not the time needed to read metadata or deliver a report.
     pub fn with_debounce(
         folder: impl Into<PathBuf>,
         debounce: Duration,
@@ -774,7 +715,7 @@ impl DirWatcher {
         let names = Translator::new(folder.clone(), root.clone());
         let for_events = Arc::clone(&inbox);
         let watch_root = root.clone();
-        let backend = backend::start(move || {
+        let (backend, identity) = backend::start(move || {
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                     let at = Instant::now();
@@ -783,12 +724,13 @@ impl DirWatcher {
                     }
                 })
                 .ok()?;
-            watcher
-                .watch(&watch_root, RecursiveMode::NonRecursive)
-                .ok()?;
-            Some(watcher)
+            register(&watch_root, || {
+                watcher
+                    .watch(&watch_root, RecursiveMode::NonRecursive)
+                    .ok()?;
+                Some(watcher)
+            })
         })?;
-        let identity = identity(&root);
         let coalescer = Coalescer::new(folder.clone(), debounce);
         let for_work = Arc::clone(&inbox);
         let for_report = Arc::clone(&shared);
@@ -822,6 +764,8 @@ impl DirWatcher {
     }
 
     /// The settled reports waiting, in the order they were settled, and forgets them.
+    ///
+    /// A pending rescan supersedes incremental changes; a lost watch supersedes both.
     ///
     /// Call [`woken`](Self::woken) before this, as [`FileWatcher::woken`](crate::watch::FileWatcher::woken)
     /// is called, so a report settled during the call wakes again instead of being missed.

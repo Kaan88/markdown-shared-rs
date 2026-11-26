@@ -1,6 +1,8 @@
 //! The tests of the watcher's edge: waking, the drop that must not wait, the thread's stop, and
 //! one real folder on Windows.
 
+#[cfg(unix)]
+use super::resolve::identity;
 use super::*;
 use crate::dirlist::Kind;
 #[cfg(windows)]
@@ -26,7 +28,10 @@ fn a_folder_that_is_still_there_is_not_lost() {
     let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-still-{}", std::process::id()));
     _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
     let started = identity(&dir);
+    #[cfg(not(unix))]
+    let started = None;
     assert_eq!(lost_signal(&dir, started), Signal::Rescan);
     _ = std::fs::remove_dir_all(&dir);
 }
@@ -55,6 +60,55 @@ fn a_folder_made_again_under_the_same_name_is_lost() {
     assert_eq!(lost_signal(&dir, started), Signal::Lost);
     _ = std::fs::remove_dir_all(&dir);
     _ = std::fs::remove_dir_all(&other);
+}
+
+#[cfg(unix)]
+#[test]
+fn losing_a_watched_symlinks_target_loses_the_watch() {
+    let dir = Dir::new("link-target");
+    let target = dir.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.0.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let started = identity(&link);
+    assert_eq!(started, identity(&target));
+    assert!(started.is_some());
+    std::fs::remove_dir(&target).unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(lost_signal(&link, started), Signal::Lost);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_replaced_during_registration_is_rejected() {
+    let dir = Dir::new("register-replaced");
+    let root = dir.0.join("watched");
+    std::fs::create_dir(&root).unwrap();
+    let result = register(&root, || {
+        std::fs::rename(&root, dir.0.join("old")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        Some(())
+    });
+    assert!(result.is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inotify_reports_loss_when_the_target_of_a_watched_link_is_deleted() {
+    let dir = Dir::new("inotify-link-target");
+    let target = dir.0.join("target");
+    let link = dir.0.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let watcher = DirWatcher::new(&link, move || {
+        send.send(()).ok();
+    })
+    .unwrap();
+    std::fs::remove_dir(&target).unwrap();
+    receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    watcher.woken();
+    assert_eq!(watcher.take(), [Signal::Lost]);
 }
 
 #[test]
@@ -238,7 +292,7 @@ fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
 
     let (started, teardown) = channel();
     let (release, gate) = channel();
-    let backend = backend::start(move || Some(GatedBackend(started, gate))).unwrap();
+    let (backend, ()) = backend::start(move || Some((GatedBackend(started, gate), ()))).unwrap();
     let inbox = Arc::new(Inbox::default());
     let watcher = DirWatcher {
         folder: folder(),
