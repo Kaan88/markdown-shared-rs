@@ -1807,13 +1807,16 @@ so an application that reads the theme once at start still gets the portal's ans
 - **Every later call never blocks.** `start_reading` takes the lock, claims a reading when none is
   under way and none listens (at most once a second), and starts the helper thread;
   `ask_in_background` is that plus the last answer at once. A reading whose answer is `None` (no
-  bus, an error) changes nothing, so a dark theme is never overwritten with `false` because a
-  read failed.
-- **The reading itself has no timeout.** `read_dark` makes a blocking `zbus` call with no limit:
-  the first call stops waiting after 500 ms, but the helper thread's call keeps running, so a
-  portal that never answers leaves that thread blocked for good, and it never starts another
-  reading. This is the same trade the motion reading makes; no timeout was added, since the
-  blocking `zbus` API used here has no bounded call.
+  bus, an error, a method call that timed out) changes nothing, so a dark theme is never
+  overwritten with `false` because a read failed.
+- **A hung portal ends the reading.** The connection is built with
+  `zbus::blocking::connection::Builder::session()` and `method_timeout(5 s)`, so a `ReadOne` or
+  `Read` that never answers fails with `ErrorKind::TimedOut` after five seconds: `read_dark`
+  returns `None`, the last answer stands, and a later call (at most once a second) starts
+  another reading. Only method calls are limited: zbus puts the timeout around the reply future
+  of `call_method`, while the `SettingChanged` signal comes from the connection's broadcast
+  stream, so the listener is not cut off. `read_dark` has no deadline of its own; the
+  connection's method timeout bounds the call.
 - **The same listener.** The first reading stays subscribed to the portal's `SettingChanged`
   signal and reads `org.freedesktop.appearance` `color-scheme` again at each change; only that
   namespace's signals count. The last answer wakes the application.
@@ -1847,9 +1850,9 @@ mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (mdsh
 passed, 33 ignored; doctests pass; exit 0), and the five dark tests on their own. Earlier, on the
 first commit of this work, the release workspace clippy and test, and the release clippy and
 tests of `recycle`, `media-session` and `notify` plus the `a11y` clippy, also passed; the second
-commit has only had the debug commands above. Not run: the release host, host+a11y and term
-clippy/test commands, the host example, the release `a11y` tests, and the rest of the matrix
-after that point. Linux: `cargo check -p mdshared-ui --all-targets --target
+and third commits have only had the debug commands above. Not run: the release host, host+a11y
+and term clippy/test commands, the host example, the release `a11y` tests, and the rest of the
+matrix after that point. Linux: `cargo check -p mdshared-ui --all-targets --target
 x86_64-unknown-linux-gnu` type-checked with a stub `pkg-config` (exit 0); nothing was linked.
 **Not run on a real Linux desktop**: the portal thread, the `SettingChanged` listener and the
 wake are type-checked only, and Linux CI runs the rest. macOS was not compiled.

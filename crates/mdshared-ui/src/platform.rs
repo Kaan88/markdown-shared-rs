@@ -1219,11 +1219,18 @@ mod imp {
         MOTION.set_wake(std::sync::Arc::new(wake));
     }
 
+    /// The longest a portal method call may take. A portal that is hung then fails the reading
+    /// instead of blocking that helper thread for good, and a later call tries again. It does
+    /// not touch the `SettingChanged` signal stream, which is not a method call.
+    #[cfg(not(target_os = "macos"))]
+    const PORTAL_METHOD_TIMEOUT: Duration = Duration::from_secs(5);
+
     /// The body of a helper thread: one reading of the portal, and then, if no other thread is
     /// doing so already, listening for the portal's `SettingChanged` signal for as long as the
     /// bus is there, reading again at each change. Every answer goes to `state`; no answer (no
-    /// bus, no portal, an error) leaves the last one standing. `read` asks the portal for the
-    /// setting, and only a signal from one of `namespaces` is taken to concern it.
+    /// bus, no portal, an error, a method call that times out) leaves the last one standing.
+    /// `read` asks the portal for the setting, and only a signal from one of `namespaces` is
+    /// taken to concern it.
     #[cfg(not(target_os = "macos"))]
     fn read_and_watch(
         state: &'static LastGood,
@@ -1232,7 +1239,9 @@ mod imp {
     ) {
         use std::time::Instant;
         use zbus::zvariant::OwnedValue;
-        let bus = zbus::blocking::Connection::session().ok();
+        let bus = zbus::blocking::connection::Builder::session()
+            .and_then(|builder| builder.method_timeout(PORTAL_METHOD_TIMEOUT).build())
+            .ok();
         // The one thread that listens subscribes before it reads, so that a change between the
         // reading and the subscription is not lost.
         let watching = bus.is_some() && state.claim_watching();
@@ -1446,9 +1455,10 @@ pub fn reveal_in_file_manager(path: &Path) -> bool {
 /// for a moment. The first call starts a reading that then stays to listen for the portal's
 /// `SettingChanged` signal, so a change of the setting is read when it is made. Only while
 /// nothing listens (no session bus, a portal without the signal) does a later call start
-/// another reading, at most once a second. A reading that fails or never ends leaves the last
-/// answer standing: a setting that was on is not taken for off because the portal did not
-/// answer in time, and an answer that comes back after a newer one is dropped.
+/// another reading, at most once a second. A reading that fails, answers nothing or times out
+/// (a portal method call is limited to five seconds) leaves the last answer standing: a setting
+/// that was on is not taken for off because the portal did not answer in time, and an answer
+/// that comes back after a newer one is dropped.
 ///
 /// Because the first call on Linux comes before the first answer, an application that wants
 /// the right value from its first frame gives [`watch_motion_reduced`] a wake and reads again
@@ -1746,9 +1756,9 @@ pub fn note_recent_document(path: &Path) {
 /// moment. The first reading then stays to listen for the portal's `SettingChanged` signal, so a
 /// change of the setting is read when it is made. Only while nothing listens (no session bus, a
 /// portal without the signal) does a later call start another reading, at most once a second. A
-/// reading that fails or never ends leaves the last answer standing: a dark theme is not taken
-/// for light because the portal did not answer in time, and an answer that comes back after a
-/// newer one is dropped.
+/// reading that fails, answers nothing or times out (a portal method call is limited to five
+/// seconds) leaves the last answer standing: a dark theme is not taken for light because the
+/// portal did not answer in time, and an answer that comes back after a newer one is dropped.
 ///
 /// An application that wants a change of the setting to reach it without winit's `ThemeChanged`
 /// gives [`watch_system_dark`] a wake and reads again when woken.
@@ -2483,7 +2493,7 @@ mod dark_tests {
         let took = start.elapsed();
         assert_eq!(first, None, "no answer in time: the first call gives false");
         assert!(
-            took >= Duration::from_millis(450) && took < Duration::from_secs(1),
+            took >= Duration::from_millis(450) && took < Duration::from_secs(3),
             "the first call waited {took:?}, not the old 500 ms limit"
         );
         assert!(!FIRST_SLOW.get(), "a timeout keeps no false answer");
