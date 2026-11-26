@@ -124,7 +124,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | T3 | **Reflow on resize.** Re-wrap lines when the width changes, using the `wrapped` flag lines already carry | M | medium | none | `mdshared_term::screen` | open |
 | T4 | **Combining marks, grapheme clusters, Unicode widths.** Cells that hold a cluster, not a `char`; widths from the Unicode data | M | medium | none (the table is generated into the source) | `mdshared_term::width`, `screen::Cell` | open |
 | T5 | **The rest of xterm that people meet.** OSC 8 hyperlinks, OSC 52 clipboard, colour queries (OSC 4/10/11), synchronized output (2026), underline styles and colours, the kitty keyboard protocol | M each | low | none | `mdshared_term::parse`, `screen`, `input` | open |
-| T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | open |
+| T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | done: `select` keeps its text (`follow`, `is_intact`) and words and lines cross a soft wrap (write-up in `docs/FEATURES.md`) |
 | T7 | **Colour schemes and IME at the cursor.** The 16 colours and the default pair as a scheme (with the palette's light and dark), and the IME composition window placed at the terminal's cursor with the preedit drawn in the cells | M | medium | none | T1, `textfield::Preedit`, winit `set_ime_cursor_area` | open |
 
 ## Purge (fast track, 2026-11-25)
