@@ -5,6 +5,7 @@ use super::*;
 use crate::dirlist::Kind;
 #[cfg(windows)]
 use crate::dirlist::{Listing, read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// The folder the made-up tests watch.
@@ -61,17 +62,19 @@ fn a_burst_of_reports_wakes_once_until_woken() {
     let wakes = AtomicBool::new(false);
     let shared = Shared::default();
     let wake = || wakes.store(true, Ordering::Release);
-    shared.deliver(vec![Signal::Rescan], &wake);
+    let a = Signal::Changed(Change::Removed(p("a")));
+    let b = Signal::Changed(Change::Removed(p("b")));
+    shared.deliver(vec![a.clone()], &wake);
     assert!(
         wakes.swap(false, Ordering::AcqRel),
         "the first report wakes"
     );
-    shared.deliver(vec![Signal::Rescan], &wake);
+    shared.deliver(vec![b.clone()], &wake);
     assert!(
         !wakes.load(Ordering::Acquire),
         "no second wake before woken"
     );
-    assert_eq!(shared.take(), vec![Signal::Rescan, Signal::Rescan]);
+    assert_eq!(shared.take(), vec![a, b]);
     shared.woken();
     shared.deliver(vec![Signal::Rescan], &wake);
     assert!(
@@ -89,6 +92,67 @@ fn an_empty_report_does_not_wake() {
     shared.deliver(Vec::new(), &wake);
     assert!(!wakes.load(Ordering::Acquire));
     assert!(shared.take().is_empty());
+}
+
+#[test]
+fn raw_overflow_collapses_the_backlog_without_hiding_folder_loss() {
+    let inbox = Inbox::default();
+    let at = Instant::now();
+    for i in 0..5_000 {
+        inbox.push(RawChange::Modified(p(&format!("{i}"))), at, None);
+    }
+    assert_eq!(
+        inbox.wait_for_batch(None).unwrap(),
+        [(RawChange::Rescan, at, None)]
+    );
+    inbox.push(RawChange::Rescan, at, None);
+    inbox.push(RawChange::Lost, at, None);
+    inbox.push(RawChange::Created(p("late")), at, None);
+    assert_eq!(
+        inbox.wait_for_batch(None).unwrap(),
+        [(RawChange::Lost, at, None)]
+    );
+}
+
+#[test]
+fn a_burst_cannot_grow_without_bound_across_detached_batches() {
+    let at = Instant::now();
+    let mut c = Coalescer::new(folder(), Duration::ZERO);
+    let mut seen = 0;
+    for batch in 0..2 {
+        let events = (0..LIMIT / 2 + 1)
+            .map(|i| (RawChange::Modified(p(&format!("{batch}-{i}"))), at, None))
+            .collect();
+        feed_batch(&mut c, events, &mut seen);
+    }
+    assert_eq!(c.flush(at), vec![Verdict::Rescan]);
+}
+
+#[test]
+fn a_stalled_ui_gets_one_rescan_or_a_lost_watch_instead_of_a_growing_queue() {
+    let shared = Shared::default();
+    let wake = || {};
+    for round in 0..2 {
+        for i in 0..5_000 {
+            shared.deliver(
+                vec![Signal::Changed(Change::Removed(p(&format!("{i}"))))],
+                &wake,
+            );
+        }
+        if round == 1 {
+            shared.deliver(vec![Signal::Lost], &wake);
+            shared.deliver(vec![Signal::Rescan], &wake);
+        }
+        assert_eq!(
+            shared.take(),
+            vec![if round == 0 {
+                Signal::Rescan
+            } else {
+                Signal::Lost
+            }]
+        );
+        shared.woken();
+    }
 }
 
 /// An entry for `path`, as `Entry::at` would read it.

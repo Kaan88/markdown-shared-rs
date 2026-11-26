@@ -76,19 +76,20 @@
 
 mod backend;
 mod order;
+mod queues;
 mod resolve;
 mod translate;
 
 use crate::dirlist::{Change, Entry};
 use notify::{RecursiveMode, Watcher as _};
 use order::{Item, settled};
+use queues::{Batch, Inbox, LIMIT, Shared};
 use resolve::{read_from_root, signal_of};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use translate::{Translator, translation};
 
@@ -696,82 +697,6 @@ fn lost_signal(root: &Path, started: Option<Identity>) -> Signal {
     Signal::Rescan
 }
 
-/// Raw events waiting for the watcher's thread, and the signal that stops it.
-#[derive(Default)]
-struct Inbox {
-    state: Mutex<InboxState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct InboxState {
-    /// Events in arrival order, each with the time it was seen.
-    events: VecDeque<(RawChange, Instant, Option<usize>)>,
-    /// The watcher was dropped; the thread must end without reporting anything more.
-    stop: bool,
-}
-
-impl Inbox {
-    /// Queues one event, unless the watcher is being dropped.
-    fn push(&self, change: RawChange, at: Instant, cookie: Option<usize>) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.stop {
-            return;
-        }
-        state.events.push_back((change, at, cookie));
-        self.ready.notify_one();
-    }
-
-    /// Tells the thread to end.
-    fn stop(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.stop = true;
-        self.ready.notify_all();
-    }
-
-    /// Whether the watcher has been dropped, so the thread must end without reporting anything
-    /// more.
-    fn stopped(&self) -> bool {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).stop
-    }
-}
-
-/// The settled reports waiting for the application, and whether a wake has been sent for them.
-#[derive(Default)]
-struct Shared {
-    /// Signals not taken yet, in the order they were settled.
-    signals: Mutex<Vec<Signal>>,
-    /// A wake has been sent and the application has not called [`DirWatcher::woken`] yet.
-    pending: AtomicBool,
-}
-
-impl Shared {
-    /// Adds a settled report and wakes once for it, as [`FileWatcher`](crate::watch::FileWatcher)
-    /// does: further reports do not wake again until `woken`.
-    fn deliver(&self, signals: Vec<Signal>, wake: &dyn Fn()) {
-        if signals.is_empty() {
-            return;
-        }
-        self.signals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(signals);
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            wake();
-        }
-    }
-
-    /// Resets the wake flag: the next report wakes again.
-    fn woken(&self) {
-        self.pending.store(false, Ordering::Release);
-    }
-
-    /// Takes the reports that are waiting, leaving none.
-    fn take(&self) -> Vec<Signal> {
-        std::mem::take(&mut *self.signals.lock().unwrap_or_else(|e| e.into_inner()))
-    }
-}
-
 /// Reads a path's entry, keeping filesystem errors for the worker.
 type Read = dyn Fn(&Path) -> io::Result<Entry> + Send + Sync;
 
@@ -931,58 +856,56 @@ fn run(
     root: PathBuf,
     started: Option<Identity>,
 ) {
-    let mut state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if state.stop {
-            return;
-        }
-        while let Some((change, at, cookie)) = state.events.pop_front() {
-            coalescer.push_tracked(change, at, cookie);
-        }
-        let now = Instant::now();
-        let Some(deadline) = coalescer.deadline() else {
-            state = inbox.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+    let mut seen = 0;
+    while let Some(batch) = inbox.wait_for_batch(coalescer.deadline()) {
+        feed_batch(&mut coalescer, batch, &mut seen);
+        let verdicts = coalescer.flush(Instant::now());
+        if verdicts.is_empty() {
             continue;
-        };
-        if deadline <= now {
-            let verdicts = coalescer.flush(now);
-            // The disk is read without the inbox held, so events keep arriving.
-            drop(state);
-            let mut signals = Vec::with_capacity(verdicts.len());
-            for verdict in verdicts {
-                // A read can be slow; stop between two of them rather than after the last.
-                if inbox.stopped() {
-                    return;
-                }
-                let signal = match verdict {
-                    // The callback only says the folder may be gone; the worker, which may
-                    // touch a disk, confirms it before the application is told the watch ended.
-                    Verdict::Lost => Some(lost_signal(&root, started)),
-                    other => signal_of(other, &*read),
-                };
-                if let Some(signal) = signal {
-                    if signal == Signal::Rescan {
-                        signals.clear();
-                        signals.push(signal);
-                        break;
-                    }
-                    signals.push(signal);
-                }
-            }
-            // Check the stop with the lock held, so a drop cannot land between the check and
-            // the wake: the drop takes this lock to set the flag.
-            state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.stop {
+        }
+        seen = 0;
+        let mut signals = Vec::with_capacity(verdicts.len());
+        for verdict in verdicts {
+            // A read can be slow; stop between two of them rather than after the last.
+            if inbox.stopped() {
                 return;
             }
-            shared.deliver(signals, wake);
-            continue;
+            let signal = match verdict {
+                Verdict::Lost => Some(lost_signal(&root, started)),
+                other => signal_of(other, &*read),
+            };
+            if let Some(signal) = signal {
+                if signal == Signal::Rescan {
+                    signals.clear();
+                    signals.push(signal);
+                    break;
+                }
+                signals.push(signal);
+            }
         }
-        state = inbox
-            .ready
-            .wait_timeout(state, deadline - now)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        let lost = signals.first() == Some(&Signal::Lost);
+        inbox.publish(&shared, signals, wake);
+        if lost {
+            inbox.stop();
+            return;
+        }
+    }
+}
+
+/// The worker can receive many small batches before the next flush. Bound the work it keeps
+/// across batches as well as the two queues. After budget is exhausted, only loss can supersede
+/// the rescan.
+fn feed_batch(coalescer: &mut Coalescer, batch: Batch, seen: &mut usize) {
+    for (change, at, cookie) in batch {
+        if change == RawChange::Lost || *seen < LIMIT {
+            coalescer.push_tracked(change, at, cookie);
+            *seen = (*seen + 1).min(LIMIT);
+        } else if !coalescer.rescan && !coalescer.lost {
+            coalescer.push(RawChange::Rescan, at);
+        }
+        if coalescer.is_idle() {
+            *seen = 0;
+        }
     }
 }
 
