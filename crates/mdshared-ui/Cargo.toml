@@ -139,5 +139,9 @@ name = "purge_shape"
 required-features = ["a11y"]
 
 [[example]]
+name = "scroll_dialog"
+required-features = ["host"]
+
+[[example]]
 name = "host"
 required-features = ["host"]
