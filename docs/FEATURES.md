@@ -2116,3 +2116,143 @@ Known behaviours and limits for later:
   memory.
 - F2 (`dirwatch`, below) now supplies the changes, and an application's list view is what would
   show this to a person first.
+
+## A watcher that says what changed (`mdshared_app::dirwatch`)
+
+`watch::FileWatcher` says only "something in this folder". A file manager needs one change per
+entry, so `dirwatch` watches one folder (not its subfolders) and reports `dirlist::Change`
+values that `Listing::apply` takes directly, a `Signal::Rescan` after an overflow, or a
+`Signal::Lost` when the folder itself is gone. It is built on the `notify` crate the workspace
+already names; no dependency was added.
+
+**The model, and the edge.** `Coalescer` has no clock and no disk. Raw events arrive through
+`push(RawChange, Instant)` and leave through `flush(now)` as `Verdict`s that name paths;
+`deadline()` says when the open burst may be reported (the last event plus the debounce, and at
+most `MAX_WAIT` after its first event), and a flush before it gives nothing. The rules are the
+ones the roadmap asked for:
+
+- create then modifies is one `Created`;
+- create then remove is nothing (the list never saw it);
+- remove then create (or remove then modify) is one `Modified`;
+- a rename chain `a` to `b` to `c` is one `Renamed { from: a, to: c }`;
+- a burst of modifies is one `Modified`;
+- a rescan or a lost watch clears what was pending and reports only itself.
+
+A report is ordered for application, not by path: whatever takes a name away (a rename's old
+name, or a removal) comes before whatever puts an entry under that name (a creation, a
+modification, or a rename's new name). A backup on save (`f` to `f~`, then a new `f`) is
+therefore the rename followed by the creation; log rotation moves the oldest file first; a
+rename onto an existing name removes that name where the platform reports no removal. When the
+verdicts form a cycle — two renames that swap their names through a temporary one — each rename
+in the report is broken into a removal and a modification, and the disk decides whether each
+name is there. The order is the same for the same events: among the verdicts that can go next,
+the first one seen goes.
+
+Rename pairing keeps each path's state in a map and the old names still waiting for a new one in
+a queue, oldest first. Windows reports the two names as separate events; inotify on Linux also
+reports a pair carrying both names, which is remembered as the same move and ignored the second
+time, including when the chain passes through a name (a repeated `Both(b, c)` after `a` to `b`
+to `c` is the same chain). An old name still waiting when the quiet period ends is a `Removed`,
+and a new name with no old one waiting is a `Created`: the unpaired fallback, a removal plus a
+creation. A name a rename landed on, and a created name that then moved on, are removed as well
+as the entry moved: a removal of an unlisted name does nothing, and leaving it out would leave
+a stale entry. macOS reports a rename as one path with no side; that path is read as a
+modification, and the disk says whether it is still there. A rename out of the folder is a
+removal and one into it a creation; an event about any other path is dropped.
+
+**The watcher.** `DirWatcher::new(folder, wake)` starts the OS watcher and one thread, which is
+the only user of the coalescer. `notify`'s callback translates each event and queues it under a
+mutex, the thread waits on a condition variable until an event or the deadline arrives (never a
+poll, so an idle folder costs nothing), reads each pending path's details there with `Entry::at`
+(the disk is never touched on the drawing thread), and queues `Signal`s. Waking is
+`FileWatcher`'s: one `wake` call, then none until `woken()`. `take()` drains the reports and
+`woken()` is called before it. `with_debounce` takes a quiet period of the caller's choice; the
+report is never held longer than `MAX_WAIT` (one second) after its first event, so a file
+written without pause cannot starve the rest.
+
+Every event path is rewritten as the caller's folder joined with the event's own file name, so
+the list's exact matching works where the platform spells paths another way: macOS FSEvents
+reports `/private/var/...` for a folder given as `/var/...`, and a relative folder comes back
+absolute. A path whose parent is not the watched folder after canonicalising both sides is
+dropped. An entry's name is the platform's own; on Windows it can come back in 8.3 short form,
+which is a different path to the list.
+
+Dropping the watcher does not wait for its thread: the thread may be inside a read on a share
+that never answers, and the drop runs on the thread that draws. The drop tells the thread to
+stop; the thread checks between two reads and before reporting, so it ends after the read it is
+in without touching the disk again or waking the application. A `Created` whose path cannot be
+read when the report is made is dropped (it went again), a `Modified` or a rename whose path is
+gone becomes a `Removed`.
+
+The watched folder itself being deleted or renamed is a lost watch: Linux reports it on the
+folder's own path (`DELETE_SELF`, `MOVE_SELF`), and `Signal::Lost` says the watch is over.
+notify's Windows backend does not report that error at all — it silently stops its watch — and
+it does not report a queue overflow either (an empty buffer gives nothing), so on Windows a
+deleted folder or lost events are noticed only by a full read; this is a limit of notify 8.2.1,
+documented rather than worked around.
+
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `folder`, `take`, `woken`), `Signal`
+(`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
+`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. Everything is
+additive: no existing signature, field or variant changed, and `Signal` is new, so its variants
+are new before any application sees them.
+
+Tests: `dirwatch_tests.rs` (50), `dirwatch_model_tests.rs` (7) and `dirwatch_watcher_tests.rs` (5). The pure tests cover every
+coalescing rule, the debounce and the longest want, order and deduplication, unpaired renames,
+a name created where another was renamed away, two renames onto one name, the folder itself,
+paths outside the folder, lost and rescan, the `notify` translation of every event kind (rescan,
+create, remove, modify, the two rename halves, a pair, macOS' single path, access, an error, the
+folder itself), the path rewriting (a canonicalised folder and a path outside), the verdict to
+`Change` reading, and the wake contract. The model tests are the cases a review asked for:
+backup on save, log rotation, a swap through a temporary name, a rename onto an existing name
+then removed, an inotify rename onto an existing name that moves again, and a random sequence
+(200 seeds, each done with Windows' two halves and with inotify's pair included) of create,
+remove, modify, rename, swap, backup and chain operations on a made-up disk; each verdict is
+resolved through that disk, applied to a `Listing`, and the list must equal the disk. Two
+further tests hold the thread down: one abandons the watcher while the reader is blocked and
+times the drop, one stops the watcher after the first read of a report and requires the second
+path not to be read. The real-disk test on Windows (create, two renames and a remove, a bounded
+poll, compare with a fresh read) remains, and passed 10 of 10 runs before this round.
+
+Fail-before evidence, each test seen failing under a change, one at a time, with the file
+restored afterwards. Before the ordering fix, the model's first seed, backup, rotation and swap
+failed; before the displaced-name fix, the rename-onto-then-removed and chain tests failed; the
+inotify chain test requires the chain's verdict shape. Under mutations of this round: no
+dependency ordering failed the backup, rotation, swap, random and created-beside-rename tests;
+no cycle split failed the swap and the random test; no removal for a landed-on name failed the
+rename-onto-then-removed, chain and random tests; no removal for a renamed-away created name
+failed the created-at-the-new-name and random tests; no rename pair remembered failed the
+inotify chain and random tests; macOS' pair read as removal plus creation failed its adapter
+test; a path not rewritten as the folder failed the canonicalised-folder test; no stop check
+between reads failed the two-reads test; a drop that waits failed the drop test; reporting after
+the stop failed the drop test's wake assertion; an ignored error failed the rescan test; an
+ignored folder event failed the lost test; and an ignored longest wait failed the wait test.
+
+Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests`, and `cargo clippy --target x86_64-unknown-linux-gnu -p mdshared-app
+--all-targets -- -D warnings`. On Linux and macOS nothing was run: the inotify pairing (the
+`Both` event and its cookie), the FSEvents single-path rename, the folder's own
+`DELETE_SELF`/`MOVE_SELF`, and the Unix side of the thread are compiled, not run. Nothing here
+was seen by a person or used by an application yet.
+
+Known behaviours and limits for later:
+
+- A rename that happens entirely outside the folder, or into it from outside, is seen by one
+  side only and reported as a creation or a removal, as the platform allows.
+- On macOS a rename cannot name both sides; a file renamed away keeps its old entry in the list
+  until the next full read, because the new path is not known. The path that is reported is
+  read as a modification, so a file renamed onto a name already listed is noticed there.
+- On Windows notify 8.2.1 reports neither a queue overflow nor a watch error; the watcher can
+  only report what notify hands it. A folder deleted there is noticed by the next full read,
+  not by a signal.
+- A name inside the folder may come back in 8.3 short form on Windows, which the list, matching
+  paths exactly, does not know.
+- A file's contents change is reported for every save, coalesced within the quiet period and
+  the longest wait; a caller that only re-reads changed entries is expected.
+- The watcher reads each changed path's details on its own thread; a dead network path can hold
+  that thread for as long as the system takes to answer, but it never holds the window, and the
+  drop does not wait for it.
+- No subfolders are watched. An entry's change of kind (a file becoming a folder) is read as a
+  change of its details, which `Listing::apply` replaces in place.

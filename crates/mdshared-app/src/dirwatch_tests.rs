@@ -2,8 +2,6 @@
 
 use super::*;
 use crate::dirlist::Kind;
-#[cfg(windows)]
-use crate::dirlist::{Listing, read};
 use notify::event::{CreateKind, Flag, RemoveKind};
 
 /// The folder every pure test watches.
@@ -91,10 +89,13 @@ fn a_rename_chain_is_one_rename_from_the_first_name_to_the_last() {
     push(&mut c, t, 3, RawChange::RenamedTo(p("c")));
     assert_eq!(
         settle(&mut c, t, 1_000),
-        vec![Verdict::Renamed {
-            from: p("a"),
-            to: p("c")
-        }]
+        vec![
+            Verdict::Removed(p("b")),
+            Verdict::Renamed {
+                from: p("a"),
+                to: p("c")
+            }
+        ]
     );
 }
 
@@ -236,7 +237,10 @@ fn a_creation_that_is_renamed_is_a_creation_at_the_new_name() {
     push(&mut c, t, 0, RawChange::Created(p("a")));
     push(&mut c, t, 1, RawChange::RenamedFrom(p("a")));
     push(&mut c, t, 2, RawChange::RenamedTo(p("b")));
-    assert_eq!(settle(&mut c, t, 1_000), vec![Verdict::Created(p("b"))]);
+    assert_eq!(
+        settle(&mut c, t, 1_000),
+        vec![Verdict::Removed(p("a")), Verdict::Created(p("b"))]
+    );
 }
 
 #[test]
@@ -262,7 +266,10 @@ fn a_renamed_entry_that_is_removed_is_a_removal_of_its_first_name() {
     push(&mut c, t, 0, RawChange::RenamedFrom(p("a")));
     push(&mut c, t, 1, RawChange::RenamedTo(p("b")));
     push(&mut c, t, 2, RawChange::Removed(p("b")));
-    assert_eq!(settle(&mut c, t, 1_000), vec![Verdict::Removed(p("a"))]);
+    assert_eq!(
+        settle(&mut c, t, 1_000),
+        vec![Verdict::Removed(p("a")), Verdict::Removed(p("b"))]
+    );
 }
 
 #[test]
@@ -320,11 +327,11 @@ fn a_name_created_after_it_was_renamed_away_is_a_creation_beside_the_rename() {
     assert_eq!(
         settle(&mut c, t, 1_000),
         vec![
-            Verdict::Created(p("a")),
             Verdict::Renamed {
                 from: p("a"),
                 to: p("b")
-            }
+            },
+            Verdict::Created(p("a"))
         ]
     );
 }
@@ -355,7 +362,7 @@ fn a_zero_quiet_period_settles_at_the_next_flush() {
 }
 
 #[test]
-fn a_report_names_each_path_once_and_lists_it_in_path_order() {
+fn a_report_names_each_path_once_in_a_stable_order() {
     let t = Instant::now();
     let mut c = coalescer();
     push(&mut c, t, 0, RawChange::Modified(p("c.txt")));
@@ -527,10 +534,21 @@ fn a_rescan_is_a_rescan() {
 
 // The translation of a `notify` event into raw changes.
 
+/// The translation of one event for the pure folder `/watched`; it exists in no file system, so
+/// the translator compares paths lexically.
+fn translate(event: &notify::Event) -> Vec<RawChange> {
+    Translator::new(&folder()).translate(event)
+}
+
+/// A `notify` result that is an error.
+fn error() -> notify::Result<notify::Event> {
+    Err(notify::Error::generic("the watch failed"))
+}
+
 #[test]
 fn a_rescan_event_is_a_rescan() {
     let event = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
-    assert_eq!(raw_changes(&event), vec![RawChange::Rescan]);
+    assert_eq!(translate(&event), vec![RawChange::Rescan]);
 }
 
 #[test]
@@ -539,7 +557,7 @@ fn a_create_event_is_a_creation_of_each_of_its_paths() {
         .add_path(p("a.txt"))
         .add_path(p("b.txt"));
     assert_eq!(
-        raw_changes(&event),
+        translate(&event),
         vec![
             RawChange::Created(p("a.txt")),
             RawChange::Created(p("b.txt"))
@@ -550,13 +568,13 @@ fn a_create_event_is_a_creation_of_each_of_its_paths() {
 #[test]
 fn a_remove_event_is_a_removal() {
     let event = notify::Event::new(EventKind::Remove(RemoveKind::File)).add_path(p("a.txt"));
-    assert_eq!(raw_changes(&event), vec![RawChange::Removed(p("a.txt"))]);
+    assert_eq!(translate(&event), vec![RawChange::Removed(p("a.txt"))]);
 }
 
 #[test]
 fn a_plain_modify_event_is_a_modification() {
     let event = notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(p("a.txt"));
-    assert_eq!(raw_changes(&event), vec![RawChange::Modified(p("a.txt"))]);
+    assert_eq!(translate(&event), vec![RawChange::Modified(p("a.txt"))]);
 }
 
 #[test]
@@ -565,11 +583,8 @@ fn the_two_halves_of_a_rename_become_from_and_to() {
         notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From))).add_path(p("a"));
     let to_event =
         notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(p("b"));
-    assert_eq!(
-        raw_changes(&from_event),
-        vec![RawChange::RenamedFrom(p("a"))]
-    );
-    assert_eq!(raw_changes(&to_event), vec![RawChange::RenamedTo(p("b"))]);
+    assert_eq!(translate(&from_event), vec![RawChange::RenamedFrom(p("a"))]);
+    assert_eq!(translate(&to_event), vec![RawChange::RenamedTo(p("b"))]);
 }
 
 #[test]
@@ -578,7 +593,7 @@ fn a_paired_rename_becomes_one_change_with_both_names() {
         .add_path(p("a"))
         .add_path(p("b"));
     assert_eq!(
-        raw_changes(&event),
+        translate(&event),
         vec![RawChange::Renamed {
             from: p("a"),
             to: p("b")
@@ -587,13 +602,44 @@ fn a_paired_rename_becomes_one_change_with_both_names() {
 }
 
 #[test]
-fn an_unpaired_rename_becomes_a_removal_and_a_creation_of_its_path() {
+fn an_unpaired_rename_becomes_a_modification_of_its_path() {
+    // macOS FSEvents gives one path and no side; the disk decides what happened to it.
     let event =
         notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any))).add_path(p("a"));
-    assert_eq!(
-        raw_changes(&event),
-        vec![RawChange::Removed(p("a")), RawChange::Created(p("a"))]
-    );
+    assert_eq!(translate(&event), vec![RawChange::Modified(p("a"))]);
+}
+
+#[test]
+fn a_rename_out_of_the_folder_becomes_a_removal_on_its_own() {
+    let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path(p("a"))
+        .add_path(elsewhere("a"));
+    assert_eq!(translate(&event), vec![RawChange::RenamedFrom(p("a"))]);
+}
+
+#[test]
+fn a_rename_into_the_folder_becomes_a_creation_on_its_own() {
+    let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+        .add_path(elsewhere("a"))
+        .add_path(p("a"));
+    assert_eq!(translate(&event), vec![RawChange::RenamedTo(p("a"))]);
+}
+
+#[test]
+fn an_event_about_the_folder_itself_is_a_lost_watch() {
+    for kind in [
+        EventKind::Remove(RemoveKind::Folder),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+    ] {
+        let event = notify::Event::new(kind).add_path(folder());
+        assert_eq!(translate(&event), vec![RawChange::Lost]);
+    }
+}
+
+#[test]
+fn an_error_from_the_os_watcher_is_a_rescan() {
+    let names = Translator::new(&folder());
+    assert_eq!(translation(error(), &names), vec![RawChange::Rescan]);
 }
 
 #[test]
@@ -604,168 +650,93 @@ fn an_access_or_untyped_event_says_nothing() {
     .add_path(p("a.txt"));
     let any = notify::Event::new(EventKind::Any).add_path(p("a.txt"));
     let other = notify::Event::new(EventKind::Other).add_path(p("a.txt"));
-    assert_eq!(raw_changes(&access), Vec::new());
-    assert_eq!(raw_changes(&any), Vec::new());
-    assert_eq!(raw_changes(&other), Vec::new());
-}
-
-// The wake contract shared with the application.
-
-#[test]
-fn a_burst_of_reports_wakes_once_until_woken() {
-    let wakes = AtomicBool::new(false);
-    let shared = Shared::default();
-    let wake = || wakes.store(true, Ordering::Release);
-    shared.deliver(vec![Signal::Rescan], &wake);
-    assert!(
-        wakes.swap(false, Ordering::AcqRel),
-        "the first report wakes"
-    );
-    shared.deliver(vec![Signal::Rescan], &wake);
-    assert!(
-        !wakes.load(Ordering::Acquire),
-        "no second wake before woken"
-    );
-    assert_eq!(shared.take(), vec![Signal::Rescan, Signal::Rescan]);
-    shared.woken();
-    shared.deliver(vec![Signal::Rescan], &wake);
-    assert!(
-        wakes.swap(false, Ordering::AcqRel),
-        "after woken it wakes again"
-    );
-    assert_eq!(shared.take(), vec![Signal::Rescan]);
+    assert_eq!(translate(&access), Vec::new());
+    assert_eq!(translate(&any), Vec::new());
+    assert_eq!(translate(&other), Vec::new());
 }
 
 #[test]
-fn an_empty_report_does_not_wake() {
-    let wakes = AtomicBool::new(false);
-    let shared = Shared::default();
-    let wake = || wakes.store(true, Ordering::Release);
-    shared.deliver(Vec::new(), &wake);
-    assert!(!wakes.load(Ordering::Acquire));
-    assert!(shared.take().is_empty());
-}
-
-// The watcher on a real folder. Windows only: the other systems have their own rename
-// machinery and are type-checked, not run, from the machine this was written on.
-
-/// A folder of its own under the temporary folder, removed when dropped.
-#[cfg(windows)]
-struct Dir(PathBuf);
-
-#[cfg(windows)]
-impl Dir {
-    fn new(name: &str) -> Dir {
-        let dir =
-            std::env::temp_dir().join(format!("mdshared-dirwatch-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Dir(dir)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Dir {
-    fn drop(&mut self) {
-        _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The shown names of a list, in its order.
-#[cfg(windows)]
-fn names(listing: &Listing) -> Vec<String> {
-    listing.visible().map(|entry| entry.name.clone()).collect()
-}
-
-#[cfg(windows)]
-#[test]
-fn a_folder_on_disk_reports_creates_renames_and_removes_that_apply_to_the_listing() {
-    use std::sync::mpsc::channel;
-
-    let dir = Dir::new("disk");
-    std::fs::write(dir.0.join("keep.txt"), "keep").unwrap();
-    std::fs::write(dir.0.join("gone.txt"), "gone").unwrap();
-    std::fs::write(dir.0.join("moving.txt"), "moving").unwrap();
-
-    let (send, receive) = channel();
-    let watcher = DirWatcher::with_debounce(dir.0.clone(), Duration::from_millis(40), move || {
-        let _ = send.send(());
-    })
-    .expect("the watcher starts");
-
-    let mut listing = Listing::new();
-    listing.set_folder(Some(dir.0.clone()));
-    listing.set_entries(read(&dir.0, &|| false));
-
-    // Let anything the watch saw before this point drain away.
-    let settle_end = std::time::Instant::now() + Duration::from_millis(300);
-    while std::time::Instant::now() < settle_end {
-        watcher.woken();
-        _ = watcher.take();
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    std::fs::write(dir.0.join("made.txt"), "made").unwrap();
-    std::fs::rename(dir.0.join("moving.txt"), dir.0.join("moved.txt")).unwrap();
-    std::fs::rename(dir.0.join("keep.txt"), dir.0.join("kept.txt")).unwrap();
-    std::fs::remove_file(dir.0.join("gone.txt")).unwrap();
-
-    let mut changes = 0;
-    let mut saw_create = false;
-    let mut saw_rename = false;
-    let mut saw_remove = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut quiet_since = std::time::Instant::now();
-    while std::time::Instant::now() < deadline {
-        watcher.woken();
-        let signals = watcher.take();
-        if signals.is_empty() {
-            if quiet_since.elapsed() > Duration::from_millis(600) {
-                break;
-            }
-            _ = receive.recv_timeout(Duration::from_millis(25));
-            continue;
-        }
-        quiet_since = std::time::Instant::now();
-        for signal in signals {
-            match signal {
-                Signal::Changed(change) => {
-                    match &change {
-                        Change::Created(_) => saw_create = true,
-                        Change::Removed(_) => saw_remove = true,
-                        Change::Renamed { .. } => saw_rename = true,
-                        Change::Modified(_) => {}
-                    }
-                    listing.apply(change);
-                    changes += 1;
-                }
-                Signal::Rescan => panic!("a small burst of changes is not an overflow"),
-            }
-        }
-    }
-
-    assert!(changes >= 3, "the report arrived: {changes} changes");
-    assert!(saw_create, "a created file was reported");
-    assert!(saw_rename, "a rename was paired");
-    assert!(saw_remove, "a removal was reported");
-
-    let mut fresh = Listing::new();
-    fresh.set_folder(Some(dir.0.clone()));
-    fresh.set_entries(read(&dir.0, &|| false));
-    let applied: Vec<Entry> = listing.visible().cloned().collect();
-    let reread: Vec<Entry> = fresh.visible().cloned().collect();
+fn an_event_path_is_rewritten_as_the_callers_folder() {
+    // A real folder, so the parent can be canonicalised; the path is given the way another
+    // spelling of the same folder would (through `sub/..`).
+    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-names-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let names = Translator::new(&dir);
+    let roundabout = dir.join("sub").join("..").join("a.txt");
+    let event = notify::Event::new(EventKind::Create(CreateKind::File)).add_path(roundabout);
     assert_eq!(
-        applied, reread,
-        "applying the report gives the same list as reading the folder again"
+        names.translate(&event),
+        vec![RawChange::Created(dir.join("a.txt"))],
+        "the path is the folder given, joined with the event's own name"
     );
-    assert_eq!(
-        names(&listing),
-        vec![
-            "kept.txt".to_string(),
-            "made.txt".to_string(),
-            "moved.txt".to_string()
-        ]
-    );
+    let outside = notify::Event::new(EventKind::Create(CreateKind::File))
+        .add_path(std::env::temp_dir().join("elsewhere.txt"));
+    assert_eq!(names.translate(&outside), Vec::new());
+    _ = std::fs::remove_dir_all(&dir);
+}
 
-    drop(watcher);
+#[test]
+fn the_watched_folder_canonicalised_still_matches_the_folder_given() {
+    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-canon-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let given = dir.clone();
+    let names = Translator::new(&given);
+    // What a platform that canonicalises its paths (macOS) would report.
+    let canonical = dir.canonicalize().unwrap();
+    let event =
+        notify::Event::new(EventKind::Create(CreateKind::File)).add_path(canonical.join("a.txt"));
+    assert_eq!(
+        names.translate(&event),
+        vec![RawChange::Created(given.join("a.txt"))],
+        "the folder given is what the report names"
+    );
+    _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_report_is_flushed_after_the_longest_wait_even_while_events_keep_coming() {
+    let t = Instant::now();
+    let mut c = Coalescer::with_max_wait(
+        folder(),
+        Duration::from_millis(50),
+        Duration::from_millis(200),
+    );
+    // An event every 20 ms: the quiet period never ends, but the wait does.
+    for ms in (0..10).map(|i| i * 20) {
+        push(&mut c, t, ms, RawChange::Modified(p("a.txt")));
+        let quiet = (ms + 50).min(200);
+        assert_eq!(
+            c.deadline(),
+            Some(t + Duration::from_millis(quiet)),
+            "at {ms} ms the burst is due at {quiet} ms"
+        );
+    }
+    assert_eq!(
+        settle(&mut c, t, 199),
+        Vec::new(),
+        "still waiting for the ceiling"
+    );
+    assert_eq!(settle(&mut c, t, 200), vec![Verdict::Modified(p("a.txt"))]);
+}
+
+#[test]
+fn a_lost_watch_clears_what_was_pending() {
+    let t = Instant::now();
+    let mut c = coalescer();
+    push(&mut c, t, 0, RawChange::Created(p("a.txt")));
+    push(&mut c, t, 1, RawChange::Lost);
+    // Events after the loss are moot: the folder is gone.
+    push(&mut c, t, 2, RawChange::Created(p("b.txt")));
+    assert_eq!(settle(&mut c, t, 1_000), vec![Verdict::Lost]);
+    assert!(c.is_idle());
+    assert_eq!(settle(&mut c, t, 2_000), Vec::new());
+}
+
+#[test]
+fn a_lost_verdict_is_a_lost_signal() {
+    let reads_nothing = |_: &Path| -> Option<Entry> { panic!("a lost watch reads nothing") };
+    assert_eq!(signal_of(Verdict::Lost, &reads_nothing), Some(Signal::Lost));
 }

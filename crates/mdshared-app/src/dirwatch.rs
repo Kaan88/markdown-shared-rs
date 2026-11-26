@@ -12,6 +12,14 @@
 //! - a rename chain `a` to `b` to `c` is one rename from `a` to `c`;
 //! - a burst of modifications is one [`Change::Modified`](crate::dirlist::Change::Modified).
 //!
+//! A report is ordered so that it can be applied top to bottom: anything that takes a name away
+//! (a rename's old name, or a removal) comes before anything that puts an entry under that name
+//! (a creation, a modification, or a rename's new name). A backup on save, which renames `f` to
+//! `f~` and then writes a new `f`, is therefore a rename followed by a creation, and log
+//! rotation moves the oldest file first. When the pending verdicts cannot be ordered — two
+//! renames that swap their names, say — the renames involved are broken into a removal and a
+//! modification and each name's fate is read from the disk instead.
+//!
 //! The work is split the way the rest of the repository splits a model from its edges:
 //!
 //! - [`Coalescer`] is the model. It has no clock and no disk: its events arrive with the
@@ -23,18 +31,32 @@
 //!   [`wake`](DirWatcher::new) call per settled report, and none again until
 //!   [`woken`](DirWatcher::woken) is called.
 //!
+//! The watcher rewrites every event path as the folder the caller gave, joined with the event's
+//! own file name, so the paths match [`Listing`](crate::dirlist::Listing)'s exact matching even
+//! where the platform reports another spelling (`/private/var` for `/var` on macOS, an absolute
+//! path for a relative folder). An event whose folder is not the watched one is dropped. A name
+//! inside the folder is still the platform's own: on Windows it may come back in 8.3 short form,
+//! which is a different path to the list.
+//!
 //! Rename pairing differs by platform. Windows reports the old and the new name as two events,
 //! Linux pairs them with an inotify cookie (and also reports a pair carrying both names), and
 //! macOS FSEvents cannot pair them at all. A rename that cannot be paired falls back to a
 //! removal of the name that went and a creation of the name that arrived: an unpaired old name
 //! is a [`Change::Removed`](crate::dirlist::Change::Removed) when the quiet period ends, and an
-//! unpaired new name is a [`Change::Created`](crate::dirlist::Change::Created) at once. A
-//! platform that reports a rename with one path and no side reads as a removal plus a creation
-//! of that path, which is a modification once the path's details are read.
+//! unpaired new name is a [`Change::Created`](crate::dirlist::Change::Created) at once. macOS
+//! reports a rename as one path with no side; that path is read as a modification, and the disk
+//! says whether it is still there.
 //!
 //! When the OS watcher reports an overflow or asks for a rescan, [`Signal::Rescan`] is emitted
 //! instead of the changes, because some events were lost and only a fresh read of the folder can
-//! be trusted.
+//! be trusted. When the watched folder itself is deleted or renamed the watch is over, and
+//! [`Signal::Lost`] is emitted; the application reads the folder again and expects it to be
+//! gone. (notify's Windows backend does not report that error at all: it silently stops its
+//! watch, so a deleted folder is noticed there only by the next full read.)
+//!
+//! A report is settled after [`DEBOUNCE`] without a new event, but never later than
+//! [`MAX_WAIT`] after its first event: one file written without pause cannot hold the rest of
+//! the report back.
 //!
 //! Only entries directly inside the watched folder are reported. A rename out of the folder is
 //! its removal, a rename into it its creation, and an event about any other path (a file's
@@ -49,19 +71,25 @@
 //! - no clock read inside [`Coalescer`], and no disk read inside it either; the watcher is what
 //!   reads the clock and the disk.
 
+mod order;
+
 use crate::dirlist::{Change, Entry};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use order::{Item, settled};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long the coalescer waits for the events of one operation to stop before it reports them,
 /// unless the caller asks for another quiet period with [`DirWatcher::with_debounce`].
 pub const DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// The longest a report is held back, from its first event to its flush, even while more events
+/// keep arriving: one file written without pause cannot starve the rest of the report.
+pub const MAX_WAIT: Duration = Duration::from_secs(1);
 
 /// One raw event, as a platform watcher saw it, before the quiet period settles it.
 ///
@@ -91,6 +119,9 @@ pub enum RawChange {
     },
     /// Some events were lost: the folder must be read again in full.
     Rescan,
+    /// The watched folder itself was deleted or renamed, or the watch failed: the report is
+    /// over, and the folder must be read again (and will probably be gone).
+    Lost,
 }
 
 /// What the coalescer decided happened to one entry, before its details are read.
@@ -115,6 +146,8 @@ pub enum Verdict {
     Modified(PathBuf),
     /// Events were lost; the folder must be read again in full.
     Rescan,
+    /// The watched folder itself was deleted or renamed, or the watch failed.
+    Lost,
 }
 
 /// One report from a [`DirWatcher`], ready for a [`Listing`](crate::dirlist::Listing).
@@ -128,6 +161,10 @@ pub enum Signal {
     /// [`Listing::set_entries`](crate::dirlist::Listing::set_entries), because the changes that
     /// were lost cannot be guessed.
     Rescan,
+    /// The watch is over: the folder itself was deleted or renamed, or the OS watcher failed.
+    /// The application should drop the watcher and read the folder again, which will probably
+    /// fail too; the list is what it was.
+    Lost,
 }
 
 /// What is known about one path since the quiet period began.
@@ -178,30 +215,52 @@ struct OpenFrom {
 pub struct Coalescer {
     folder: PathBuf,
     debounce: Duration,
+    max_wait: Duration,
     /// What is pending for each path, by path.
     paths: HashMap<PathBuf, Track>,
     /// Renames whose old name has been seen and whose new name has not, oldest first.
     open: VecDeque<OpenFrom>,
+    /// Rename pairs already made from the two halves, so the platform's pair carrying both
+    /// names is recognised as the same move.
+    paired: Vec<(PathBuf, PathBuf)>,
     /// The time of the most recent accepted event; `None` when nothing is pending.
     last_at: Option<Instant>,
+    /// The time of the first accepted event since the last flush.
+    first_at: Option<Instant>,
     /// Events were lost, so nothing pending matters any more.
     rescan: bool,
+    /// The watch is over; nothing pending matters any more.
+    lost: bool,
 }
 
 impl Coalescer {
     /// A coalescer for entries directly inside `folder`, settling each burst `debounce` after
-    /// its last event.
+    /// its last event, and never later than [`MAX_WAIT`] after its first.
     ///
     /// A zero debounce settles at once: the next [`flush`](Self::flush) reports what it has,
     /// which is what a caller that wants no delay asks for.
     pub fn new(folder: impl Into<PathBuf>, debounce: Duration) -> Coalescer {
+        Coalescer::with_max_wait(folder, debounce, MAX_WAIT)
+    }
+
+    /// [`new`](Self::new), with a longest wait of the caller's choosing, for a test or an
+    /// application that wants a different ceiling.
+    pub fn with_max_wait(
+        folder: impl Into<PathBuf>,
+        debounce: Duration,
+        max_wait: Duration,
+    ) -> Coalescer {
         Coalescer {
             folder: folder.into(),
             debounce,
+            max_wait,
             paths: HashMap::new(),
             open: VecDeque::new(),
+            paired: Vec::new(),
             last_at: None,
+            first_at: None,
             rescan: false,
+            lost: false,
         }
     }
 
@@ -215,16 +274,31 @@ impl Coalescer {
     /// An event about a path that is not directly inside the folder is dropped and does not
     /// extend the quiet period. After a [`RawChange::Rescan`] every later event is dropped until
     /// [`flush`](Self::flush) reports the rescan, because the events that follow may be
-    /// duplicates of what the fresh read will find anyway.
+    /// duplicates of what the fresh read will find anyway; a [`RawChange::Lost`] replaces
+    /// whatever was pending, and needs no events after it.
     pub fn push(&mut self, change: RawChange, at: Instant) {
+        if self.lost {
+            return;
+        }
+        if let RawChange::Lost = change {
+            self.lost = true;
+            self.rescan = false;
+            self.paths.clear();
+            self.open.clear();
+            self.paired.clear();
+            self.touch(at);
+            return;
+        }
         if self.rescan {
             return;
         }
         match change {
+            RawChange::Lost => {}
             RawChange::Rescan => {
                 self.rescan = true;
                 self.paths.clear();
                 self.open.clear();
+                self.paired.clear();
                 self.touch(at);
             }
             RawChange::Created(path) => {
@@ -261,7 +335,7 @@ impl Coalescer {
                 let inside_from = self.inside(&from);
                 let inside_to = self.inside(&to);
                 if inside_from && inside_to {
-                    if self.paths.get(&to) == Some(&Track::Moved { from: from.clone() }) {
+                    if self.paired.contains(&(from.clone(), to.clone())) {
                         // The platform reported this rename as a pair and as two sides; the
                         // sides already paired, and this is the same move a second time.
                         return;
@@ -281,25 +355,35 @@ impl Coalescer {
     }
 
     /// When the burst that is open now may be reported: the last accepted event plus the
-    /// debounce. `None` when nothing is pending.
+    /// debounce, but never the first accepted event plus the longest wait. `None` when nothing
+    /// is pending.
     ///
     /// A flush before this instant gives nothing. When the addition overflows an `Instant`,
     /// this is the last event's own time, so the burst is reported at once rather than never.
     pub fn deadline(&self) -> Option<Instant> {
         let last = self.last_at?;
-        if !self.rescan && self.paths.is_empty() && self.open.is_empty() {
+        if !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty() {
             return None;
         }
-        Some(last.checked_add(self.debounce).unwrap_or(last))
+        let mut deadline = last.checked_add(self.debounce).unwrap_or(last);
+        if let Some(first) = self.first_at
+            && let Some(cap) = first.checked_add(self.max_wait)
+        {
+            deadline = deadline.min(cap);
+        }
+        Some(deadline)
     }
 
     /// Reports the settled burst as one verdict per entry, at `now`, and forgets it.
     ///
     /// `now` before [`deadline`](Self::deadline) gives an empty list and keeps the burst. At or
     /// after it, every pending path is reported once; a rename whose new name never arrived is
-    /// reported as a removal of its old name; the list is ordered by path, and a removal comes
-    /// before anything else at the same path, so a path removed and created again (which is a
-    /// modification) is applied the way it happened.
+    /// reported as a removal of its old name.
+    ///
+    /// The report is ordered so that it can be applied top to bottom: anything that takes a name
+    /// away comes before anything that puts an entry under that name. If no such order exists
+    /// (two renames that swap their names), the renames are broken into a removal and a
+    /// modification, and each name's fate is read from the disk instead.
     pub fn flush(&mut self, now: Instant) -> Vec<Verdict> {
         let Some(deadline) = self.deadline() else {
             return Vec::new();
@@ -308,52 +392,44 @@ impl Coalescer {
             return Vec::new();
         }
         self.last_at = None;
+        self.first_at = None;
+        self.paired.clear();
+        if self.lost {
+            self.lost = false;
+            self.paths.clear();
+            self.open.clear();
+            return vec![Verdict::Lost];
+        }
         if self.rescan {
             self.rescan = false;
             self.paths.clear();
             self.open.clear();
             return vec![Verdict::Rescan];
         }
-        // The primary path of each verdict, a rank that puts a removal first at one path, and
-        // the verdict itself.
-        let mut settled: Vec<(PathBuf, u8, Verdict)> =
-            Vec::with_capacity(self.paths.len() + self.open.len());
-        for (path, track) in self.paths.drain() {
-            let (rank, verdict) = match track {
-                Track::Created => (1, Verdict::Created(path.clone())),
-                Track::Modified => (1, Verdict::Modified(path.clone())),
-                Track::Removed => (0, Verdict::Removed(path.clone())),
-                Track::Moved { from } => (
-                    1,
-                    Verdict::Renamed {
-                        from,
-                        to: path.clone(),
-                    },
-                ),
+        let mut named: Vec<(PathBuf, Track)> = self.paths.drain().collect();
+        // The map has no order of its own; sorting keeps the report the same for the same
+        // events in every run.
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut items: Vec<Item> = Vec::with_capacity(named.len() + self.open.len());
+        for (path, track) in named {
+            let verdict = match track {
+                Track::Created => Verdict::Created(path),
+                Track::Modified => Verdict::Modified(path),
+                Track::Removed => Verdict::Removed(path),
+                Track::Moved { from } if from == path => Verdict::Modified(path),
+                Track::Moved { from } => Verdict::Renamed { from, to: path },
             };
-            settled.push((path, rank, verdict));
+            items.push(Item::new(verdict));
         }
         for open in self.open.drain(..) {
-            settled.push((open.path.clone(), 0, Verdict::Removed(open.path)));
+            items.push(Item::new(Verdict::Removed(open.path)));
         }
-        settled.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        let mut out: Vec<Verdict> = Vec::with_capacity(settled.len());
-        let mut last_removed: Option<PathBuf> = None;
-        for (_, _, verdict) in settled {
-            if let Verdict::Removed(path) = &verdict {
-                if last_removed.as_ref() == Some(path) {
-                    continue;
-                }
-                last_removed = Some(path.clone());
-            }
-            out.push(verdict);
-        }
-        out
+        settled(items)
     }
 
     /// Whether nothing is pending.
     pub fn is_idle(&self) -> bool {
-        !self.rescan && self.paths.is_empty() && self.open.is_empty()
+        !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty()
     }
 
     /// Whether `path` is directly inside the folder, as the folder spells it.
@@ -361,12 +437,15 @@ impl Coalescer {
         path.parent() == Some(self.folder.as_path())
     }
 
-    /// Remembers that `at` is the newest accepted event.
+    /// Remembers that `at` is the newest accepted event, and the first of the burst if it is.
     fn touch(&mut self, at: Instant) {
         self.last_at = Some(match self.last_at {
             Some(last) if last > at => last,
             _ => at,
         });
+        if self.first_at.is_none() {
+            self.first_at = Some(at);
+        }
     }
 
     /// A name appeared.
@@ -405,8 +484,11 @@ impl Coalescer {
         match self.paths.remove(&path) {
             // Created and then removed: the list never saw it.
             Some(Track::Created) => {}
-            // A rename whose destination was removed: the entry is gone under its first name.
+            // A rename landed here and the name is gone again. The list may hold the entry this
+            // name had before the rename landed, so this name is removed too, as well as the
+            // first name the entry came from.
             Some(Track::Moved { from }) => {
+                self.paths.insert(path, Track::Removed);
                 self.paths.entry(from).or_insert(Track::Removed);
             }
             Some(Track::Modified) | Some(Track::Removed) | None => {
@@ -423,10 +505,18 @@ impl Coalescer {
         }
         let track = self.paths.remove(&path);
         let origin = match track {
-            // The entry was created and then renamed: its destination is a creation.
-            Some(Track::Created) | Some(Track::Removed) => Origin::Fresh,
-            // A chain: keep the first name.
-            Some(Track::Moved { from }) => Origin::Moved(from),
+            // A name a rename landed on, or a creation, is vacated: the list may still hold the
+            // entry that was at this name before the burst, so this name is removed too. The
+            // collapsed rename no longer names it (a chain keeps only its first and last names,
+            // and a creation moved on becomes a creation at the destination).
+            Some(Track::Moved { from }) => {
+                self.paths.insert(path.clone(), Track::Removed);
+                Origin::Moved(from)
+            }
+            Some(Track::Created) | Some(Track::Removed) => {
+                self.paths.insert(path.clone(), Track::Removed);
+                Origin::Fresh
+            }
             Some(Track::Modified) | None => Origin::Moved(path.clone()),
         };
         self.open.push_back(OpenFrom { path, origin });
@@ -435,10 +525,15 @@ impl Coalescer {
     /// A rename arrived at `path`.
     fn to(&mut self, path: PathBuf) {
         let track = match self.open.pop_front() {
-            Some(open) => match open.origin {
-                Origin::Fresh => Track::Created,
-                Origin::Moved(from) => Track::Moved { from },
-            },
+            Some(open) => {
+                // Remember the pair, so the platform's event carrying both names is known to be
+                // the same move.
+                self.paired.push((open.path, path.clone()));
+                match open.origin {
+                    Origin::Fresh => Track::Created,
+                    Origin::Moved(from) => Track::Moved { from },
+                }
+            }
             // No old name waiting: the entry was renamed into the folder from outside.
             None => Track::Created,
         };
@@ -479,47 +574,150 @@ fn signal_of(verdict: Verdict, read: &dyn Fn(&Path) -> Option<Entry>) -> Option<
             None => Change::Removed(from),
         })),
         Verdict::Rescan => Some(Signal::Rescan),
+        Verdict::Lost => Some(Signal::Lost),
     }
 }
 
-/// What a `notify` event means, as raw changes. Empty for an event that says nothing about a
-/// name inside the folder (an access, or an event with no path).
+/// Rewrites the paths of `notify`'s events as the caller's folder, and drops everything that is
+/// not an entry directly inside it.
 ///
-/// A platform that cannot pair a rename's two names reports it as one event carrying one path;
-/// that becomes a removal and a creation of the same path, which the coalescer settles as a
-/// modification of it.
-fn raw_changes(event: &notify::Event) -> Vec<RawChange> {
-    if event.need_rescan() {
-        return vec![RawChange::Rescan];
+/// Platforms spell a path their own way: macOS FSEvents reports `/private/var/...` for a folder
+/// given as `/var/...`, and a relative folder may come back absolute. Every path's parent is
+/// therefore compared after canonicalising both sides, and the path handed on is the caller's
+/// folder joined with the event's own file name, so a [`Listing`](crate::dirlist::Listing) with
+/// that folder matches it exactly. The file name itself is the platform's: on Windows it can be
+/// the 8.3 short form, which is a different path to the list.
+#[derive(Clone, Debug)]
+struct Translator {
+    /// The folder as the caller gave it.
+    folder: PathBuf,
+    /// The same folder, canonicalised, for comparing against what the platform reports.
+    canonical: Option<PathBuf>,
+}
+
+impl Translator {
+    fn new(folder: &Path) -> Translator {
+        Translator {
+            folder: folder.to_path_buf(),
+            canonical: std::fs::canonicalize(folder).ok(),
+        }
     }
-    let mut out = Vec::with_capacity(event.paths.len());
-    match &event.kind {
-        EventKind::Create(_) => out.extend(event.paths.iter().cloned().map(RawChange::Created)),
-        EventKind::Remove(_) => out.extend(event.paths.iter().cloned().map(RawChange::Removed)),
-        EventKind::Modify(ModifyKind::Name(mode)) => match mode {
-            RenameMode::From => out.extend(event.paths.iter().cloned().map(RawChange::RenamedFrom)),
-            RenameMode::To => out.extend(event.paths.iter().cloned().map(RawChange::RenamedTo)),
-            RenameMode::Both => match event.paths.as_slice() {
-                [from, to, ..] => out.push(RawChange::Renamed {
-                    from: from.clone(),
-                    to: to.clone(),
-                }),
-                _ => out.extend(event.paths.iter().cloned().map(RawChange::RenamedTo)),
-            },
-            // macOS FSEvents pairs no names: the one path it gives is both sides, which is a
-            // removal and a creation of it.
-            RenameMode::Any | RenameMode::Other => {
-                for path in &event.paths {
-                    out.push(RawChange::Removed(path.clone()));
-                    out.push(RawChange::Created(path.clone()));
-                }
+
+    /// Whether this path names the watched folder itself: it was deleted or renamed.
+    fn is_folder(&self, path: &Path) -> bool {
+        if path == self.folder {
+            return true;
+        }
+        match &self.canonical {
+            Some(canonical) => std::fs::canonicalize(path).is_ok_and(|path| &path == canonical),
+            None => false,
+        }
+    }
+
+    /// The event path rewritten as the caller's folder, when it is directly inside it.
+    fn inside(&self, path: &Path) -> Option<PathBuf> {
+        let name = path.file_name()?;
+        let parent = path.parent()?;
+        let matches = match &self.canonical {
+            Some(canonical) => std::fs::canonicalize(parent).is_ok_and(|path| &path == canonical),
+            None => parent == self.folder,
+        };
+        matches.then(|| self.folder.join(name))
+    }
+
+    /// What one `notify` event means, as raw changes. Empty for an event that says nothing about
+    /// a name inside the folder (an access, or an event with no path).
+    fn translate(&self, event: &notify::Event) -> Vec<RawChange> {
+        if event.need_rescan() {
+            return vec![RawChange::Rescan];
+        }
+        if matches!(
+            event.kind,
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        ) && event.paths.iter().any(|path| self.is_folder(path))
+        {
+            return vec![RawChange::Lost];
+        }
+        let mut out = Vec::with_capacity(event.paths.len());
+        match &event.kind {
+            EventKind::Create(_) => {
+                out.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter_map(|p| self.inside(p))
+                        .map(RawChange::Created),
+                );
             }
-        },
-        EventKind::Modify(_) => out.extend(event.paths.iter().cloned().map(RawChange::Modified)),
-        // An access changes nothing a list shows, and an untyped event says nothing usable.
-        EventKind::Access(_) | EventKind::Any | EventKind::Other => {}
+            EventKind::Remove(_) => {
+                out.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter_map(|p| self.inside(p))
+                        .map(RawChange::Removed),
+                );
+            }
+            EventKind::Modify(ModifyKind::Name(mode)) => match mode {
+                RenameMode::From => out.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter_map(|p| self.inside(p))
+                        .map(RawChange::RenamedFrom),
+                ),
+                RenameMode::To => out.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter_map(|p| self.inside(p))
+                        .map(RawChange::RenamedTo),
+                ),
+                RenameMode::Both => match event.paths.as_slice() {
+                    [from, to, ..] => match (self.inside(from), self.inside(to)) {
+                        (Some(from), Some(to)) => out.push(RawChange::Renamed { from, to }),
+                        (Some(from), None) => out.push(RawChange::RenamedFrom(from)),
+                        (None, Some(to)) => out.push(RawChange::RenamedTo(to)),
+                        (None, None) => {}
+                    },
+                    _ => out.extend(
+                        event
+                            .paths
+                            .iter()
+                            .filter_map(|p| self.inside(p))
+                            .map(RawChange::RenamedTo),
+                    ),
+                },
+                // macOS FSEvents pairs no names: the one path it gives is its own, and the disk
+                // says whether it is still there. Every such path reads as a change of it.
+                RenameMode::Any | RenameMode::Other => out.extend(
+                    event
+                        .paths
+                        .iter()
+                        .filter_map(|p| self.inside(p))
+                        .map(RawChange::Modified),
+                ),
+            },
+            EventKind::Modify(_) => out.extend(
+                event
+                    .paths
+                    .iter()
+                    .filter_map(|p| self.inside(p))
+                    .map(RawChange::Modified),
+            ),
+            // An access changes nothing a list shows, and an untyped event says nothing usable.
+            EventKind::Access(_) | EventKind::Any | EventKind::Other => {}
+        }
+        out
     }
-    out
+}
+
+/// One `notify` result as raw changes: an error means events may have been lost, so a rescan.
+fn translation(result: notify::Result<notify::Event>, names: &Translator) -> Vec<RawChange> {
+    match result {
+        Ok(event) => names.translate(&event),
+        Err(_) => vec![RawChange::Rescan],
+    }
 }
 
 /// Raw events waiting for the watcher's thread, and the signal that stops it.
@@ -553,6 +751,12 @@ impl Inbox {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.stop = true;
         self.ready.notify_all();
+    }
+
+    /// Whether the watcher has been dropped, so the thread must end without reporting anything
+    /// more.
+    fn stopped(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).stop
     }
 }
 
@@ -592,6 +796,9 @@ impl Shared {
     }
 }
 
+/// Reads one path's entry; `Entry::at` in a real watcher, a made-up disk in a test.
+type Read = dyn Fn(&Path) -> Option<Entry> + Send + Sync;
+
 /// Watches one folder and reports what changed in it, settled, as [`Signal`]s.
 ///
 /// [`DirWatcher::new`] starts the OS watcher and a thread of its own. That thread is the only
@@ -601,14 +808,16 @@ impl Shared {
 /// (once, until [`woken`](Self::woken) is called) and the application takes the report with
 /// [`take`](Self::take).
 ///
-/// The thread ends when this value is dropped, and joins before the drop returns.
+/// Dropping the watcher does not wait for the thread: the thread may be in the middle of a read
+/// on a share that never answers, and the application's thread must not wait for it. The drop
+/// tells the thread to stop, and the thread ends by itself after the read it is in returns,
+/// without reading anything else or reporting anything.
 pub struct DirWatcher {
     folder: PathBuf,
-    /// The OS watcher; dropped after the thread is joined.
+    /// The OS watcher; dropping it stops its callbacks.
     watcher: RecommendedWatcher,
     inbox: Arc<Inbox>,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl DirWatcher {
@@ -619,10 +828,10 @@ impl DirWatcher {
     /// folder again on a slow poll. `wake` runs on the watcher's own thread: it must be cheap,
     /// must not block on anything the application holds, and must not panic.
     ///
-    /// Give the folder as an absolute path, spelled exactly as
-    /// [`dirlist::read`](crate::dirlist::read) is given it. The paths in the report are the
-    /// folder joined with each name, so a relative folder is reported relative on Windows and
-    /// Linux but absolute on macOS; an absolute one is reported the same way everywhere.
+    /// Every path in the report is this folder joined with the entry's own name, so the list's
+    /// exact matching works wherever the platform spells paths another way. An entry's name is
+    /// the platform's own; on Windows it may be the 8.3 short form, which is a different path to
+    /// the list.
     pub fn new(
         folder: impl Into<PathBuf>,
         wake: impl Fn() + Send + Sync + 'static,
@@ -633,26 +842,37 @@ impl DirWatcher {
     /// [`new`](Self::new), with a quiet period of the caller's choosing.
     ///
     /// A shorter period reports sooner and splits one operation into more reports; a longer one
-    /// settles a save that writes several files. Nothing here caps the period.
+    /// settles a save that writes several files. The report is settled at most [`MAX_WAIT`] after
+    /// its first event whatever the quiet period.
     pub fn with_debounce(
         folder: impl Into<PathBuf>,
         debounce: Duration,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Option<DirWatcher> {
-        let folder = folder.into();
+        DirWatcher::start(
+            folder.into(),
+            debounce,
+            wake,
+            Arc::new(|path: &Path| Entry::at(path)),
+        )
+    }
+
+    /// Starts the watcher with the reader given: [`Entry::at`](crate::dirlist::Entry::at) in a
+    /// real watcher, and a made-up disk in a test of this module.
+    fn start(
+        folder: PathBuf,
+        debounce: Duration,
+        wake: impl Fn() + Send + Sync + 'static,
+        read: Arc<Read>,
+    ) -> Option<DirWatcher> {
         let inbox = Arc::new(Inbox::default());
         let shared = Arc::new(Shared::default());
-        let watched = Arc::clone(&inbox);
+        let names = Translator::new(&folder);
+        let for_events = Arc::clone(&inbox);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let at = Instant::now();
-            match event {
-                Ok(event) => {
-                    for change in raw_changes(&event) {
-                        watched.push(change, at);
-                    }
-                }
-                // The watcher could not say what happened, so events may have been lost.
-                Err(_) => watched.push(RawChange::Rescan, at),
+            for change in translation(event, &names) {
+                for_events.push(change, at);
             }
         })
         .ok()?;
@@ -663,16 +883,16 @@ impl DirWatcher {
         let coalescer = Coalescer::new(folder.clone(), debounce);
         let for_work = Arc::clone(&inbox);
         let for_report = Arc::clone(&shared);
-        let worker = std::thread::Builder::new()
+        // The handle is dropped at once: the thread is not waited for. See `DirWatcher`.
+        _ = std::thread::Builder::new()
             .name("mdshared-dirwatch".to_string())
-            .spawn(move || run(for_work, for_report, coalescer, &wake))
+            .spawn(move || run(for_work, for_report, coalescer, &wake, read))
             .ok()?;
         Some(DirWatcher {
             folder,
             watcher,
             inbox,
             shared,
-            worker: Some(worker),
         })
     }
 
@@ -697,13 +917,11 @@ impl DirWatcher {
 
 impl Drop for DirWatcher {
     fn drop(&mut self) {
-        // Release the watch first, so the OS watcher stops queueing events; the thread is then
-        // told to end and joined, and the field itself is dropped after this body.
+        // Stop the OS watch first, so its callback pushes nothing more, then tell the thread to
+        // stop and do not wait for it: it may be inside a read on a share that never answers,
+        // and this drop runs on the thread that draws.
         _ = self.watcher.unwatch(&self.folder);
         self.inbox.stop();
-        if let Some(worker) = self.worker.take() {
-            _ = worker.join();
-        }
     }
 }
 
@@ -711,7 +929,14 @@ impl Drop for DirWatcher {
 ///
 /// It waits on the inbox's condition variable until either an event arrives or the open burst's
 /// deadline passes; the wait is for a duration, never a poll, so an idle folder costs nothing.
-fn run(inbox: Arc<Inbox>, shared: Arc<Shared>, mut coalescer: Coalescer, wake: &dyn Fn()) {
+/// Once the watcher is dropped it ends without reading anything more or reporting anything.
+fn run(
+    inbox: Arc<Inbox>,
+    shared: Arc<Shared>,
+    mut coalescer: Coalescer,
+    wake: &(dyn Fn() + Sync),
+    read: Arc<Read>,
+) {
     let mut state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if state.stop {
@@ -729,10 +954,19 @@ fn run(inbox: Arc<Inbox>, shared: Arc<Shared>, mut coalescer: Coalescer, wake: &
             let verdicts = coalescer.flush(now);
             // The disk is read without the inbox held, so events keep arriving.
             drop(state);
-            let signals: Vec<Signal> = verdicts
-                .into_iter()
-                .filter_map(|verdict| signal_of(verdict, &|path| Entry::at(path)))
-                .collect();
+            let mut signals = Vec::with_capacity(verdicts.len());
+            for verdict in verdicts {
+                // A read can be slow; stop between two of them rather than after the last.
+                if inbox.stopped() {
+                    return;
+                }
+                if let Some(signal) = signal_of(verdict, &*read) {
+                    signals.push(signal);
+                }
+            }
+            if inbox.stopped() {
+                return;
+            }
             shared.deliver(signals, wake);
             state = inbox.state.lock().unwrap_or_else(|e| e.into_inner());
             continue;
@@ -748,3 +982,11 @@ fn run(inbox: Arc<Inbox>, shared: Arc<Shared>, mut coalescer: Coalescer, wake: &
 #[cfg(test)]
 #[path = "dirwatch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dirwatch_model_tests.rs"]
+mod model_tests;
+
+#[cfg(test)]
+#[path = "dirwatch_watcher_tests.rs"]
+mod watcher_tests;
