@@ -52,13 +52,13 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 
 | Phase | What | Items |
 |---|---|---|
+| B | **Barbican first** (the owner, 2026-11-26: "put barbican top, we'll resume that later"): ahead of every other phase once work on it resumes, which the owner will say; fast-tracked since 2026-11-25; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
 | P | **Purge fast track** (the owner, 2026-11-25), ahead of the rest: merge `feat/anim` to `main`, then W8 (Windows UIA at Purge's scope), W1 (one window), W5b, X8, P1-P7, P8 last and optional; the consumer is `examples/purge_shape.rs`; the checks C1-C3 below | W8, W1, W5b, X8, P1-P8 |
 | 0 | The animation module's review fixes | done on `feat/anim` (`6027946..bc8fa9f`); the breaking changes for mdmix are listed in [FEATURES.md](FEATURES.md), "The review's fixes" |
 | 1 | **Music player**, one item at a time, in this order: the seek bar, cover art and its colours, meters with the waveform and spectrum, the knob and fader, JPEG and the thumbnail cache, the media session; then sectioned lists, cursors, the horizontal scrollbar and theme tokens; then the menu's look, which mdplay's mockup asked for (the owner, 2026-11-24), and the look as a user setting | M3, M5, M2, M4, F6, M1, L2, W4, L3, W5, L11, L12 |
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
-| B | **Barbican fast track** (the owner, 2026-11-25): after the md and Purge items, or whenever it is convenient; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
 | CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around, when convenient; CS1 and CS2 first (below) | CS1-CS15 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
