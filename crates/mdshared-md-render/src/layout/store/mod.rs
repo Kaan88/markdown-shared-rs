@@ -378,7 +378,7 @@ impl ImageStore {
 
     /// A local file at a device `scale` (which only an SVG's raster depends on).
     pub(super) fn file(&mut self, path: &Path, scale: f32, allow: bool) -> (u32, Found) {
-        let Ok(meta) = std::fs::metadata(path) else {
+        let Ok(meta) = crate::image::metadata(path) else {
             // Missing: remembered as failed under an identity a new file will not match.
             let key = ImageKey::File {
                 path: path.to_path_buf(),

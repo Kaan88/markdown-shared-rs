@@ -26,13 +26,14 @@ use pieces::*;
 use crate::highlight;
 use crate::image::{self, DecodedImage};
 use crate::theme::{Color, Theme};
-use mdshared_md_core::links::{ImageSource, classify_image};
 use mdshared_md_core::model::{
     Align, BlockKind, Dir, Document, ImageAlign, ImageInfo, Length, ListMarker, NONE, SpanKind,
 };
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 /// The largest local image that is embedded in the file.
 pub const MAX_EMBED: u64 = 4 * 1024 * 1024;
@@ -753,8 +754,8 @@ impl<'a> Writer<'a> {
         if lower.starts_with("data:image/") {
             return Some(src.to_string());
         }
-        let path = self.local_path(src)?;
-        let bytes = image::read(&path)?;
+        let (path, bytes) = image::local_paths(src, self.opts.base_dir)
+            .find_map(|path| image::read(&path).map(|bytes| (path, bytes)))?;
         let mime = image_mime(&bytes)?;
         let len = bytes.len() as u64;
         if len <= MAX_EMBED && self.embedded + len <= MAX_TOTAL {
@@ -762,23 +763,6 @@ impl<'a> Writer<'a> {
             return Some(format!("data:{mime};base64,{}", base64(&bytes)));
         }
         Some(file_url(&path))
-    }
-
-    /// The file a document's image `src` names, as the page looks for it.
-    fn local_path(&self, src: &str) -> Option<PathBuf> {
-        let base = self.opts.base_dir;
-        let raw = PathBuf::from(src);
-        let joined = match base {
-            Some(dir) if raw.is_relative() => dir.join(&raw),
-            _ => raw,
-        };
-        if joined.is_absolute() && joined.is_file() {
-            return Some(joined);
-        }
-        match classify_image(src, base.unwrap_or(Path::new(""))) {
-            ImageSource::Local(p) if p.is_absolute() && p.is_file() => Some(p),
-            _ => None,
-        }
     }
 
     // ---- footnotes -------------------------------------------------------------------------

@@ -9,7 +9,6 @@ use super::store::Found;
 use super::{Code, Rect, Source, SourceKind};
 use crate::highlight;
 use mdshared_md_core::model::BlockKind;
-use std::path::PathBuf;
 
 /// The box, in logical px, that stands in for a local image a refinement pass may not load, and
 /// the heights for a formula and a diagram block. Such a block is measured again with everything
@@ -40,12 +39,14 @@ impl<'a, 'b> Pager<'a, 'b> {
         let (id, found) = if remote {
             self.store.remote(trimmed, self.allow)
         } else {
-            let path = PathBuf::from(src);
-            let path = match &self.base_dir {
-                Some(dir) if path.is_relative() => dir.join(path),
-                _ => path,
-            };
-            self.store.file(&path, self.scale, self.allow)
+            let mut result = (u32::MAX, Found::Failed);
+            for path in crate::image::local_paths(src, self.base_dir.as_deref()) {
+                result = self.store.file(&path, self.scale, self.allow);
+                if !matches!(result.1, Found::Failed) {
+                    break;
+                }
+            }
+            result
         };
         self.note(id, &found, !remote);
         (id, found)
