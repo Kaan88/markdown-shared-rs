@@ -58,6 +58,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
 | B | **Barbican fast track** (the owner, 2026-11-25): after the md and Purge items, or whenever it is convenient; milestone by milestone, BT1 first (below) | K5, K11, K7, K14, K1, K4, K3, K8, K9, K10 |
+| CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around, when convenient; CS1 and CS2 first (below) | CS1-CS15 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
 ## Shell and window
@@ -254,6 +255,33 @@ terminal's. The K ids are Barbican's and clash with nothing here.
 Also wanted by Barbican, already rows here: L5 (rename in place), P8b (the hand-over reaching a
 winit window); L9 (images on the clipboard) after its switch. No longer wanted by Barbican: W9,
 X6, L4, and W1 beyond its damage regions.
+
+## Claude Switch (2026-11-26)
+
+Claude Switch (`Kaan88/claude-switch`, public) is a terminal application built on this toolkit,
+pinned to `main` at `df8d4e1`. Its `docs/TODO.md`, "For the toolkit", lists 18 things its authors
+had to work around; the owner asked for them to go on this roadmap (2026-11-26). Its numbers are
+given in brackets. Already covered here: plain and icon buttons outside dialogs [2], a search box
+[3] and a badge [4] are K4; dropping files is K8; pictures on the clipboard are L9. When an item
+lands on `main`, tell the Claude Switch session the commit, so the app can raise its pin.
+
+| Id | What | Size | Risk | Builds on | Status |
+|---|---|---|---|---|---|
+| CS1 | **A translucent terminal background** [15]. `termview` draws the default background (and, if asked, the padding round the grid) at a chosen opacity over the window backdrop (Mica, Acrylic, frost), while glyphs, explicit cell backgrounds, the selection and the cursor stay opaque; a contrast floor keeps text readable on any desktop colour. The host's frost has one window-wide key and veil today, and keying the finished grid would key out glyph pixels | M | high | `termview`, `Painter::set_frost_key`, X11 | open |
+| CS2 | **A cursor shape the application chooses** [16]. A renderer-side override on `termview::View` (block, bar, underline; blink on or off), used while the program has not set a shape with DECSCUSR and giving way when it has; visibility and wide-character coverage stay right. No escape sequences fed into the grid | S | low | `termview`, `mdshared_term::Screen` | open |
+| CS3 | **Insert and F13-F24 in `keys::KeyName`** [10]; `mdshared_term::input::Key` has them already. Added keys only (the enum's rules in AGENTS.md apply) | S | low | `keys`, `host` | open |
+| CS4 | **The wheel in lines** [13]. `Event::Wheel` gives pixels only, and Shift+wheel arrives as `dx`: say whether the system sent lines or pixels, and the lines | S | medium | `host`, W1 | open |
+| CS5 | **`chrome::draw_tab` that can be placed and styled** [8]: a y not fixed to the title row, a chosen icon, a tab with no close button, and a fill other than `pal.bar` (the app passes a whole palette per tab today) | S | low | `chrome` | open |
+| CS6 | **The selection's colours in `termview`** [14]. `draw::look` replaces a selected cell's background after `Scheme::cell_colors`; with `selection_text: None`, explicit backgrounds and inverse glyphs can lose contrast against the fill, and a full-block glyph can cover it | S | medium | `termview` | open |
+| CS7 | **A local line in `mdshared_term::Screen`** [12]: text the application adds (an end-of-program notice) without feeding escape sequences | S | low | `mdshared_term::screen` | open |
+| CS8 | **A colour swatch on drop-down and menu items** [1] | S | low | `menu`, `dropdown` | open |
+| CS9 | **A label and value grid** [4] (the badge is K4) | S | low | `layout`, `table` | open |
+| CS10 | **Relative time and the local offset in `fmt`** [5]: "3 h ago", and the local time-zone offset | S | medium | `fmt` | open |
+| CS11 | **Models for a confirm dialog and a text prompt** [6] | S | low | `overlay`, `textfield`, K4 | open |
+| CS12 | **`InfoBar::hit` and `parts` without a `Painter`** [7] | S | low | `infobar` | open |
+| CS13 | **Getters on `mdshared_pty::Command`** [9] besides `program()`: the arguments, the folder, the environment | S | low | `mdshared-pty` | open |
+| CS14 | **`host::App::raw` without a winit type the toolkit does not re-export** [11]: re-export it, or give `raw` a type of the toolkit's | S | medium | `host` | open |
+| CS15 | **The settings forms** [17, 18]: colour rows and a card style on `settings::pages::Form`; the grouped form's style reaching its own dropdown menus and colour-picker flyouts | M | medium | `settings`, `settings::pages`, `menu::Look` | open |
 
 ## Left over from what exists
 
