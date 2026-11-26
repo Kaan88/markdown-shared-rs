@@ -168,10 +168,11 @@ fn a_stopped_watcher_reads_no_more_paths() {
     let at = Instant::now();
     let inbox = Arc::new(Inbox::default());
     let shared = Arc::new(Shared::default());
-    inbox.push(RawChange::Created(p("a.txt")), at);
+    inbox.push(RawChange::Created(p("a.txt")), at, None);
     inbox.push(
         RawChange::Created(p("b.txt")),
         at + Duration::from_millis(1),
+        None,
     );
     let coalescer = Coalescer::new(folder(), Duration::from_millis(10));
 

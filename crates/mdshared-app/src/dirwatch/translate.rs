@@ -9,6 +9,31 @@ use notify::EventKind;
 use notify::event::{ModifyKind, RenameMode};
 use std::path::{Path, PathBuf};
 
+/// Retains inotify's cookie on each half. In notify 8.2.1 a tracked `Both` is an echo
+/// after `From` and `To`, not another move, even if the worker settled between callbacks.
+pub(super) fn translation(
+    result: notify::Result<notify::Event>,
+    names: &Translator,
+) -> impl Iterator<Item = (RawChange, Option<usize>)> {
+    let (changes, tracker) = match result {
+        Ok(event) => {
+            let tracker = event.tracker();
+            let echo = tracker.is_some()
+                && event.kind == EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+            (
+                if echo {
+                    Vec::new()
+                } else {
+                    names.translate(&event)
+                },
+                tracker,
+            )
+        }
+        Err(_) => (vec![RawChange::Rescan], None),
+    };
+    changes.into_iter().map(move |change| (change, tracker))
+}
+
 /// Rewrites the paths of `notify`'s events as the caller's folder, and drops everything that is
 /// not an entry directly inside it.
 ///

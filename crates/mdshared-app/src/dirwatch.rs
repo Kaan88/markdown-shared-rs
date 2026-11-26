@@ -76,17 +76,19 @@
 //!   reads the clock and the disk.
 
 mod order;
+mod resolve;
 mod translate;
 
 use crate::dirlist::{Change, Entry};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use order::{Item, settled};
+use resolve::signal_of;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use translate::Translator;
+use translate::{Translator, translation};
 
 /// How long the coalescer waits for the events of one operation to stop before it reports them,
 /// unless the caller asks for another quiet period with [`DirWatcher::with_debounce`].
@@ -228,9 +230,10 @@ pub struct Coalescer {
     paths: HashMap<PathBuf, Track>,
     /// Renames whose old name has been seen and whose new name has not, oldest first.
     open: VecDeque<OpenFrom>,
-    /// Rename pairs already made from the two halves, so the platform's pair carrying both
-    /// names is recognised as the same move.
-    paired: Vec<(PathBuf, PathBuf)>,
+    /// Tracked halves are independent of the public, untracked FIFO.
+    tracked: HashMap<usize, OpenFrom>,
+    /// Compatibility for callers that echo an untracked pair immediately after its halves.
+    last_pair: Option<(PathBuf, PathBuf)>,
     /// The time of the most recent accepted event; `None` when nothing is pending.
     last_at: Option<Instant>,
     /// The time of the first accepted event since the last flush.
@@ -264,7 +267,8 @@ impl Coalescer {
             max_wait,
             paths: HashMap::new(),
             open: VecDeque::new(),
-            paired: Vec::new(),
+            tracked: HashMap::new(),
+            last_pair: None,
             last_at: None,
             first_at: None,
             rescan: false,
@@ -285,6 +289,11 @@ impl Coalescer {
     /// duplicates of what the fresh read will find anyway; a [`RawChange::Lost`] replaces
     /// whatever was pending, and needs no events after it.
     pub fn push(&mut self, change: RawChange, at: Instant) {
+        self.push_tracked(change, at, None);
+    }
+
+    fn push_tracked(&mut self, change: RawChange, at: Instant, cookie: Option<usize>) {
+        let last_pair = self.last_pair.take();
         if self.lost {
             return;
         }
@@ -293,7 +302,7 @@ impl Coalescer {
             self.rescan = false;
             self.paths.clear();
             self.open.clear();
-            self.paired.clear();
+            self.tracked.clear();
             self.touch(at);
             return;
         }
@@ -306,7 +315,7 @@ impl Coalescer {
                 self.rescan = true;
                 self.paths.clear();
                 self.open.clear();
-                self.paired.clear();
+                self.tracked.clear();
                 self.touch(at);
             }
             RawChange::Created(path) => {
@@ -329,13 +338,13 @@ impl Coalescer {
             }
             RawChange::RenamedFrom(path) => {
                 if self.inside(&path) {
-                    self.from(path);
+                    self.from(path, cookie);
                     self.touch(at);
                 }
             }
             RawChange::RenamedTo(path) => {
                 if self.inside(&path) {
-                    self.to(path);
+                    self.to(path, cookie);
                     self.touch(at);
                 }
             }
@@ -343,17 +352,18 @@ impl Coalescer {
                 let inside_from = self.inside(&from);
                 let inside_to = self.inside(&to);
                 if inside_from && inside_to {
-                    if self.paired.contains(&(from.clone(), to.clone())) {
-                        // The platform reported this rename as a pair and as two sides; the
-                        // sides already paired, and this is the same move a second time.
+                    if last_pair
+                        .as_ref()
+                        .is_some_and(|(a, b)| a == &from && b == &to)
+                    {
                         return;
                     }
-                    self.from(from);
-                    self.to(to);
+                    let origin = self.depart(&from);
+                    self.land(to, origin);
                 } else if inside_from {
-                    self.from(from);
+                    self.removed(from);
                 } else if inside_to {
-                    self.to(to);
+                    self.land(to, Origin::Fresh);
                 } else {
                     return;
                 }
@@ -370,7 +380,7 @@ impl Coalescer {
     /// this is the last event's own time, so the burst is reported at once rather than never.
     pub fn deadline(&self) -> Option<Instant> {
         let last = self.last_at?;
-        if !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty() {
+        if self.is_idle() {
             return None;
         }
         let mut deadline = last.checked_add(self.debounce).unwrap_or(last);
@@ -401,7 +411,7 @@ impl Coalescer {
         }
         self.last_at = None;
         self.first_at = None;
-        self.paired.clear();
+        self.last_pair = None;
         if self.lost {
             self.lost = false;
             self.paths.clear();
@@ -418,7 +428,7 @@ impl Coalescer {
         // The map has no order of its own; sorting keeps the report the same for the same
         // events in every run.
         named.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut items: Vec<Item> = Vec::with_capacity(named.len() + self.open.len());
+        let mut items = Vec::with_capacity(named.len() + self.open.len() + self.tracked.len());
         for (path, track) in named {
             let verdict = match track {
                 Track::Created => Verdict::Created(path),
@@ -430,7 +440,13 @@ impl Coalescer {
             };
             items.push(Item::new(verdict));
         }
-        for open in self.open.drain(..) {
+        let mut tracked: Vec<_> = self.tracked.drain().collect();
+        tracked.sort_unstable_by(|(a, left), (b, right)| left.path.cmp(&right.path).then(a.cmp(b)));
+        for open in self
+            .open
+            .drain(..)
+            .chain(tracked.into_iter().map(|(_, open)| open))
+        {
             // A rename whose new name never arrived: the old name is gone. When its old name
             // was itself the destination of an earlier rename, the entry is gone under that
             // first name too, and the list may still hold it.
@@ -446,7 +462,11 @@ impl Coalescer {
 
     /// Whether nothing is pending.
     pub fn is_idle(&self) -> bool {
-        !self.rescan && !self.lost && self.paths.is_empty() && self.open.is_empty()
+        !self.rescan
+            && !self.lost
+            && self.paths.is_empty()
+            && self.open.is_empty()
+            && self.tracked.is_empty()
     }
 
     /// Whether `path` is directly inside the folder, as the folder spells it.
@@ -528,42 +548,60 @@ impl Coalescer {
     }
 
     /// A rename left `path`.
-    fn from(&mut self, path: PathBuf) {
+    fn from(&mut self, path: PathBuf, cookie: Option<usize>) {
+        if let Some(cookie) = cookie {
+            if !self.tracked.contains_key(&cookie) {
+                let origin = self.depart(&path);
+                self.tracked.insert(cookie, OpenFrom { path, origin });
+            }
+            return;
+        }
         // Some platforms repeat an old name; it is the same move.
         if self.open.iter().any(|open| open.path == path) {
             return;
         }
-        let track = self.paths.remove(&path);
-        let origin = match track {
+        let origin = self.depart(&path);
+        self.open.push_back(OpenFrom { path, origin });
+    }
+
+    fn depart(&mut self, path: &Path) -> Origin {
+        match self.paths.remove(path) {
             // A name a rename landed on, or a creation, is vacated: the list may still hold the
             // entry that was at this name before the burst, so this name is removed too. The
             // collapsed rename no longer names it (a chain keeps only its first and last names,
             // and a creation moved on becomes a creation at the destination).
             Some(Track::Landed { from }) => {
-                self.paths.insert(path.clone(), Track::Removed);
+                self.paths.insert(path.to_owned(), Track::Removed);
                 from.map(Origin::Moved).unwrap_or(Origin::Fresh)
             }
             Some(Track::Created) | Some(Track::Removed) => {
-                self.paths.insert(path.clone(), Track::Removed);
+                self.paths.insert(path.to_owned(), Track::Removed);
                 Origin::Fresh
             }
-            Some(Track::Modified) | None => Origin::Moved(path.clone()),
-        };
-        self.open.push_back(OpenFrom { path, origin });
+            Some(Track::Modified) | None => Origin::Moved(path.to_owned()),
+        }
     }
 
     /// A rename arrived at `path`.
-    fn to(&mut self, path: PathBuf) {
-        let origin = match self.open.pop_front() {
+    fn to(&mut self, path: PathBuf, cookie: Option<usize>) {
+        let open = match cookie {
+            Some(cookie) => self.tracked.remove(&cookie),
+            None => self.open.pop_front(),
+        };
+        let origin = match open {
             Some(open) => {
-                // Remember the pair, so the platform's event carrying both names is known to be
-                // the same move.
-                self.paired.push((open.path, path.clone()));
+                if cookie.is_none() {
+                    self.last_pair = Some((open.path, path.clone()));
+                }
                 open.origin
             }
             // No old name waiting: the entry was renamed into the folder from outside.
             None => Origin::Fresh,
         };
+        self.land(path, origin);
+    }
+
+    fn land(&mut self, path: PathBuf, origin: Origin) {
         let track = match origin {
             Origin::Fresh => Track::Landed { from: None },
             Origin::Moved(from) => Track::Landed { from: Some(from) },
@@ -583,37 +621,6 @@ impl Coalescer {
         {
             self.paths.entry(from).or_insert(Track::Removed);
         }
-    }
-}
-
-/// Reads one verdict into a signal, with `read` standing in for the disk.
-///
-/// A created entry that cannot be read is not reported: it is gone again, and the list never
-/// saw it. A modified entry that cannot be read is removed, because the path it names is not
-/// there any more. A rename whose new name cannot be read is a removal of the old name, for the
-/// same reason.
-fn signal_of(verdict: Verdict, read: &dyn Fn(&Path) -> Option<Entry>) -> Option<Signal> {
-    match verdict {
-        Verdict::Created(path) => read(&path).map(|entry| Signal::Changed(Change::Created(entry))),
-        Verdict::Modified(path) => Some(Signal::Changed(match read(&path) {
-            Some(entry) => Change::Modified(entry),
-            None => Change::Removed(path),
-        })),
-        Verdict::Removed(path) => Some(Signal::Changed(Change::Removed(path))),
-        Verdict::Renamed { from, to } => Some(Signal::Changed(match read(&to) {
-            Some(entry) => Change::Renamed { from, to: entry },
-            None => Change::Removed(from),
-        })),
-        Verdict::Rescan => Some(Signal::Rescan),
-        Verdict::Lost => Some(Signal::Lost),
-    }
-}
-
-/// One `notify` result as raw changes: an error means events may have been lost, so a rescan.
-fn translation(result: notify::Result<notify::Event>, names: &Translator) -> Vec<RawChange> {
-    match result {
-        Ok(event) => names.translate(&event),
-        Err(_) => vec![RawChange::Rescan],
     }
 }
 
@@ -697,19 +704,19 @@ struct Inbox {
 #[derive(Default)]
 struct InboxState {
     /// Events in arrival order, each with the time it was seen.
-    events: VecDeque<(RawChange, Instant)>,
+    events: VecDeque<(RawChange, Instant, Option<usize>)>,
     /// The watcher was dropped; the thread must end without reporting anything more.
     stop: bool,
 }
 
 impl Inbox {
     /// Queues one event, unless the watcher is being dropped.
-    fn push(&self, change: RawChange, at: Instant) {
+    fn push(&self, change: RawChange, at: Instant, cookie: Option<usize>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.stop {
             return;
         }
-        state.events.push_back((change, at));
+        state.events.push_back((change, at, cookie));
         self.ready.notify_one();
     }
 
@@ -841,8 +848,8 @@ impl DirWatcher {
         let for_events = Arc::clone(&inbox);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let at = Instant::now();
-            for change in translation(event, &names) {
-                for_events.push(change, at);
+            for (change, cookie) in translation(event, &names) {
+                for_events.push(change, at, cookie);
             }
         })
         .ok()?;
@@ -927,8 +934,8 @@ fn run(
         if state.stop {
             return;
         }
-        while let Some((change, at)) = state.events.pop_front() {
-            coalescer.push(change, at);
+        while let Some((change, at, cookie)) = state.events.pop_front() {
+            coalescer.push_tracked(change, at, cookie);
         }
         let now = Instant::now();
         let Some(deadline) = coalescer.deadline() else {

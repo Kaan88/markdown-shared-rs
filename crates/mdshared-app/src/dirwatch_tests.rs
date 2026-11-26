@@ -688,6 +688,70 @@ fn a_case_only_rename_without_sides_requires_a_rescan() {
 }
 
 #[test]
+fn three_complete_renames_can_repeat_the_first_pair() {
+    let at = Instant::now();
+    let mut c = coalescer();
+    for (from, to) in [("a", "b"), ("b", "a"), ("a", "b")] {
+        c.push(
+            RawChange::Renamed {
+                from: p(from),
+                to: p(to),
+            },
+            at,
+        );
+    }
+    assert!(settle(&mut c, at, 1_000).contains(&Verdict::Renamed {
+        from: p("a"),
+        to: p("b"),
+    }));
+}
+
+fn settle_backend_renames(events: &[(RenameMode, usize, &[&str])]) -> Vec<Verdict> {
+    let at = Instant::now();
+    let mut c = coalescer();
+    let names = Translator::new(folder(), folder());
+    for &(mode, cookie, paths) in events {
+        let mut event =
+            notify::Event::new(EventKind::Modify(ModifyKind::Name(mode))).set_tracker(cookie);
+        for name in paths {
+            event = event.add_path(p(name));
+        }
+        for (change, cookie) in translation(Ok(event), &names) {
+            c.push_tracked(change, at, cookie);
+        }
+    }
+    settle(&mut c, at, 1_000)
+}
+
+#[test]
+fn unrelated_inotify_moves_do_not_transfer_the_selection() {
+    let verdicts =
+        settle_backend_renames(&[(RenameMode::From, 1, &["a"]), (RenameMode::To, 2, &["b"])]);
+    assert_eq!(
+        verdicts,
+        vec![Verdict::Created(p("b")), Verdict::Removed(p("a"))]
+    );
+}
+
+#[test]
+fn interleaved_inotify_moves_pair_by_cookie_even_without_both() {
+    let verdicts = settle_backend_renames(&[
+        (RenameMode::From, 1, &["a"]),
+        (RenameMode::From, 2, &["b"]),
+        (RenameMode::To, 2, &["c"]),
+        (RenameMode::Both, 2, &["b", "c"]),
+        (RenameMode::To, 1, &["d"]),
+    ]);
+    assert_eq!(verdicts.len(), 2);
+    for (from, to) in [("a", "d"), ("b", "c")] {
+        assert!(verdicts.contains(&Verdict::Renamed {
+            from: p(from),
+            to: p(to)
+        }));
+    }
+}
+
+#[test]
 fn a_rename_out_of_the_folder_becomes_a_removal_on_its_own() {
     let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
         .add_path(p("a"))
@@ -717,7 +781,10 @@ fn an_event_about_the_folder_itself_is_a_lost_watch() {
 #[test]
 fn an_error_from_the_os_watcher_is_a_rescan() {
     let names = Translator::new(folder(), folder());
-    assert_eq!(translation(error(), &names), vec![RawChange::Rescan]);
+    assert_eq!(
+        translation(error(), &names).collect::<Vec<_>>(),
+        vec![(RawChange::Rescan, None)]
+    );
 }
 
 #[test]
