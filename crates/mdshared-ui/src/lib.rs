@@ -7,9 +7,6 @@
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, a scroll area ([`scrollarea`]), the keyboard focus over the
 //! widgets a frame declares
-//! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), and with the
-
-//! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), pictures kept
 //! at their drawn size ([`picture`]), and with the
 //! feature `a11y` an accessibility tree built from the same models (`a11y`). No window loop; the
