@@ -117,8 +117,10 @@ fn copy_opaque(frame: &mut Bitmap, image: &crate::image::DecodedImage, left: i32
 impl<'a, 'b> Pager<'a, 'b> {
     pub(super) fn finish(mut self, engine: &mut TextEngine) -> Rendered {
         let content_height = self.y + self.px(24.0);
-        let height = content_height.ceil().max(1.0) as u32;
-        let width = self.width.round().max(1.0) as u32;
+        let (width, height) = super::frame::raster_size(
+            self.width as u32,
+            content_height.min(self.max_y).ceil() as u32,
+        );
         let mut frame = Bitmap::new(width, height);
         frame.clear(self.theme.bg);
         let stats = self.draw(&mut frame, 0.0, engine);
@@ -137,8 +139,7 @@ impl<'a, 'b> Pager<'a, 'b> {
         total_height: f32,
         engine: &mut TextEngine,
     ) -> Slice {
-        let rows = height.ceil().max(1.0) as u32;
-        let width = self.width.round().max(1.0) as u32;
+        let (width, rows) = super::frame::raster_size(self.width as u32, height.ceil() as u32);
         let mut frame = Bitmap::new(width, rows);
         frame.clear(self.theme.bg);
         let stats = self.draw(&mut frame, top, engine);

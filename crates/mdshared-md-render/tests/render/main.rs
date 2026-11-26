@@ -9,6 +9,8 @@ use mdshared_md_render::{DARK, DocumentRenderer, LIGHT, Options, render, render_
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> mdshared_md_core::Document {
+    // A fixture can contain formulas or diagrams; decide on the engine before any render.
+    engine_available();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/md")
         .join(name);
@@ -49,6 +51,7 @@ fn rects_of(
 
 /// The page for `markdown` in the light theme, as BGRA rows.
 fn page(markdown: &str) -> mdshared_md_render::Rendered {
+    engine_available();
     render(&mdshared_md_core::parse(markdown), &Options::light())
 }
 

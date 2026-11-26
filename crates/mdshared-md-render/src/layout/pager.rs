@@ -121,22 +121,18 @@ impl<'a, 'b> Pager<'a, 'b> {
         details: &'b HashMap<u32, bool>,
         gap: Option<Gap>,
     ) -> Self {
-        let scale = options.scale.max(0.1);
-        let logical_width = options.width.max(120.0);
+        let (logical_width, scale) = super::frame::layout_size(options);
         let content = (logical_width - 2.0 * options.theme.margin)
             .max(80.0)
             .min(options.theme.reading_width);
         let left = (logical_width - content) / 2.0 * scale;
-        let max_y = options
-            .max_height
-            .map_or(f32::MAX, |h| (h * scale).max(1.0));
         Pager {
             doc,
             theme: options.theme,
             scale,
             width: (logical_width * scale).round(),
             left: left.round(),
-            max_y,
+            max_y: f32::MAX,
             y: 0.0,
             paints: Vec::new(),
             blocks: Vec::new(),
@@ -188,7 +184,9 @@ impl<'a, 'b> Pager<'a, 'b> {
         self.y = self.px(36.0);
         let content = self.content_width();
         self.blocks(NONE, self.left, content, self.theme.text, 0);
-        self.footnotes();
+        if self.y < self.max_y {
+            self.footnotes();
+        }
     }
 
     pub(super) fn blocks(
@@ -749,15 +747,21 @@ impl<'a, 'b> Pager<'a, 'b> {
         y: f32,
         base_size: f32,
     ) {
+        if y >= self.max_y {
+            return;
+        }
         let layout = Rc::new(layout);
         // Only document text is hittable; a list marker or a language label is drawn but has no
         // document offsets to select.
         let track = self.record && !inline.origins.is_empty();
-        let source = Rc::new(inline.clone());
+        let source = track.then(|| Rc::new(inline.clone()));
         let mut images = Vec::new();
         // The layout's boxes come in the order of `inline.boxes`, spacers aside.
         let mut boxes = inline.boxes.iter();
         for line in layout.lines() {
+            if y + line.metrics().block_min_coord >= self.max_y {
+                break;
+            }
             for item in line.items() {
                 if let PositionedLayoutItem::InlineBox(inline_box) = item {
                     if inline_box.id & SPACER != 0 {
@@ -810,11 +814,16 @@ impl<'a, 'b> Pager<'a, 'b> {
         let mut lines = Vec::new();
         for line in layout.lines() {
             let metrics = line.metrics();
+            if y + metrics.block_min_coord >= self.max_y {
+                break;
+            }
             let line_height = metrics.line_height.max(1.0);
             let baseline = y + metrics.baseline;
             let top = baseline - line_height * 0.82;
             let bottom = baseline + line_height * 0.18;
-            if track && let Some(doc_start) = inline.doc_at(line.text_range().start) {
+            if let Some(source) = &source
+                && let Some(doc_start) = inline.doc_at(line.text_range().start)
+            {
                 lines.push(LineGeom {
                     top,
                     bottom,

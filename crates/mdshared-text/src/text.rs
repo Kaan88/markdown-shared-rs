@@ -274,19 +274,16 @@ impl TextEngine {
         let image = if color.is_some() {
             color
         } else if unhinted.scale_outline_into(key.glyph, &mut self.vertical.linear) {
-            if can_hint_at_size(font_ref, size) {
-                let mut hinted = self
-                    .scaler
-                    .builder(font_ref)
-                    .size(size)
-                    .hint(true)
-                    .normalized_coords(coords)
-                    .build();
-                if hinted.scale_outline_into(key.glyph, &mut self.vertical.hinted) {
-                    self.vertical.fit();
-                }
-            }
-            Some(self.vertical.render(format, offset))
+            let fitted = if can_hint_at_size(font_ref, size)
+                && self
+                    .vertical
+                    .draw_hinted(font_ref, font.index, key.glyph, size, coords)
+            {
+                self.vertical.fit(size, format, offset)
+            } else {
+                None
+            };
+            fitted.or_else(|| self.vertical.render(format, offset))
         } else {
             None
         };

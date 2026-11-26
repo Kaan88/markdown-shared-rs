@@ -69,8 +69,8 @@ pub struct PageLayout {
 
 impl PageLayout {
     /// A layout whose blocks all carry the given (estimated) heights.
-    pub(super) fn new(doc: &Document, options: &Options, spans: Vec<BlockBox>, top: f32) -> Self {
-        let scale = options.scale.max(0.1);
+    pub(super) fn new(doc: &Document, options: &Options, spans: Vec<BlockBox>) -> Self {
+        let scale = options.layout_scale();
         let count = spans.len();
         let mut page = PageLayout {
             spans,
@@ -81,14 +81,14 @@ impl PageLayout {
                 notes: Vec::new(),
                 measure: Measure::Estimated,
             },
-            top,
+            top: (36.0 * scale).round(),
             bottom: (24.0 * scale).round(),
             total_height: 0.0,
             dirty: 0,
             generation: 0,
             estimated: count,
             width: options.width,
-            scale: options.scale,
+            scale,
             theme: options.theme.key(),
             shape: (doc.text.len(), doc.blocks.len()),
         };
@@ -168,7 +168,7 @@ impl PageLayout {
 
     pub fn matches(&self, options: &Options) -> bool {
         self.width == options.width
-            && (self.scale - options.scale).abs() < 0.001
+            && (self.scale - options.layout_scale()).abs() < 0.001
             && self.theme == options.theme.key()
     }
 

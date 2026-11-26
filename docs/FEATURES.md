@@ -4,17 +4,67 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Mouse editing in a single-line field (`mdshared_ui::textfield`)
+
+Keep one `Pointer::system(scale)` per `TextField`. Pass the same text rectangle, face, font
+size and scale to `FieldHit` that the field draws with. `FieldHit::cursor` requests the I-beam;
+`Pointer::press` accepts a primary press inside the field, which the caller can then focus.
+The field uses Parley's visual clusters from one shaped line for hits, carets, and selection
+bands; one logical range can draw as several bands in bidi text. The pointer won't split
+a grapheme inside a shaping run (for example, decomposed `e` plus an accent). Parley 0.12
+can split a grapheme at a font-run boundary, and the existing password display still uses
+one dot per character. `pointer_move` extends the selection from the initial click or Shift anchor; double
+click selects a word and triple click selects all. The caller routes moves and releases even
+outside the field, schedules a wake at `deadline()` for `tick()`, and cancels on loss of focus.
+At a horizontal edge the drag advances through hidden text, even with the pointer at rest,
+and stops at the end or on release. `clicks::ClickCounter`, also used by the host, can be used
+directly for a multi-line composer or the `seltext` paragraph.
+
+On a right press, cancel the drag and open a `menu::Menu` or `submenu::Cascade` with
+`TextField::context_menu()`. The right press need not change the selection. Hand the chosen
+item back to `apply_context_action`. Cut deletes only after a successful clipboard write.
+Paste fetches text once, rejects more than `MAX_PASTE_BYTES` (64 KiB of UTF-8 before
+cleaning) without changing the selection, and turns line separators and tabs into spaces.
+Opening the menu never reads the paste payload: Windows and macOS ask for its format;
+Linux's arboard backend lacks that query, so it offers Paste and checks the size after its
+single fetch. Windows limits the UTF-16 scan before decoding and writes with a private
+message-only owner window. macOS checks the native string length before converting it.
+Keyboard paste checks permission and the secret flag before any read; it still takes the
+first line. `selection_for_export` returns nothing for a secret; `text()` and
+`selected_text()` are raw owner access. Debug hides secret field and settings row values,
+and hides IME text and settings text values whose types carry no secret flag. `set_preedit`
+discards invalid cursor offsets. The old low-level pointer signatures are unchanged;
+applications opt into shaped mouse hits by routing events to `Pointer`.
+
+Try `cargo run -p mdshared-ui --features host --example textfield` with the mixed-direction
+and secret fields. On Windows with Rust 1.99.1, formatting, workspace Clippy and tests with
+`host,a11y`, the catalogue check, and the example build passed. The review workspace run
+passed 2,387 tests; 45 were ignored and four `explorer_tests` cases were explicitly skipped.
+Tests cover selection and click thresholds, auto-scroll wake-ups, and clipboard actions with
+a fake clipboard. The drag's selection pixels match the equivalent keyboard selection; the
+test failed with the drag update bypassed. The review added RTL and accent hit tests, a
+pixel test that fails if two selection bands are merged, and a check that field drawing
+doesn't shape prefixes. The native Windows clipboard round-trip test is not ignored in
+CI; the requested local test command excludes it under `explorer_tests`. The example was
+not launched, and Linux and macOS were not run.
+
 ## Vertical-only text hinting (`mdshared_text::text`)
 
-On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
-skrifa to preserve linear metrics, but that is not a guarantee of bit-identical X coordinates:
+On an eligible monochrome glyph cache miss, swash scales the unhinted outline and the fitter
+draws the hinted outline through skrifa with swash's smooth LCD settings. Preserving linear
+metrics is not a guarantee of bit-identical X coordinates:
 the hinted draw can use different scaling precision. Skrifa can return a rounded TrueType
-advance from that draw; swash uses only the outline and discards the returned metrics. The
+advance from that draw; the fitter uses only the outline and discards the returned metrics. The
 rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
 commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
-rather than risking a bad point match. The existing quarter-pixel X phases, subpixel offsets,
-colour glyph sources, and blending are unchanged. Parley still supplies all positions and
-advances; no API or dependency was added.
+rather than risking a bad geometric match. A fit is also rejected if any Y moves more than
+four ems or if the combined outline leaves a box extending four ems from the origin in every
+direction. Both monochrome paths reject coordinates outside ±4096 device px, masks with a
+side over 8192 px, and masks over 4 MiB (one byte per alpha pixel or four per LCD pixel).
+The fitter keeps the unhinted outline if only the fit fails; if neither can be rasterized,
+the glyph draws no ink. The existing quarter-pixel X phases, subpixel offsets, colour glyph
+sources, and blending are unchanged. Parley still supplies all positions and advances;
+the public API is unchanged.
 
 At fractional device sizes, the fitter first checks bit 3 of the font's OpenType
 `head.flags`. If it is set (or cannot be read), the fitter skips hinting: skrifa's
@@ -44,16 +94,41 @@ grid in both themes. See `E:/mds-target/vhint/shots/review/{unhinted,before,afte
 The review fix changed 143 pixels on the 125% UI sheet; the other five sheets did not
 change from the pre-fix render.
 
-**Left open for review:**
+**Finding 1 fixed (Astra review, 2026-11-26):** Swash 0.2.10 can return a partly fitted
+TrueType outline after a glyph-program error. The fitter now draws with
+`DrawSettings::hinted(instance, true)` and keeps the unhinted outline on error, before any
+geometric checks or Y replacement. With owner approval it names `skrifa = "=0.44.0"`
+directly; this is the version already used by swash in `Cargo.lock`. A synthetic test
+moves the top edge one pixel before the program errors and verifies unhinted masks in
+all three modes at all four X phases. The same program without the error matches the
+previous hinted masks at those phases.
 
-- The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only runs on
-  Windows; the UI asks for Segoe UI Variable Text first. All the hinting tests, including the
-  cache-key test that needs no Segoe UI, are `cfg(windows)`, so Linux and macOS CI check none
-  of this.
+### Left open from the Astra review (2026-11-26)
+
+- **Finding 3 — Point correspondence.** Matching commands and point counts with X within 1/16 px is a
+   geometric check, not proof of point identity. TrueType on-curve flags can change contour
+   construction, and in CFF/CFF2 different degenerate segments can disappear after scaling.
+   An accepted path has the hinted commands and Y and the exact unhinted X. Source-point
+   correspondence would be needed if point identity became a requirement.
+- **Finding 4 — Grayscale hint target.** `Subpixel::None` produces one coverage value, but still uses
+   the same smooth horizontal LCD hint target as RGB and BGR. A font can choose different
+   stem adjustments for a grayscale hint target; that target is not selected here.
+- **Finding 5 — Fractional CFF/CFF2.** The `head.flags` check can skip fitting for these outlines even
+   though skrifa supports fractional sizes for them. The fallback is the unhinted mask at
+   the requested size.
+- **Finding 6 — Portable coverage.** The cache-key test no longer has a Windows gate. A synthetic
+   TrueType fixture checks a rejected fit against the legacy alpha, RGB and BGR masks at
+   all four X phases. The installed-Segoe tests remain Windows-only and exercise static
+   Segoe UI, not Segoe UI Variable Text. Portable comparisons for composite, variable and
+   CFF/CFF2 outlines are still open.
+
+**Other open questions:**
+
 - Outline-matching fallback happens glyph by glyph and is not counted.
-- A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
-  hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
-  has not been measured.
+- A cold eligible miss scales the outline twice and runs the hinter. Like swash, the fitter
+   caches eight hinting instances per format group (TrueType, CFF/CFF2, other), keyed by
+   face, exact device size and normalized coordinates. A busy page can make it rebuild them.
+   Cold-cache cost has not been measured.
 - The exact-size cache key also drops the old 1/64 px bucketing for unhinted glyphs, so sizes
   that differ only by float noise no longer share masks (fewer hits, not wrong pixels). Keying
   on "hinted or not" plus the old bucket would keep the old hit rate.
@@ -64,6 +139,13 @@ Windows verification: formatting, workspace Clippy and tests with `host,a11y` (t
 excluded `explorer_tests`), `term` Clippy and `termview` tests, and the UI ignored tests
 without a specimen directory override passed. No existing pixel test expectation needed
 updating. The full release CI matrix was not run.
+
+For the Astra bounds fix, the Windows workspace Clippy and test checks with `host,a11y`
+(`explorer_tests` excluded), formatting and the catalogue check passed on Rust 1.99.1.
+The synthetic regressions fail without the corresponding geometry or mask-size guards.
+For the pedantic draw, those checks passed again, and the Windows release renderer suite
+passed with the existing goldens and an explicit `MDV_ENGINE` path. Linux `mdshared-text`
+Clippy with a `pkg-config` stub type-checked only; nothing was linked or run on Linux.
 The sheets have not been judged by a person or checked in a running application. Linux and
 macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
 
@@ -3155,3 +3237,70 @@ workspace tests (2,370 passed, four Explorer tests filtered), release render (14
 and release preview with `server` (20 passed). The catalogue check passed. On local
 Rust 1.100.0, Clippy additionally flagged an unrelated range loop in `sections_tests.rs`;
 no change was made there. Linux and macOS were not run for this refresh.
+
+The Astra follow-up checks local image names before touching the filesystem, rejects
+relative names without an absolute document directory, and reads only regular file
+handles. Linux and macOS open first with `O_NONBLOCK` so a FIFO cannot wait for a writer.
+Default SVG options ignore external image references. Applications look only beside
+the running executable or at an explicit absolute engine path. WebP stills and animation
+frames use a bounded header walk to check bitstream dimensions before decoding.
+
+The preview passes its device size separately from the minimum text column, and the
+renderer caps full-page and viewport raster bytes before allocation. A clipped table
+lays out a prefix of rows that can reach the height limit; the reported content height
+describes the measured prefix, not a second full layout. Inline math delimiter searches
+and the span walks for HTML export and rich copy no longer rescan the same suffix or
+paragraph for each opener or child.
+
+### Left open from the Astra review (2026-11-26)
+
+- **10 — Engine supervision:** reap a normally idle-exited helper without waiting for
+  another job; start execution deadlines when the job starts and handle queue expiry separately.
+- **11 — Preview message size:** a full 8192 × 8192 bitmap plus the fixed 72-byte update
+  overhead is eight bytes above the reader's limit. Budget the full serialized update,
+  including optional metadata, and enforce the same limit in the writer.
+- **12 — Peer dimensions:** fixed in this follow-up. Check both preview band bounds and
+  engine reply dimensions before multiplying or moving kept pixels.
+- **13 — Preview request queue:** enforce per-kind lengths before allocating and bound
+  queued work; coalesce superseded revisions without reordering input.
+- **14 — Clipboard offsets:** fixed in this follow-up. Rich copy declines offsets inside
+  a UTF-8 character.
+- **15 — Layout cache identity:** a replacement document of the same byte length and
+  block count can match the existing cache. The preview already calls `layout` on `Text`;
+  other callers need to invalidate explicitly until the renderer has a revision key.
+- **16 — Decoder input:** fixed in this follow-up. Check the image input cap at ingress
+  and engine request lengths before assembling or copying the payload.
+
+Checked on Windows with Rust 1.99.1: format, workspace Clippy and tests with `host,a11y`
+(2,383 passed; four Explorer tests excluded), the catalogue, preview-server Clippy, release
+renderer (156 passed, including all eight unchanged goldens), and release preview server
+(22 passed). Nine regression tests failed when their corresponding fixes were temporarily
+disabled. The FIFO test was cross-checked by Clippy for Linux and both macOS targets;
+it was not linked or run on Unix. No application visuals were reviewed by a person.
+
+Re-review follow-up: #1 now rejects a host base before normalization, including a
+double-slash spelling on Unix. On Windows a caller-supplied canonical local drive
+base is accepted; document-supplied device and UNC paths are still refused. For #3,
+only renderer unit tests search ancestors; shipping with debug assertions does not
+enable that search. The direct renderer uses one normalized scale for page margins,
+layout and hit tests. These four re-review items are closed; #10, #11, #13 and #15
+remain open.
+
+All four re-review regressions failed before the fixes and passed after them on Windows.
+Format, workspace Clippy with `host,a11y`, preview-server Clippy and the catalogue check
+passed. Release renderer tests passed (159 passed, two ignored), including all eight
+goldens, whose hashes did not change. Release preview-server tests passed (22 passed).
+Linux renderer Clippy passed with the `pkg-config` stub; Unix runtime behavior was not tested.
+
+PR #53 Windows CI: the `render` integration tests shared engine configuration. The
+source-hit test could set the engine path between another test's full-page and slice
+renders. Forcing that order reproduced `4663.8486 vs 3622` exactly. The suite now
+sets up the engine before rendering fixtures, and the slice comparison still checks
+the original height and pixel assertions with a second engine lookup between renders.
+This did not involve the layout cache; #15 remains open.
+On Windows with Rust 1.99.1, the regression passed in isolation and the entire render
+integration binary passed 60 runs with 64 test threads. Format, workspace Clippy with
+`host,a11y`, the catalogue, release render (159 passed) and release preview server
+(22 passed) passed. Release workspace tests passed (2,304 passed, four Explorer tests
+excluded to leave the desktop alone). All eight golden hashes were unchanged.
+CI, Linux and macOS were not rerun for this test-only change.

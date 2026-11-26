@@ -99,7 +99,6 @@ impl DocumentRenderer {
     /// A fresh layout with every height still zero and nothing measured.
     pub(super) fn start_layout(&mut self, doc: &Document, options: &Options) {
         self.drop_layout();
-        let scale = options.scale.max(0.1);
         let spans = doc
             .children(NONE)
             .map(|block| super::BlockBox {
@@ -109,7 +108,7 @@ impl DocumentRenderer {
             })
             .collect();
         self.floats = FloatBook::new(doc, doc.children(NONE));
-        let mut page = PageLayout::new(doc, options, spans, (36.0 * scale).round());
+        let mut page = PageLayout::new(doc, options, spans);
         if !doc.footnotes.iter().any(|f| f.number > 0 && f.defined) {
             let count = page.len();
             page.set(count, 0.0, Measure::Exact);

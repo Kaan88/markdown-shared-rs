@@ -408,6 +408,10 @@ fn a_slice_matches_the_same_rows_of_the_full_page() {
     };
     let full = render(&doc, &options);
     assert!(full.bitmap.height > 700, "{}", full.bitmap.height);
+    // Exercise the order that failed in CI: the source-hit test asks for the engine
+    // after the whole-page render but before the slice. Fixture setup must already
+    // have made that decision, so this call cannot change what the slice draws.
+    engine_available();
     let slice = render_slice(&doc, &options, 200.0, 300.0);
     assert_eq!(slice.bitmap.width, full.bitmap.width);
     assert_eq!(slice.bitmap.height, 300);

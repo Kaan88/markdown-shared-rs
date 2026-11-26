@@ -58,7 +58,7 @@ mod unchanged;
 
 /// The value of one control, as it comes back in [`Outcome::Changed`] and goes in
 /// [`Form::set_value`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Bool(bool),
     /// An index into the row's options.
@@ -69,7 +69,7 @@ pub enum Value {
 
 /// One row of the form. `id` is the application's own number for the setting; `help` is one line
 /// under the label, or empty.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Row {
     /// Starts a group; the groups become the category list when there is more than one.
     Header(String),
@@ -114,6 +114,8 @@ pub enum Row {
         button: String,
     },
 }
+
+mod diagnostic;
 
 impl Row {
     pub fn header(text: impl Into<String>) -> Row {

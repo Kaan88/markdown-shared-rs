@@ -155,5 +155,9 @@ name = "host_regions"
 required-features = ["host"]
 
 [[example]]
+name = "textfield"
+required-features = ["host"]
+
+[[example]]
 name = "term_backdrop"
 required-features = ["host", "term"]

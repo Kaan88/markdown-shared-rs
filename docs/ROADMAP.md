@@ -32,6 +32,7 @@ something that cannot be tested headless).
 
 | Question | Answer |
 |---|---|
+| Reject partial vertical hinting (TS1) | 2026-11-26: use `skrifa = "=0.44.0"` directly in `mdshared-text` for pedantic glyph draws. Match the version already resolved for swash; do not add a second version. |
 | Markdown viewing (X13) | 2026-11-26: “markdown viewing is useful for many apps. shared it is.” Move the page renderer into this toolkit. |
 | JPEG and other decoders (F6, M5, F5) | `zune-jpeg =0.5.15`, pure Rust, behind the image module's decoder slot |
 | Accessibility (W8) | AccessKit: `accesskit` + `accesskit_winit`, behind an opt-in feature `a11y` |
@@ -61,7 +62,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
-| CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around, when convenient; CS1 and CS2 first (below) | CS1-CS15 |
+| CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around and the font settings it asked for, when convenient; CS1 and CS2 first (below) | CS1-CS18 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
 ## Shell and window
@@ -92,6 +93,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | L7 | **Drag and drop inside a window.** A drag that starts after a threshold, a drag image, drop targets that light up, drop position between rows, auto-scroll at the edges, files dropped from the system (winit's hover and drop of paths) | M | medium | none | `rows`, `grid`, `select`, `anim` | open |
 | L8 | **Dragging files out to other applications**, which winit does not do and needs OLE, XDND/Wayland data devices and NSDraggingSource | L | high | none (three systems' glue, `unsafe`) | L7, `platform` | open |
 | L9 | **Files and images on the clipboard.** Copy and cut of file lists (with the "cut" flag file managers honour), paste of them; an image as pixels, both ways | M | high | decided: hand-written formats | `platform` clipboard, `cf_html` as the pattern for a pure format | open |
+| L13 | **Mouse editing in a single-line field.** Click, drag, Shift+click, double/triple click, edge scrolling and an edit menu | S | low | additive API | `textfield`, `menu`, `platform` | implemented on `feat/textfield-mouse`; see `textfield::Pointer`, `clicks::ClickCounter` and `examples/textfield.rs`; app wiring and visual review still required |
 | L11 | **A menu's look.** The corners, the shadow, the row height, the padding, the hover's shape, the separator's gap and the submenu's gap of `menu::Menu` and `submenu::Cascade` as an opt-in `menu::Look`, for an application whose own chrome is square and flat (mdplay: its toolbar has no shadows, and the rounded, shadowed drop-down clashed with it). The default is today's look, pixel for pixel; a flat preset beside it | S | low | none (the look changes only for an application that opts in) | `menu`, `submenu`, `tokens::Sizes::radius_popup` | done, on main (PR #11): `menu::Look`, `Menu::with_look`/`set_look`, `Cascade::with_look`; seen in mdplay's mockup, not yet by the owner |
 | L10 | **Settings form with motion and the new widgets.** `settings::Form` draws its own switches, ticks and scrollbar; give it an animator and a slider row | M | medium | none | `settings`, `slider`, `anim`; must stay pixel-identical when not opted in | done, on main: `Form::draw_animated` (switches slide, the chosen segment slides, the row, category and dropdown-menu hover fills fade, the scrollbar widens, a slider's thumb glides; highlights at once after `Form::set_high_contrast`); a number row drawn and moved as a slider after `Form::show_as_slider(id)` (no new `Row` variant; the value stays `Value::Number`), with `Form::pointer` and `slider_rect`; the paged form draws such a row as its stepper. Pixel-tested: `draw` at rest and under `Policy::Never`, different in motion; the existing freezes pass. The form has no check box, so there is no tick to animate. Not seen by a person in a running app |
 | L12 | **The look as a user setting.** A scheme (dark, light, warm, cool), where the accent comes from (the theme, the system, the cover, a colour), the corners, the shadows' strength, the menu's rows, menus joined to the control that opens them, the speed of motion and the submenu's delay, as plain data an application saves in one setting and applies (mdplay makes its whole look a setting, D-024); the menu's shadow strength and the joined tab with its fillets drawn by `menu` | M | low | none (the look changes only for an application that opts in) | `tokens::accented`, `theme`, `menu::Look`, `anim::fluent`, `mdshared_app::settings` | done, on main (PR #11); for mdplay's look, D-024: `appearance` (86afe1b), `menu::joins`/`join_under`/`join_over` (09ea256), `Painter::shadow_with` and `Look::shadow_strength` (e8a9df8); the prototype's soft shadows `Painter::soft_shadow` (9bebfcd), `Look::soft_shadow` (b4eb980) and the form's `settings::Style` (b1211de); not yet seen by the owner nor used by an application |
@@ -280,6 +282,9 @@ given in brackets. Already covered here: plain and icon buttons outside dialogs 
 [3] and a badge [4] are K4; dropping files is K8; pictures on the clipboard are L9. When an item
 lands on `main`, tell the Claude Switch session the commit, so the app can raise its pin.
 
+Claude Switch also asked for CS16–CS18, the font settings below; the owner approved them on
+2026-11-26.
+
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
 | CS1 | **A translucent terminal background** [15]. `termview` draws the default background (and, if asked, the padding round the grid) at a chosen opacity over the window backdrop (Mica, Acrylic, frost), while glyphs, explicit cell backgrounds, the selection and the cursor stay opaque; a contrast floor keeps text readable on any desktop colour | M | high | `termview`, `Painter::set_frost_key`, X11 | done on `feat/cs1-translucent-bg`: per-pixel alpha independent of the chrome veil; opaque fallback; Windows smoke and pixel tests, not visually inspected in a live window |
@@ -297,6 +302,9 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 | CS13 | **Getters on `mdshared_pty::Command`** [9] besides `program()`: the arguments, the folder, the environment | S | low | `mdshared-pty` | open |
 | CS14 | **`host::App::raw` without a winit type the toolkit does not re-export** [11]: re-export it, or give `raw` a type of the toolkit's | S | medium | `host` | open |
 | CS15 | **The settings forms** [17, 18]: colour rows and a card style on `settings::pages::Form`; the grouped form's style reaching its own dropdown menus and colour-picker flyouts | M | medium | `settings`, `settings::pages`, `menu::Look` | open |
+| CS16 | **List the installed font families.** Give each family once, sorted by name, with a monospace flag. Use the fontique collection `mdshared_text::fonts::shared_fonts` already loads; read `post.isFixedPitch` and PANOSE, and cross-check against equal glyph advances. Done when a test finds at least one monospace and one proportional family on each OS, and the API is in the catalogue | S | medium | `mdshared_text::fonts`, fontique | open |
+| CS17 | **Let the app choose the painter's fonts.** An additive setter in `gfx` for the interface family, the monospace family and a size scale. Changing any of them triggers a relayout and repaint; the private `UI_FAMILY` and `MONO_FAMILY` stay the defaults. Done when a pixel test shows the chosen family in buttons, menus and fields and the defaults are byte-identical | S-M | medium | `gfx`, `mdshared_text::fonts` | open |
+| CS18 | **A font-picker row for settings.** Closed, it shows the family in its own face and the size. The popup has a search field above the CS16 list, names drawn in their own faces, a preview line and a monospace-only filter. Apply, Cancel and a click outside work as they do in the colour picker. Depends on CS16 and the colour picker confirm fix | S | medium | `settings`, `colour_picker`, `textfield`, CS16 | open |
 
 ## Left over from what exists
 

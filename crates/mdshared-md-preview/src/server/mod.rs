@@ -137,7 +137,7 @@ impl Server {
                 // tens of gigabytes (audit 4, E10).
                 let (width, height) = (width.min(wire::MAX_SIDE), height.min(wire::MAX_SIDE));
                 let scale = if scale.is_finite() && scale > 0.1 {
-                    scale
+                    scale.min(8.0)
                 } else {
                     1.0
                 };
@@ -490,14 +490,14 @@ impl Server {
         if !self.dirty {
             return None;
         }
-        let (Some(doc), Some((_, height))) = (&self.doc, self.size) else {
+        let (Some(doc), Some(size)) = (&self.doc, self.size) else {
             return None;
         };
         self.dirty = false;
         let started = Instant::now();
         let frame = self
             .renderer
-            .view_frame(doc, &self.options, self.top, height as f32);
+            .view_frame_sized(doc, &self.options, self.top, size);
         let (width, rows) = (frame.bitmap.width, frame.bitmap.height);
         let row = width as usize * 4;
         let band = if self.whole { None } else { frame.band };
