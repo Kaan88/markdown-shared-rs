@@ -269,15 +269,18 @@ impl PageTransition {
     /// `rebase` with the old page drawn at the new place.
     /// Returns whether the switch is still running.
     ///
-    /// The blend is of the whole region and does not heed the painter's clip.
+    /// The blend is of the whole region and does not heed the painter's clip. Fades use the
+    /// painter's frost key to mix marked chrome with premultiplied pixels as they will appear.
+    /// Cancel the switch or replace the old snapshot if the frost key changes between frames.
     pub fn apply(&mut self, anim: &mut Animator, p: &mut Painter, r: Rect) -> bool {
         let rect = p.dev_rect(r);
         let scale = p.scale;
-        self.apply_dev(anim, p.bmp, rect, scale)
+        let key = p.frost_key().copied();
+        self.apply_with_key(anim, p.bmp, rect, scale, key.as_ref())
     }
 
     /// As [`apply`](Self::apply), for a device rectangle (far edges outside) of a bitmap held
-    /// without a painter, as [`begin_dev`](Self::begin_dev) takes them. `rect` and `scale` are
+    /// without a painter or frost key, as [`begin_dev`](Self::begin_dev) takes them. `rect` and `scale` are
     /// this frame's; the switch ends if they, or the bitmap's size, are not those of its start.
     pub fn apply_dev(
         &mut self,
@@ -285,6 +288,17 @@ impl PageTransition {
         bmp: &mut Bitmap,
         rect: (i32, i32, i32, i32),
         scale: f32,
+    ) -> bool {
+        self.apply_with_key(anim, bmp, rect, scale, None)
+    }
+
+    fn apply_with_key(
+        &mut self,
+        anim: &mut Animator,
+        bmp: &mut Bitmap,
+        rect: (i32, i32, i32, i32),
+        scale: f32,
+        key: Option<&crate::frost::Key>,
     ) -> bool {
         let Some(old) = &self.old else {
             return false;
@@ -309,15 +323,16 @@ impl PageTransition {
         // How far the new page still is from its place, of the way it has to go.
         let left = 1.0 - self.easing.at(t);
         match self.effect {
-            PageEffect::Crossfade => old.crossfade(bmp, 1.0 - left),
+            PageEffect::Crossfade => old.crossfade_keyed(bmp, 1.0 - left, key),
             PageEffect::SlideFade { from, distance } => {
                 let (ux, uy) = from.direction();
                 let d = distance * self.scale * left;
-                old.slide_fade(
+                old.slide_fade_keyed(
                     bmp,
                     (ux * d).round() as i32,
                     (uy * d).round() as i32,
                     t * 2.0,
+                    key,
                 );
             }
             PageEffect::Push { from } => {
@@ -345,6 +360,56 @@ mod tests {
     const GREEN: [u8; 3] = [0, 200, 0];
     const BACK: [u8; 3] = [9, 9, 9];
     const REGION: Rect = Rect::new(10.0, 5.0, 40.0, 20.0);
+
+    #[test]
+    fn page_fades_mix_marked_chrome_and_translucent_pixels_as_shown_in_both_directions() {
+        use crate::frost::{Key, key_out};
+        let chrome = [255, 255, 255, 254];
+        let translucent = [180; 4];
+        let key = Key::new([255; 3], 0);
+        for (effect, halfway) in [
+            (PageEffect::Crossfade, 50),
+            (
+                PageEffect::SlideFade {
+                    from: Edge::Right,
+                    distance: 2.0,
+                },
+                25,
+            ),
+        ] {
+            for (old, new) in [(chrome, translucent), (translucent, chrome)] {
+                let area = Rect::new(0.0, 0.0, 4.0, 1.0);
+                let mut r = Rig::sized(4, 1, area);
+                let paint = |bmp: &mut Bitmap, px| {
+                    bmp.pixels.as_chunks_mut::<4>().0.fill(px);
+                };
+                paint(&mut r.bmp, old);
+                let mut p = Painter::new(&mut r.bmp, &mut r.gfx, 1.0);
+                p.set_frost_key(Some(key));
+                r.tr.begin(&mut r.anim, &p, area, effect);
+                for (ms, expected) in [(0, old), (halfway, [90; 4]), (100 - halfway, new)] {
+                    r.clock.advance_ms(ms);
+                    r.anim.begin_frame(r.clock.now());
+                    paint(&mut r.bmp, new);
+                    let mut p = Painter::new(&mut r.bmp, &mut r.gfx, 1.0);
+                    p.set_frost_key(Some(key));
+                    r.tr.apply(&mut r.anim, &mut p, area);
+                    r.anim.end_frame();
+                    assert_eq!(
+                        r.bmp.pixels,
+                        expected.repeat(4),
+                        "{effect:?}, {old:?}, +{ms}ms"
+                    );
+                    if expected == [90; 4] {
+                        let mut pixels =
+                            [u32::from_le_bytes(r.bmp.pixels[..4].try_into().unwrap())];
+                        key_out(&key, &mut pixels, 1, (0, 0, 1, 1));
+                        assert_eq!(pixels, [0x5a5a_5a5a]);
+                    }
+                }
+            }
+        }
+    }
 
     fn at(bmp: &Bitmap, x: u32, y: u32) -> [u8; 3] {
         let o = ((y * bmp.width + x) * 4) as usize;

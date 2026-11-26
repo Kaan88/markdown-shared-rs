@@ -92,15 +92,6 @@ pub(super) fn replace(p: &mut Painter, rect: (i32, i32, i32, i32), [r, g, b]: Rg
     }
 }
 
-/// Makes sure the chrome key pass does not mistake already composited ink for chrome.
-pub(super) fn finish(p: &mut Painter, rect: (i32, i32, i32, i32)) {
-    for row in rows(p, rect) {
-        for px in row.as_chunks_mut::<4>().0 {
-            px[3] = avoid_mark(px[3]);
-        }
-    }
-}
-
 /// Blends a partly covered box-drawing piece. On opaque pixels keep the painter's exact
 /// rounding; on translucent pixels the source covers RGB and alpha together.
 pub(super) fn blend_piece(p: &mut Painter, rect: (i32, i32, i32, i32), rgb: Rgb, alpha: f32) {

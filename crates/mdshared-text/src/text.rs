@@ -108,12 +108,19 @@ struct Key {
     coords: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GlyphPixels {
+    Mask,
+    StraightRgba,
+    PremultipliedRgba,
+}
+
 struct Entry {
     left: i32,
     top: i32,
     w: u32,
     h: u32,
-    color: bool,
+    pixels: GlyphPixels,
     data: Box<[u8]>,
     /// The engine's tick when this glyph was last drawn, for least-recently-used eviction.
     last_used: u64,
@@ -294,27 +301,36 @@ impl TextEngine {
                 top: 0,
                 w: 0,
                 h: 0,
-                color: false,
+                pixels: GlyphPixels::Mask,
                 data: Box::new([]),
                 last_used: tick,
             };
         };
         let (w, h) = (image.placement.width, image.placement.height);
-        let (color, data): (bool, Box<[u8]>) = match image.content {
-            Content::Color => (true, image.data.into_boxed_slice()),
+        let (pixels, data) = match image.content {
+            Content::Color => {
+                // Swash layers colour outlines onto transparent pixels, but bitmap strikes
+                // carry straight RGBA. Keep the distinction until the glyph is composited.
+                let pixels = if matches!(image.source, Source::ColorOutline(_)) {
+                    GlyphPixels::PremultipliedRgba
+                } else {
+                    GlyphPixels::StraightRgba
+                };
+                (pixels, image.data.into_boxed_slice())
+            }
             Content::SubpixelMask => {
                 let mut data = Vec::with_capacity((w * h * 3) as usize);
                 for pixel in image.data.as_chunks::<4>().0 {
                     data.extend_from_slice(&pixel[..3]);
                 }
-                (false, data.into_boxed_slice())
+                (GlyphPixels::Mask, data.into_boxed_slice())
             }
             Content::Mask => {
                 let mut data = Vec::with_capacity((w * h * 3) as usize);
                 for &a in &image.data {
                     data.extend_from_slice(&[a, a, a]);
                 }
-                (false, data.into_boxed_slice())
+                (GlyphPixels::Mask, data.into_boxed_slice())
             }
         };
         Entry {
@@ -322,7 +338,7 @@ impl TextEngine {
             top: image.placement.top,
             w,
             h,
-            color,
+            pixels,
             data,
             last_used: tick,
         }
@@ -394,6 +410,10 @@ impl TextEngine {
     /// On a premultiplied translucent destination, blends ink with a single coverage for
     /// all three channels so the edge composites correctly over an unknown backdrop. Colour
     /// glyphs use their own colours and alpha. Pixels with zero coverage are left alone.
+    ///
+    /// This is plain premultiplied blending: alpha can become 254. If using `mdshared-ui`'s
+    /// frosted chrome key, keep marked chrome out of the destination and finish the drawn
+    /// region with `mdshared_ui::frost::finish_premultiplied` before presenting it.
     #[allow(clippy::too_many_arguments)] // same coordinates and tint as the existing draw
     pub fn draw_layout_clipped_tinted_premultiplied(
         &mut self,
@@ -522,7 +542,11 @@ fn blit(
         lut.channel(brush[1]),
         lut.channel(brush[2]),
     );
-    let bpp = if entry.color { 4 } else { 3 };
+    let bpp = if entry.pixels == GlyphPixels::Mask {
+        3
+    } else {
+        4
+    };
     let cs = x0.max(clip.0);
     let ce = (x0 + w).min(clip.2);
     for row in y0.max(clip.1)..(y0 + h).min(clip.3) {
@@ -534,7 +558,7 @@ fn blit(
         let n = (ce - cs) as usize;
         let src = &entry.data[so..so + n * bpp];
         let dst = &mut fb.pixels[d0..d0 + n * 4];
-        if entry.color {
+        if entry.pixels != GlyphPixels::Mask {
             for (s, d) in src
                 .as_chunks::<4>()
                 .0
@@ -546,11 +570,18 @@ fn blit(
                     continue;
                 }
                 if premultiplied && d[3] < 255 {
-                    crate::bitmap::blend_premultiplied(d, [s[0], s[1], s[2]], s[3]);
+                    if entry.pixels == GlyphPixels::PremultipliedRgba {
+                        for (dst, src) in d.iter_mut().zip([s[2], s[1], s[0], s[3]]) {
+                            let keep = (u32::from(*dst) * (255 - a) + 127) / 255;
+                            *dst = src.saturating_add(keep as u8);
+                        }
+                    } else {
+                        crate::bitmap::blend_premultiplied(d, [s[0], s[1], s[2]], s[3]);
+                    }
                     continue;
                 }
                 let ia = 255 - a;
-                // swash emits straight-alpha RGBA; the framebuffer is BGRA.
+                // Keep the opaque drawing's historical interpretation of both colour sources.
                 d[0] = ((s[2] as u32 * a + d[0] as u32 * ia + 127) / 255) as u8;
                 d[1] = ((s[1] as u32 * a + d[1] as u32 * ia + 127) / 255) as u8;
                 d[2] = ((s[0] as u32 * a + d[2] as u32 * ia + 127) / 255) as u8;
@@ -609,21 +640,80 @@ mod tests {
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
 
     #[test]
+    #[cfg(windows)]
+    fn a_swash_colour_outline_keeps_its_premultiplied_edge_on_translucent_pixels() {
+        let path = std::path::Path::new(&std::env::var_os("WINDIR").unwrap_or_default())
+            .join("Fonts/seguiemj.ttf");
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skipping colour outline test: Segoe UI Emoji is absent");
+            return;
+        };
+        let font = FontData::new(bytes.into(), 0);
+        let glyph = FontRef::from_index(font.data.as_ref(), 0)
+            .unwrap()
+            .charmap()
+            .map('😀');
+        let mut engine = TextEngine::new(1 << 20);
+        let size = 32.0_f32;
+        let entry = engine.raster(
+            Key {
+                font: font.data.id(),
+                index: 0,
+                glyph,
+                size: size.to_bits(),
+                sub: 0,
+                coords: 0,
+            },
+            &font,
+            std::iter::empty(),
+            size,
+        );
+        assert_eq!(entry.pixels, GlyphPixels::PremultipliedRgba);
+        let mut bmp = Bitmap::new(entry.w, entry.h);
+        let clip = (0, 0, entry.w as i32, entry.h as i32);
+        let at = (-entry.left, entry.top);
+        bmp.pixels.fill(0);
+        blit(&mut bmp, clip, &entry, at, [0; 4], &engine.lut, true);
+        let mut edges = 0;
+        for (rgba, bgra) in entry
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(bmp.pixels.as_chunks::<4>().0)
+        {
+            let [r, g, b, a] = *rgba;
+            if (1..255).contains(&a) && r.max(g).max(b) > 0 {
+                assert_eq!(*bgra, [b, g, r, a]);
+                edges += 1;
+            }
+        }
+        assert!(
+            edges > 0,
+            "the colour outline must exercise partial coverage"
+        );
+    }
+
+    #[test]
     fn partial_glyph_coverage_composites_over_black_and_white_without_a_halo() {
         let lut = Lut(Box::new(std::array::from_fn(|_| {
             std::array::from_fn(|i| if i == 1 { 0 } else { i as u8 })
         })));
         let ink = [220, 200, 180];
-        for (color, data, a) in [
-            (false, vec![1, 1, 1, 32, 64, 96], 64),
-            (true, vec![0, 0, 0, 0, 220, 200, 180, 64], 64),
+        for (pixels, data, a) in [
+            (GlyphPixels::Mask, vec![1, 1, 1, 32, 64, 96], 64),
+            (
+                GlyphPixels::StraightRgba,
+                vec![0, 0, 0, 0, 220, 200, 180, 64],
+                64,
+            ),
         ] {
             let entry = Entry {
                 left: 0,
                 top: 0,
                 w: 2,
                 h: 1,
-                color,
+                pixels,
                 data: data.into_boxed_slice(),
                 last_used: 0,
             };
@@ -652,7 +742,7 @@ mod tests {
                     let expected = back + (f64::from(fg) - back) * f64::from(a) / 255.0;
                     assert!(
                         (actual - expected).abs() <= 1.0,
-                        "{color}: {actual} vs {expected}"
+                        "{pixels:?}: {actual} vs {expected}"
                     );
                 }
             }

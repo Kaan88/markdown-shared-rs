@@ -46,6 +46,10 @@ pub struct Bitmap {
 
 /// Lays straight RGB ink with coverage `0..=255` over one premultiplied BGRA pixel, rounding
 /// each channel to the nearest byte. Zero coverage leaves the destination unchanged.
+///
+/// The result can have alpha 254. If using `mdshared-ui`'s frosted chrome key, do not blend
+/// into marked chrome; use `mdshared_ui::frost::finish_premultiplied` on the drawn region
+/// before presenting it.
 #[inline]
 pub fn blend_premultiplied(dst: &mut [u8; 4], rgb: [u8; 3], coverage: u8) {
     let a = u32::from(coverage);
