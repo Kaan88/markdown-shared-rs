@@ -259,10 +259,10 @@ pub(super) fn can_hide(w: &Window) -> bool {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        return !matches!(
+        !matches!(
             w.window_handle().map(|h| h.as_raw()),
             Ok(RawWindowHandle::Wayland(_))
-        );
+        )
     }
     #[cfg(any(not(unix), target_os = "macos"))]
     {
