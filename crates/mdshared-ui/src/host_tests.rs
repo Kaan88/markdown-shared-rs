@@ -6,6 +6,8 @@
 
 use super::frame::*;
 use super::input::*;
+use super::run::fire_due_timers;
+use super::timers::NamedTimers;
 use super::*;
 use crate::anim::Animator;
 use crate::anim::{Clock, ManualClock, Motion};
@@ -162,6 +164,212 @@ fn merging_joins_the_rectangles_and_keeps_a_whole_window() {
     assert!(a.full);
     a.merge(Damage::default());
     assert!(a.full);
+}
+
+// ---- regions of damage ----
+
+#[test]
+fn two_far_apart_rectangles_stay_two_pieces_with_the_gap_between_them() {
+    let a = Rect::new(10.0, 10.0, 20.0, 10.0);
+    let b = Rect::new(200.0, 100.0, 20.0, 10.0);
+    let mut d = Damage::with_pieces(true);
+    d.add(a);
+    d.add(b);
+    assert_eq!(d.regions(), &[a, b][..]);
+    assert_eq!(
+        d.pieces(1.0, 400, 300),
+        vec![(10, 10, 30, 20), (200, 100, 220, 110)]
+    );
+    // The union is one rectangle from one corner to the other, holding the gap; neither piece
+    // does, so a frame that drew the union would paint {the gap} that nothing changed.
+    assert_eq!(d.device(1.0, 400, 300), Some((10, 10, 220, 110)));
+    for &(x0, y0, x1, y1) in &d.pieces(1.0, 400, 300) {
+        assert!(
+            !(x0 <= 120 && 120 < x1 && y0 <= 50 && 50 < y1),
+            "piece holds the gap"
+        );
+    }
+}
+
+#[test]
+fn overlapping_rectangles_join_into_one_piece_and_touching_ones_do_not() {
+    let mut d = Damage::with_pieces(true);
+    d.add(Rect::new(0.0, 0.0, 20.0, 20.0));
+    d.add(Rect::new(10.0, 10.0, 20.0, 20.0));
+    assert_eq!(d.regions(), &[Rect::new(0.0, 0.0, 30.0, 30.0)][..]);
+    assert_eq!(d.pieces(1.0, 100, 100), vec![(0, 0, 30, 30)]);
+
+    let mut touching = Damage::with_pieces(true);
+    touching.add(Rect::new(0.0, 0.0, 10.0, 10.0));
+    touching.add(Rect::new(10.0, 0.0, 10.0, 10.0));
+    assert_eq!(
+        touching.pieces(1.0, 100, 100),
+        vec![(0, 0, 10, 10), (10, 0, 20, 10)]
+    );
+}
+
+#[test]
+fn a_join_that_grows_the_rectangle_restarts_the_scan_so_no_pieces_overlap() {
+    // D, then A, then C: joining C with A grows it to reach D, which the scan had passed.
+    let mut d = Damage::with_pieces(true);
+    d.add(Rect::new(0.0, 0.0, 10.0, 5.0));
+    d.add(Rect::new(20.0, 0.0, 10.0, 10.0));
+    d.add(Rect::new(0.0, 8.0, 22.0, 22.0));
+    assert_eq!(d.regions(), &[Rect::new(0.0, 0.0, 30.0, 30.0)][..]);
+}
+
+#[test]
+fn random_rectangles_leave_pieces_that_never_overlap() {
+    let mut rng = Lcg(19);
+    for _ in 0..100 {
+        let mut d = Damage::with_pieces(true);
+        for _ in 0..10 {
+            d.add(Rect::new(
+                rng.below(200) as f32,
+                rng.below(200) as f32,
+                1.0 + rng.below(80) as f32,
+                1.0 + rng.below(80) as f32,
+            ));
+        }
+        let rs = d.regions();
+        for i in 0..rs.len() {
+            for j in i + 1..rs.len() {
+                let (a, b) = (rs[i], rs[j]);
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ten_thousand_disjoint_rectangles_stay_at_most_sixteen_pieces_and_the_union_holds_them() {
+    let mut d = Damage::with_pieces(true);
+    for i in 0..10_000 {
+        d.add(Rect::new(
+            (i % 100) as f32 * 20.0,
+            (i / 100) as f32 * 20.0,
+            5.0,
+            5.0,
+        ));
+    }
+    assert!(d.regions().len() <= KEEP_PIECES);
+    let pieces = d.pieces(1.0, 5000, 5000);
+    assert_eq!(
+        pieces.len(),
+        1,
+        "ten thousand pieces fall back to the union"
+    );
+    assert_eq!(pieces[0], (0, 0, 1985, 1985));
+    assert_eq!(d.device(1.0, 5000, 5000), Some((0, 0, 1985, 1985)));
+
+    // An application that did not ask keeps no pieces at all, as before.
+    let mut plain = Damage::default();
+    for i in 0..10_000 {
+        plain.add(Rect::new(i as f32 % 700.0, i as f32 / 700.0, 5.0, 5.0));
+    }
+    assert!(plain.regions().is_empty());
+    assert!(plain.pieces(1.0, 1000, 1000).is_empty());
+}
+
+#[test]
+fn an_application_that_did_not_ask_for_regions_keeps_no_pieces() {
+    let mut d = Damage::default();
+    d.add(Rect::new(0.0, 0.0, 10.0, 10.0));
+    d.add(Rect::new(20.0, 20.0, 10.0, 10.0));
+    assert!(d.regions().is_empty());
+    assert!(d.pieces(1.0, 100, 100).is_empty());
+    // The frame still gets the union, exactly as before.
+    assert_eq!(d.device(1.0, 100, 100), Some((0, 0, 30, 30)));
+}
+
+#[test]
+fn a_whole_window_is_one_piece_and_pieces_outside_the_bitmap_are_left_out() {
+    let mut d = Damage::with_pieces(true);
+    d.add(Rect::new(1.0, 1.0, 2.0, 2.0));
+    d.all();
+    assert!(d.regions().is_empty());
+    assert_eq!(d.pieces(1.0, 100, 80), vec![(0, 0, 100, 80)]);
+
+    let mut far = Damage::with_pieces(true);
+    far.add(Rect::new(5000.0, 5000.0, 10.0, 10.0));
+    far.add(Rect::new(2.0, 3.0, 4.0, 5.0));
+    assert_eq!(far.pieces(1.0, 100, 80), vec![(2, 3, 6, 8)]);
+    assert!(Damage::default().pieces(1.0, 0, 0).is_empty());
+}
+
+#[test]
+fn the_hosts_region_loop_paints_each_piece_and_leaves_the_gap() {
+    use super::run::paint_regions;
+    use crate::gfx::{Gfx, Painter};
+    use mdshared_text::Bitmap;
+
+    let px = |bmp: &Bitmap, x: u32, y: u32| {
+        let i = ((y * bmp.width + x) * 4) as usize;
+        [bmp.pixels[i + 2], bmp.pixels[i + 1], bmp.pixels[i]]
+    };
+    let base = [10u8, 20, 30];
+    let hot = [200u8, 10, 10];
+    let mut bmp = Bitmap::new(240, 120);
+    let mut gfx = Gfx::new();
+    let mut anim = Animator::new();
+    anim.begin_frame(Instant::now());
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), base);
+    }
+    let mut d = Damage::with_pieces(true);
+    d.add(Rect::new(10.0, 10.0, 20.0, 10.0));
+    d.add(Rect::new(200.0, 80.0, 20.0, 10.0));
+    let pieces = d.pieces(1.0, 240, 120);
+    assert_eq!(pieces.len(), 2);
+    // The loop `Host::frame` runs for a regions application, with a closure standing in for
+    // `App::draw`: one painter and clip per piece, the animator's group reset each time.
+    let mut drawn = Vec::new();
+    let mut timers = NamedTimers::default();
+    paint_regions(
+        &mut bmp,
+        &mut gfx,
+        &mut anim,
+        &mut timers,
+        None,
+        1.0,
+        &pieces,
+        |p, anim, _timers, region, _clip| {
+            if drawn.is_empty() {
+                // A group set in the first region must not leak into the second.
+                anim.group("first");
+            }
+            drawn.push(region);
+            let _: f32 = anim.value_from(
+                format!("v{}", drawn.len()),
+                0.0,
+                1.0,
+                Motion::tween_ms(100, crate::anim::Easing::Linear),
+            );
+            p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), hot);
+        },
+    );
+    let _ = anim.end_frame();
+    assert!(
+        anim.ungrouped_deadline().is_some(),
+        "the second region's value is not in the first region's group"
+    );
+    assert_eq!(
+        drawn,
+        vec![
+            Rect::new(10.0, 10.0, 20.0, 10.0),
+            Rect::new(200.0, 80.0, 20.0, 10.0)
+        ]
+    );
+    for (x, y) in [(15, 15), (205, 85)] {
+        assert_eq!(px(&bmp, x, y), hot, "a changed region at ({x}, {y})");
+    }
+    // The gap inside the union but in neither piece still holds the old frame.
+    for (x, y) in [(120, 50), (15, 85), (205, 15)] {
+        assert_eq!(px(&bmp, x, y), base, "the gap at ({x}, {y})");
+    }
 }
 
 // ---- deadlines ----
@@ -326,6 +534,99 @@ fn a_timer_asked_of_the_animator_comes_back_as_its_deadline() {
     );
 }
 
+#[test]
+fn the_loop_wakes_at_the_earliest_of_the_animator_and_a_named_timer() {
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    let mut timers = NamedTimers::default();
+    timers.set("autosave", t0 + ms(500));
+    let anim = t0 + ms(16);
+    let d = Deadlines {
+        anim: Some(anim),
+        timer: None,
+    };
+    // The animator's deadline comes first.
+    assert_eq!(next_wake(&d, &timers, false), Some(anim));
+    // A named timer sooner than it wins.
+    timers.set("caret", t0 + ms(2));
+    assert_eq!(next_wake(&d, &timers, false), Some(t0 + ms(2)));
+    // Hidden, the animator's deadline is left out but the named timers stay.
+    assert_eq!(next_wake(&d, &timers, true), Some(t0 + ms(2)));
+    timers.cancel("caret");
+    assert_eq!(next_wake(&d, &timers, true), Some(t0 + ms(500)));
+    assert_eq!(
+        next_wake(&Deadlines::default(), &NamedTimers::default(), true),
+        None
+    );
+}
+
+#[test]
+fn a_callback_that_rearms_itself_at_now_fires_once_per_turn_and_the_turn_ends() {
+    let now = Instant::now();
+    let mut timers = NamedTimers::default();
+    timers.set("poll", now);
+    let mut fired = Vec::new();
+    let mut calls = 0;
+    for _ in 0..3 {
+        let any = fire_due_timers(&mut timers, now, |timers, name| {
+            calls += 1;
+            assert!(calls <= 5, "the firing loop spun");
+            fired.push(name.to_string());
+            // Re-armed at the same instant: it belongs to the next turn, not this one.
+            timers.set(name, now);
+            true
+        });
+        assert!(any);
+    }
+    assert_eq!(
+        fired,
+        vec!["poll".to_string(), "poll".to_string(), "poll".to_string()]
+    );
+    assert_eq!(calls, 3);
+    assert_eq!(timers.at("poll"), Some(now));
+}
+
+#[test]
+fn a_callback_can_cancel_or_move_a_sibling_from_the_same_turn() {
+    let now = Instant::now();
+    let later = now + Duration::from_millis(100);
+
+    // Cancelled: the sibling due at the same instant does not fire.
+    let mut timers = NamedTimers::default();
+    timers.set("first", now);
+    timers.set("second", now);
+    let mut fired = Vec::new();
+    fire_due_timers(&mut timers, now, |timers, name| {
+        fired.push(name.to_string());
+        if name == "first" {
+            timers.cancel("second");
+        }
+        true
+    });
+    assert_eq!(fired, vec!["first".to_string()]);
+    assert_eq!(timers.next(), None);
+
+    // Moved later: it fires once, in a later turn.
+    let mut timers = NamedTimers::default();
+    timers.set("first", now);
+    timers.set("second", now);
+    let mut fired = Vec::new();
+    fire_due_timers(&mut timers, now, |timers, name| {
+        fired.push(name.to_string());
+        if name == "first" {
+            timers.set("second", later);
+        }
+        true
+    });
+    assert_eq!(fired, vec!["first".to_string()]);
+    assert_eq!(timers.next(), Some(later));
+    assert!(fire_due_timers(&mut timers, later, |_timers, name| {
+        fired.push(name.to_string());
+        true
+    }));
+    assert_eq!(fired, vec!["first".to_string(), "second".to_string()]);
+}
+
 // ---- clicks ----
 
 /// Windows' default double-click rectangle, 4 x 4 device px, at scale 1: 2 px each way.
@@ -464,6 +765,49 @@ fn a_covered_or_minimized_window_is_hidden_until_both_are_over() {
     assert!(!v.hidden());
     // A repeat of the same word changes nothing.
     assert!(!v.set_occluded(false));
+}
+
+#[test]
+fn a_window_the_application_hides_is_hidden_until_it_is_shown_again() {
+    let mut v = Visibility::default();
+    assert!(!v.app_hidden());
+    assert!(!v.set_app_hidden(true));
+    assert!(v.hidden());
+    assert!(v.app_hidden());
+    assert!(!v.os_hidden());
+    // A repeat changes nothing.
+    assert!(!v.set_app_hidden(true));
+    // Shown: seen again once, which redraws everything.
+    assert!(v.set_app_hidden(false));
+    assert!(!v.hidden());
+    assert!(!v.set_app_hidden(false));
+    // Hidden by the application while covered stays hidden when the cover goes.
+    v.set_app_hidden(true);
+    v.set_occluded(true);
+    v.set_app_hidden(false);
+    assert!(v.hidden());
+    v.set_occluded(false);
+    assert!(!v.hidden());
+}
+
+#[test]
+fn nothing_is_drawn_while_the_application_hides_the_window_but_timers_still_come() {
+    let t0 = Instant::now();
+    let mut v = Visibility::default();
+    let mut damage = Damage::default();
+    damage.add(Rect::new(10.0, 10.0, 20.0, 20.0));
+    assert!(wants_frame(v.hidden(), &damage));
+    v.set_app_hidden(true);
+    assert!(!wants_frame(v.hidden(), &damage));
+    // The animator's deadline is dropped while hidden; the named and one-shot timers are not.
+    let d = Deadlines {
+        anim: Some(t0 + Duration::from_millis(16)),
+        timer: Some(t0 + Duration::from_secs(1)),
+    };
+    assert_eq!(d.next(v.hidden()), Some(t0 + Duration::from_secs(1)));
+    let mut timers = NamedTimers::default();
+    timers.set("autosave", t0 + Duration::from_secs(30));
+    assert_eq!(timers.next(), Some(t0 + Duration::from_secs(30)));
 }
 
 #[test]

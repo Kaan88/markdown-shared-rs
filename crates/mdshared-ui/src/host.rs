@@ -22,14 +22,17 @@
 //! any thread with the [`Proxy`] that [`Cx::proxy`] gives.
 //!
 //! **Frames.** The application asks for a redraw of a rectangle ([`Cx::request_redraw`]); the
-//! rectangles asked for before a frame are joined into the one rectangle that holds them all,
-//! the frame draws that rectangle only ([`App::draw`] is given it, and the painter is clipped to
-//! it), and only that rectangle is sent to the window (softbuffer's `present_with_damage`). The
-//! bitmap keeps the rest of the last frame. A resize, a change of scale, a change of the backdrop
-//! or of its palette, and the window coming back from being covered or minimized repaint
-//! everything. A window that is covered (winit's `Occluded`) or minimized (a size of zero, or
-//! `is_minimized`; winit 0.30 never says `Occluded` on Windows) is not drawn until it is seen
-//! again.
+//! rectangles asked for before a frame are kept. An application that did not ask for regions
+//! ([`App::damage_regions`] is false, the default) is drawn once and sent one rectangle, the
+//! one that holds them all, as before. One that did gets one `draw` call and one presented
+//! rectangle per piece, the painter clipped to each (softbuffer's `present_with_damage`).
+//! Pieces are disjoint in logical px and overlap is joined; at a fractional scale two
+//! neighbours can round to share one device column, which is copied twice harmlessly. The
+//! bitmap keeps the rest of the last frame. A resize, a change of scale, a change of the
+//! backdrop or of its palette, and the window coming back from being covered, minimized or
+//! hidden by the application repaint everything. A window that is covered (winit's `Occluded`),
+//! minimized (a size of zero, or `is_minimized`; winit 0.30 never says `Occluded` on Windows)
+//! or hidden by the application ([`Cx::hide_window`]) is not drawn until it is seen again.
 //!
 //! **Every animated value on every frame.** A frame that draws only its damage still ends the
 //! animator's frame, and [`Animator::end_frame`](crate::anim::Animator::end_frame) forgets every
@@ -42,18 +45,25 @@
 //!
 //! **One wake-up.** The animator's deadline (`end_frame`), which already holds a caret's blink
 //! ([`TextField::blink_caret`](crate::textfield::TextField::blink_caret)) and anything else in
-//! motion, and the application's own timers ([`Cx::wake_at`], a tooltip's delay) are folded into
-//! one `ControlFlow::WaitUntil`; with neither, the loop waits for an event
-//! (`ControlFlow::Wait`) and an idle window does no work. When the animator's deadline comes,
-//! the host redraws what the last frame said was moving ([`Cx::animating`]; the whole window if
-//! it said nothing). When a timer comes, the application gets [`Event::Wake`] and decides.
+//! motion, the application's own one-shot timer ([`Cx::wake_at`], a tooltip's delay) and its
+//! named timers ([`Cx::timer_at`], an autosave, a toast's end) are folded into one
+//! `ControlFlow::WaitUntil`; with none, the loop waits for an event (`ControlFlow::Wait`) and an
+//! idle window does no work. When the animator's deadline comes, the host redraws what the last
+//! frame said was moving ([`Cx::animating`]; the whole window if it said nothing). When a timer
+//! comes, the application gets [`Event::Wake`] or [`App::timer_fired`] and decides. A named
+//! timer can be moved or cancelled by its name; two due together are told together.
 //!
 //! **The window.** Undecorated, with the size and the minimum size of the [`Config`], the
 //! system's shadow on Windows, and the dark title-bar mode and corners of the config. A press
 //! on the 8 px band at the edge of a restored window resizes it
 //! ([`window::edge_at`](crate::window::edge_at)) and shows the resize cursor there; the title row
 //! is the application's, which drags the window by [`Cx::drag_window`] and gets snap layouts by
-//! [`Cx::set_maximize_button`].
+//! [`Cx::set_maximize_button`]. The application may hide the window but keep it alive, for a
+//! close to a tray ([`Cx::hide_window`], [`Cx::show_window`]): timers and messages still come,
+//! nothing is drawn while it is hidden, and it is drawn whole when shown again. On Wayland
+//! `set_visible` is a no-op, so there `hide_window` does nothing and the window keeps drawing.
+//! The tray icon that would bring it back is the application's to add ([`crate::tray`]); the
+//! host provides no icon of its own.
 //!
 //! **The backdrop** (Windows only). Mica or Acrylic ([`Cx::set_backdrop`]) is asked for through
 //! [`frost::Frost`](crate::frost::Frost): never under high contrast
@@ -92,15 +102,15 @@
 //! which mdview wires itself; a backdrop off Windows (above); the window's place and size kept
 //! between runs ([`window_state`](crate::window_state) is the application's to call); a menu
 //! bar, a tray, a file drop, touch, pinch and pen, and key releases, none of which is reduced
-//! to an [`Event`] (an application that needs one reads winit's own in [`App::raw`]); regions of the window with
-//! their own damage (the damage is one rectangle); a GPU. Tested: everything pure (the damage,
-//! the deadlines, the covered and minimized window, the click count, the reduction of events) in
-//! `host_tests.rs`; the window parts by the example
-//! `cargo run -p mdshared-ui --features host --example host`, compiled and run headless for a
-//! few seconds on Windows, not seen by a person; Linux and macOS only compiled.
+//! to an [`Event`] (an application that needs one reads winit's own in [`App::raw`]); a GPU.
+//! Tested: everything pure (the damage's pieces and their device rectangles, the deadlines, the
+//! named timers, the covered, minimized and application-hidden window, the click count, the
+//! reduction of events) in `host_tests.rs` and `timers_tests.rs`; the window parts by the
+//! examples `host` and `host_regions`, compiled and run headless for a few seconds on Windows,
+//! not seen by a person; Linux and macOS only compiled.
 //!
 //! The parts: `cx` (what the application may ask), `input` (winit's input reduced), `frame`
-//! (the damage, the deadlines, the present) and `run` (the loop).
+//! (the damage, the deadlines, the present), `timers` (the named timers) and `run` (the loop).
 
 use std::time::Instant;
 
@@ -115,6 +125,7 @@ mod cx;
 mod frame;
 mod input;
 mod run;
+mod timers;
 
 pub use cx::Cx;
 pub use run::run;
@@ -214,7 +225,9 @@ pub enum Event {
     /// [`platform::system_high_contrast`](crate::platform::system_high_contrast) itself, off the
     /// loop's thread.
     Contrast(bool),
-    /// The time asked for by [`Cx::wake_at`] came; the instant is now. Ask again for a later one.
+    /// The time asked for by [`Cx::wake_at`] came; the instant is now. Ask again for a later
+    /// one. A named timer set with [`Cx::timer_at`] comes to
+    /// [`App::timer_fired`](App::timer_fired) instead, with its name.
     Wake(Instant),
     /// The window's close button of the system, Alt+F4 or the taskbar asked to close. The
     /// window stays open unless the application calls [`Cx::exit`].
@@ -248,6 +261,10 @@ pub trait App: 'static {
     /// the painter is clipped to it. Drawing outside it is cut off. A redraw asked for here
     /// comes in the next frame.
     ///
+    /// When [`damage_regions`](Self::damage_regions) answers true this is called once per
+    /// damage rectangle, each call given that rectangle; otherwise once, with the one rectangle
+    /// holding them all.
+    ///
     /// **Ask for every animated value on every frame, whatever the damage** (or name it with
     /// [`Animator::keep`](crate::anim::Animator::keep)): the animator's frame ends after every
     /// draw, partial ones included, and forgets the names a frame did not ask for. A value not
@@ -259,6 +276,34 @@ pub trait App: 'static {
     /// A worker's message arrived. Nothing by default.
     fn message(&mut self, cx: &mut Cx<'_, Self::Message>, message: Self::Message) {
         let _ = (cx, message);
+    }
+
+    /// The named timer `name`, set with [`Cx::timer_at`], came due. It is gone: ask for another
+    /// with [`Cx::timer_at`] for a repeating timer. The turn's due names were taken as a
+    /// snapshot when it began (earliest first, set order at one instant), and each fires only
+    /// while it is still waiting and still due: cancelling or moving a sibling here is obeyed.
+    /// A timer set here, even at [`Cx::now`], waits for the next turn. Nothing by default.
+    fn timer_fired(&mut self, cx: &mut Cx<'_, Self::Message>, name: &str) {
+        let _ = (cx, name);
+    }
+
+    /// Whether [`draw`](Self::draw) wants one call per damage rectangle instead of one call for
+    /// the rectangle holding them all. False by default, which draws once with the union and is
+    /// what every application did before this existed; the host then pays one rectangle and no
+    /// allocation for the damage, as before.
+    ///
+    /// When true, a frame with two far-apart rectangles (a blinking caret and a scrolling list)
+    /// makes two `draw` calls, each given one rectangle and clipped to it, and presents the two
+    /// rectangles with `present_with_damage`: the gap between them is neither drawn nor sent to
+    /// the window. Overlapping rectangles are joined, so the pieces are disjoint in logical px;
+    /// at a fractional scale the outward rounding can still make two neighbours share one
+    /// device column, which is copied twice (the same pixels). At most sixteen pieces are kept;
+    /// beyond that the union is drawn as one rectangle, so a long-hidden window cannot grow the
+    /// list without bound. Drawing the whole scene in every call is correct (the clip cuts it);
+    /// draw only the rectangle to save the work. Read once before [`App::start`](Self::start),
+    /// not per frame.
+    fn damage_regions(&self) -> bool {
+        false
     }
 
     /// Adds the window's accessibility nodes to `tree` and answers the node that has the
