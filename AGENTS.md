@@ -197,6 +197,11 @@ the docs ends with what was run and what was not.
   `mdshared-fetch`, `mdshared-term`, `mdshared-pty`, `shared` (several crates), `docs`, `ci`.
 - Body: what was added and how it behaves, then what was run and what was not. A new
   dependency is justified here.
+- Before merging, update the docs the change affects and check the pull request's docs list.
+  When merging `main` into a branch, check the "I want to ..." index and the sibling revision
+  table for entries the merge made stale.
+- If you work in a sibling repository and change its toolkit pin or add or move a reusable
+  crate, send the catalogue update to this repository's session or open a PR here.
 - An agent's commit ends with a trailer naming the model that wrote it, for example
   `Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`.
 - Do not push, and do not touch `main`, unless the owner asked. Work on the branch you were
@@ -221,9 +226,10 @@ Windows is the first platform; Linux and macOS are supported and checked by CI.
 
 | File | What |
 |---|---|
-| [docs/CATALOGUE.md](docs/CATALOGUE.md) | Every public module, its purpose and entry points. **Update it with every module you add or extend.** |
+| [docs/CATALOGUE.md](docs/CATALOGUE.md) | **Update it with every module you add or extend**, including the "I want to ..." line for each need it meets. Replace any "not yet: ROADMAP \<id>" marker with the module. Name each crate by its Cargo package name in backticks. |
+| [What exists outside these crates](docs/CATALOGUE.md#what-exists-outside-these-crates) | Update the sibling revision table when an app moves its toolkit pin or adds or moves a reusable crate. |
 | [docs/NEW-MODULE.md](docs/NEW-MODULE.md) | The checklist for adding a module |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | What is not built yet, sized, with what each builds on. Claim an item there before starting it |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Claim an item before starting it. When it merges, mark the row done or remove it, and point each index line that sent readers to that item at the module instead. |
 | [docs/FEATURES.md](docs/FEATURES.md) | One section per feature added since the applications began using the crates: design notes, API added, what was verified |
 | [docs/ANIMATION.md](docs/ANIMATION.md) | The animation model and how an application wires it into its loop |
 | [docs/PLAN.md](docs/PLAN.md) | Why the repository exists and the original order of work (the shared window frame, step 4, is still open; see the roadmap) |
