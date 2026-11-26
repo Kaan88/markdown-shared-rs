@@ -21,9 +21,12 @@ use parley::Layout;
 /// wide the band is; their lengths are equal, and one is `wavelength / 2` where that is a length.
 /// The wave's peaks are half the band's height less half the stroke from the middle line, so the
 /// stroke fills the band from edge to edge. A wavelength that is not a number, is zero or is
-/// negative gives one wave of the band's own width; a band with no width or height gives an
-/// empty path.
+/// negative gives one arch, as wide as the band; a band with no width or height gives an empty
+/// path.
 fn squiggle(band: Rect, thickness: f32, wavelength: f32) -> Path {
+    if !(band.w.is_finite() && band.w > 0.0 && band.h.is_finite() && band.h > 0.0) {
+        return Path::new();
+    }
     let amp = ((band.h - thickness) / 2.0).max(0.0);
     let mid = band.y + band.h / 2.0;
     let half = if wavelength.is_finite() && wavelength > 0.0 {
@@ -57,27 +60,42 @@ impl Painter<'_> {
     /// The layout is drawn in its own units, which are the device pixels it was shaped at: a
     /// caller that shaped at `size * scale` passes the logical px it wants, as every draw here
     /// takes them, and the painter moves the layout to whole device pixels at its scale, adds its
-    /// offset and honours its clip. Returns the rectangle the layout's lines cover, with its top
-    /// left corner at `(x, y)` and its size the layout's own divided by the scale, so a caller
-    /// can draw a background, a caret or a squiggle against it without measuring again. A place
-    /// that is not a number draws nothing; an empty layout draws nothing and returns no size.
+    /// offset and honours its clip. A line that does not meet the clip is skipped, as
+    /// `TextEngine::draw_layout_clipped` skips it, so an off-screen layout costs almost nothing.
+    ///
+    /// Returns the rectangle the lines occupy, so a caller can draw a background, a caret or a
+    /// squiggle against it without measuring again: from `x` plus each line's own inline start
+    /// (the alignment's offset) to the furthest end of a line, `y` down for the layout's height,
+    /// in logical px. A line placed to the right by a centred or end alignment, or by a
+    /// right-to-left direction, is therefore covered where it is drawn, not at `x`. The
+    /// rectangle is the lines' own, not their ink: a raised or lowered run, a rounded glyph or a
+    /// swash may reach past it. A place that is not a number draws nothing and answers no size;
+    /// a layout with no lines draws nothing and answers no size.
     pub fn rich_text(&mut self, layout: &Layout<Brush>, x: f32, y: f32) -> Rect {
-        let (w, h) = (layout.width(), layout.height());
-        let size = Rect::new(x, y, w / self.scale, h / self.scale);
         if !x.is_finite() || !y.is_finite() {
-            return size;
+            return Rect::new(x, y, 0.0, 0.0);
         }
+        let (mut left, mut right) = (f32::MAX, f32::MIN);
+        for line in layout.lines() {
+            let metrics = line.metrics();
+            let start = metrics.inline_min_coord + metrics.offset;
+            left = left.min(start);
+            right = right.max(start + metrics.advance);
+        }
+        if left > right {
+            return Rect::new(x, y, 0.0, 0.0);
+        }
+        let size = Rect::new(
+            x + left / self.scale,
+            y,
+            (right - left) / self.scale,
+            layout.height() / self.scale,
+        );
         let dx = (x * self.scale).round() + self.origin.0 as f32;
         let dy = (y * self.scale).round() + self.origin.1 as f32;
-        let (xi, yi) = (dx.floor() as i32, dy.floor() as i32);
-        let (bw, bh) = (w.ceil() as i32 + 2, h.ceil() as i32 + 2);
-        let c = self.clip;
-        if xi >= c.2 || yi >= c.3 || xi + bw <= c.0 || yi + bh <= c.1 {
-            return size;
-        }
         self.gfx
             .engine
-            .draw_layout_clipped(self.bmp, layout, dx, dy, c);
+            .draw_layout_clipped(self.bmp, layout, dx, dy, self.clip);
         size
     }
 
@@ -91,8 +109,10 @@ impl Painter<'_> {
     /// width.
     ///
     /// A band with no width or height, a thickness or an alpha that is zero, negative or not a
-    /// number, or a place that is not a number, draws nothing. A wavelength that is not a
-    /// positive length draws one wave across the band.
+    /// number, or a place that is not a number, draws nothing. A thickness more than the band's
+    /// height is held to it (the stroke would only be cut back to the band anyway, and a mask
+    /// taller than the band is wasted work). A wavelength that is not a positive length draws
+    /// one arch across the band.
     pub fn wavy_underline(
         &mut self,
         band: Rect,
@@ -110,6 +130,7 @@ impl Painter<'_> {
         {
             return;
         }
+        let thickness = thickness.min(band.h);
         let path = squiggle(band, thickness, wavelength);
         if path.is_empty() {
             return;
@@ -203,10 +224,21 @@ mod tests {
         base: Brush,
         add: impl FnOnce(&mut parley::RangedBuilder<'_, Brush>),
     ) -> Layout<Brush> {
+        layout_in(UI_FAMILY, text, size, base, add)
+    }
+
+    /// [`layout`] in the family list `family`.
+    fn layout_in(
+        family: &str,
+        text: &str,
+        size: f32,
+        base: Brush,
+        add: impl FnOnce(&mut parley::RangedBuilder<'_, Brush>),
+    ) -> Layout<Brush> {
         let mut fonts = mdshared_text::shared_fonts();
         let mut layouts = LayoutContext::<Brush>::new();
         let mut b = layouts.ranged_builder(&mut fonts, text, 1.0, true);
-        b.push_default(StyleProperty::FontFamily(FontFamily::from(UI_FAMILY)));
+        b.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
         b.push_default(StyleProperty::FontSize(size));
         b.push_default(StyleProperty::Brush(base));
         add(&mut b);
@@ -216,11 +248,85 @@ mod tests {
         layout
     }
 
+    /// Whether any cluster of `layout` is the second half of a ligature, i.e. whether the font
+    /// the text was shaped in has the ligature the test needs.
+    fn ligates(layout: &Layout<Brush>) -> bool {
+        layout
+            .lines()
+            .flat_map(|line| line.runs())
+            .any(|run| run.clusters().any(|c| c.is_ligature_continuation()))
+    }
+
     /// Two runs of `text`, the second one from byte `split` on in `second`.
     fn two_runs(text: &str, size: f32, split: usize, second: Brush) -> Layout<Brush> {
         layout(text, size, RED_BRUSH, |b| {
             b.push(StyleProperty::Brush(second), split..)
         })
+    }
+
+    #[test]
+    fn a_ligature_across_a_brush_change_keeps_its_bytes_in_one_run() {
+        /// One family the test tries: the family list, the text, where the brush changes, and
+        /// the byte ranges the runs must come out with.
+        struct Case {
+            family: &'static str,
+            text: &'static str,
+            split: usize,
+            ranges: &'static [(usize, usize)],
+        }
+        // A brush change does not split shaping, so `fi` may stay one glyph with the `i` in
+        // another colour, and parley's glyph runs group by shaped cluster, not by grapheme. The
+        // font must have the ligature for this test to mean anything, so the families this
+        // machine may have are tried in turn, the Arabic lam-alef last (its ligature is not
+        // optional in any font that has Arabic).
+        let cases = [
+            Case {
+                family: "Calibri, Carlito, sans-serif",
+                text: "find",
+                split: 1,
+                ranges: &[(0, 2), (2, 4)],
+            },
+            Case {
+                family: "Georgia, Palatino Linotype, serif",
+                text: "find",
+                split: 1,
+                ranges: &[(0, 2), (2, 4)],
+            },
+            Case {
+                family: "DejaVu Sans, Noto Sans, sans-serif",
+                text: "find",
+                split: 1,
+                ranges: &[(0, 2), (2, 4)],
+            },
+            Case {
+                family: UI_FAMILY,
+                text: "لا",
+                split: 2,
+                ranges: &[(0, 4)],
+            },
+        ];
+        for case in cases {
+            let layout = layout_in(case.family, case.text, 26.0, RED_BRUSH, |b| {
+                b.push(StyleProperty::Brush(BLUE_BRUSH), case.split..)
+            });
+            if !ligates(&layout) {
+                continue;
+            }
+            let boxes = crate::richtext::runs(&layout);
+            let ranges: Vec<_> = boxes.iter().map(|b| b.range.clone()).collect();
+            let wanted: Vec<_> = case.ranges.iter().map(|&(a, b)| a..b).collect();
+            assert_eq!(
+                ranges, wanted,
+                "{} {}: the ligature's bytes are not in one run's range",
+                case.family, case.text
+            );
+            // The boxes follow each other on the one line.
+            for pair in boxes.windows(2) {
+                assert!((pair[0].rect.right() - pair[1].rect.x).abs() < 0.5);
+            }
+            return;
+        }
+        panic!("no font here has the ligature this test needs (`fi` or the Arabic lam-alef)");
     }
 
     #[test]
@@ -357,14 +463,25 @@ mod tests {
         // Nothing for nothing.
         let none = page(150, 50, 1.0, WHITE, |p| {
             p.wavy_underline(Rect::new(10.0, 20.0, 0.0, 6.0), 1.5, 8.0, RED, 1.0);
+            p.wavy_underline(Rect::new(10.0, 20.0, -120.0, 6.0), 1.5, 8.0, RED, 1.0);
             p.wavy_underline(Rect::new(10.0, 20.0, 120.0, 0.0), 1.5, 8.0, RED, 1.0);
+            p.wavy_underline(Rect::new(10.0, 20.0, 120.0, -6.0), 1.5, 8.0, RED, 1.0);
             p.wavy_underline(band, 0.0, 8.0, RED, 1.0);
+            p.wavy_underline(band, -1.0, 8.0, RED, 1.0);
             p.wavy_underline(band, 1.5, 8.0, RED, 0.0);
+            p.wavy_underline(band, 1.5, 8.0, RED, -0.5);
             p.wavy_underline(band, 1.5, 8.0, RED, f32::NAN);
             p.wavy_underline(band, f32::NAN, 8.0, RED, 1.0);
             p.wavy_underline(Rect::new(f32::NAN, 20.0, 120.0, 6.0), 1.5, 8.0, RED, 1.0);
         });
         assert_eq!(ink(&none, WHITE).0, 0);
+
+        // A stroke far thicker than its band is held to the band: the whole band is inked and
+        // the rasterizer is not asked for a mask a million pixels tall.
+        let fat = page(150, 50, 1.0, WHITE, |p| {
+            p.wavy_underline(Rect::new(10.0, 20.0, 120.0, 4.0), 1e6, 8.0, RED, 1.0)
+        });
+        assert_eq!(ink(&fat, WHITE).1, (10, 20, 130, 24));
     }
 
     #[test]
@@ -395,8 +512,8 @@ mod tests {
             }
         }
         assert!(inside > 50, "the clip kept nothing");
-        // The layout is cut as well: the whole drawing has text ink above the wave, and some of
-        // it is on each side of the clip's right edge.
+        // The layout is cut as well: the whole drawing has text ink above the wave, some of it
+        // on each side of the clip's right edge.
         let (mut text, mut text_inside) = (0, 0);
         for y in 0..26 {
             for x in 0..260 {
@@ -410,6 +527,77 @@ mod tests {
             text > 100 && text_inside > 20,
             "the layout's own ink: {text} of it, {text_inside} inside the clip"
         );
+        assert!(
+            text > text_inside,
+            "nothing of the layout was cut off: {text} of it, all inside"
+        );
+    }
+
+    #[test]
+    fn a_line_placed_by_its_alignment_is_drawn_and_the_rect_covers_it() {
+        let mut layout = layout("OK", 26.0, BLACK_BRUSH, |_| ());
+        layout.break_all_lines(Some(300.0));
+        layout.align(Alignment::End, AlignmentOptions::default());
+        let line = crate::richtext::runs(&layout)[0].rect;
+        assert!(line.x > 200.0, "the line was not placed right: {line:?}");
+
+        // A clip over only the right part of the 300 px the text was broken into: the glyphs sit
+        // in it, so they must be drawn there (a box taken from the layout's own width would end
+        // before the clip starts).
+        let (whole, wide) = scale_page(320, 60, 1.0, |p| p.rich_text(&layout, 0.0, 8.0));
+        let (cut, narrow) = scale_page(320, 60, 1.0, |p| {
+            let old = p.clip(Rect::new(150.0, 0.0, 170.0, 60.0));
+            let r = p.rich_text(&layout, 0.0, 8.0);
+            p.restore(old);
+            r
+        });
+        let (n, b) = ink(&cut, WHITE);
+        assert!(n > 50, "the aligned line was not drawn inside the clip");
+        assert!(b.0 >= 150 && b.2 > 250, "ink at {b:?}");
+        for y in 0..60 {
+            for x in 0..320 {
+                let want = if x < 150 { WHITE } else { at(&whole, x, y) };
+                assert_eq!(at(&cut, x, y), want, "{x},{y}");
+            }
+        }
+        // The rectangle answers the line's place, and the clip does not change it.
+        assert_eq!(wide, narrow);
+        assert!((narrow.x - line.x).abs() <= 1.0, "{narrow:?} of {line:?}");
+        assert!(
+            narrow.right() >= line.right() - 1.0,
+            "{narrow:?} of {line:?}"
+        );
+        assert!((narrow.h - layout.height()).abs() < 0.01, "{narrow:?}");
+    }
+
+    #[test]
+    fn the_offset_moves_the_text_and_the_squiggle_by_whole_pixels() {
+        let layout = two_runs("wrong word", 20.0, 6, BLUE_BRUSH);
+        let band = Rect::new(8.0, 40.0, 120.0, 5.0);
+        let (plain, still) = scale_page(260, 80, 1.0, |p| {
+            p.wavy_underline(band, 1.5, 8.0, RED, 1.0);
+            p.rich_text(&layout, 8.0, 6.0)
+        });
+        let (moved, same) = scale_page(260, 80, 1.0, |p| {
+            let o = p.offset(7.0, 9.0);
+            p.wavy_underline(band, 1.5, 8.0, RED, 1.0);
+            let r = p.rich_text(&layout, 8.0, 6.0);
+            p.restore_offset(o);
+            r
+        });
+        assert!(plain.pixels != moved.pixels, "the offset moved nothing");
+        for y in 9..80 {
+            for x in 7..260 {
+                assert_eq!(
+                    at(&moved, x, y),
+                    at(&plain, x - 7, y - 9),
+                    "{x},{y} did not move by seven across and nine down"
+                );
+            }
+        }
+        // The rectangle the caller gets is in logical px and knows nothing of the offset.
+        assert_eq!(still, same);
+        assert!((same.x - 8.0).abs() < 0.01, "{same:?}");
     }
 
     #[test]

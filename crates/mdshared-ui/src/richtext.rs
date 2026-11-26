@@ -26,7 +26,10 @@ use std::ops::Range;
 /// caller that shaped at `size * scale` divides by its scale for logical px, or draws with the
 /// same scale the painter is given. A wrapped layout gives one entry per run on each line, in
 /// reading order, so the runs of one line follow each other and a later line's runs come after.
+///
+/// `#[non_exhaustive]`: a field may be added without breaking an application.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct RunBox {
     /// The run's byte range in the text the layout was built from.
     pub range: Range<usize>,
@@ -42,7 +45,11 @@ pub struct RunBox {
 ///
 /// A run is a stretch of text parley placed in one style: a change of colour, of family, of size
 /// or of weight begins another, and a run that wraps continues on the next line as another entry
-/// with the rest of its range. The work is linear in the layout's length.
+/// with the rest of its range. Two things do not begin one, because parley shapes them as one
+/// piece: the second half of a ligature, whatever style it asks for (a brush change does not
+/// split shaping, so `fi` may stay one glyph with the `i` in another colour), and a cluster with
+/// no glyph of its own (a soft hyphen), whose bytes join the run being built. The work is
+/// linear in the layout's length.
 pub fn runs(layout: &Layout<Brush>) -> Vec<RunBox> {
     let mut out = Vec::new();
     for line in layout.lines() {
@@ -50,26 +57,32 @@ pub fn runs(layout: &Layout<Brush>) -> Vec<RunBox> {
         let top = metrics.content_block_min_coord;
         let height = (metrics.content_block_max_coord - top).max(0.0);
         // Parley places a shaped run's glyph runs in visual order and keeps the clusters of each
-        // glyph run together in that same order, so the k-th stretch of one style among a run's
-        // visual clusters is its k-th glyph run: that is where the byte ranges come from, while
-        // the boxes come from the placed glyph runs themselves.
+        // glyph run together in that same order, so the k-th group of a run's visual clusters is
+        // its k-th glyph run: that is where the byte ranges come from, while the boxes come from
+        // the placed glyph runs themselves. Parley groups by shaped cluster (atom), not by
+        // grapheme, which is why a ligature's continuation extends the group whatever its style,
+        // and why a cluster without glyphs starts none.
         let mut ranges: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
         for run in line.runs() {
             let mut groups: Vec<Range<usize>> = Vec::new();
             let mut style = None;
             for cluster in run.visual_clusters() {
                 let range = cluster.text_range();
-                match style {
-                    Some(s) if s == cluster.style_index() => {
-                        if let Some(last) = groups.last_mut() {
-                            last.start = last.start.min(range.start);
-                            last.end = last.end.max(range.end);
-                        }
-                    }
-                    _ => {
-                        style = Some(cluster.style_index());
-                        groups.push(range);
-                    }
+                let joins = groups.last().is_some_and(|_| {
+                    cluster.is_ligature_continuation() || style == Some(cluster.style_index())
+                });
+                if joins {
+                    let last = groups.last_mut().expect("a group");
+                    last.start = last.start.min(range.start);
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+                // A cluster whose glyphs belong to the one before it (a ligature's second
+                // letter) has no glyphs of its own; the first cluster of a run cannot be one,
+                // so this only guards a layout parley would not build.
+                if cluster.is_ligature_continuation() || cluster.glyphs().next().is_some() {
+                    style = Some(cluster.style_index());
+                    groups.push(range);
                 }
             }
             ranges.push((run.index(), groups));
@@ -150,7 +163,10 @@ mod tests {
     #[test]
     fn a_wrapped_layout_reports_its_runs_line_by_line() {
         let text = "one two three four five six seven eight nine ten eleven twelve";
-        let mut layout = layout(text, 18.0, RED, |_| ());
+        let marked = text.find("five").expect("the marked word");
+        let mut layout = layout(text, 18.0, RED, |b| {
+            b.push(StyleProperty::Brush(BLUE), marked..marked + 4)
+        });
         layout.break_all_lines(Some(90.0));
         let boxes = runs(&layout);
         assert!(boxes.len() > 2, "{boxes:?}");
@@ -165,6 +181,15 @@ mod tests {
             assert!(b.rect.h > 0.0);
         }
         assert_eq!(at, text.len());
+        // The runs split where the style does, not only where the line does.
+        assert!(
+            boxes.iter().any(|b| b.range.start == marked),
+            "no run begins at the marked word: {boxes:?}"
+        );
+        assert!(
+            boxes.iter().any(|b| b.range.start == marked + 4),
+            "no run ends at the marked word: {boxes:?}"
+        );
         // The second line's baseline is below the first's.
         let first = boxes[0].rect.y;
         let below = boxes

@@ -25,8 +25,9 @@ pub use soft::{LIGHT_SHADOW, Shade, soft_bounds};
 pub type Rgb = [u8; 3];
 /// One run's brush, as [`TextEngine`] reads it and as [`crate::richtext`] wants it: red, green
 /// and blue, and a fourth byte that is 255 for text on the baseline. `mdshared_text`'s
-/// `RAISED`, `LOWERED` and `MARKED` ask for a run that is raised, lowered or marked, which also
-/// gives it a glyph run of its own. The same type as `mdshared_text::text::Brush`.
+/// `RAISED` and `LOWERED` raise or lower the run; `MARKED` (a `<mark>`) only gives the run a
+/// glyph run of its own, so a caller can find its box and draw a highlight behind it — no call
+/// here draws that highlight. The same type as `mdshared_text::text::Brush`.
 pub type Brush = [u8; 4];
 
 pub const fn rgb(hex: u32) -> Rgb {
