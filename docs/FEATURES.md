@@ -4,6 +4,36 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Mouse editing in settings text rows (`mdshared_ui::settings`)
+
+Both the single-page `Form` and `pages::Form` can opt into the single-line field's shaped
+pointer selection. After layout, route primary presses to `pointer_press` with the drawing
+scale, the window's `Gfx`, the modifiers and the event time. The field counts its own clicks;
+the supplied click count still goes to other controls. Route moves to `pointer_motion` and
+releases to `pointer_release`, even beyond the text area. Schedule `tick_text_scroll` only at
+`text_scroll_deadline`, and call `cancel_text_pointer` on lost capture, lost window focus or
+a scale change. Existing pointer methods are unchanged.
+
+Use `pointer_cursor_at` for the I-beam and, in the single-page form, the number drag cursor.
+`popup_open` is true as soon as a dropdown or colour picker takes input; the form does not
+offer the underlying text cursor or text menu while that popup is open. On a right press,
+call `context_menu(Some((x, y)))` to focus the field without disturbing its selection, or
+`context_menu(None)` for the already focused field. The host owns the menu and gives it input
+first. Pass its chosen item to `apply_context_action`; Cut and Paste report `Outcome::Changed`
+when they change the row's value. Secret fields use the field's export guard and refuse all
+clipboard actions. Select all still works.
+
+Try `cargo run -p mdshared-ui --features host --example settings_textfield`. Drag out of the
+Name field, double- or triple-click it and open its edit menu. Try the Secret menu and hover
+over the Name field where the Mode dropdown covers it.
+
+On Windows with Rust 1.99.1, formatting, the catalogue check, workspace Clippy and tests
+with `host,a11y`, the release checks and the workspace example build passed.
+`explorer_tests` were skipped in workspace tests. The settings tests cover selection pixels
+that match keyboard selection, click counting, timed edge scrolling, the secret menu and
+the overlapping dropdown. The example was compiled, not launched or visually reviewed.
+Linux and macOS were not run.
+
 ## Mouse editing in a single-line field (`mdshared_ui::textfield`)
 
 Keep one `Pointer::system(scale)` per `TextField`. Pass the same text rectangle, face, font

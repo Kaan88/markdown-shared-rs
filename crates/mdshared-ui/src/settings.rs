@@ -38,6 +38,7 @@ mod drag_number;
 mod motion;
 pub mod pages;
 mod slider_row;
+mod text_edit;
 
 #[cfg(test)]
 #[path = "settings/colour_tests.rs"]
@@ -401,6 +402,7 @@ pub struct Form {
     title: String,
     rows: Vec<Row>,
     fields: Vec<TextField>,
+    text_pointer: text_edit::TextPointer,
     /// A row index, or `rows.len()` for the Close button.
     focus: Option<usize>,
     /// The focus ring shows once the keyboard has been used.
@@ -451,6 +453,7 @@ impl Form {
             title: title.into(),
             rows: Vec::new(),
             fields: Vec::new(),
+            text_pointer: text_edit::TextPointer::default(),
             focus: None,
             focus_visible: false,
             scroll: 0.0,
@@ -519,6 +522,7 @@ impl Form {
     /// the scroll and the focus where they are. Text boxes the user is editing keep their caret
     /// when their text is unchanged.
     pub fn set_rows(&mut self, rows: Vec<Row>) {
+        self.cancel_text_pointer();
         let old_ids: Vec<Option<u32>> = self.rows.iter().map(Row::id).collect();
         let mut old_fields = std::mem::take(&mut self.fields);
         let focus_id = self.focus.and_then(|f| self.rows.get(f)).and_then(Row::id);
@@ -622,6 +626,9 @@ impl Form {
     pub fn focus_row(&mut self, id: u32) -> bool {
         match self.rows.iter().position(|r| r.id() == Some(id)) {
             Some(i) => {
+                if self.focus != Some(i) {
+                    self.cancel_text_pointer();
+                }
                 self.focus = Some(i);
                 self.reveal_focus();
                 true
@@ -1135,6 +1142,7 @@ impl Form {
     /// number or a slider (Ctrl takes bigger steps), Home and End go to the ends, Page Up and
     /// Page Down take big steps of a number or a slider; a text box takes the usual editing keys.
     pub fn key(&mut self, key: &KeyName, mods: Mods, typed: Option<&str>) -> Outcome {
+        self.cancel_text_pointer();
         if let Some(o) = self.colour_key(key, mods, typed) {
             return o;
         }
@@ -1318,6 +1326,7 @@ impl Form {
     /// on its track moves the value there at once ([`Outcome::Changed`]); a press outside the
     /// card closes the dialog (and, with a dropdown open, only the dropdown).
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
+        self.cancel_text_pointer();
         self.drag = Drag::None;
         self.pressed = None;
         self.menu_pressed = None;
