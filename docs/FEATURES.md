@@ -2261,3 +2261,28 @@ message). Not run on Linux or macOS, so `can_hide`'s Wayland branch is compiled 
 was not run. **Not seen by a person**: the window itself, the blink and the scroll, and the
 close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
 makes close-to-tray usable is out of scope and is the application's to add.
+
+## A cursor style the application chooses (`mdshared_ui::termview`, roadmap CS2)
+
+`View::cursor_preference(shape, blinking)` sets the application's default cursor style without
+writing anything to the grid. Pass `mdshared_term::CursorShape::Block`, `Bar` or `Underline` and
+whether the cursor should blink. A view without a preference draws exactly as before.
+An explicit program style takes precedence for shape and blink; `CSI 0 SP q` (also with the
+parameter omitted) restores the application preference. `Screen::cursor_style_is_explicit()`
+distinguishes those cases even when the program explicitly chooses the built-in blinking
+block. The built-in values returned by `Screen::cursor()` are unchanged.
+
+DECTCEM still hides the cursor; an unfocused cursor is still a steady outline. The cursor uses
+the existing wide-character bounds, including when positioned on the second cell. The animated
+draws use the same interval and motion policy as before; a steady preference asks for no blink
+frame. After a preference change, an application painting only dirty rows can redraw the row
+returned by `View::cursor_row`.
+
+Run on Windows with `CARGO_TARGET_DIR=E:/mds-target/cs2` and two build jobs: formatting,
+workspace Clippy with `host,a11y`, and `mdshared-ui` Clippy with `term` passed. Workspace
+tests with `host,a11y` passed (1,880 including doctests, 38 ignored, four Explorer tests
+skipped); the `termview` suite passed (50 passed, two ignored). All eight new pixel tests
+failed when the preference was disabled, and targeted regressions also failed for block
+fill, program precedence, reset, visibility and wide coverage. The screen state test
+failed when zero did not clear the explicit flag. The extra release CI matrix was not run
+locally. Not run on Linux or macOS; not seen by a person in a live terminal.

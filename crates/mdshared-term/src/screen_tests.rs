@@ -485,6 +485,34 @@ fn queries_are_answered_in_order_and_the_answers_are_bounded() {
 }
 
 #[test]
+fn an_explicit_cursor_style_is_distinct_from_the_default_and_dirties_its_row() {
+    let mut s = Screen::new(10, 3, 0);
+    s.feed(b"\x1b[2;1H");
+    let default = s.cursor();
+    assert!(!s.cursor_style_is_explicit());
+    s.take_dirty();
+
+    s.feed(b"\x1b[1 q");
+    assert!(s.cursor_style_is_explicit());
+    assert_eq!(s.cursor(), default);
+    let dirty = 1..2;
+    assert_eq!(s.take_dirty(), std::slice::from_ref(&dirty));
+
+    for reset in [b"\x1b[0 q".as_slice(), b"\x1b[ q"] {
+        s.feed(reset);
+        assert!(!s.cursor_style_is_explicit());
+        assert_eq!(s.cursor(), default);
+        assert_eq!(s.take_dirty(), std::slice::from_ref(&dirty));
+        s.feed(b"\x1b[6 q");
+        assert!(s.cursor_style_is_explicit());
+        assert_eq!(s.cursor().shape, CursorShape::Bar);
+    }
+    s.feed(b"\x1bc");
+    assert!(!s.cursor_style_is_explicit());
+    assert_eq!(s.cursor(), Screen::new(10, 3, 0).cursor());
+}
+
+#[test]
 fn modes_title_bell_and_cursor_shape() {
     let mut s = Screen::new(10, 3, 10);
     assert_eq!(s.modes(), Modes::default());
