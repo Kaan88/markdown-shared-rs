@@ -1,10 +1,6 @@
 # Checks on every push to main, feat/linux or f/macos and every pull request: formatting, clippy
-# (warnings are errors) and the tests, on Linux, on real Windows and on real Macs (Apple Silicon
-# and Intel). See docs/CI.md.
-# The Recycle Bin (feature `recycle`), the media session (feature `media-session`), the
-# notifications (feature `notify`), the accessibility tree (feature `a11y`) and the window host
-# (feature `host`, alone and with `a11y`), off in the workspace build, are built and tested on
-# their own.
+# (warnings are errors) and the tests, on Linux, Windows and Apple Silicon. Intel macOS runs
+# only on pushes to main.
 name: ci
 
 on:
@@ -14,8 +10,9 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A shared group can replace pending runs even with cancellation disabled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -24,6 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUST_TOOLCHAIN: 1.99.1
+  UI_FEATURES: recycle,media-session,notify,a11y,host,term
 
 jobs:
   linux:
@@ -51,20 +49,13 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - run: cargo test --release --workspace
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features recycle recycle
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features media-session media_session
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features notify notify
-      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features ${{ env.UI_FEATURES }} -- -D warnings
+      # Keep a positional filter so Cargo skips doctests, as in the original filtered runs.
+      - run: 'cargo test --release -p mdshared-ui --features ${{ env.UI_FEATURES }} recycle -- media_session notify a11y host:: termview'
+      # Keep the host and its examples covered without the accessibility integration.
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features term termview
+      # Selecting UI and preview together would enable mdshared-app's defaults for preview.
       - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-md-preview --features server
       - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
@@ -85,20 +76,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - run: cargo test --release --workspace --no-fail-fast
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features recycle recycle
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features media-session media_session
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features notify notify
-      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features ${{ env.UI_FEATURES }} -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features ${{ env.UI_FEATURES }} recycle -- media_session notify a11y host:: termview'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features term termview
       - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-md-preview --features server
       - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
@@ -109,12 +90,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            arch: aarch64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/main' && '["aarch64","x86_64"]' || '["aarch64"]') }}
+    runs-on: ${{ matrix.arch == 'x86_64' && 'macos-15-intel' || 'macos-15' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -128,20 +105,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --release --workspace --all-targets -- -D warnings
       - run: cargo test --release --workspace --no-fail-fast
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features recycle -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features recycle recycle
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features media-session -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features media-session media_session
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features notify -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features notify notify
-      - run: cargo clippy --release -p mdshared-ui --features a11y --all-targets -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features a11y a11y
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features ${{ env.UI_FEATURES }} -- -D warnings
+      - run: 'cargo test --release -p mdshared-ui --features ${{ env.UI_FEATURES }} recycle -- media_session notify a11y host:: termview'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
-      - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
-      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
-      - run: cargo test --release -p mdshared-ui --features term termview
       - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
       - run: cargo test --release -p mdshared-md-preview --features server
       - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
