@@ -2827,8 +2827,10 @@ Windows reports separate, untracked rename halves, paired oldest first. The Linu
 inotify's cookies and ignores the redundant tracked `Both` notification from notify 8.2.1.
 A tracked half never pairs with a different cookie or an untracked half. An old name still
 waiting at flush is removed; a new name without its old name is created. An explicit complete
-rename does not consume a waiting old name. The public coalescer still ignores an immediate echo
-of a just-paired untracked rename; it does not keep a history of path pairs. FSEvents can report
+rename does not consume a waiting old name. The public coalescer ignores an immediate echo
+of just-paired untracked halves if nothing has brought the old name back. An ambiguous match
+later in the same burst requests a rescan instead of guessing which names to remove. Repeated
+complete renames without untracked halves are processed in order. FSEvents can report
 a rename without saying which side it is. That requests a rescan, so a case-only rename is
 resolved using directory names, not two successful metadata lookups.
 
@@ -2849,7 +2851,9 @@ reads under the captured root and rewrites only the reported path, so changing t
 directory cannot redirect its metadata reads. A path whose parent is not the root is dropped.
 
 Drop stops delivery, then signals native teardown without waiting for either thread. A
-filesystem call already in progress may keep its thread occupied. Only `NotFound` counts as
+filesystem call already in progress may keep its thread occupied. At most 64 backend owners
+may be outstanding per process, including owners blocked in teardown. The builder returns
+`WouldBlock` at the limit; the older constructors still return `None`. Only `NotFound` counts as
 absence in a metadata read: a creation that vanished is dropped, and a modification or rename
 whose destination vanished becomes a removal. Other errors invalidate the incremental batch
 and request a rescan.
@@ -2860,14 +2864,32 @@ the worker confirms it before the application hears anything — the folder is n
 is not the same folder on Unix (the device and inode of the followed directory, checked on
 both sides of registration) — and reports `Signal::Lost`. The application can drop that
 watcher and start a fresh one if the folder is available again. If the original folder is
-still present, a rescan is the fallback. This is event-driven; it does not poll for a symlink
-retarget when the backend emits no loss event.
+still present, a rescan is the fallback. Without periodic reconciliation this is event-driven.
 
-**Public API.** `DirWatcher` (`new`, `with_debounce`, `folder`, `take`, `woken`), `Signal`
+**Periodic reconciliation.** On Windows the default is 30 seconds: missed changes are
+eventually found without constantly reading large or remote folders. It is off by default
+on other platforms. `reconcile_interval(None)` or zero disables it; positive intervals
+below one second are rounded up to one second. The worker requests re-registration on the
+existing native backend and does a strict directory read. Restart work is off the worker and
+caller threads, with at most one request pending. A failed re-registration can be retried
+on the next cycle. A slow read cannot stack up more reads: there is one worker, and the
+interval starts again after the read finishes.
+
+With `initial_entries` from the caller's unfiltered list, the worker starts with that
+baseline and keeps it in step with the changes it reports. Otherwise the first complete
+read reports `Rescan` on the usual path to establish a baseline; the caller handles it as
+any other rescan (read off the drawing thread). Later reads report removals, creations and
+metadata changes through `Changed`; no rename identity is inferred from a snapshot.
+An incomplete read is never used as a snapshot. If opening the root says it no longer
+exists or is not a directory, the worker reports `Lost`. Native notification failures are
+still not observable as such, and snapshots cannot recover changes that happen and undo
+themselves between reads.
+
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `builder`, `folder`, `take`, `woken`),
+`DirWatcherBuilder` (`debounce`, `reconcile_interval`, `initial_entries`, `start`), `Signal`
 (`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
-`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. Everything is
-additive: no existing signature, field or variant changed, and `Signal` is new, so its variants
-are new before any application sees them.
+`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. No existing public
+signature, field or variant changed.
 
 Tests: `dirwatch_tests.rs`, `dirwatch_model_tests.rs` and
 `dirwatch_watcher_tests.rs`. The pure tests cover the coalescing rules, the debounce and
@@ -2926,9 +2948,8 @@ Known behaviours and limits for later:
 - On macOS a side-less rename requests a rescan, not a pair that transfers selection.
 - On Windows notify 8.2.1 can return success even when the initial `ReadDirectoryChangesW` call
   fails. Zero-byte overflows and terminal read failures can also go unreported. `DirWatcher`
-  cannot distinguish these from a quiet watch. Reliable native reporting requires an upstream
-  fix and a verified update; a periodic full read and watch restart would be a mitigation, not
-  a way to detect the missing backend signals.
+  cannot distinguish these from a quiet watch. The periodic full read and watch restart work
+  around those failures without changing notify.
 - The watcher reads each changed path's details on its own thread; a dead network path can hold
   that thread for as long as the system takes to answer, but it never holds the window, and the
   drop does not wait for it.
@@ -2939,12 +2960,12 @@ Known behaviours and limits for later:
 
 - **#9 — Fixed.** Relative paths are resolved under the captured root before restoring the
   caller's path spelling.
-- **#10 — Open.** A Windows 8.3 short name can produce a duplicate or leave the long-name row
-  stale on removal. A removed alias cannot reliably be expanded after the fact; reconcile
-  ambiguous names against an actual directory enumeration.
+- **#10 — Mitigated by periodic recovery.** Native notifications with 8.3 short names can still
+  produce a duplicate or leave the long-name row stale until a complete read corrects the list.
+  The native path does not expand a removed alias.
 - **#11 — Open.** `dirlist::read_checked` skips errors after enumeration opens. Reconciliation
-  needs an opt-in strict scan that distinguishes incomplete enumeration from an individual
-  entry vanishing, without changing the existing best-effort API.
+  now has a private strict scan; the caller-facing best-effort API and manual `Rescan` recovery
+  are unchanged.
 - **#12 — Fixed.** The worker tests use gates and observe exit, the disk test waits for the
   expected listing, and the 20,000-verdict test checks correctness rather than wall time.
 
@@ -2955,8 +2976,17 @@ flagged an unchanged `needless_range_loop` in `sections_tests.rs`. Synthetic reg
 ambiguous renames, wrong cookie pairing, repeated complete renames, metadata errors and queue
 overflow failed before their fixes; a synchronous teardown mutation failed the gated drop
 test. The `mdshared-app` tests type-checked for Linux x86-64 and macOS ARM64, but were not
-run there. No disconnected share or Windows backend failure was reproduced, and no
+ run there. No disconnected share or Windows backend failure was reproduced, and no
 application was tested.
+
+Re-review verification: Windows Rust 1.99.1 fmt and both Clippy checks passed (workspace with
+`host,a11y`, and `mdshared-app` with no default features). The Windows all-features
+`mdshared-app` tests passed (650 passed, one ignored); the catalogue check passed. The
+delayed-echo and temp-collision tests failed before their fixes. Removing the periodic wake
+deadline or the owner cap failed the corresponding fake-backend test. Linux x86-64 Clippy
+passed with the `pkg-config` stub on Rust 1.100.0, without linking or running anything for
+Linux. The reconciliation test uses a silent fake backend; it does not reproduce a native
+overflow or stalled SMB share. macOS was not checked in this round.
 
 ## X13. The Markdown page renderer
 

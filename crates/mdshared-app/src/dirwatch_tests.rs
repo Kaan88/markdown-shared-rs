@@ -299,6 +299,24 @@ fn a_rename_reported_both_as_halves_and_as_a_pair_is_one_rename() {
 }
 
 #[test]
+fn a_delayed_rename_echo_cannot_remove_a_recreated_source() {
+    let at = Instant::now();
+    let mut c = coalescer();
+    for change in [
+        RawChange::RenamedFrom(p("a")),
+        RawChange::RenamedTo(p("b")),
+        RawChange::Created(p("a")),
+        RawChange::Renamed {
+            from: p("a"),
+            to: p("b"),
+        },
+    ] {
+        c.push(change, at);
+    }
+    assert_eq!(settle(&mut c, at, 1_000), vec![Verdict::Rescan]);
+}
+
+#[test]
 fn a_rename_onto_a_name_that_was_moving_keeps_the_first_entries_removal() {
     let t = Instant::now();
     let mut c = coalescer();
@@ -691,15 +709,15 @@ fn a_paired_rename_becomes_one_change_with_both_names() {
 #[test]
 fn a_case_only_rename_without_sides_requires_a_rescan() {
     // On a case-insensitive volume, both spellings would pass a metadata lookup.
-    let mut c = coalescer();
     let at = Instant::now();
     for (mode, name) in [(RenameMode::Any, "Report"), (RenameMode::Other, "report")] {
+        let mut c = coalescer();
         let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(mode))).add_path(p(name));
         for change in translate(&event) {
             c.push(change, at);
         }
+        assert_eq!(settle(&mut c, at, 1_000), vec![Verdict::Rescan], "{mode:?}");
     }
-    assert_eq!(settle(&mut c, at, 1_000), vec![Verdict::Rescan]);
 }
 
 #[test]

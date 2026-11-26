@@ -193,9 +193,13 @@ fn is_hidden(name: &str, meta: &Metadata) -> bool {
 /// Nothing here follows a link: [`DirEntry::metadata`](fs::DirEntry::metadata) reports the link
 /// itself, which on Windows costs no extra read because the folder scan already carried it.
 fn read_entry(item: &fs::DirEntry) -> Option<Entry> {
-    let file_type = item.file_type().ok()?;
-    let meta = item.metadata().ok()?;
-    Some(entry_of(
+    read_entry_checked(item).ok()
+}
+
+pub(crate) fn read_entry_checked(item: &fs::DirEntry) -> io::Result<Entry> {
+    let file_type = item.file_type()?;
+    let meta = item.metadata()?;
+    Ok(entry_of(
         item.path(),
         item.file_name().to_string_lossy().into_owned(),
         &file_type,

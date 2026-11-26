@@ -1,8 +1,10 @@
 //! The tests of the watcher's edge: waking, the drop that must not wait, the thread's stop, and
 //! one real folder on Windows.
 
+use super::queues::LIMIT;
 #[cfg(unix)]
 use super::resolve::identity;
+use super::worker::{Worker, feed_batch};
 use super::*;
 use crate::dirlist::Kind;
 #[cfg(windows)]
@@ -25,41 +27,33 @@ fn p(name: &str) -> PathBuf {
 /// A folder that is still the same folder is not lost: the events were confused, so re-read.
 #[test]
 fn a_folder_that_is_still_there_is_not_lost() {
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-still-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Dir::new("still");
     #[cfg(unix)]
-    let started = identity(&dir);
+    let started = identity(&dir.0);
     #[cfg(not(unix))]
     let started = None;
-    assert_eq!(lost_signal(&dir, started), Signal::Rescan);
-    _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(lost_signal(&dir.0, started), Signal::Rescan);
 }
 
 /// A folder that is gone is lost.
 #[test]
 fn a_folder_that_is_gone_is_lost() {
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-gone-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(lost_signal(&dir, None), Signal::Lost);
+    let dir = Dir::new("gone");
+    assert_eq!(lost_signal(&dir.0.join("absent"), None), Signal::Lost);
 }
 
 /// A folder made again under the same name is not the folder that was watched, so it is lost.
 #[cfg(unix)]
 #[test]
 fn a_folder_made_again_under_the_same_name_is_lost() {
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-again-{}", std::process::id()));
-    let other =
-        std::env::temp_dir().join(format!("mdshared-dirwatch-again-o-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    _ = std::fs::remove_dir_all(&other);
-    std::fs::create_dir_all(&dir).unwrap();
+    let sandbox = Dir::new("again");
+    let dir = sandbox.0.join("watched");
+    let other = sandbox.0.join("old");
+    std::fs::create_dir(&dir).unwrap();
     let started = identity(&dir);
     std::fs::rename(&dir, &other).unwrap();
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir(&dir).unwrap();
     assert_eq!(lost_signal(&dir, started), Signal::Lost);
-    _ = std::fs::remove_dir_all(&dir);
-    _ = std::fs::remove_dir_all(&other);
 }
 
 #[cfg(unix)]
@@ -87,9 +81,9 @@ fn a_root_replaced_during_registration_is_rejected() {
     let result = register(&root, || {
         std::fs::rename(&root, dir.0.join("old")).unwrap();
         std::fs::create_dir(&root).unwrap();
-        Some(())
+        Ok(())
     });
-    assert!(result.is_none());
+    assert!(result.is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -229,10 +223,8 @@ fn entry_at(path: PathBuf) -> Entry {
 /// Abandons the watcher while the reader is blocked, before opening the gate.
 #[test]
 fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
-    let dir = std::env::temp_dir().join(format!("mdshared-dirwatch-drop-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let dir = dir.canonicalize().unwrap();
+    let sandbox = Dir::new("drop");
+    let dir = sandbox.0.canonicalize().unwrap();
 
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -251,6 +243,7 @@ fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
             let _ = wake_tx.try_send(());
         },
         read,
+        None,
     )
     .expect("the watcher starts");
 
@@ -275,7 +268,6 @@ fn dropping_the_watcher_does_not_wait_for_a_slow_read() {
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
         "the worker exits without waking"
     );
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -292,7 +284,9 @@ fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
 
     let (started, teardown) = channel();
     let (release, gate) = channel();
-    let (backend, ()) = backend::start(move || Some((GatedBackend(started, gate), ()))).unwrap();
+    let (mut backend, ()) =
+        backend::start(move || Ok((GatedBackend(started, gate), ())), |_| Ok(())).unwrap();
+    let owner_thread = backend.thread.take().unwrap();
     let inbox = Arc::new(Inbox::default());
     let watcher = DirWatcher {
         folder: folder(),
@@ -311,6 +305,7 @@ fn dropping_the_watcher_returns_before_native_teardown_can_finish() {
     result.expect("dropping returns without waiting for native teardown");
     assert!(inbox.stopped());
     dropping.join().unwrap();
+    owner_thread.join().unwrap();
 }
 
 /// The thread reads no path after the watcher is dropped, even when a report had several.
@@ -343,7 +338,16 @@ fn a_stopped_watcher_reads_no_more_paths() {
     let for_report = Arc::clone(&shared);
     let (done, exited) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        run(for_work, for_report, coalescer, &wake, read, folder(), None);
+        Worker {
+            inbox: for_work,
+            shared: for_report,
+            coalescer,
+            read,
+            root: folder(),
+            started: None,
+            periodic: None,
+        }
+        .run(&wake, || {});
         done.send(()).ok();
     });
 
@@ -368,12 +372,39 @@ struct Dir(PathBuf);
 
 impl Dir {
     fn new(name: &str) -> Dir {
-        let dir =
-            std::env::temp_dir().join(format!("mdshared-dirwatch-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Dir(dir)
+        Self::new_in(&std::env::temp_dir(), name)
     }
+
+    fn new_in(parent: &Path, name: &str) -> Dir {
+        let base = format!("mdshared-dirwatch-{name}-{}", std::process::id());
+        for attempt in 0..1024 {
+            let dir = if attempt == 0 {
+                parent.join(&base)
+            } else {
+                parent.join(format!("{base}-{attempt}"))
+            };
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Dir(dir),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("cannot claim {}: {e}", dir.display()),
+            }
+        }
+        panic!("no unused temporary directory for {base}");
+    }
+}
+
+#[test]
+fn a_temp_directory_collision_leaves_the_existing_contents_alone() {
+    let parent = Dir::new("collision-sandbox");
+    let occupied = parent
+        .0
+        .join(format!("mdshared-dirwatch-probe-{}", std::process::id()));
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), b"untouched").unwrap();
+    let claimed = Dir::new_in(&parent.0, "probe");
+    assert_ne!(claimed.0, occupied);
+    drop(claimed);
+    assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"untouched");
 }
 
 impl Drop for Dir {
@@ -390,6 +421,83 @@ fn a_relative_report_reads_metadata_under_the_captured_root() {
     let entry = read_from_root(&dir.0, &relative).unwrap();
     assert_eq!(entry.path, relative);
     assert_eq!(entry.size, 8);
+}
+
+#[test]
+fn a_silent_backend_still_recovers_the_listing_and_gets_a_restart_request() {
+    let dir = Dir::new("silent-backend");
+    std::fs::write(dir.0.join("arrived"), "new").unwrap();
+    let inbox = Arc::new(Inbox::default());
+    let shared = Arc::new(Shared::default());
+    let (restart, restarted) = std::sync::mpsc::channel();
+    let (notify, notified) = std::sync::mpsc::channel();
+    let interval = Duration::from_secs(3_600);
+    let now = Instant::now();
+    let mut periodic = Periodic::new(interval, now, Some(vec![entry_at(p("gone"))])).unwrap();
+    periodic.make_due(now);
+    let worker = Worker {
+        inbox: Arc::clone(&inbox),
+        shared: Arc::clone(&shared),
+        coalescer: Coalescer::new(folder(), DEBOUNCE),
+        read: Arc::new(|_| panic!("the fake backend sent no incremental events")),
+        root: dir.0.clone(),
+        started: None,
+        periodic: Some(periodic),
+    };
+    let thread = std::thread::spawn(move || {
+        worker.run(
+            &|| {
+                _ = notify.send(());
+            },
+            || {
+                _ = restart.send(());
+            },
+        )
+    });
+    let wake = notified.recv_timeout(Duration::from_secs(5));
+    inbox.stop();
+    thread.join().unwrap();
+    wake.unwrap();
+    restarted.try_recv().unwrap();
+    let mut listing = crate::dirlist::Listing::new();
+    listing.set_folder(Some(folder()));
+    listing.set_entries(vec![entry_at(p("gone"))]);
+    let signals = shared.take();
+    assert_eq!(signals.len(), 2);
+    for signal in signals {
+        let Signal::Changed(change) = signal else {
+            panic!("expected a list change, got {signal:?}")
+        };
+        listing.apply(change);
+    }
+    assert_eq!(
+        listing
+            .visible()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>(),
+        [p("arrived")]
+    );
+}
+
+#[test]
+fn reconcile_builder_defaults_and_explicit_disable_are_platform_appropriate() {
+    let builder = DirWatcher::builder(folder());
+    assert_eq!(
+        builder.interval,
+        cfg!(windows).then(|| Duration::from_secs(30))
+    );
+    assert!(
+        builder
+            .reconcile_interval(Some(Duration::ZERO))
+            .interval
+            .is_none()
+    );
+    assert!(
+        DirWatcher::builder(folder())
+            .reconcile_interval(None)
+            .interval
+            .is_none()
+    );
 }
 
 /// The shown names of a list, in its order.

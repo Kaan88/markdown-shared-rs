@@ -30,18 +30,24 @@ pub(super) fn identity(path: &Path) -> Option<Identity> {
 /// setup. Otherwise a live watcher could be registered against a different directory.
 pub(super) fn register<T>(
     root: &Path,
-    watch: impl FnOnce() -> Option<T>,
-) -> Option<(T, Option<Identity>)> {
+    watch: impl FnOnce() -> io::Result<T>,
+) -> io::Result<(T, Option<Identity>)> {
     #[cfg(unix)]
     {
-        let before = identity(root)?;
+        let before = identity(root)
+            .ok_or_else(|| io::Error::other("cannot identify the directory to watch"))?;
         let watcher = watch()?;
-        (identity(root) == Some(before)).then_some((watcher, Some(before)))
+        if identity(root) != Some(before) {
+            return Err(io::Error::other(
+                "watched directory changed during registration",
+            ));
+        }
+        Ok((watcher, Some(before)))
     }
     #[cfg(not(unix))]
     {
         let _ = root;
-        Some((watch()?, None))
+        Ok((watch()?, None))
     }
 }
 
