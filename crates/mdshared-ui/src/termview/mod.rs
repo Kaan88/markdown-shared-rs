@@ -41,6 +41,15 @@
 //! tests says how many on the machine it runs on); the damaged rows of a shell's output, a
 //! fraction of that.
 //!
+//! # A translucent background
+//!
+//! [`draw_screen_with_background`] and [`draw_rows_with_background`] produce premultiplied
+//! pixels ready to present. Ordinary scrollbars (including animated and horizontal variants)
+//! and [`Painter::text`](crate::gfx::Painter::text), for example for IME preedit or search labels,
+//! assume an opaque destination. Put them in an opaque gutter or paint an opaque backing under
+//! their full bounds, including antialiased edges, before drawing them. Do not mark a
+//! translucent terminal area as frosted chrome.
+//!
 //! # A frame, and the pointer
 //!
 //! ```ignore
@@ -81,6 +90,7 @@
 //! `termview-150.png`. The speed of a full 200 by 60 frame: `cargo test --release -p
 //! mdshared-ui --features term termview_speed -- --ignored --nocapture`.
 
+mod backdrop;
 mod boxes;
 mod draw;
 mod font;
@@ -89,11 +99,15 @@ mod scheme;
 mod view;
 
 #[cfg(test)]
+mod backdrop_tests;
+#[cfg(test)]
 mod tests;
 
+pub use backdrop::BackgroundOpacity;
 pub use boxes::is_box_char;
 pub use draw::{
-    cursor_blinks_on, draw_rows, draw_rows_animated, draw_screen, draw_screen_animated,
+    cursor_blinks_on, draw_rows, draw_rows_animated, draw_rows_with_background, draw_screen,
+    draw_screen_animated, draw_screen_with_background,
 };
 pub use font::{CellFont, MAX_SHAPED, MONO_FAMILY};
 pub use metrics::Metrics;

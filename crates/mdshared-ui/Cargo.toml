@@ -149,3 +149,7 @@ required-features = ["host"]
 [[example]]
 name = "host_regions"
 required-features = ["host"]
+
+[[example]]
+name = "term_backdrop"
+required-features = ["host", "term"]
