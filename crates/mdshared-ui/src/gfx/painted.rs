@@ -179,9 +179,13 @@ fn blend_pixel(d: &mut [u8], px: [f32; 4], cover: f32) {
 /// of `radius` (device px) already folded into alpha: what a [`Picture`](crate::picture) draws
 /// again and again.
 ///
-/// `None` when the picture is empty, a side is zero, or the buffer is short. A radius that is
-/// not finite is treated as no rounding. The caller keeps `w * h` small enough to be worth
-/// keeping: this allocates floats for the whole destination.
+/// `None` when the picture is empty, a side is zero, or the buffer is short. The radius is cut
+/// to half the smaller side as the painter cuts it, so an infinite or NaN radius rounds fully.
+///
+/// The work is not bounded by `w * h` alone: it allocates `w` by the number of source rows the
+/// destination reads, 16 bytes a sample, before the `w * h * 4` bytes of the result. A tall
+/// source scaled down can therefore take hundreds of MiB even when the destination is small,
+/// and the caller keeps both sizes small enough to be worth that.
 pub(crate) fn prepare_image(
     rgba: &[u8],
     width: u32,
@@ -192,8 +196,7 @@ pub(crate) fn prepare_image(
 ) -> Option<Vec<u8>> {
     let (wi, hi) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
     let scaled = Scaled::take(rgba, width, height, 0, 0, wi, hi, (0, 0, wi, hi))?;
-    let rad = if radius.is_finite() { radius } else { 0.0 };
-    let rad = rad.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
+    let rad = radius.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
     let mut out = Vec::with_capacity((w as usize).checked_mul(h as usize)?.checked_mul(4)?);
     for r in 0..h as usize {
         for i in 0..w as usize {

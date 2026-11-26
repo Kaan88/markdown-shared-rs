@@ -20,30 +20,38 @@ use crate::gfx::{Painter, Rect};
 use mdshared_text::image::{Error, Image, Limits};
 
 /// The largest prepared picture, a side in device px and a number of pixels. A picture drawn
-/// larger than this is handed to [`Painter::image`] each time instead, so a nonsense rectangle
-/// cannot ask for a gigabyte of prepared pixels. 1024 px a side and a million pixels cover the
-/// avatars, icons and badges this is for; a full-screen photo is not prepared.
+/// larger than this is handed to [`Painter::image`] each time instead. 1024 px a side and a
+/// million pixels cover the avatars, icons and badges this is for. The prepared buffer itself
+/// is at most a few MiB, but `prepare_image` also allocates 16 bytes for each source row the
+/// destination reads: a tall source scaled down can still take hundreds of MiB.
 const MAX_PREPARED_SIDE: u32 = 1024;
 const MAX_PREPARED_PIXELS: u64 = 1_000_000;
 
-/// A decoder an application adds for a format the toolkit does not read: given a whole file,
-/// the first frame as straight RGBA, or `None` when it is not one this decoder knows.
+/// A decoder an application adds for a format the toolkit does not read: given a whole file
+/// and the limits the caller allows, the first frame as straight RGBA, or `None` when it is
+/// not one this decoder knows.
 ///
 /// It is asked only after [`mdshared_text::image::decode`] has refused the bytes as
-/// [`Error::Unsupported`], so it never overrides PNG or JPEG. A picture it returns is held to
-/// the [`Limits`] given to [`Picture::load`]. A closure `Fn(&[u8]) -> Option<Image>` is a
-/// decoder, so a small one needs no struct.
+/// [`Error::Unsupported`], so it never overrides PNG or JPEG. The decoder should read the
+/// header and check it against `limits` *before* decoding, the way the built-in decoders do:
+/// a picture over the limits is refused afterwards as [`Error::TooLarge`], but by then the
+/// slot has already allocated it. What it returns is also checked for a length that matches
+/// its size, and a panic inside it is [`Error::Damaged`], as a damaged file is.
+///
+/// A closure `Fn(&[u8], Limits) -> Option<Image>` is a decoder, so a small one needs no
+/// struct.
 pub trait Decoder {
-    /// The picture in `bytes`, or `None` for bytes this decoder does not recognise.
-    fn decode(&self, bytes: &[u8]) -> Option<Image>;
+    /// The picture in `bytes`, or `None` for bytes this decoder does not recognise. `limits`
+    /// is the caller's [`Limits`], to be checked before the pixels are allocated.
+    fn decode(&self, bytes: &[u8], limits: Limits) -> Option<Image>;
 }
 
 impl<F> Decoder for F
 where
-    F: Fn(&[u8]) -> Option<Image>,
+    F: Fn(&[u8], Limits) -> Option<Image>,
 {
-    fn decode(&self, bytes: &[u8]) -> Option<Image> {
-        self(bytes)
+    fn decode(&self, bytes: &[u8], limits: Limits) -> Option<Image> {
+        self(bytes, limits)
     }
 }
 
@@ -104,7 +112,9 @@ impl Picture {
     ///
     /// The built-in [`Limits`] are applied to the built-in decoders and to what the slot
     /// returns: a slot picture over them is [`Error::TooLarge`]. A damaged PNG stays
-    /// [`Error::Damaged`]; the slot is not asked to reinterpret it.
+    /// [`Error::Damaged`]; the slot is not asked to reinterpret it. A slot that panics, or
+    /// returns pixels whose length is not `width * height * 4` (or a zero side), is
+    /// [`Error::Damaged`] too: a decoder is not allowed to take the application down.
     pub fn load(
         bytes: &[u8],
         limits: Limits,
@@ -116,9 +126,24 @@ impl Picture {
                 if !matches!(error, Error::Unsupported(_)) {
                     return Err(error);
                 }
-                let Some(image) = extra.and_then(|d| d.decode(bytes)) else {
+                let Some(extra) = extra else {
                     return Err(error);
                 };
+                // A slot is application code; the built-in decoders' `guarded` is the model.
+                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    extra.decode(bytes, limits)
+                }));
+                let image = match decoded {
+                    Ok(Some(image)) => image,
+                    Ok(None) => return Err(error),
+                    Err(_) => return Err(Error::Damaged),
+                };
+                let len = (image.width as usize)
+                    .checked_mul(image.height as usize)
+                    .and_then(|n| n.checked_mul(4));
+                if image.width == 0 || image.height == 0 || len != Some(image.rgba.len()) {
+                    return Err(Error::Damaged);
+                }
                 if !limits.allows(image.width, image.height) {
                     return Err(Error::TooLarge {
                         width: image.width,
@@ -141,10 +166,17 @@ impl Picture {
     /// the rectangle exactly; the caller keeps the aspect ratio by the rectangle it gives.
     ///
     /// The first draw at a device size prepares the pixels; a later draw at the same size,
-    /// scale and radius blits them, and the clip and offset still apply. An empty or
-    /// non-finite rectangle, or a zero or non-finite alpha, draws nothing; a target over 1024
-    /// device px a side or a million pixels is handed to [`Painter::image`]. So no size panics
-    /// or asks for a huge buffer. A radius that is not finite is no rounding.
+    /// scale and radius blits them, and the clip and offset still apply. The prepared size is
+    /// `round(dst.w * scale)` by `round(dst.h * scale)`, which is a property of the rectangle
+    /// and not of where it sits, so moving a picture by whole or fractional logical px does
+    /// not prepare it again. `dev_rect` rounds the two edges separately and can place it a
+    /// pixel narrower or wider than that; the cached pixels are then blitted at the left edge,
+    /// up to a pixel short or a pixel over at the far edge.
+    ///
+    /// An empty or non-finite rectangle, or a zero or NaN alpha, draws nothing; a target over
+    /// 1024 device px a side or a million pixels, and one under a device pixel, is handed to
+    /// [`Painter::image`], so no nonsense size asks for a large prepared buffer. An infinite
+    /// or NaN radius rounds as far as half the smaller side, as it does in [`Painter::image`].
     ///
     /// This changes the picture (it keeps the prepared pixels), not the painter.
     pub fn draw(&mut self, painter: &mut Painter<'_>, dst: Rect, radius: f32, alpha: f32) {
@@ -162,38 +194,40 @@ impl Picture {
         if alpha <= 0.0 {
             return;
         }
-        let radius = if radius.is_finite() {
-            radius.max(0.0)
-        } else {
-            0.0
-        };
-        let (x0, y0, x1, y1) = painter.dev_rect(dst);
-        let w = x1 as i64 - x0 as i64;
-        let h = y1 as i64 - y0 as i64;
-        if w <= 0 || h <= 0 {
+        let scale = painter.scale;
+        let wide = dst.w * scale;
+        let tall = dst.h * scale;
+        if !wide.is_finite() || !tall.is_finite() || wide < 1.0 || tall < 1.0 {
+            self.draw_unprepared(painter, dst, radius, alpha);
             return;
         }
+        let w = wide.round() as i64;
+        let h = tall.round() as i64;
         if w > i64::from(MAX_PREPARED_SIDE)
             || h > i64::from(MAX_PREPARED_SIDE)
             || w.saturating_mul(h) > MAX_PREPARED_PIXELS as i64
         {
             // Too large to keep: the painter's own scaler, which allocates only the clip.
-            painter.image(
-                &self.image.rgba,
-                self.image.width,
-                self.image.height,
-                dst,
-                radius,
-                alpha,
-            );
+            self.draw_unprepared(painter, dst, radius, alpha);
+            return;
+        }
+        let (x0, y0, x1, y1) = painter.dev_rect(dst);
+        let placed_w = x1 as i64 - x0 as i64;
+        let placed_h = y1 as i64 - y0 as i64;
+        if placed_w <= 0 || placed_h <= 0 {
+            return;
+        }
+        if (placed_w - w).abs() > 1 || (placed_h - h).abs() > 1 {
+            // Only an extreme rectangle and scale get here; let the painter match it.
+            self.draw_unprepared(painter, dst, radius, alpha);
             return;
         }
         let (w, h) = (w as u32, h as u32);
-        let rad = (radius * painter.scale)
+        let rad = (radius * scale)
             .min(w as f32 / 2.0)
             .min(h as f32 / 2.0)
             .max(0.0);
-        let key = (w, h, painter.scale.to_bits(), rad.to_bits());
+        let key = (w, h, scale.to_bits(), rad.to_bits());
         if self.prepared.as_ref().is_none_or(|p| p.key != key) {
             let Some(rgba) = crate::gfx::prepare_image(
                 &self.image.rgba,
@@ -211,6 +245,18 @@ impl Picture {
         if let Some(prepared) = &self.prepared {
             painter.blit_rgba(&prepared.rgba, w, h, x0, y0, alpha);
         }
+    }
+
+    /// The painter's own scaler, for a target too small or too large to keep.
+    fn draw_unprepared(&self, painter: &mut Painter<'_>, dst: Rect, radius: f32, alpha: f32) {
+        painter.image(
+            &self.image.rgba,
+            self.image.width,
+            self.image.height,
+            dst,
+            radius,
+            alpha,
+        );
     }
 }
 
@@ -263,6 +309,21 @@ mod tests {
         [bmp.pixels[o + 2], bmp.pixels[o + 1], bmp.pixels[o], 255]
     }
 
+    /// The pixels that are not white: how many, and the box they lie in (x0, y0, x1, y1, the
+    /// far edges outside).
+    fn ink(bmp: &Bitmap) -> (usize, (i32, i32, i32, i32)) {
+        let (mut n, mut b) = (0, (i32::MAX, i32::MAX, i32::MIN, i32::MIN));
+        for y in 0..bmp.height as i32 {
+            for x in 0..bmp.width as i32 {
+                if rgba_at(bmp, x, y) != [255, 255, 255, 255] {
+                    n += 1;
+                    b = (b.0.min(x), b.1.min(y), b.2.max(x + 1), b.3.max(y + 1));
+                }
+            }
+        }
+        (n, b)
+    }
+
     /// The worst channel difference between two pages of the same size.
     fn worst(a: &Bitmap, b: &Bitmap) -> i32 {
         assert_eq!((a.width, a.height), (b.width, b.height));
@@ -310,7 +371,7 @@ mod tests {
         let _ = page(40, 30, 1.0, |p| {
             pic.draw(p, Rect::new(2.0, 1.0, 20.0, 12.0), 3.0, 1.0)
         });
-        assert_eq!(pic.prepares, 1, "a move reprepares");
+        assert_eq!(pic.prepares, 1, "a move reprepared");
     }
 
     #[test]
@@ -338,6 +399,46 @@ mod tests {
     }
 
     #[test]
+    fn a_move_at_a_fractional_scale_does_not_prepare_again() {
+        for scale in [1.25, 1.5] {
+            let mut pic = Picture::new(sample());
+            for x in [1.0, 2.0, 1.5, 2.7, 3.0] {
+                let _ = page(64, 48, scale, |p| {
+                    pic.draw(p, Rect::new(x, 2.0, 15.0, 15.0), 4.0, 1.0)
+                });
+                assert_eq!(pic.prepares, 1, "scale {scale}, moved to {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_alpha_change_does_not_prepare_again() {
+        let mut pic = Picture::new(sample());
+        let dst = Rect::new(4.0, 3.0, 20.0, 14.0);
+        let _ = page(40, 30, 1.5, |p| pic.draw(p, dst, 3.0, 1.0));
+        let _ = page(40, 30, 1.5, |p| pic.draw(p, dst, 3.0, 0.35));
+        assert_eq!(pic.prepares, 1, "an alpha change reprepared");
+    }
+
+    #[test]
+    fn an_infinite_or_nan_radius_rounds_as_the_painter_does() {
+        let source = sample();
+        let dst = Rect::new(6.0, 6.0, 24.0, 24.0);
+        for radius in [f32::INFINITY, f32::NAN] {
+            let direct = page(40, 40, 1.0, |p| {
+                p.image(&source.rgba, source.width, source.height, dst, radius, 1.0);
+            });
+            let mut pic = Picture::new(source.clone());
+            let prepared = page(40, 40, 1.0, |p| pic.draw(p, dst, radius, 1.0));
+            let d = worst(&direct, &prepared);
+            assert!(d <= 2, "radius {radius}: the drawings differ by {d}");
+            assert_eq!(pic.prepares, 1);
+            // Half the smaller side is 12 device px: the very corner is not covered.
+            assert_eq!(rgba_at(&prepared, 6, 6), [255, 255, 255, 255]);
+        }
+    }
+
+    #[test]
     fn the_clip_and_the_offset_are_honoured() {
         let source = sample();
         let dst = Rect::new(10.0, 10.0, 40.0, 40.0);
@@ -349,6 +450,8 @@ mod tests {
             pic.draw(p, dst, 8.0, 1.0);
             p.restore(old);
         });
+        assert_eq!(ink(&part).1, (10, 10, 30, 25));
+        assert_eq!(pic.prepares, 1, "the clipped draw prepared again");
         for y in 0..25 {
             for x in 0..30 {
                 assert_eq!(rgba_at(&part, x, y), rgba_at(&whole, x, y), "{x},{y}");
@@ -396,21 +499,21 @@ mod tests {
         );
         // A huge target is not prepared: it is handed to the painter, which allocates only
         // the visible part; it draws the picture's top-left corner and nothing panics.
-        let _ = page(24, 24, 1.0, |p| {
+        let huge = page(24, 24, 1.0, |p| {
             pic.draw(p, Rect::new(0.0, 0.0, 1.0e9, 1.0e9), 0.0, 1.0);
         });
         assert_eq!(pic.prepares, 0, "a huge target was prepared");
-        // A finite rectangle with a huge radius, an infinite one and a NaN one: all are cut
-        // to no more than half the side, and the first two differ in what they prepared.
+        assert!(ink(&huge).0 > 0, "the huge target drew nothing");
+        // A finite rectangle with a huge radius, an infinite one and a NaN one: all round as
+        // far as half the smaller side, as `Painter::image` does, so all three are one size.
         let some = page(24, 24, 1.0, |p| {
             pic.draw(p, Rect::new(2.0, 2.0, 10.0, 10.0), 1.0e6, 1.0);
             pic.draw(p, Rect::new(2.0, 2.0, 10.0, 10.0), f32::INFINITY, 1.0);
             pic.draw(p, Rect::new(2.0, 2.0, 10.0, 10.0), f32::NAN, 1.0);
         });
         assert_eq!(
-            pic.prepares, 2,
-            "the million-px radius is cut to half the side, the infinite radius is no \
-             rounding, and the NaN radius no rounding again"
+            pic.prepares, 1,
+            "a huge, an infinite and a NaN radius all round to half the side"
         );
         for y in 0..24 {
             for x in 0..24 {
@@ -425,7 +528,7 @@ mod tests {
     #[test]
     fn the_decoder_slot_reads_a_format_the_toolkit_refuses() {
         let gif = b"GIF89a a tiny picture";
-        let slot = |bytes: &[u8]| {
+        let slot = |bytes: &[u8], _: Limits| {
             bytes
                 .starts_with(b"GIF89a")
                 .then(|| pixels(2, 1, |x, _| [x as u8 * 200, 10, 20, 255]))
@@ -443,19 +546,49 @@ mod tests {
             Err(Error::Unsupported(Format::Unknown))
         ));
         // A damaged PNG stays damaged; a slot that would take anything is not asked.
-        let any = |_: &[u8]| Some(pixels(1, 1, |_, _| [0, 0, 0, 255]));
+        let any = |_: &[u8], _: Limits| Some(pixels(1, 1, |_, _| [0, 0, 0, 255]));
         assert!(matches!(
             Picture::load(b"\x89PNG\r\n\x1a\n", Limits::DEFAULT, Some(&any)),
             Err(Error::Damaged)
         ));
         // What the slot returns is held to the limits.
-        let wide = |_: &[u8]| Some(pixels(2, 2, |_, _| [0, 0, 0, 255]));
+        let wide = |_: &[u8], _: Limits| Some(pixels(2, 2, |_, _| [0, 0, 0, 255]));
         assert!(matches!(
             Picture::load(gif, Limits::new(1, 100), Some(&wide)),
             Err(Error::TooLarge {
                 width: 2,
                 height: 2
             })
+        ));
+    }
+
+    #[test]
+    fn a_slot_that_panics_or_returns_a_broken_image_is_damaged() {
+        let gif = b"GIF89a a tiny picture";
+        let boom = |_: &[u8], _: Limits| -> Option<Image> { panic!("the decoder gave up") };
+        assert!(matches!(
+            Picture::load(gif, Limits::DEFAULT, Some(&boom)),
+            Err(Error::Damaged)
+        ));
+        // A picture whose pixels are not `width * height * 4` is not drawn.
+        let short = |_: &[u8], _: Limits| {
+            let mut image = pixels(2, 2, |_, _| [0, 0, 0, 255]);
+            image.rgba.pop();
+            Some(image)
+        };
+        assert!(matches!(
+            Picture::load(gif, Limits::DEFAULT, Some(&short)),
+            Err(Error::Damaged)
+        ));
+        let zero = |_: &[u8], _: Limits| {
+            let mut image = pixels(1, 1, |_, _| [0, 0, 0, 255]);
+            image.width = 0;
+            image.rgba.clear();
+            Some(image)
+        };
+        assert!(matches!(
+            Picture::load(gif, Limits::DEFAULT, Some(&zero)),
+            Err(Error::Damaged)
         ));
     }
 }
