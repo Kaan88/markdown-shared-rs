@@ -61,7 +61,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | 2 | **mdmix's further pieces**, when mdmix asks for them (it is made usable from what exists first, by its own session): submenus, window state, tray and notifications, focus | L1, W3, W6, W7, W2 |
 | 3 | **File manager** | F1, F2, F3, F4, F5, L5, L6, L7, L8, L9, L4 |
 | 4 | **Terminal** | T2, T1, T3, T4, T6, T7, T5 |
-| CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around, when convenient; CS1 and CS2 first (below) | CS1-CS15 |
+| CS | **Claude Switch** (the owner, 2026-11-26): the gaps its authors worked around and the font settings it asked for, when convenient; CS1 and CS2 first (below) | CS1-CS18 |
 | any | When an application asks for it | W1 (once a second application would share it), W8 (after W2), W9 (before a first release), the X items |
 
 ## Shell and window
@@ -280,6 +280,9 @@ given in brackets. Already covered here: plain and icon buttons outside dialogs 
 [3] and a badge [4] are K4; dropping files is K8; pictures on the clipboard are L9. When an item
 lands on `main`, tell the Claude Switch session the commit, so the app can raise its pin.
 
+Claude Switch also asked for CS16–CS18, the font settings below; the owner approved them on
+2026-11-26.
+
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
 | CS1 | **A translucent terminal background** [15]. `termview` draws the default background (and, if asked, the padding round the grid) at a chosen opacity over the window backdrop (Mica, Acrylic, frost), while glyphs, explicit cell backgrounds, the selection and the cursor stay opaque; a contrast floor keeps text readable on any desktop colour | M | high | `termview`, `Painter::set_frost_key`, X11 | done on `feat/cs1-translucent-bg`: per-pixel alpha independent of the chrome veil; opaque fallback; Windows smoke and pixel tests, not visually inspected in a live window |
@@ -297,6 +300,9 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 | CS13 | **Getters on `mdshared_pty::Command`** [9] besides `program()`: the arguments, the folder, the environment | S | low | `mdshared-pty` | open |
 | CS14 | **`host::App::raw` without a winit type the toolkit does not re-export** [11]: re-export it, or give `raw` a type of the toolkit's | S | medium | `host` | open |
 | CS15 | **The settings forms** [17, 18]: colour rows and a card style on `settings::pages::Form`; the grouped form's style reaching its own dropdown menus and colour-picker flyouts | M | medium | `settings`, `settings::pages`, `menu::Look` | open |
+| CS16 | **List the installed font families.** Give each family once, sorted by name, with a monospace flag. Use the fontique collection `mdshared_text::fonts::shared_fonts` already loads; read `post.isFixedPitch` and PANOSE, and cross-check against equal glyph advances. Done when a test finds at least one monospace and one proportional family on each OS, and the API is in the catalogue | S | medium | `mdshared_text::fonts`, fontique | open |
+| CS17 | **Let the app choose the painter's fonts.** An additive setter in `gfx` for the interface family, the monospace family and a size scale. Changing any of them triggers a relayout and repaint; the private `UI_FAMILY` and `MONO_FAMILY` stay the defaults. Done when a pixel test shows the chosen family in buttons, menus and fields and the defaults are byte-identical | S-M | medium | `gfx`, `mdshared_text::fonts` | open |
+| CS18 | **A font-picker row for settings.** Closed, it shows the family in its own face and the size. The popup has a search field above the CS16 list, names drawn in their own faces, a preview line and a monospace-only filter. Apply, Cancel and a click outside work as they do in the colour picker. Depends on CS16 and the colour picker confirm fix | S | medium | `settings`, `colour_picker`, `textfield`, CS16 | open |
 
 ## Left over from what exists
 
