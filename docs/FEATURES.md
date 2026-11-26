@@ -1939,8 +1939,9 @@ Decisions:
   tests, which fail with that grouping.
 - **Mixed families need no code.** Each run's font, size and normalized coordinates come from
   the layout, as `TextEngine` already reads them, so a run in the mono family is drawn with it;
-  the test checks that parley shaped the two runs in two different fonts and that the pixels
-  are the engine's own.
+  the test checks that the pixels are the engine's own and that parley shaped the two runs in
+  two different fonts, and says so and passes where the machine has no family of another width
+  to show that with.
 - **For the owner: `parley` is part of the public API now.** `richtext` re-exports it, and
   `Painter::rich_text` takes a `parley::Layout<Brush>`; a caller cannot draw a rich layout
   without naming the type, so parley's version is in this crate's signature either way. A
@@ -1970,9 +1971,9 @@ against the tree before this change; each assertion was also shown failing under
   on this machine.
 - `richtext::tests::a_ligature_in_a_right_to_left_line_keeps_its_bytes` and
   `a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole`: `لا` with the alef
-  in another brush is one run `0..4`, and `بلا` with only the alef blue is one run `0..6` whose
-  box is as wide as the word; both skip with a note where no Arabic font ligates. With the
-  visual-cluster grouping they fail with `2..4` and `4..6`.
+  in another brush is one run covering the whole text, and `بلا` with only the alef blue keeps
+  the ligature's bytes (`2..6`) in one run; both skip with a note where no Arabic font ligates.
+  With the visual-cluster grouping they fail with `2..4` and `4..6`.
 - `a_wavy_underline_is_continuous_across_its_band_and_stays_inside_it`: every device column of
   the band has ink in it, nothing outside the band is touched, the crest and the trough reach
   the band's first and last row, the two halves of one wavelength are on opposite sides of the
@@ -2001,19 +2002,26 @@ against the tree before this change; each assertion was also shown failing under
   the device place the scale names, and the wave's ink box is exactly the band in device px
   (120 by 10 at scale 2).
 - `richtext::tests::each_run_gives_its_text_and_the_box_it_was_placed_in`,
-  `a_run_that_changes_colour_back_again_is_three_runs` (red, blue, red gives 0..4, 4..7,
-  7..11 and three boxes that follow each other),
-  `a_right_to_left_line_keeps_each_range_with_its_own_box` (the long run's box is the wide one
-  and the logically first run is placed on the right), and
-  `a_wrapped_layout_reports_its_runs_line_by_line` (every byte in exactly one run, in order, a
-  later line below an earlier one, and a run beginning and ending where a brush change does) all
-  fail when `runs` reports the shaped run's own range (`0..11` three times, `0..10` for both
-  halves).
+  `a_colour_that_changes_back_makes_the_middle_word_a_run_of_its_own`,
+  `a_right_to_left_line_keeps_each_range_with_its_own_box`,
+  `a_right_to_left_line_split_between_two_fonts_reports_each_part`, and
+  `a_wrapped_layout_reports_its_runs_line_by_line` share one helper (`checked`) that asserts
+  what holds whatever fonts the machine has, since a fallback may split a line into more runs
+  by itself: the ranges tile the text in reading order, every brush boundary is a run boundary,
+  and the boxes of one line touch in visual order; the widths of the boxes add up to the same
+  line drawn in one colour, which is what "each range's box is where its text was drawn" means
+  here. The RTL test finds its boxes by the byte they start at and checks that the three-letter
+  range is the wide one and sits left of the one-letter range; the split test asks for the space
+  in the mono family so that a font fallback's own split (the shape a Mac gives of its own
+  accord) is exercised on every machine, and notes and passes where the machine has no mono
+  family to split with. All of them fail when `runs` reports the shaped run's own range (`0..11` three times, `0..10` for both halves); the RTL test also fails when the
+  atoms are not turned round for a right-to-left run (the boxes no longer touch and the narrow
+  range gets the wide box).
 
 Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
 --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
 --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
-test binary passes; the `mdshared-ui` library alone ran 1132 tests with 34 ignored and 4
+test binary passes; the `mdshared-ui` library alone ran 1138 tests with 34 ignored and 4
 filtered, and the doctests passed); and the sheet
 `cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
 `target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
@@ -2058,3 +2066,16 @@ doc says "every byte of a run that has glyphs"). An empty layout now answers
 background has its place (with a test). And the wave is now cut a stroke's thickness beyond the
 clip on each side and taken as whole half waves rather than shortened inside it, so the pixels
 inside the clip are exactly the unclipped drawing's and the clip test demands equality again.
+
+PR #38 then failed on both macOS runners: `a_right_to_left_line_keeps_each_range_with_its_own_box`
+expected two runs, and a Mac's font fallback splits `א אאא` into three (the space comes from
+another font), so the count and the exact ranges were a statement about the machine, not about
+`runs`. Every test that counted runs was rewritten to assert what holds on any font: the ranges
+tile the text, every brush boundary is a run boundary, the boxes of a line touch in visual
+order, and their widths add up to the same line drawn in one colour; boxes are found by the byte
+they start at, never by index. A new test pins the split shape on purpose — the space asked for
+in the mono family — so the three-run case is exercised on Windows and Linux too. The awkward
+half of this was that a single-atom run cannot show a range paired with the wrong box, which is
+what the RTL test is for; the split test therefore checks the split shape while the pairing test
+keeps its two runs (still three on a Mac, where the properties hold). Both still fail when the
+atoms are not turned round (the boxes stop touching and the narrow range gets the wide box).

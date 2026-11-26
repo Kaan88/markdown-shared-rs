@@ -217,23 +217,64 @@ mod tests {
             .any(|run| run.clusters().any(|c| c.is_ligature_continuation()))
     }
 
+    /// What every set of runs satisfies, whatever fonts the machine resolved (a font fallback
+    /// may split a run by itself, so the count is not fixed): the ranges tile the text in
+    /// reading order, every brush boundary the caller made is a run boundary, and the boxes of
+    /// one line touch in visual order.
+    fn checked(boxes: &[RunBox], text: &str, boundaries: &[usize]) {
+        let mut ranges: Vec<_> = boxes.iter().map(|b| b.range.clone()).collect();
+        ranges.sort_by_key(|r| r.start);
+        let mut at = 0;
+        for r in &ranges {
+            assert_eq!(r.start, at, "{boxes:?}");
+            assert!(r.end > r.start, "an empty run: {boxes:?}");
+            at = r.end;
+        }
+        assert_eq!(at, text.len(), "the runs do not cover the text: {boxes:?}");
+        for &cut in boundaries {
+            assert!(
+                boxes.iter().any(|b| b.range.start == cut),
+                "no run begins at the brush change {cut}: {boxes:?}"
+            );
+        }
+        for pair in boxes.windows(2) {
+            if (pair[0].rect.y - pair[1].rect.y).abs() < 0.01 {
+                assert!(
+                    (pair[0].rect.right() - pair[1].rect.x).abs() < 0.5,
+                    "the boxes do not touch: {:?} then {:?}",
+                    pair[0].rect,
+                    pair[1].rect
+                );
+            }
+        }
+    }
+
+    /// The boxes' widths added up: the same on any font, so a line drawn in one colour and the
+    /// same line drawn in two add to the same length.
+    fn width(boxes: &[RunBox]) -> f32 {
+        boxes.iter().map(|b| b.rect.w).sum()
+    }
+
     #[test]
     fn each_run_gives_its_text_and_the_box_it_was_placed_in() {
-        let layout = layout("wrong word", 26.0, RED, |b| {
-            b.push(StyleProperty::Brush(BLUE), 6..)
-        });
+        let text = "wrong word";
+        let layout = layout(text, 26.0, RED, |b| b.push(StyleProperty::Brush(BLUE), 6..));
         let boxes = runs(&layout);
-        assert_eq!(boxes.len(), 2, "{boxes:?}");
-        assert_eq!(boxes[0].range, 0..6);
-        assert_eq!(boxes[1].range, 6..10);
-        // The second run starts where the first ends, on the same baseline.
-        let (a, b) = (boxes[0].rect, boxes[1].rect);
-        assert!((a.right() - b.x).abs() < 0.5, "{a:?} then {b:?}");
-        assert_eq!(boxes[0].baseline, boxes[1].baseline);
-        assert_eq!(a.y, b.y);
+        checked(&boxes, text, &[6]);
+        let first = boxes
+            .iter()
+            .find(|b| b.range.start == 0)
+            .expect("the first");
+        let second = boxes
+            .iter()
+            .find(|b| b.range.start == 6)
+            .expect("the second");
+        // The second run begins where the first ends, on the same baseline.
+        assert_eq!(first.baseline, second.baseline);
+        assert_eq!(first.rect.y, second.rect.y);
         // Both words are there, and the boxes stay inside the layout's width.
-        assert!(a.w > 10.0 && b.w > 10.0);
-        assert!(b.right() <= layout.width() + 1.0);
+        assert!(first.rect.w > 10.0 && second.rect.w > 10.0);
+        assert!(second.rect.right() <= layout.width() + 1.0);
     }
 
     #[test]
@@ -246,26 +287,14 @@ mod tests {
         layout.break_all_lines(Some(90.0));
         let boxes = runs(&layout);
         assert!(boxes.len() > 2, "{boxes:?}");
-        // Every byte of the text is in exactly one run, in order, and the lines go down.
-        let mut at = 0;
+        checked(&boxes, text, &[marked, marked + 4]);
+        // The lines go down.
         let mut last_y = f32::MIN;
         for b in &boxes {
-            assert_eq!(b.range.start, at, "{boxes:?}");
-            at = b.range.end;
-            assert!(b.rect.y >= last_y);
+            assert!(b.rect.y >= last_y, "{boxes:?}");
             last_y = b.rect.y;
             assert!(b.rect.h > 0.0);
         }
-        assert_eq!(at, text.len());
-        // The runs split where the style does, not only where the line does.
-        assert!(
-            boxes.iter().any(|b| b.range.start == marked),
-            "no run begins at the marked word: {boxes:?}"
-        );
-        assert!(
-            boxes.iter().any(|b| b.range.start == marked + 4),
-            "no run ends at the marked word: {boxes:?}"
-        );
         // The second line's baseline is below the first's.
         let first = boxes[0].rect.y;
         let below = boxes
@@ -276,45 +305,105 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_changes_colour_back_again_is_three_runs() {
+    fn a_colour_that_changes_back_makes_the_middle_word_a_run_of_its_own() {
         let text = "aaa bbb aaa";
         let layout = layout(text, 22.0, RED, |b| {
             b.push(StyleProperty::Brush(BLUE), 4..7);
         });
         let boxes = runs(&layout);
-        let ranges: Vec<_> = boxes.iter().map(|b| b.range.clone()).collect();
-        assert_eq!(ranges, vec![0..4, 4..7, 7..11], "{boxes:?}");
-        // The three boxes follow each other across the line.
-        assert!((boxes[0].rect.right() - boxes[1].rect.x).abs() < 0.5);
-        assert!((boxes[1].rect.right() - boxes[2].rect.x).abs() < 0.5);
+        // The colour changes at byte 4 and back at 7, so those are run boundaries on any font
+        // and the middle word is one run of its own.
+        checked(&boxes, text, &[4, 7]);
+        let middle = boxes
+            .iter()
+            .find(|b| b.range.start == 4)
+            .expect("the blue word");
+        assert_eq!(middle.range.end, 7, "{boxes:?}");
     }
 
     #[test]
     fn a_right_to_left_line_keeps_each_range_with_its_own_box() {
-        // The logical first run sits on the right, so pairing a range with the wrong box would
-        // show here: the long run is three letters, the short one a single letter.
+        // The logical first run sits on the right, so a pairing that put a range with the wrong
+        // box would show here: the long stretch is three letters, the short one a single
+        // letter. Whatever fonts the machine resolved (a fallback may split the line by itself,
+        // and the space between the words may come from another font), the runs must tile the
+        // text, the brush change must be a run boundary, and the boxes must touch in visual
+        // order.
         let text = "א אאא";
-        let layout = layout(text, 22.0, RED, |b| b.push(StyleProperty::Brush(BLUE), 3..));
-        let boxes = runs(&layout);
-        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        let coloured = layout(text, 22.0, RED, |b| b.push(StyleProperty::Brush(BLUE), 3..));
+        let boxes = runs(&coloured);
+        checked(&boxes, text, &[3]);
+
         let short = boxes
             .iter()
             .find(|b| b.range.start == 0)
-            .unwrap_or_else(|| panic!("the first: {boxes:?}"));
+            .unwrap_or_else(|| panic!("the first run: {boxes:?}"));
         let long = boxes
             .iter()
-            .find(|b| b.range.end == text.len())
-            .unwrap_or_else(|| panic!("the second: {boxes:?}"));
-        assert_eq!((short.range.clone(), long.range.clone()), (0..3, 3..9));
+            .find(|b| b.range.start == 3)
+            .unwrap_or_else(|| panic!("the long run: {boxes:?}"));
+        // Visual order: the logically first run is placed after the logically last one.
+        assert!(short.rect.x > long.rect.x, "{boxes:?}");
+        assert_eq!(short.baseline, long.baseline);
+        // The range with three letters is the wide one: each range keeps its own box.
         assert!(
             long.rect.w > 1.5 * short.rect.w,
             "the long run is {} wide and the short one {}",
             long.rect.w,
             short.rect.w
         );
-        // Visual order: the logically first run is placed after the logically last one.
-        assert!(short.rect.x > long.rect.x, "{boxes:?}");
-        assert_eq!(short.baseline, long.baseline);
+        // Each range's box is where that text was drawn: the widths add up to the same line
+        // drawn in one colour.
+        let plain = runs(&layout(text, 22.0, RED, |_| ()));
+        assert!(
+            (width(&boxes) - width(&plain)).abs() < 0.5,
+            "{} of the one-colour line's {}",
+            width(&boxes),
+            width(&plain)
+        );
+    }
+
+    #[test]
+    fn a_right_to_left_line_split_between_two_fonts_reports_each_part() {
+        // A font fallback can split one line into several runs by itself: here the space is
+        // asked for in the mono family, which has no Hebrew, so the letters and the space come
+        // from different fonts on any machine that has a mono family. The same properties hold,
+        // and each part keeps its own box.
+        let text = "א אאא";
+        let mono = |b: &mut parley::RangedBuilder<'_, Brush>| {
+            b.push(
+                StyleProperty::FontFamily(FontFamily::from(
+                    "Cascadia Mono, Consolas, DejaVu Sans Mono, monospace",
+                )),
+                2..3,
+            );
+        };
+        let boxes = runs(&layout(text, 22.0, RED, mono));
+        checked(&boxes, text, &[]);
+        // The mono family has no Hebrew, so the space is a run of its own; a machine without a
+        // mono family falls back to the letters' font and says so rather than failing.
+        if !boxes.iter().any(|b| b.range.start == 2) {
+            eprintln!("note: the space took the letters' font; the split was not tested");
+            return;
+        }
+        // The logically first part is placed after the last one, and the parts add up to the
+        // line drawn with the same fonts and no colour change.
+        let first = boxes
+            .iter()
+            .find(|b| b.range.start == 0)
+            .unwrap_or_else(|| panic!("the first run: {boxes:?}"));
+        let last = boxes
+            .iter()
+            .find(|b| b.range.end == text.len())
+            .unwrap_or_else(|| panic!("the last run: {boxes:?}"));
+        assert!(first.rect.x > last.rect.x, "{boxes:?}");
+        let plain = runs(&layout(text, 22.0, RED, mono));
+        assert!(
+            (width(&boxes) - width(&plain)).abs() < 0.5,
+            "{} of the one-font line's {}",
+            width(&boxes),
+            width(&plain)
+        );
     }
 
     /// A layout of `text` in the first family list on this machine that shapes it with a
@@ -344,43 +433,52 @@ mod tests {
         // The lam-alef is one shaped cluster, and a right-to-left run walks its clusters
         // backwards: the alef, the continuation, comes before the lam that starts the glyph. A
         // machine without a font that ligates it skips this, with a note.
-        let Some(layout) = ligating("لا", |b| b.push(StyleProperty::Brush(BLUE), 2..)) else {
+        let text = "لا";
+        let Some(layout) = ligating(text, |b| b.push(StyleProperty::Brush(BLUE), 2..)) else {
             eprintln!("note: no Arabic font with the lam-alef ligature here; skipped one test");
             return;
         };
-        let whole = ligating("لا", |_| ()).expect("the same font");
         let boxes = runs(&layout);
-        let plain = runs(&whole);
-        assert_eq!(plain.len(), 1, "{plain:?}");
-        assert_eq!(boxes.len(), 1, "{boxes:?}");
-        assert_eq!(boxes[0].range, 0..4, "the lam's bytes were lost: {boxes:?}");
+        checked(&boxes, text, &[]);
+        // The ligature is one glyph, so its two letters are one run even though the alef asks
+        // for another brush.
         assert!(
-            (boxes[0].rect.w - plain[0].rect.w).abs() < 0.5,
-            "the box is {} wide of the word's {}",
-            boxes[0].rect.w,
-            plain[0].rect.w
+            boxes
+                .iter()
+                .any(|b| b.range.start == 0 && b.range.end == text.len()),
+            "the lam's bytes were lost: {boxes:?}"
+        );
+        // And the box is as wide as the text drawn in one colour.
+        let plain = runs(&ligating(text, |_| ()).expect("the same font"));
+        assert!(
+            (width(&boxes) - width(&plain)).abs() < 0.5,
+            "{} of the one-colour line's {}",
+            width(&boxes),
+            width(&plain)
         );
     }
 
     #[test]
     fn a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole() {
-        // Blue on the alef alone, inside the lam-alef: the run is the whole word, so its box
-        // must be as wide as the word, not as wide as the alef.
-        let Some(layout) = ligating("بلا", |b| b.push(StyleProperty::Brush(BLUE), 4..)) else {
+        // Blue on the alef alone, inside the lam-alef: the ligature's bytes stay in one run, so
+        // their box is as wide as both letters, not as wide as the alef.
+        let text = "بلا";
+        let Some(layout) = ligating(text, |b| b.push(StyleProperty::Brush(BLUE), 4..)) else {
             eprintln!("note: no Arabic font with the lam-alef ligature here; skipped one test");
             return;
         };
-        let whole = ligating("بلا", |_| ()).expect("the same font");
         let boxes = runs(&layout);
-        let plain = runs(&whole);
-        assert_eq!(plain.len(), 1, "{plain:?}");
-        assert_eq!(boxes.len(), 1, "{boxes:?}");
-        assert_eq!(boxes[0].range, 0..6, "{boxes:?}");
+        checked(&boxes, text, &[]);
         assert!(
-            (boxes[0].rect.w - plain[0].rect.w).abs() < 0.5,
-            "the box is {} wide of the word's {}",
-            boxes[0].rect.w,
-            plain[0].rect.w
+            boxes.iter().any(|b| b.range.start <= 2 && b.range.end >= 6),
+            "the lam-alef was split: {boxes:?}"
+        );
+        let plain = runs(&ligating(text, |_| ()).expect("the same font"));
+        assert!(
+            (width(&boxes) - width(&plain)).abs() < 0.5,
+            "{} of the one-colour line's {}",
+            width(&boxes),
+            width(&plain)
         );
     }
 
