@@ -1566,6 +1566,66 @@ fourteen tests, the seven above among them) and the three commands below, on Win
 Compiled, not run, on Linux and macOS. Not seen by a person: no window draws a selection yet
 (roadmap T1).
 
+## A layout helper: rows and columns of boxes (`layout`, 2026-11-26, `feat/k5-layout`, roadmap K5, Barbican BT1)
+
+`mdshared_ui::layout` is pure arithmetic: `Flex::row()` or `Flex::column()` with padding
+(`Insets`), a gap between neighbours, a gap between lines, `Justify` along the main axis,
+`Align` across it, wrapping and a pixel grid, and `layout(area, &items)` gives one `Rect` per
+`Item` in their order. Nothing is kept between calls; a nested layout is a second call with one
+of the rectangles as its area. It draws nothing and hits nothing.
+
+How sizes are decided, as CSS's flexible box does it, cut down:
+
+- `Item::fixed(px)` neither grows nor shrinks unless `.grow(w)` or `.shrink(w)` says so;
+  `Item::flex(w)` has no length of its own and takes `w` shares of what is left. `.min` and
+  `.max` bound the main size; when the least is more than the most, the least wins.
+- Room to spare is shared among the growers by weight; missing room is taken from the
+  shrinkers by weight times basis. Growing and shrinking count from the basis, not from the
+  size raised to its least, as in CSS. An item that reaches a bound is frozen there and the rest
+  share again (CSS's "resolve flexible lengths"). One difference: growers whose weights add up
+  to less than 1 still share all the space; CSS gives them only that fraction.
+- What is left when nothing can grow is placed by `Justify` (start, centre, end, space between,
+  around, evenly). Items that do not fit start at the start and run past the end whatever the
+  justification, so the first is never pushed out; the caller clips.
+- Across the main axis an item without `.cross(px)` fills its line; one with it is placed by
+  `Align` (the layout's, or the item's own). Without wrapping a cross size is held to the line.
+- With `.wrap(true)` a line takes items while their natural sizes fit; an item longer than a
+  line has a line to itself; each line resolves its own flexible lengths; a line is as thick as
+  its thickest item, and a line where no item has a cross size shares the space left.
+- Edges are snapped one by one to a grid (`.snap(step)`: 1 logical pixel by default, `1/scale`
+  for device pixels, 0 for none), so neighbours share an edge and the boxes cover exactly the
+  snapped length of the area: three shares of 301 px are 100, 101, 100.
+- `natural(&items)` is the main length the items want (natural sizes, gaps and padding) and
+  `cross_extent(main, &items)` the cross length they need at a given main length (an infinite
+  main length: one line). A scroll area sizes its content with these.
+- Nonsense in: negative or non-finite lengths are 0 (an item's `max` of NaN or infinity is no
+  limit), lengths above `MAX_LENGTH` (1e9) are held there, an area with a non-finite place is
+  empty; every rectangle out is finite with no negative size. The new enums are
+  `#[non_exhaustive]`, and `Item`'s and `Flex`'s fields are private, so more can be added.
+
+Run: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
+mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
+mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests`, on Windows only. The
+37 tests in `layout_tests.rs` cover zero and negative space, least/most conflicts, shrinking,
+every justification and alignment, wrapping (including an item longer than a line and lines
+without cross sizes), snapping with no lost pixel (against the snapped length of the area for
+500 pseudo-random splits), device-pixel steps, nonsense and huge input, a wrapping layout laid
+out at its own `natural` length keeping one line (2000 cases), and the resolved lengths against
+the rules they must keep (bounds, the line filled, equal growth or shrink per weight; 3000
+pseudo-random lines). A pixel test draws seven flexible boxes at scale 1 and 1.5 in both
+palettes and checks every device column belongs to exactly the box whose edges hold it. The
+sheet `cargo test -p mdshared-ui layout_sheet -- --ignored` writes `target/specimen/layout.png`
+and `layout-150.png` (a toolbar, a form row, wrapped chips, the justifications, equal shares);
+I looked at the scale-1 sheet, the owner has not. Not used by any application yet; not seen in
+a window.
+
+Reviewed by `cc-reviewer` (Opus); its five blocking findings are fixed (a wrap break lost to the
+float rounding of the padding, `cross_extent` of an infinite length, and three doc claims that
+said more than the code did). Left for later: `layout_into` reuses the output vector but still
+allocates small working vectors each call; with a snap step that is not a whole number, a box's
+`right()` and the next box's `x` can differ in the last bit of a float, since `Rect` keeps a
+width; CSS's rule for weights adding up to less than 1 is not followed (documented).
+
 ## A page switch that survives a resize (`PageTransition::fits`, `PageTransition::rebase`, 2026-11-26, `feat/x10-page-resize`, roadmap X10)
 
 Until now a switch held a snapshot of the old page taken at one size, and `apply` ended it as
