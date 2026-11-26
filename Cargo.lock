@@ -1392,6 +1392,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdshared-pty"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mdshared-term",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "mdshared-term"
 version = "0.1.0"
 
@@ -1413,6 +1422,7 @@ dependencies = [
  "accesskit_winit",
  "arboard",
  "mdshared-app",
+ "mdshared-term",
  "mdshared-text",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
