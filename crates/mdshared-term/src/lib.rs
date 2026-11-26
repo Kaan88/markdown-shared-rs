@@ -59,6 +59,8 @@
 //! Nor is anything here that needs the system: a pseudo-terminal (ConPTY, `openpty`), a child
 //! process, drawing a grid of glyphs, the bell's sound.
 
+mod line;
+
 pub mod input;
 pub mod parse;
 pub mod screen;
