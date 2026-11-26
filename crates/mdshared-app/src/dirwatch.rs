@@ -47,8 +47,8 @@
 //! removal of the name that went and a creation of the name that arrived: an unpaired old name
 //! is a [`Change::Removed`](crate::dirlist::Change::Removed) when the quiet period ends, and an
 //! unpaired new name is a [`Change::Created`](crate::dirlist::Change::Created) at once. macOS
-//! reports a rename as one path with no side; that path is read as a modification, and the disk
-//! says whether it is still there.
+//! reports a rename as one path with no side; it requests a rescan so the list uses the actual
+//! names in the directory, even on case-insensitive volumes.
 //!
 //! When the OS watcher reports an overflow or asks for a rescan, [`Signal::Rescan`] is emitted
 //! instead of the changes, because some events were lost and only a fresh read of the folder can

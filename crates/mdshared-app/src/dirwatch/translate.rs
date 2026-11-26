@@ -107,15 +107,13 @@ impl Translator {
                             .map(RawChange::RenamedTo),
                     ),
                 },
-                // macOS FSEvents pairs no names: the one path it gives is its own, and the disk
-                // says whether it is still there. Every such path reads as a change of it.
-                RenameMode::Any | RenameMode::Other => out.extend(
-                    event
-                        .paths
-                        .iter()
-                        .filter_map(|p| self.inside(p))
-                        .map(RawChange::Modified),
-                ),
+                // A metadata read cannot distinguish the old spelling from the new one on a
+                // case-insensitive volume. Only enumerating the folder gives its actual names.
+                RenameMode::Any | RenameMode::Other => {
+                    if event.paths.iter().any(|p| self.inside(p).is_some()) {
+                        out.push(RawChange::Rescan);
+                    }
+                }
             },
             EventKind::Modify(_) => out.extend(
                 event

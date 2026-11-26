@@ -674,11 +674,17 @@ fn a_paired_rename_becomes_one_change_with_both_names() {
 }
 
 #[test]
-fn an_unpaired_rename_becomes_a_modification_of_its_path() {
-    // macOS FSEvents gives one path and no side; the disk decides what happened to it.
-    let event =
-        notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any))).add_path(p("a"));
-    assert_eq!(translate(&event), vec![RawChange::Modified(p("a"))]);
+fn a_case_only_rename_without_sides_requires_a_rescan() {
+    // On a case-insensitive volume, both spellings would pass a metadata lookup.
+    let mut c = coalescer();
+    let at = Instant::now();
+    for (mode, name) in [(RenameMode::Any, "Report"), (RenameMode::Other, "report")] {
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(mode))).add_path(p(name));
+        for change in translate(&event) {
+            c.push(change, at);
+        }
+    }
+    assert_eq!(settle(&mut c, at, 1_000), vec![Verdict::Rescan]);
 }
 
 #[test]
