@@ -2262,6 +2262,34 @@ was not run. **Not seen by a person**: the window itself, the blink and the scro
 close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
 makes close-to-tray usable is out of scope and is the application's to add.
 
+## A cursor style the application chooses (`mdshared_ui::termview`, roadmap CS2)
+
+`View::cursor_preference(shape, blinking)` sets the application's default cursor style without
+writing anything to the grid. Pass `mdshared_term::CursorShape::Block`, `Bar` or `Underline` and
+whether the cursor should blink. A view without a preference draws exactly as before.
+An explicit program style takes precedence for shape and blink; `CSI 0 SP q` (also with the
+parameter omitted) restores the application preference. `Screen::cursor_style_is_explicit()`
+distinguishes those cases even when the program explicitly chooses the built-in blinking
+block. The built-in values returned by `Screen::cursor()` are unchanged.
+
+DECTCEM still hides the cursor; an unfocused cursor is still a steady outline. The cursor uses
+the existing wide-character bounds, including when positioned on the second cell. The animated
+draws use the same interval and motion policy as before; a steady preference asks for no blink
+frame. After a preference change, an application painting only dirty rows can redraw the row
+returned by `View::cursor_row`.
+
+Run on Windows with `CARGO_TARGET_DIR=E:/mds-target/cs2` and two build jobs: formatting,
+workspace Clippy with `host,a11y`, and `mdshared-ui` Clippy with `term` passed. Workspace
+tests with `host,a11y` passed (1,880 including doctests, 38 ignored, four Explorer tests
+skipped); the `termview` suite passed (50 passed, two ignored). All eight new pixel tests
+failed when the preference was disabled, and targeted regressions also failed for block
+fill, program precedence, reset, visibility and wide coverage. The screen state test
+failed when zero did not clear the explicit flag. The extra release CI matrix was not run
+locally. Not run on Linux or macOS; not seen by a person in a live terminal.
+
+When `feat/t3-reflow` is merged with this branch, its `screen/dispatch.rs` must carry the line that sets
+`cursor_style_is_explicit`, or the preference silently beats every program.
+
 ## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
 
 An application that shapes its own text with parley can now hand that layout to the painter
@@ -2635,8 +2663,175 @@ Known behaviours and limits for later:
   one hash per entry and no copied path; the lower-case name of every entry is kept beside it,
   and the sorted order is one `usize` per entry, so a folder costs about its names again in
   memory.
-- F2, the watcher that says what changed, is still open, and an application's list view is what
-  would show this to a person first.
+- F2 (`dirwatch`, below) now supplies the changes, and an application's list view is what would
+  show this to a person first.
+
+## A watcher that says what changed (`mdshared_app::dirwatch`)
+
+`watch::FileWatcher` says only "something in this folder". A file manager needs one change per
+entry, so `dirwatch` watches one folder (not its subfolders) and reports `dirlist::Change`
+values that `Listing::apply` takes directly, a `Signal::Rescan` after an overflow, or a
+`Signal::Lost` when the folder itself is gone. It is built on the `notify` crate the workspace
+already names; no dependency was added.
+
+**The model, and the edge.** `Coalescer` has no clock and no disk. Raw events arrive through
+`push(RawChange, Instant)` and leave through `flush(now)` as `Verdict`s that name paths;
+`deadline()` says when the open burst may be reported (the last event plus the debounce, and at
+most `MAX_WAIT` after its first event), and a flush before it gives nothing. The rules are the
+ones the roadmap asked for:
+
+- create then modifies is one `Created`;
+- create then remove is nothing (the list never saw it);
+- remove then create (or remove then modify) is one `Modified`;
+- a rename chain `a` to `b` to `c` is one `Renamed { from: a, to: c }`;
+- a burst of modifies is one `Modified`;
+- a rescan or a lost watch clears what was pending and reports only itself.
+
+A report is ordered for application, not by path: whatever takes a name away (a rename's old
+name, or a removal) comes before whatever puts an entry under that name (a creation, a
+modification, or a rename's new name). A backup on save (`f` to `f~`, then a new `f`) is
+therefore the rename followed by the creation; log rotation moves the oldest file first; a
+rename onto an existing name removes that name where the platform reports no removal. When the
+verdicts form a cycle — two renames that swap their names through a temporary one — only the
+renames in the cycle are broken into a removal and a modification, and the disk decides whether
+each name is there; an unrelated rename stays a rename, so the selection can follow it. The
+order is the same for the same events: among the verdicts that can go next, the first one seen
+goes. The puts are indexed by path once and the next verdict comes from a heap, so a report of
+twenty thousand verdicts is ordered in about `n log n` (a test flushes 20,000 removals and
+renames and holds the report to a few seconds in a debug build).
+
+Rename pairing keeps each path's state in a map and the old names still waiting for a new one in
+a queue, oldest first. Windows reports the two names as separate events; inotify on Linux also
+reports a pair carrying both names, which is remembered as the same move and ignored the second
+time, including when the chain passes through a name (a repeated `Both(b, c)` after `a` to `b`
+to `c` is the same chain). An old name still waiting when the quiet period ends is a `Removed`,
+and a new name with no old one waiting is a `Created`: the unpaired fallback, a removal plus a
+creation. A name a rename landed on, and a created name that then moved on, are removed as well
+as the entry moved: a removal of an unlisted name does nothing, and leaving it out would leave
+a stale entry. macOS reports a rename as one path with no side; that path is read as a
+modification, and the disk says whether it is still there. A rename out of the folder is a
+removal and one into it a creation; an event about any other path is dropped.
+
+**The watcher.** `DirWatcher::new(folder, wake)` starts the OS watcher and one thread, which is
+the only user of the coalescer. `notify`'s callback translates each event and queues it under a
+mutex, the thread waits on a condition variable until an event or the deadline arrives (never a
+poll, so an idle folder costs nothing), reads each pending path's details there with `Entry::at`
+(the disk is never touched on the drawing thread), and queues `Signal`s. Waking is
+`FileWatcher`'s: one `wake` call, then none until `woken()`. `take()` drains the reports and
+`woken()` is called before it. `with_debounce` takes a quiet period of the caller's choice; the
+report is never held longer than `MAX_WAIT` (one second) after its first event, so a file
+written without pause cannot starve the rest.
+
+The root the OS watcher is given is worked out once, at start: `std::path::absolute` on Windows
+and Linux, `canonicalize` on macOS. Every event path is compared against that root as it is and
+rewritten as the caller's folder joined with the event's own file name, so the list's exact
+matching works where the platform spells paths another way (macOS FSEvents reports
+`/private/var/...` for a folder given as `/var/...`), and the callback touches no disk at all:
+a hung mount cannot make it, or the drop that waits for the callback, wait. A path whose parent
+is not the root is dropped. An entry's name is the platform's own; on Windows it can come back
+in 8.3 short form, which is a different path to the list.
+
+Dropping the watcher does not wait for its thread: the thread may be inside a read on a share
+that never answers, and the drop runs on the thread that draws. The drop tells the thread to
+stop; the thread checks between two reads and before reporting, so it ends after the read it is
+in without touching the disk again or waking the application. A `Created` whose path cannot be
+read when the report is made is dropped (it went again), a `Modified` or a rename whose path is
+gone becomes a `Removed`.
+
+The watched folder itself being deleted or renamed is a lost watch: Linux reports it on the
+folder's own path (`DELETE_SELF`, `MOVE_SELF`). The callback only says the folder may be gone;
+the worker confirms it before the application hears anything — the folder is not there, or it
+is not the same folder on Unix (`symlink_metadata`'s device and inode) — and reports
+`Signal::Lost`. A folder that is still the same one means the events were confused, and a full
+read (`Rescan`) is the safe answer. notify's Windows backend does not report that error at all —
+it silently stops its watch — and it does not report a queue overflow either (an empty buffer
+gives nothing), so on Windows a deleted folder or lost events are noticed only by a full read;
+this is a limit of notify 8.2.1, documented rather than worked around. The stop a drop sets is
+checked with the queue's lock held before a report is delivered, so a drop cannot land between
+the check and the wake.
+
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `folder`, `take`, `woken`), `Signal`
+(`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
+`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. Everything is
+additive: no existing signature, field or variant changed, and `Signal` is new, so its variants
+are new before any application sees them.
+
+Tests: `dirwatch_tests.rs` (53), `dirwatch_model_tests.rs` (10) and
+`dirwatch_watcher_tests.rs` (8). The pure tests cover every coalescing rule, the debounce and
+the longest wait, a burst that cancels out leaving no stale wait, order and deduplication,
+unpaired renames, a name created where another was renamed away, two renames onto one name, a
+cycle beside an unrelated rename, the folder itself, paths outside the folder, lost and rescan,
+the `notify` translation of every event kind (rescan, create, remove, modify, the two rename
+halves, a pair, macOS' single path, access, an error, the folder itself), the path rewriting
+(the root the watcher was given versus the folder the caller named, macOS' canonical root, a
+path outside), the verdict to `Change` reading, the wake contract, and 20,000 removals and
+renames in one report. The model tests are the cases a review asked for: backup on save, log
+rotation, a swap through a temporary name, a rename onto an existing name then removed, a name
+created and renamed onto an existing one then removed, a name moved in onto an existing one
+then removed, an inotify rename onto an existing name that moves again, a chain that leaves the
+folder, and a random model: 2,000 seeds per style with the operations of create, remove,
+modify, rename, swap, backup, chain, move in and move out on a made-up disk; each run advances
+a clock so reports are split by the quiet period and the longest wait; Windows reports the
+removal of an overwritten name, inotify reports its pairs, and macOS reports every touched path
+as a modification; every verdict is resolved through the disk, applied to a `Listing`, and the
+list must equal the disk in names and generations after every report and at the end. Three
+further tests hold the thread down: one abandons the watcher while the reader is blocked and
+times the drop, one stops the watcher after the first read of a report and requires the second
+path not to be read, and three check that a folder-loss report is confirmed (still there → a
+rescan, gone → lost, made again under the same name on Unix → lost). The real-disk test on
+Windows (create, two renames and a remove, a bounded poll, compare with a fresh read) remains,
+and passed 10 of 10 runs before this round.
+
+Fail-before evidence, each test seen failing under a change, one at a time, with the file
+restored afterwards. Before the ordering fix, the model's first seed, backup, rotation and swap
+failed; before the displaced-name fix, the rename-onto-then-removed and chain tests failed; the
+inotify chain test requires the chain's verdict shape. Under mutations of this round: no
+dependency ordering failed the backup, rotation, swap, random and created-beside-rename tests;
+no cycle split failed the swap and the random test; no removal for a landed-on name failed the
+rename-onto-then-removed, chain and random tests; no removal for a renamed-away created name
+failed the created-at-the-new-name and random tests; no rename pair remembered failed the
+inotify chain and random tests; macOS' pair read as removal plus creation failed its adapter
+test; a path not rewritten as the folder failed the canonicalised-folder test; no stop check
+between reads failed the two-reads test; a drop that waits failed the drop test; reporting after
+the stop failed the drop test's wake assertion; an ignored error failed the rescan test; an
+ignored folder event failed the lost test; and an ignored longest wait failed the wait test.
+This round: the two hole-2 tests and the random model failed before the fix that keeps a landing
+name's removal; a chain leaving the folder failed before the first name's removal was reported;
+the burst-that-cancels test failed before the wait was reset; the random model also found a
+rename chain whose last hop left the folder and lost the first name; the 20,000-verdict test
+took 27 s with the quadratic edge loop and is held to a few seconds; splitting every rename
+with a cycle failed the cycle-only test; per-event canonicalisation failed the path-rewriting
+tests; always-lost and never-lost failed the two folder-loss tests.
+
+Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests`, and `cargo clippy --target x86_64-unknown-linux-gnu -p mdshared-app
+--all-targets -- -D warnings`. On Linux and macOS nothing was run: the inotify pairing (the
+`Both` event and its cookie), the FSEvents single-path rename, the folder's own
+`DELETE_SELF`/`MOVE_SELF`, and the Unix side of the thread are compiled, not run. Nothing here
+was seen by a person or used by an application yet.
+
+Known behaviours and limits for later:
+
+- A rename that happens entirely outside the folder, or into it from outside, is seen by one
+  side only and reported as a creation or a removal, as the platform allows.
+- On macOS a rename cannot be paired: FSEvents reports both the old and the new path as a
+  modification, so the list converges (the old entry is removed, the new one inserted or
+  changed), but the two are not tied together, so a selection does not follow the entry through
+  a rename.
+- On Windows notify 8.2.1 reports neither a queue overflow nor a watch error; the watcher can
+  only report what notify hands it. A folder deleted there is noticed by the next full read,
+  not by a signal.
+- A name inside the folder may come back in 8.3 short form on Windows, which the list, matching
+  paths exactly, does not know.
+- A file's contents change is reported for every save, coalesced within the quiet period and
+  the longest wait; a caller that only re-reads changed entries is expected.
+- The watcher reads each changed path's details on its own thread; a dead network path can hold
+  that thread for as long as the system takes to answer, but it never holds the window, and the
+  drop does not wait for it.
+- No subfolders are watched. An entry's change of kind (a file becoming a folder) is read as a
+  change of its details, which `Listing::apply` replaces in place.
 
 ## X13. The Markdown page renderer
 
@@ -2687,3 +2882,8 @@ tests. No before/after CI build-time comparison was measured. Linux (with the cr
 `pkg-config` stub) and both macOS targets passed Clippy, including the opt-in preview server;
 compiled, not linked or run there. The output was pixel-tested on Windows, not seen by a
 person in an application.
+
+After the split and merge with main, Windows debug format, Clippy and workspace tests
+passed again: 195 core and 148 render tests passed, unchanged, with their three existing
+ignores. Preview with `server` enabled passed all 20 tests after the split. Release and
+cross-target checks were not rerun for this follow-up.

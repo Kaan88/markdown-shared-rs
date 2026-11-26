@@ -1,9 +1,9 @@
 //! The application's side of a grid's state: how far back it looks, whether it has the focus,
-//! and the questions that need both the view and the screen.
+//! its default cursor style, and the questions that need both the view and the screen.
 
 use super::metrics::Metrics;
 use crate::gfx::Rect;
-use mdshared_term::{Point, Screen};
+use mdshared_term::{CursorShape, Point, Screen};
 use std::ops::Range;
 
 /// How a screen is looked at: the scroll offset into the scrollback, the focus, and whether the
@@ -14,6 +14,7 @@ pub struct View {
     scroll: usize,
     focused: bool,
     cursor_shown: bool,
+    cursor_preference: Option<(CursorShape, bool)>,
 }
 
 impl Default for View {
@@ -29,6 +30,7 @@ impl View {
             scroll: 0,
             focused: true,
             cursor_shown: true,
+            cursor_preference: None,
         }
     }
 
@@ -58,6 +60,27 @@ impl View {
             cursor_shown: on,
             ..self
         }
+    }
+
+    /// Sets the application's default cursor shape and whether it blinks. A program's
+    /// explicit DECSCUSR style takes precedence for both until it resets the style to default.
+    /// This does not show a hidden cursor or change the steady outline drawn without focus.
+    /// The animated draw calls still need a blink interval and an animator that allows motion.
+    pub const fn cursor_preference(self, shape: CursorShape, blinking: bool) -> View {
+        View {
+            cursor_preference: Some((shape, blinking)),
+            ..self
+        }
+    }
+
+    pub(super) fn cursor_style(&self, screen: &Screen) -> (CursorShape, bool) {
+        if let Some(preference) = self.cursor_preference
+            && !screen.cursor_style_is_explicit()
+        {
+            return preference;
+        }
+        let c = screen.cursor();
+        (c.shape, c.blinking)
     }
 
     /// The scroll offset as given.
