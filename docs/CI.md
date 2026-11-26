@@ -12,10 +12,12 @@ retired), each:
 2. `cargo clippy --release --workspace --all-targets -- -D warnings`
 3. `cargo test --release --workspace`
 
-then each feature that is off in the workspace build, built with clippy and its tests run:
-`recycle`, `media-session`, `notify`, the accessibility tree `a11y`, and the window host, `host` and `host,a11y` (the host's
-tests, `host::`). AGENTS.md lists the commands. The Windows job then runs the host's example for
-two seconds, a real window that draws a few frames and closes on its timer.
+then the separate release checks: Clippy and tests for the UI's `recycle`, `media-session`,
+`notify`, `a11y`, `host`, `host,a11y` and `term` features, and for `mdshared-md-preview` with
+`server`; plus all-targets Clippy for `mdshared-app` with default features off. The Windows
+job then runs the host's example for two seconds, a real window that draws a few frames and
+closes on its timer. The Linux job checks the catalogue and has a 60-minute timeout;
+the Windows job and both Mac runners have 90 minutes.
 
 The Rust toolchain is pinned in the workflow (`RUST_TOOLCHAIN`, 1.99.1, `dtolnay/rust-toolchain`);
 there is no `rust-toolchain.toml`. `Swatinem/rust-cache` caches the registry and `target`. The

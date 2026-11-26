@@ -1,0 +1,15 @@
+[package]
+name = "mdshared-md-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+mdshared-app = { path = "../mdshared-app", default-features = false }
+memchr = "=2.8.3"
+pulldown-cmark.workspace = true
+regex-syntax = { version = "=0.8.11", default-features = false, features = ["unicode-perl"] }
+unicase = "=2.10.0"
+
+[dev-dependencies]
+serde_json = "=1.0.154"

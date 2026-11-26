@@ -1,0 +1,22 @@
+[package]
+name = "mdshared-md-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "mdshared_md_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mdview-engine"
+path = "src/main.rs"
+
+[dependencies]
+mdshared-md-engine-proto = { path = "../mdshared-md-engine-proto" }
+resvg = "=0.47.0"
+ratex-layout = "=0.1.15"
+ratex-parser = "=0.1.15"
+ratex-svg = { version = "=0.1.15", features = ["embed-fonts"] }
+ratex-types = "=0.1.16"
+merman.workspace = true

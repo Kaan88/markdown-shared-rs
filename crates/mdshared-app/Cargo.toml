@@ -4,13 +4,28 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["full"]
+# With default features off, parsing needs only notes, wiki-links and their file/path helpers.
+full = ["dep:notify", "dep:windows-sys"]
+
+[[test]]
+name = "crash_hook"
+path = "tests/crash_hook.rs"
+required-features = ["full"]
+
+[[example]]
+name = "crash"
+path = "examples/crash.rs"
+required-features = ["full"]
+
 [dependencies]
-notify = { version = "=8.2.1", default-features = false }
+notify = { version = "=8.2.1", default-features = false, optional = true }
 
 # Windows: the unhandled-exception filter of the crash reports; the named mutex, its record (a
 # file mapping), the windows and WM_COPYDATA of `single_mutex`.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.59.0", features = [
+windows-sys = { version = "=0.59.0", optional = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_DataExchange",
@@ -29,4 +44,4 @@ windows-sys = { version = "=0.59.0", features = ["Win32_Graphics_Gdi", "Win32_St
 
 # macOS: the FSEvents backend (Linux uses inotify, Windows ReadDirectoryChangesW, with no feature).
 [target.'cfg(target_os = "macos")'.dependencies]
-notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "=8.2.1", default-features = false, features = ["macos_fsevent"], optional = true }

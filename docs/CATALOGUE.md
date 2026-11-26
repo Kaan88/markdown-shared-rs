@@ -12,7 +12,7 @@ motion ([ANIMATION.md](ANIMATION.md)).
 
 ## I want to ...
 
-- **Show a Markdown page:** [mdview-preview](#what-exists-outside-these-crates) today; moving to `mdshared-md-preview` ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+- **Show a Markdown page:** [`mdshared-md-preview`](#markdown-pages) for an embedded preview, or [`mdshared-md-render`](#markdown-pages) for headless layout and drawing.
 - **Show a terminal:** [`termview`](#widgets-mdshared-ui) (feature `term`) draws the [`mdshared-term`](#terminal-mdshared-term) screen.
 - **Run a shell in a pseudo-terminal (PTY):** [`mdshared-pty`](#pseudo-terminal-mdshared-pty).
 - **Draw rich or styled text:** [`richtext` and `Painter::rich_text`](#painting-mdshared-ui-mdshared-text).
@@ -62,6 +62,23 @@ motion ([ANIMATION.md](ANIMATION.md)).
 | `mdshared_highlight` | Highlighting a whole code block by language name | `tokens`, `Token` |
 | `mdshared_highlight::incremental` | Highlighting line by line for an editor, with checkpoints and limits | `LineHighlighter`, `Language::for_path` / `by_token`, `Limits`, `Span` |
 | `mdshared_highlight::scan`, `sfc` | The hand-written scanners behind the above (Kotlin, Swift, PowerShell, TypeScript, Vue, Svelte, ...) | `scan::Lang` |
+
+## Markdown pages
+
+**I want to show a Markdown page:** parse it with `mdshared_md_core::parse`, then render
+it with `mdshared_md_render::render` or keep a `DocumentRenderer` for a view that scrolls.
+See the [Markdown renderer README](../crates/mdshared-md-render/README.md) for dependencies,
+engine shipping and editor previews. The renderer does not run a window loop.
+
+| Module or crate | For | Start at |
+|---|---|---|
+| `mdshared-md-core` (`mdshared_md_core`) | Parse Markdown into the document model with bounded input and wiki-link resolution supplied by the caller | `parse`, `parse_bytes`, `parse_wiki_embeds`, `Document`, `limits::notes_config` |
+| `mdshared_md_core::{autolink, emoji, frontmatter, html, slug}` | Recognise bare links, shortcodes, front matter and HTML, and make heading anchors | `find_links`, `replace`, `take`, `Tokenizer`, `Slugger` |
+| `mdshared_md_core::{find, links, rich, select, tasks}` | Search the page, classify links and pictures, copy selected text as HTML and find or toggle task marks | `find`, `classify_link`, `classify_image`, `selection_html`, `word_range`, `document_boxes`, `toggle` |
+| `mdshared-md-render` (`mdshared_md_render`) | Page layout, bitmap drawing, animated images and export, with no window system | `DocumentRenderer`, `Options`, `render`, `render_slice`, `decode_image`, `export_html`, `set_engine_path` |
+| `mdshared-md-engine-proto` (`mdshared_md_engine_proto`) | Versionless request and reply frames between the renderer and the separate rasterizer | `Request`, `Reply`, `write_request`, `read_reply` |
+| `mdshared-md-engine` (`mdshared_md_engine`) | Separate process that draws SVG, TeX and Mermaid | `mdview-engine` binary; `render_svg`, `render_math`, `render_mermaid` |
+| `mdshared-md-preview` (`mdshared_md_preview`) | Version 7 editor preview frames; `server` opts into the drawing loop | `Request`, `Update`, `wire::MAGIC`, `Server`, `serve` |
 
 ## Widgets (`mdshared-ui`)
 
@@ -176,6 +193,8 @@ The only modules that call the system. Each fails soft where the system lacks th
 ## Application plumbing (`mdshared-app`, `mdshared-fetch`)
 
 No window system. All of it is usable from a test with a temporary folder.
+`mdshared-app` defaults to `full`; with default features off it builds only `notes`,
+`wikilink`, `files` and `paths`, with no third-party dependencies.
 
 | Module | For | Start at |
 |---|---|---|
@@ -256,7 +275,10 @@ library does not pull in the toolkit, even if its app does.
 
 [markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) ·
 `https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`.
-All five are moving into this toolkit ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+All five reusable crates have moved into this toolkit ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+For new dependencies, use the `mdshared-md-*` packages above and pin them and any other
+toolkit crates to the full toolkit commit that merges `feat/md-renderer`. The table below
+records the old mdview revision and its actual pins until mdview switches over.
 
 | Crate | Path | For | Toolkit pin |
 |---|---|---|---|
