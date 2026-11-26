@@ -5,16 +5,15 @@
 //! deadline kills the process and forgets it, so the next job starts a fresh one. A broken or slow
 //! rasterizer therefore costs a placeholder, never the viewer.
 //!
-//! The binary is looked for beside this executable or in a workspace `target/release` above it;
-//! `MDV_ENGINE` overrides the search.
+//! Applications use the binary beside their executable or an explicit absolute override.
 
-use crate::image::{DecodedImage, MAX_PIXELS};
+use crate::image::{DecodedImage, MAX_BYTES, MAX_PIXELS};
 use mdshared_md_engine_proto::{
-    KIND_MATH, KIND_MERMAID, KIND_SVG, KIND_SVG_AT, MAX_REPLY, Request, STATUS_OK, math_payload,
-    mermaid_payload, read_reply, svg_at_payload, write_request,
+    KIND_MATH, KIND_MERMAID, KIND_SVG, KIND_SVG_AT, MAX_REPLY, MAX_REQUEST, Request, STATUS_OK,
+    math_payload, mermaid_payload, read_reply, svg_at_payload, write_request,
 };
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -140,6 +139,9 @@ fn invalidate(handle: &Handle) {
 /// Renders SVG bytes through the shared engine. `None` when the engine is missing, times out,
 /// fails, or returns something the image cache cannot use.
 pub fn render_svg(bytes: &[u8]) -> Option<DecodedImage> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return None;
+    }
     let reply = submit(KIND_SVG, bytes.to_vec())?;
     decode(reply)
 }
@@ -147,7 +149,7 @@ pub fn render_svg(bytes: &[u8]) -> Option<DecodedImage> {
 /// Renders SVG bytes at `scale` device pixels per SVG unit, so a vector image is drawn sharp at
 /// the device scale rather than stretched from its natural size.
 pub fn render_svg_at(bytes: &[u8], scale: f32) -> Option<DecodedImage> {
-    if !scale.is_finite() || scale < 0.05 || scale > 8.0 {
+    if !scale.is_finite() || scale < 0.05 || scale > 8.0 || bytes.len() as u64 > MAX_BYTES {
         return None;
     }
     let reply = submit(KIND_SVG_AT, svg_at_payload(scale, bytes))?;
@@ -162,7 +164,11 @@ pub fn render_math(
     font_size: f32,
     color: [u8; 3],
 ) -> Option<DecodedImage> {
-    if !font_size.is_finite() || font_size < 4.0 || font_size > 512.0 {
+    if !font_size.is_finite()
+        || font_size < 4.0
+        || font_size > 512.0
+        || source.len() > MAX_REQUEST as usize - 8
+    {
         return None;
     }
     let reply = submit(KIND_MATH, math_payload(font_size, display, color, source))?;
@@ -172,7 +178,7 @@ pub fn render_math(
 /// Renders a Mermaid diagram. `scale` is device pixels per SVG unit; the renderer asks for twice
 /// its own scale and halves the box, as it does for math.
 pub fn render_mermaid(source: &str, scale: f32, dark: bool) -> Option<DecodedImage> {
-    if !scale.is_finite() || scale < 0.1 || scale > 8.0 {
+    if !scale.is_finite() || scale < 0.1 || scale > 8.0 || source.len() > MAX_REQUEST as usize - 8 {
         return None;
     }
     let reply = submit(KIND_MERMAID, mermaid_payload(scale, dark, source))?;
@@ -216,12 +222,11 @@ fn submit(kind: u32, payload: Vec<u8>) -> Option<mdshared_md_engine_proto::Reply
 }
 
 fn decode(reply: Reply) -> Option<DecodedImage> {
+    let area = u64::from(reply.width) * u64::from(reply.height);
     if reply.status != STATUS_OK
-        || reply.width == 0
-        || reply.height == 0
+        || !(1..=MAX_PIXELS).contains(&area)
         || reply.rgba.len() as u64 > MAX_REPLY
-        || reply.rgba.len() != reply.width as usize * reply.height as usize * 4
-        || reply.width as u64 * reply.height as u64 > MAX_PIXELS
+        || reply.rgba.len() as u64 != area * 4
     {
         return None;
     }
@@ -237,22 +242,31 @@ fn decode(reply: Reply) -> Option<DecodedImage> {
 /// beside mdview): set once, before the first formula or diagram, it wins over the search.
 static ENGINE_AT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Sets the engine binary for this process, as [`ENGINE_AT`] says. Later calls do nothing.
+/// Sets the engine binary for this process, as [`ENGINE_AT`] says. The path must be absolute;
+/// an invalid override leaves the engine unavailable. Later calls do nothing.
 pub fn set_engine_path(path: PathBuf) {
     let _ = ENGINE_AT.set(path);
 }
 
-/// The engine binary: the path set with [`set_engine_path`], `MDV_ENGINE`, a sibling of this executable, or the workspace target beside
-/// an ancestor (a test binary runs from `target/release/deps`).
 fn engine_path() -> Option<PathBuf> {
-    if let Some(path) = ENGINE_AT.get() {
-        return path.is_file().then(|| path.clone());
+    let override_path = ENGINE_AT
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("MDV_ENGINE").map(PathBuf::from));
+    let exe = std::env::current_exe().ok();
+    discover(exe.as_deref(), override_path, cfg!(test), Path::is_file)
+}
+
+fn discover(
+    exe: Option<&Path>,
+    override_path: Option<PathBuf>,
+    unit_test: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(path) = override_path {
+        return (path.is_absolute() && exists(&path)).then_some(path);
     }
-    if let Some(path) = std::env::var_os("MDV_ENGINE") {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    let mut directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let mut directory = exe?.parent()?.to_path_buf();
     let name = if cfg!(windows) {
         "mdview-engine.exe"
     } else {
@@ -260,11 +274,14 @@ fn engine_path() -> Option<PathBuf> {
     };
     for _ in 0..6 {
         let sibling = directory.join(name);
-        if sibling.is_file() {
+        if exists(&sibling) {
             return Some(sibling);
         }
+        if !unit_test {
+            break;
+        }
         let target = directory.join("target").join("release").join(name);
-        if target.is_file() {
+        if exists(&target) {
             return Some(target);
         }
         if !directory.pop() {
@@ -297,6 +314,52 @@ pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn production_discovery_checks_only_the_sibling_or_an_absolute_override() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let exe = root.join("install/viewer");
+        let name = if cfg!(windows) {
+            "mdview-engine.exe"
+        } else {
+            "mdview-engine"
+        };
+        let ancestor = root.join(name);
+        let sibling = exe.with_file_name(name);
+        assert_eq!(discover(Some(&exe), None, false, |p| p == ancestor), None);
+        assert_eq!(
+            discover(Some(&exe), None, true, |p| p == ancestor),
+            Some(ancestor.clone())
+        );
+        assert_eq!(
+            discover(Some(&exe), None, false, |p| p == sibling),
+            Some(sibling)
+        );
+        assert_eq!(
+            discover(Some(&exe), Some(ancestor.clone()), false, |p| p == ancestor),
+            Some(ancestor)
+        );
+        assert_eq!(
+            discover(Some(&exe), Some(name.into()), false, |_| panic!(
+                "relative path was probed"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn engine_reply_dimensions_are_bounded_before_multiplying_by_four() {
+        assert!(
+            decode(Reply {
+                status: STATUS_OK,
+                width: u32::MAX,
+                height: u32::MAX,
+                baseline: 0,
+                rgba: vec![],
+            })
+            .is_none()
+        );
+    }
 
     fn badge() -> &'static [u8] {
         include_bytes!("../../../fixtures/md/assets/badge.svg")

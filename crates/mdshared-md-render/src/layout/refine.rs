@@ -121,7 +121,7 @@ impl DocumentRenderer {
 
     /// The average glyph advances for these options, shaped once per scale and theme.
     fn metrics(&mut self, doc: &Document, options: &Options) -> super::estimate::Metrics {
-        let key = (options.scale.to_bits(), options.theme.key());
+        let key = (options.layout_scale().to_bits(), options.theme.key());
         if let Some((scale, theme, metrics)) = self.metrics
             && (scale, theme) == key
         {

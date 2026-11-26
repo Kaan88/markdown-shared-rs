@@ -16,6 +16,9 @@ pub struct Image {
 /// expensive part of an engine start, so the engine does it once, not once per job.
 pub fn options() -> resvg::usvg::Options<'static> {
     let mut options = resvg::usvg::Options::default();
+    // A document's SVG is not permission to read another file. The data resolver
+    // remains available for images carried inside the bounded engine request.
+    options.image_href_resolver.resolve_string = Box::new(|_, _| None);
     options.fontdb_mut().load_system_fonts();
     // usvg's default selector falls back to a serif family, which a minimal Linux install may not
     // have. The viewer's own stack is sans, so retry a missing family with a sans face.
@@ -40,6 +43,26 @@ pub fn options() -> resvg::usvg::Options<'static> {
         database.query(&query)
     });
     options
+}
+
+#[cfg(test)]
+#[test]
+fn default_svg_options_refuse_external_images_but_keep_embedded_data() {
+    let options = options();
+    let resolver = &options.image_href_resolver;
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/md/assets/badge.svg");
+    assert!(fixture.is_file());
+    assert!((resolver.resolve_string)(fixture.to_str().unwrap(), &options).is_none());
+    let badge = include_bytes!("../../../fixtures/md/assets/badge.svg");
+    assert!(
+        (resolver.resolve_data)(
+            "image/svg+xml",
+            std::sync::Arc::new(badge.to_vec()),
+            &options
+        )
+        .is_some()
+    );
 }
 
 /// Renders SVG bytes at their natural size, shrinking to stay under `max_pixels`. A document's

@@ -403,9 +403,7 @@ pub(crate) struct WebpPlayer {
 }
 
 fn webp_decoder(bytes: &Bytes) -> Option<image_webp::WebPDecoder<Cursor<Bytes>>> {
-    let mut decoder = image_webp::WebPDecoder::new(Cursor::new(bytes.clone())).ok()?;
-    decoder.set_memory_limit(MAX_ANIMATION_PIXELS as usize * 8);
-    Some(decoder)
+    crate::image::webp::decoder(bytes.clone(), MAX_ANIMATION_PIXELS)
 }
 
 impl WebpPlayer {

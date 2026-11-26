@@ -34,32 +34,70 @@ pub(super) fn github_math(src: &str) -> Cow<'_, str> {
             out.push_str(line);
             continue;
         }
-        let mut at = 0;
-        while let Some(open) = line[at..].find("$`").map(|i| at + i) {
-            let body = open + 2;
-            let close = line[body..].find("`$").map(|i| body + i);
-            match close {
-                Some(close) if close > body && !line[body..close].contains(['`', '$']) => {
-                    out.push_str(&line[at..open]);
-                    out.push('$');
-                    out.push_str(&line[body..close]);
-                    out.push('$');
-                    at = close + 2;
-                    changed = true;
-                }
-                _ => {
-                    out.push_str(&line[at..body]);
-                    at = body;
-                }
-            }
-        }
-        out.push_str(&line[at..]);
+        changed |= rewrite_line(line, &mut out, |_| {});
     }
     if changed {
         Cow::Owned(out)
     } else {
         Cow::Borrowed(src)
     }
+}
+
+fn rewrite_line(line: &str, out: &mut String, mut scanned: impl FnMut(usize)) -> bool {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    let mut changed = false;
+    loop {
+        let open = memchr::memmem::find(&bytes[at..], b"$`");
+        scanned(open.map_or(bytes.len() - at, |i| i + 2));
+        let Some(open) = open.map(|i| at + i) else {
+            break;
+        };
+        let body = open + 2;
+        // The first special byte must start the closer: any earlier backtick or dollar
+        // would make the body invalid. On failure the next opener search can only rescan
+        // the ordinary text up to this byte, not the entire remaining line.
+        let special = memchr::memchr2(b'`', b'$', &bytes[body..]);
+        scanned(special.map_or(bytes.len() - body, |i| i + 1));
+        match special.map(|i| i + body) {
+            Some(close) if close > body && bytes[close..].starts_with(b"`$") => {
+                out.push_str(&line[at..open]);
+                out.push('$');
+                out.push_str(&line[body..close]);
+                out.push('$');
+                at = close + 2;
+                changed = true;
+            }
+            _ => {
+                out.push_str(&line[at..body]);
+                at = body;
+            }
+        }
+    }
+    out.push_str(&line[at..]);
+    changed
+}
+
+#[cfg(test)]
+#[test]
+fn malformed_github_math_scans_at_most_twice_the_line() {
+    let run = |count: usize| {
+        let line = "$`é ".repeat(count);
+        let mut out = String::new();
+        let mut work = 0;
+        assert!(!rewrite_line(&line, &mut out, |n| work += n));
+        assert_eq!(out, line);
+        assert!(
+            work <= 2 * line.len(),
+            "{work} bytes scanned for {}",
+            line.len()
+        );
+        work
+    };
+    let small = run(2048);
+    let large = run(4096);
+    assert!(large <= 2 * small + 1, "{small} then {large} bytes");
+    assert_eq!(github_math("a $`open $`é`$ z"), "a $`open $é$ z");
 }
 
 /// Passes that may hide rejected delimiters before the rest are shown as literal text. The first

@@ -167,24 +167,28 @@ impl Update {
     /// of another size is replaced by a whole frame. False when the update needs a whole frame
     /// and is only a band (the copy was lost): the caller asks again.
     pub fn apply(&self, frame: &mut Vec<u8>, size: &mut (u32, u32)) -> bool {
-        let row = self.width as usize * 4;
-        let rows = self.height as usize;
+        let Some((row, bytes)) = frame_bytes(
+            self.width,
+            self.height,
+            self.shift,
+            self.band,
+            self.pixels.len(),
+        ) else {
+            return false;
+        };
         match self.band {
             None => {
-                if self.pixels.len() != row * rows {
-                    return false;
-                }
                 frame.clear();
                 frame.extend_from_slice(&self.pixels);
                 *size = (self.width, self.height);
                 true
             }
             Some((first, count)) => {
-                if *size != (self.width, self.height) || frame.len() != row * rows {
+                if *size != (self.width, self.height) || frame.len() != bytes {
                     return false;
                 }
                 let shift = self.shift;
-                if shift != 0 && shift.unsigned_abs() as usize <= rows {
+                if shift != 0 {
                     let by = shift.unsigned_abs() as usize * row;
                     if shift > 0 {
                         frame.copy_within(by.., 0);
@@ -194,14 +198,34 @@ impl Update {
                     }
                 }
                 let (first, count) = (first as usize, count as usize);
-                if first + count > rows || self.pixels.len() != count * row {
-                    return false;
-                }
                 frame[first * row..(first + count) * row].copy_from_slice(&self.pixels);
                 true
             }
         }
     }
+}
+
+fn frame_bytes(
+    width: u32,
+    height: u32,
+    shift: i32,
+    band: Option<(u32, u32)>,
+    pixels: usize,
+) -> Option<(usize, usize)> {
+    if width > MAX_SIDE || height > MAX_SIDE || shift.unsigned_abs() > height {
+        return None;
+    }
+    let row = (width as usize).checked_mul(4)?;
+    let bytes = row.checked_mul(height as usize)?;
+    let expected = if let Some((first, count)) = band {
+        if first.checked_add(count)? > height {
+            return None;
+        }
+        row.checked_mul(count as usize)?
+    } else {
+        bytes
+    };
+    (pixels == expected).then_some((row, bytes))
 }
 
 const TEXT: u32 = 1;
@@ -557,7 +581,11 @@ pub fn read_update(r: &mut impl Read) -> io::Result<Option<Update>> {
         let micros = f.u32()?;
         let answers = f.u32()?;
         let line = f.f32()?;
-        let pixels = f.bytes()?.to_vec();
+        let band = (has != 0).then_some((first, count));
+        let pixels = f.bytes()?;
+        frame_bytes(width, height, shift, band, pixels.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid preview frame"))?;
+        let pixels = pixels.to_vec();
         let selection = if f.u32()? != 0 {
             let n = f.count(16)?;
             let mut rects = Vec::with_capacity(n);
@@ -612,7 +640,7 @@ pub fn read_update(r: &mut impl Read) -> io::Result<Option<Update>> {
             top,
             total,
             shift,
-            band: (has != 0).then_some((first, count)),
+            band,
             pixels,
             micros,
             answers,
@@ -787,5 +815,32 @@ mod tests {
         // A band for a copy of another size is refused.
         let mut other = (2, 3);
         assert!(!u.apply(&mut frame, &mut other));
+    }
+
+    #[test]
+    fn an_invalid_band_never_shifts_the_kept_pixels() {
+        let mut frame: Vec<u8> = (0..12).collect();
+        let kept = frame.clone();
+        let mut size = (1, 3);
+        for (width, height, shift, band) in [
+            (1, 3, 1, Some((3, 1))),
+            (1, 3, 4, Some((2, 1))),
+            (u32::MAX, u32::MAX, 0, None),
+        ] {
+            let update = Update {
+                width,
+                height,
+                shift,
+                band,
+                pixels: vec![0; 4],
+                ..Update::default()
+            };
+            assert!(!update.apply(&mut frame, &mut size));
+            assert_eq!(frame, kept);
+            assert_eq!(size, (1, 3));
+            let mut wire = Vec::new();
+            write_update(&mut wire, &update).unwrap();
+            assert!(read_update(&mut wire.as_slice()).is_err());
+        }
     }
 }

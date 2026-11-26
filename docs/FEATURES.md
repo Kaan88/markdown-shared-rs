@@ -3197,3 +3197,70 @@ workspace tests (2,370 passed, four Explorer tests filtered), release render (14
 and release preview with `server` (20 passed). The catalogue check passed. On local
 Rust 1.100.0, Clippy additionally flagged an unrelated range loop in `sections_tests.rs`;
 no change was made there. Linux and macOS were not run for this refresh.
+
+The Astra follow-up checks local image names before touching the filesystem, rejects
+relative names without an absolute document directory, and reads only regular file
+handles. Linux and macOS open first with `O_NONBLOCK` so a FIFO cannot wait for a writer.
+Default SVG options ignore external image references. Applications look only beside
+the running executable or at an explicit absolute engine path. WebP stills and animation
+frames use a bounded header walk to check bitstream dimensions before decoding.
+
+The preview passes its device size separately from the minimum text column, and the
+renderer caps full-page and viewport raster bytes before allocation. A clipped table
+lays out a prefix of rows that can reach the height limit; the reported content height
+describes the measured prefix, not a second full layout. Inline math delimiter searches
+and the span walks for HTML export and rich copy no longer rescan the same suffix or
+paragraph for each opener or child.
+
+### Left open from the Astra review (2026-11-26)
+
+- **10 — Engine supervision:** reap a normally idle-exited helper without waiting for
+  another job; start execution deadlines when the job starts and handle queue expiry separately.
+- **11 — Preview message size:** a full 8192 × 8192 bitmap plus the fixed 72-byte update
+  overhead is eight bytes above the reader's limit. Budget the full serialized update,
+  including optional metadata, and enforce the same limit in the writer.
+- **12 — Peer dimensions:** fixed in this follow-up. Check both preview band bounds and
+  engine reply dimensions before multiplying or moving kept pixels.
+- **13 — Preview request queue:** enforce per-kind lengths before allocating and bound
+  queued work; coalesce superseded revisions without reordering input.
+- **14 — Clipboard offsets:** fixed in this follow-up. Rich copy declines offsets inside
+  a UTF-8 character.
+- **15 — Layout cache identity:** a replacement document of the same byte length and
+  block count can match the existing cache. The preview already calls `layout` on `Text`;
+  other callers need to invalidate explicitly until the renderer has a revision key.
+- **16 — Decoder input:** fixed in this follow-up. Check the image input cap at ingress
+  and engine request lengths before assembling or copying the payload.
+
+Checked on Windows with Rust 1.99.1: format, workspace Clippy and tests with `host,a11y`
+(2,383 passed; four Explorer tests excluded), the catalogue, preview-server Clippy, release
+renderer (156 passed, including all eight unchanged goldens), and release preview server
+(22 passed). Nine regression tests failed when their corresponding fixes were temporarily
+disabled. The FIFO test was cross-checked by Clippy for Linux and both macOS targets;
+it was not linked or run on Unix. No application visuals were reviewed by a person.
+
+Re-review follow-up: #1 now rejects a host base before normalization, including a
+double-slash spelling on Unix. On Windows a caller-supplied canonical local drive
+base is accepted; document-supplied device and UNC paths are still refused. For #3,
+only renderer unit tests search ancestors; shipping with debug assertions does not
+enable that search. The direct renderer uses one normalized scale for page margins,
+layout and hit tests. These four re-review items are closed; #10, #11, #13 and #15
+remain open.
+
+All four re-review regressions failed before the fixes and passed after them on Windows.
+Format, workspace Clippy with `host,a11y`, preview-server Clippy and the catalogue check
+passed. Release renderer tests passed (159 passed, two ignored), including all eight
+goldens, whose hashes did not change. Release preview-server tests passed (22 passed).
+Linux renderer Clippy passed with the `pkg-config` stub; Unix runtime behavior was not tested.
+
+PR #53 Windows CI: the `render` integration tests shared engine configuration. The
+source-hit test could set the engine path between another test's full-page and slice
+renders. Forcing that order reproduced `4663.8486 vs 3622` exactly. The suite now
+sets up the engine before rendering fixtures, and the slice comparison still checks
+the original height and pixel assertions with a second engine lookup between renders.
+This did not involve the layout cache; #15 remains open.
+On Windows with Rust 1.99.1, the regression passed in isolation and the entire render
+integration binary passed 60 runs with 64 test threads. Format, workspace Clippy with
+`host,a11y`, the catalogue, release render (159 passed) and release preview server
+(22 passed) passed. Release workspace tests passed (2,304 passed, four Explorer tests
+excluded to leave the desktop alone). All eight golden hashes were unchanged.
+CI, Linux and macOS were not rerun for this test-only change.

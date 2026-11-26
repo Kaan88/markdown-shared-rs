@@ -3,15 +3,144 @@
 //! turns animation on; the format comes from the magic bytes, never the extension); SVG through
 //! `mdview-engine`, so its rasterizer and fonts never live in the viewer.
 //!
-//! The plan caps an image at 12 MiB on disk and 24 M pixels once decoded, so a document cannot make
-//! the viewer allocate without bound. Anything over a limit, unreadable, or in another format is
-//! left to the text placeholder the layout already draws.
+//! The input is capped at 12 MiB and the decoded image at 24 million pixels. An unreadable,
+//! unsupported or oversized image leaves the text placeholder the layout already draws.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use mdshared_md_core::links::{ImageSource, classify_image};
+
+mod local_file;
+pub(crate) mod webp;
 
 pub const MAX_BYTES: u64 = 12 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 24_000_000;
+
+/// Resolve the local spelling without consulting the filesystem. Keep literal filenames (for
+/// example a wiki embed with a `%` or `#`) as the first choice, then try the URL spelling.
+pub(crate) fn local_paths(src: &str, base: Option<&Path>) -> impl Iterator<Item = PathBuf> {
+    resolve_local_paths(src, base).into_iter().flatten()
+}
+
+fn resolve_local_paths(src: &str, base: Option<&Path>) -> [Option<PathBuf>; 2] {
+    let base = base.unwrap_or(Path::new(""));
+    // Check the caller's original spelling before joining or normalizing. On Unix,
+    // components() folds a leading double slash into the root of a local path.
+    let trusted_disk = verbatim_disk(base);
+    if has_host_prefix(base) && !trusted_disk {
+        return [None, None];
+    }
+    let src = src.trim();
+    let file_url = src
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("file:"));
+    // classify_image rejects document-supplied host and device prefixes, including in
+    // decoded URLs. A verbatim-disk prefix may only survive resolution from the caller's base.
+    let ImageSource::Local(decoded) = classify_image(src, base) else {
+        return [None, None];
+    };
+    let decoded = if file_url && decoded.is_relative() {
+        base.join(decoded)
+    } else {
+        decoded
+    };
+    if !absolute_local(&decoded, trusted_disk) {
+        return [None, None];
+    }
+    // Check the resolved URL before considering the literal spelling. An encoded
+    // network path must not cause even a probe of a same-named literal.
+    let literal = (!file_url)
+        .then(|| base.join(src))
+        .filter(|p| *p != decoded && absolute_local(p, trusted_disk));
+    [literal, Some(decoded)]
+}
+
+fn has_host_prefix(path: &Path) -> bool {
+    let mut head = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_control());
+    let slash = |c| c == b'/' || c == b'\\';
+    head.next().is_some_and(slash) && head.next().is_some_and(slash)
+}
+
+#[cfg(windows)]
+pub(crate) fn verbatim_disk(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        )
+}
+
+#[cfg(not(windows))]
+fn verbatim_disk(_: &Path) -> bool {
+    false
+}
+
+fn absolute_local(path: &Path, trusted_disk: bool) -> bool {
+    if !path.is_absolute() || (has_host_prefix(path) && !(trusted_disk && verbatim_disk(path))) {
+        return false;
+    }
+    #[cfg(windows)]
+    let device = path.components().any(|part| {
+        matches!(part, std::path::Component::Normal(name) if device_name(&name.to_string_lossy()))
+    });
+    #[cfg(not(windows))]
+    let device = false;
+    !device
+}
+
+/// Win32 still recognizes these names in ordinary drive paths, even with an extension.
+#[cfg(windows)]
+fn device_name(name: &str) -> bool {
+    let stem = name
+        .split(['.', ':'])
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+}
+
+pub(crate) fn metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if substitute_probe() {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    std::fs::metadata(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROBES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn substitute_probe() -> bool {
+    PROBES.with(|n| match n.get() {
+        Some(count) => {
+            n.set(Some(count + 1));
+            true
+        }
+        None => false,
+    })
+}
 
 /// Straight-alpha RGBA, row-major.
 #[derive(Debug, Clone)]
@@ -30,8 +159,12 @@ pub fn load(path: &Path) -> Option<DecodedImage> {
 
 /// The file's bytes, or `None` when it is unreadable or over [`MAX_BYTES`].
 pub(crate) fn read(path: &Path) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_BYTES {
+    #[cfg(test)]
+    if substitute_probe() {
+        return None;
+    }
+    let (file, len) = local_file::open(path)?;
+    if len > MAX_BYTES {
         return None;
     }
     // Capped again at the read, so a file that grows after the check still cannot exceed the limit.
@@ -53,6 +186,9 @@ pub fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
 /// Picks the decoder from the leading bytes. A decoder that panics on hostile input counts as a
 /// failed decode (where the build unwinds), so the page shows the placeholder.
 pub(crate) fn decode(bytes: &[u8]) -> Option<DecodedImage> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return None;
+    }
     std::panic::catch_unwind(|| decode_unchecked(bytes))
         .ok()
         .flatten()
@@ -230,12 +366,11 @@ fn decode_gif(bytes: &[u8]) -> Option<DecodedImage> {
 /// Static lossy or lossless WebP, with alpha when the file has it; the first frame (already
 /// composited by the decoder) for an animated one.
 fn decode_webp(bytes: &[u8]) -> Option<DecodedImage> {
-    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut decoder = webp::decoder(bytes, MAX_PIXELS)?;
     let (width, height) = decoder.dimensions();
     if !fits(width, height) {
         return None;
     }
-    decoder.set_memory_limit(MAX_PIXELS as usize * 8);
     let mut buffer = vec![0u8; decoder.output_buffer_size()?];
     decoder.read_image(&mut buffer).ok()?;
     let rgba = if decoder.has_alpha() {
@@ -261,12 +396,116 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_image_paths_never_probe_in_layout_or_export() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut observed = Vec::new();
+        let mut expected_probes = Vec::new();
+        for (src, base, expected) in [
+            ("picture.png", None, 0),
+            ("//./NUL", Some(base.clone()), 0),
+            ("//example.invalid/share/picture.png", Some(base.clone()), 0),
+            (
+                "%2f%2fexample.invalid/share/picture.png",
+                Some(base.clone()),
+                0,
+            ),
+            (
+                "file://example.invalid/share/picture.png",
+                Some(base.clone()),
+                0,
+            ),
+            (
+                "picture.png",
+                Some(PathBuf::from("//example.invalid/share")),
+                0,
+            ),
+            ("picture.png", Some(base), 1),
+        ] {
+            let doc = mdshared_md_core::parse(&format!("![sample]({src})"));
+            PROBES.set(Some(0));
+            crate::render(
+                &doc,
+                &crate::Options {
+                    base_dir: base.clone(),
+                    ..Default::default()
+                },
+            );
+            let layout_probes = PROBES.replace(Some(0)).unwrap();
+            crate::export_html(
+                &doc,
+                &crate::ExportOptions {
+                    title: "",
+                    theme: crate::LIGHT,
+                    base_dir: base.as_deref(),
+                    remote_images: false,
+                    print: false,
+                },
+            );
+            let export_probes = PROBES.replace(None).unwrap();
+            observed.push((src, layout_probes, export_probes));
+            expected_probes.push((src, expected, expected));
+        }
+        assert_eq!(observed, expected_probes);
+    }
+
+    #[test]
+    fn host_base_is_rejected_before_any_path_can_be_probed() {
+        let base = Path::new("//example.invalid/share");
+        let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("picture.png");
+        assert!(local.is_absolute());
+        // The lexical policy refuses a host base before path resolution can erase its prefix,
+        // even when the source could otherwise be resolved without that base.
+        for src in ["picture.png", local.to_str().unwrap()] {
+            assert_eq!(local_paths(src, Some(base)).next(), None, "{src}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_disk_base_can_load_images_but_document_device_paths_are_refused() {
+        use std::path::{Component, Prefix};
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/md/assets")
+            .canonicalize()
+            .unwrap();
+        assert!(matches!(
+            base.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        ));
+        for src in ["badge.png", "badge%2Epng", "file:badge.png"] {
+            let path = local_paths(src, Some(&base))
+                .find(|path| path.is_file())
+                .expect("existing local image under a canonical disk base");
+            assert!(read(&path).is_some());
+        }
+        for src in [
+            r"\\?\C:\badge.png",
+            r"\\?\UNC\example.invalid\share\badge.png",
+            r"\\.\CON",
+            "NUL.png",
+            "%5c%5c%3f%5cC%3a%5cbadge.png",
+        ] {
+            assert!(local_paths(src, Some(&base)).next().is_none(), "{src}");
+        }
+    }
+
+    #[test]
     fn limits_are_the_plan_numbers() {
         assert!(fits(4000, 6000));
         assert!(!fits(4001, 6000));
         assert!(!fits(0, 100));
         assert_eq!(MAX_BYTES, 12 * 1024 * 1024);
         assert_eq!(MAX_PIXELS, 24_000_000);
+    }
+
+    #[test]
+    fn oversized_decoder_input_is_rejected_even_if_the_image_is_valid() {
+        let mut bytes = asset("badge.png");
+        assert!(decode_image(&bytes).is_some());
+        bytes.resize(MAX_BYTES as usize, 0);
+        assert!(decode_image(&bytes).is_some());
+        bytes.push(0);
+        assert!(decode_image(&bytes).is_none());
     }
 
     fn asset(name: &str) -> Vec<u8> {

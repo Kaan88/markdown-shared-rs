@@ -1,4 +1,32 @@
 use super::*;
+
+thread_local! {
+    static INLINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn count_inline_visit() {
+    INLINE_VISITS.with(|n| n.set(n.get() + 1));
+}
+
+#[test]
+fn export_visits_each_flat_span_once() {
+    for count in [256, 512] {
+        let doc = mdshared_md_core::parse(&"*é* ".repeat(count));
+        INLINE_VISITS.set(0);
+        let html = export_html(
+            &doc,
+            &ExportOptions {
+                title: "",
+                theme: crate::LIGHT,
+                base_dir: None,
+                remote_images: false,
+                print: false,
+            },
+        );
+        assert_eq!(html.matches("<em>é</em>").count(), count);
+        assert_eq!(INLINE_VISITS.get(), count);
+    }
+}
 use crate::theme::LIGHT;
 use mdshared_md_core::parse;
 
@@ -256,6 +284,11 @@ fn file_urls_are_escaped_and_windows_paths_get_a_slash() {
     );
     assert_eq!(
         file_url(Path::new("C:\\x\\y z.png")),
+        "file:///C:/x/y%20z.png"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        file_url(Path::new(r"\\?\C:\x\y z.png")),
         "file:///C:/x/y%20z.png"
     );
 }

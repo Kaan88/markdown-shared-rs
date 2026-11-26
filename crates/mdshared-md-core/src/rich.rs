@@ -6,12 +6,98 @@
 //! escaped. Links are kept only when they are http, https or mailto addresses. The plain text
 //! that goes with it is the selected slice of `Document::text`, untouched.
 
-use crate::model::{BlockKind, Document, NONE, SpanKind};
+use crate::model::{BlockKind, Document, NONE, Span, SpanKind};
+use std::ops::Range;
+
+/// The direct children of the spans in one block, in their original order. Build it once to
+/// walk an inline tree without searching the whole block again for every parent. A span whose
+/// parent is outside the block belongs at the root, addressed by [`NONE`].
+pub struct SpanChildren {
+    start: u32,
+    first: Vec<u32>,
+    next: Vec<u32>,
+}
+
+impl SpanChildren {
+    /// Indexes a block's span range in one pass. An out-of-bounds range produces an empty tree.
+    pub fn new(spans: &[Span], range: Range<u32>) -> Self {
+        let slice = spans
+            .get(range.start as usize..range.end as usize)
+            .unwrap_or_default();
+        let mut first = vec![NONE; slice.len() + 1];
+        let mut next = vec![NONE; slice.len()];
+        for (i, span) in slice.iter().enumerate().rev() {
+            let parent = if range.contains(&span.parent) {
+                (span.parent - range.start) as usize
+            } else {
+                slice.len()
+            };
+            next[i] = std::mem::replace(&mut first[parent], range.start + i as u32);
+        }
+        Self {
+            start: range.start,
+            first,
+            next,
+        }
+    }
+
+    /// Lists the children of `parent`, or the root spans for [`NONE`]. An unknown parent has
+    /// no children.
+    pub fn children(&self, parent: u32) -> impl Iterator<Item = u32> + '_ {
+        let index = if parent == NONE {
+            Some(self.next.len())
+        } else {
+            parent
+                .checked_sub(self.start)
+                .map(|i| i as usize)
+                .filter(|&i| i < self.next.len())
+        };
+        let head = index.map_or(NONE, |i| self.first[i]);
+        std::iter::successors((head != NONE).then_some(head), |&child| {
+            let next = self.next[(child - self.start) as usize];
+            (next != NONE).then_some(next)
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INLINE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_inline_visit() {
+    INLINE_VISITS.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+#[test]
+fn clipboard_visits_each_flat_span_once() {
+    for count in [256, 512] {
+        let doc = crate::parse(&"*é* ".repeat(count));
+        INLINE_VISITS.set(0);
+        let html = selection_html(&doc, 0, doc.text.len() as u32).unwrap();
+        assert_eq!(html.matches("<em>é</em>").count(), count);
+        assert_eq!(INLINE_VISITS.get(), count);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn clipboard_declines_offsets_inside_a_utf8_character() {
+    let doc = crate::parse("aéz");
+    assert_eq!(selection_html(&doc, 0, 2), None);
+    assert_eq!(selection_html(&doc, 2, 4), None);
+    assert_eq!(selection_html(&doc, 1, 3).as_deref(), Some("<p>é</p>"));
+}
 
 /// The selected range `from..to` (offsets into `Document::text`) as an HTML fragment, or `None`
-/// when the range holds nothing to copy.
+/// when the range holds nothing to copy or either offset is not a UTF-8 boundary.
 pub fn selection_html(doc: &Document, from: u32, to: u32) -> Option<String> {
-    if from >= to || to as usize > doc.text.len() {
+    if from >= to
+        || !doc.text.is_char_boundary(from as usize)
+        || !doc.text.is_char_boundary(to as usize)
+    {
         return None;
     }
     let mut w = Writer {
@@ -254,7 +340,8 @@ impl Writer<'_> {
                 false,
             );
         } else {
-            self.inline(b.spans.start, b.spans.end, NONE, start, end);
+            let children = SpanChildren::new(&doc.spans, b.spans.start..b.spans.end);
+            self.inline(&children, NONE, start, end);
         }
         if self.out.len() == body {
             self.out.truncate(mark);
@@ -268,17 +355,14 @@ impl Writer<'_> {
         (at > self.from || (at == 0 && self.from == 0)) && at < self.to
     }
 
-    /// Text `from..to` of a block, with the spans among `spans` whose parent is `parent`.
-    fn inline(&mut self, spans_start: u32, spans_end: u32, parent: u32, from: u32, to: u32) {
+    /// Text `from..to` of a block, with the direct children of `parent`.
+    fn inline(&mut self, children: &SpanChildren, parent: u32, from: u32, to: u32) {
         let doc = self.doc;
         let mut at = from;
-        for s in spans_start..spans_end {
+        for s in children.children(parent) {
+            #[cfg(test)]
+            count_inline_visit();
             let span = doc.spans[s as usize];
-            // A span with no parent in this block is at its top, whatever it was carried from.
-            let top = parent == NONE && !(spans_start..spans_end).contains(&span.parent);
-            if span.parent != parent && !top {
-                continue;
-            }
             let atom = matches!(
                 span.kind,
                 SpanKind::Image(_) | SpanKind::Checkbox { .. } | SpanKind::FootnoteRef(_)
@@ -306,7 +390,7 @@ impl Writer<'_> {
             match span.kind {
                 // The source of a formula is shown as code; its text has no spans inside.
                 SpanKind::Math { .. } => self.text(cs, ce),
-                _ => self.inline(spans_start, spans_end, s, cs, ce),
+                _ => self.inline(children, s, cs, ce),
             }
             if self.out.len() == body {
                 self.out.truncate(mark);

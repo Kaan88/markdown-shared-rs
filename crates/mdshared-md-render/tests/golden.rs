@@ -12,6 +12,8 @@
 use mdshared_md_render::{DARK, LIGHT, Options, Theme, render};
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// A pixel counts as different when any channel differs by more than this.
 const CHANNEL_TOLERANCE: u8 = 24;
 /// At most this many pixels may differ.
@@ -36,6 +38,7 @@ fn read_rgb(path: &Path) -> (u32, u32, Vec<u8>) {
 }
 
 fn check(fixture: &str, name: &str, theme: Theme, scale: f32) {
+    common::engine_available();
     let showcase = root().join(format!("fixtures/md/{fixture}.md"));
     let doc = mdshared_md_core::parse_bytes(&std::fs::read(&showcase).unwrap());
     let rendered = render(
