@@ -6,7 +6,7 @@ use super::*;
 use crate::controls::{button, button::Look};
 use crate::gfx::{Gfx, Rect};
 use crate::keys::{KeyName, Mods};
-use crate::theme::{DARK, LIGHT};
+use crate::theme::LIGHT;
 use crate::tooltip::Tooltip;
 use mdshared_text::Bitmap;
 use std::time::Duration;
@@ -32,13 +32,13 @@ fn at(bmp: &Bitmap, x: usize, y: usize) -> [u8; 3] {
 
 #[test]
 fn the_icon_button_is_a_square_of_the_buttons_height_and_holds_its_glyph_and_tip() {
-    let b = IconButton::new(crate::glyph::SEARCH);
+    let b = IconButton::new(crate::glyph::SEARCH, "Search (Ctrl+F)");
     assert_eq!(b.icon(), crate::glyph::SEARCH);
-    assert_eq!(b.tip_text(), "");
+    assert_eq!(b.name(), "Search (Ctrl+F)");
     assert_eq!(b.rect(10.0, 9.0), Rect::new(10.0, 9.0, SIZE, SIZE));
     assert_eq!(SIZE, button::HEIGHT);
-    let b = b.tip("Search (Ctrl+F)");
-    assert_eq!(b.tip_text(), "Search (Ctrl+F)");
+    let named = IconButton::new(crate::glyph::SEARCH, "Find");
+    assert_eq!(named.name(), "Find");
     assert_eq!(rect(10.0, 9.0), b.rect(10.0, 9.0));
     // The hit is the square's, not the glyph's.
     assert!(b.hit(R, R.x, R.y));
@@ -46,10 +46,10 @@ fn the_icon_button_is_a_square_of_the_buttons_height_and_holds_its_glyph_and_tip
     assert!(!b.hit(R, R.right(), R.cy()));
     assert!(!b.hit(R, f32::NAN, R.cy()));
     // The keys are a push button's.
-    assert!(b.key(&KeyName::Enter, Mods::default()));
-    assert!(b.key(&KeyName::Space, Mods::default()));
-    assert!(!b.key(&KeyName::Escape, Mods::default()));
-    assert!(!b.key(
+    assert!(named.key(&KeyName::Enter, Mods::default()));
+    assert!(named.key(&KeyName::Space, Mods::default()));
+    assert!(!named.key(&KeyName::Escape, Mods::default()));
+    assert!(!named.key(
         &KeyName::Enter,
         Mods {
             ctrl: true,
@@ -60,8 +60,7 @@ fn the_icon_button_is_a_square_of_the_buttons_height_and_holds_its_glyph_and_tip
 
 #[test]
 fn the_icon_button_draws_its_glyph_and_every_state_differs_in_both_palettes() {
-    for pal in [&LIGHT, &DARK] {
-        let theme = if pal.dark { "dark" } else { "light" };
+    for (theme, pal) in palettes() {
         let states = [
             ("rest", Look::default()),
             (
@@ -123,7 +122,7 @@ fn the_icon_button_draws_its_glyph_and_every_state_differs_in_both_palettes() {
 
 #[test]
 fn a_disabled_icon_button_takes_no_mark() {
-    for pal in [&LIGHT, &DARK] {
+    for (_, pal) in palettes() {
         let quiet = Look {
             disabled: true,
             ..Look::default()
@@ -135,8 +134,10 @@ fn a_disabled_icon_button_takes_no_mark() {
                 disabled: true,
                 hovered: true,
                 pressed: true,
+                open: true,
                 focused: true,
                 default: true,
+                high_contrast: true,
             },
         );
         assert_eq!(
@@ -182,7 +183,7 @@ fn an_icon_button_with_no_room_draws_nothing() {
 
 #[test]
 fn the_icon_button_gives_the_tooltip_model_its_text_and_anchor() {
-    let b = IconButton::new(crate::glyph::SEARCH).tip("Search (Ctrl+F)");
+    let b = IconButton::new(crate::glyph::SEARCH, "Search (Ctrl+F)");
     let over = b.over("search", R);
     assert_eq!(over.key, "search");
     assert_eq!(over.text, "Search (Ctrl+F)");
@@ -219,4 +220,16 @@ fn the_icon_button_gives_the_tooltip_model_its_text_and_anchor() {
         tip.shown().is_none(),
         "the tip returned at once after a press"
     );
+}
+
+/// The four palettes the pixel tests run over.
+fn palettes() -> [(&'static str, &'static Palette); 4] {
+    use crate::theme::{DARK, LIGHT};
+    use crate::tokens::{HIGH_CONTRAST_DARK, HIGH_CONTRAST_LIGHT};
+    [
+        ("light", &LIGHT),
+        ("dark", &DARK),
+        ("high-contrast light", &HIGH_CONTRAST_LIGHT),
+        ("high-contrast dark", &HIGH_CONTRAST_DARK),
+    ]
 }

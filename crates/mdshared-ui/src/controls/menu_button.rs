@@ -8,13 +8,14 @@
 //! in its own state, draws it after the button with `Menu::draw_in`, and reads `Menu::chosen`
 //! back. The keys this module answers are the Windows ones: Space, Enter and Down open a menu
 //! button; Space and Enter run a split button's action while Down and Alt+Down open its menu.
-//! Nothing here draws an open menu or tracks whether one is open; a button whose menu is open is
-//! drawn `pressed`, which is what Windows shows.
+//! Nothing here tracks whether a menu is open; while it is, the caller draws the button with
+//! [`Look::open`](crate::controls::button::Look::open), which draws the pressed fill whatever
+//! the pointer is doing.
 //!
 //! Deliberately not here: the menu's items, its keyboard (the `Menu` has `step`, `pointer` and
 //! `chosen`), Escape to close it (the menu's scope does that), a menu that follows the button
 //! when the window scrolls or moves (the caller places it each frame, which is what `Menu::around`
-//! is for), and motion.
+//! is for), key repeat (the caller ignores a repeat for Enter, Space and Down), and motion.
 
 use crate::gfx::{Painter, Rect, mix};
 use crate::glyph;
@@ -90,10 +91,11 @@ impl MenuButton {
         button::hit(r, x, y)
     }
 
-    /// Whether the key opens the menu: Enter and Space (with or without Shift, without Alt or
-    /// Ctrl) and Down (with or without Alt, the usual Alt+Down) do; every other key, and any key
-    /// with Ctrl, does not. The caller decides whether the keyboard is on the button at all, and
-    /// leaves a disabled button out of its keys.
+    /// Whether the key opens the menu: Enter and Space (with or without Shift, without Alt,
+    /// Ctrl or the Mac's Control) and Down (with or without Alt, the usual Alt+Down) do; every
+    /// other key does not. The caller decides whether the keyboard is on the button at all, and
+    /// leaves a disabled button out of its keys. A repeat is the caller's to ignore, as for
+    /// [`button::key`].
     pub fn key(&self, k: &KeyName, mods: Mods) -> bool {
         matches!(key(k, mods), Press::Open | Press::Activate)
     }
@@ -123,23 +125,27 @@ pub fn chevron_rect(r: Rect) -> Rect {
     )
 }
 
-/// The room a menu button's label is centred in: `r` less the chevron's [`GAP`], [`CHEVRON`] and
-/// the right padding.
+/// The room a menu button's label is centred in: [`button::PAD`] from the left edge, and
+/// [`GAP`] short of the chevron. With [`menu_button_w`] that is exactly the label's width, so
+/// the label sits 12 px from the left and 6 px from the chevron, as Windows' menu buttons do.
+/// A narrower rectangle leaves a rectangle that is not positive wide, and drawing it draws no
+/// text.
 pub fn label_rect(r: Rect) -> Rect {
     Rect::new(
-        r.x,
+        r.x + button::PAD,
         r.y,
-        (r.w - (button::PAD + GAP + CHEVRON)).max(0.0),
+        (r.w - 2.0 * button::PAD - GAP - CHEVRON).max(0.0),
         r.h,
     )
 }
 
-/// What a menu button or a split button does with a key: Enter and Space (without Alt or Ctrl)
-/// [`Press::Activate`]; Down, with or without Alt, [`Press::Open`]; everything else, and anything
-/// with Ctrl, [`Press::None`]. A menu button takes [`Press::Activate`] as [`Press::Open`] as
-/// well, in [`MenuButton::key`].
+/// What a menu button or a split button does with a key: Enter and Space (without Alt, Ctrl or
+/// the Mac's Control) [`Press::Activate`]; Down, with or without Alt, [`Press::Open`]; everything
+/// else, and anything with one of those modifiers, [`Press::None`]. A menu button takes
+/// [`Press::Activate`] as [`Press::Open`] as well, in [`MenuButton::key`]. Repeat is not here:
+/// the key event carries no such flag, and the caller ignores a repeat for these keys.
 pub fn key(key: &KeyName, mods: Mods) -> Press {
-    if mods.ctrl {
+    if mods.ctrl || mods.control {
         return Press::None;
     }
     match key {
@@ -158,10 +164,11 @@ pub fn menu_under<T: Clone>(menu: Menu<T>, button: Rect) -> Menu<T> {
     menu.around(button)
 }
 
-/// Draws a menu button with `label` in `r`: the box `kind` draws, the label centred in the room
-/// left of the chevron, and a down chevron in the same ink. Disabled, it is the quiet frame with
-/// a faint label and chevron, as [`button::draw`] draws a disabled button. Nothing else differs
-/// from [`button::draw`], and nothing is drawn outside `r` except a focused button's ring.
+/// Draws a menu button with `label` in `r`: the box `kind` draws (with every state of
+/// [`button::Look`], an open menu included), the label centred in the room left of the chevron,
+/// and a down chevron in the same ink. Disabled, it is the quiet frame with a faint label and
+/// chevron, as [`button::draw`] draws a disabled button. Nothing else differs from
+/// [`button::draw`], and nothing is drawn outside `r` except a focused button's ring.
 pub fn draw(p: &mut Painter, pal: &Palette, r: Rect, label: &str, kind: Kind, look: button::Look) {
     let (_, ink) = button::draw_box(p, pal, r, kind, look);
     if !sane(r) {
@@ -299,7 +306,7 @@ pub fn hit(r: Rect, x: f32, y: f32) -> Option<Half> {
 
 /// How a split button's two halves are drawn just now, from the caller's own state. Each half
 /// has the states of a [`button::Look`]; the focus ring and a default mark cover the whole
-/// button when either half asks for one.
+/// button when either half asks for one, and either half's `open` draws its own fill pressed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SplitLook {
     pub main: button::Look,
@@ -308,10 +315,14 @@ pub struct SplitLook {
 
 /// Draws a split button with `label` in `r`: one rounded box in `kind`'s colours, its two halves
 /// lit on their own ([`SplitLook`]), a divider line between them, the label centred in the main
-/// half and a down chevron in the chevron half. A subtle button draws no divider until one half
+/// half and a down chevron in the chevron half.
+///
+/// The box and the default mark are drawn with [`Painter::frame`], so each line is one device
+/// pixel; a half whose fill differs from the rest is painted inside that line, so neither the
+/// frame nor the default mark is painted over. A subtle button draws no divider until one half
 /// is hovered or pressed, since at rest it has no fill for a line to sit on. Disabled when
 /// either half says so: then the whole control is the one quiet frame, with a faint label and
-/// chevron, and no ring, hover, press or default mark is drawn.
+/// chevron, and no ring, hover, press, open or default mark is drawn.
 pub fn draw_split(
     p: &mut Painter,
     pal: &Palette,
@@ -345,46 +356,67 @@ pub fn draw_split(
     if look.main.focused || look.chevron.focused {
         crate::focus::draw_ring(p, pal, r, button::RADIUS);
     }
-    let style = button::style(pal, kind);
+    let hc = button::high_contrast(pal, look.main.high_contrast || look.chevron.high_contrast);
+    let style = button::style(pal, kind, hc);
     let (main_fill, main_ink) = button::state(&style, look.main);
     let (chev_fill, chev_ink) = button::state(&style, look.chevron);
-    if let Some(c) = main_fill {
-        p.fill_path(&button::side(h.main, button::RADIUS, false), c, 1.0);
-    }
-    if let Some(c) = chev_fill {
-        p.fill_path(&button::side(h.chevron, button::RADIUS, true), c, 1.0);
-    }
-    if let Some(border) = style.border {
-        p.stroke_path(
-            &button::rounded(r.inset(0.5), (button::RADIUS - 0.5).max(0.0)),
-            1.0,
-            border,
-            1.0,
-        );
+    let default = look.main.default || look.chevron.default;
+    let px = p.px();
+    let base = style.fill.unwrap_or(pal.field);
+    let ring = if default {
+        Some(button::default_line(pal, kind, main_ink))
+    } else {
+        style.border
+    };
+    match ring {
+        Some(stroke) => {
+            p.frame(r, button::RADIUS, base, stroke);
+            // A half that differs from the rest is painted inside the frame's one device pixel,
+            // so the frame (or the default mark) stays whole.
+            let inner = r.inset(px);
+            let radius = (button::RADIUS - px).max(0.0);
+            let main = Rect::new(
+                h.main.x + px,
+                inner.y,
+                (h.main.right() - px - (h.main.x + px)).max(0.0),
+                inner.h,
+            );
+            let chevron = Rect::new(
+                h.chevron.x,
+                inner.y,
+                (inner.right() - h.chevron.x).max(0.0),
+                inner.h,
+            );
+            if main_fill != style.fill
+                && let Some(c) = main_fill
+            {
+                p.fill_path(&button::side(main, radius, false), c, 1.0);
+            }
+            if chev_fill != style.fill
+                && let Some(c) = chev_fill
+            {
+                p.fill_path(&button::side(chevron, radius, true), c, 1.0);
+            }
+        }
+        None => {
+            if let Some(c) = main_fill {
+                p.fill_path(&button::side(h.main, button::RADIUS, false), c, 1.0);
+            }
+            if let Some(c) = chev_fill {
+                p.fill_path(&button::side(h.chevron, button::RADIUS, true), c, 1.0);
+            }
+        }
     }
     if main_fill.is_some() || chev_fill.is_some() || style.fill.is_some() {
         let base = main_fill.or(chev_fill).unwrap_or(pal.popup);
-        let px = p.px();
         p.fill(
-            Rect::new(h.chevron.x - px / 2.0, r.y + 2.0, px, (r.h - 4.0).max(0.0)),
+            Rect::new(
+                h.chevron.x - px / 2.0,
+                r.y + px,
+                px,
+                (r.h - 2.0 * px).max(0.0),
+            ),
             mix(base, pal.text, 0.15),
-        );
-    }
-    if look.main.default || look.chevron.default {
-        let line = if matches!(kind, Kind::Primary | Kind::Destructive) {
-            mix(
-                pal.on_accent,
-                button::style(pal, kind).fill.unwrap_or(pal.accent),
-                0.5,
-            )
-        } else {
-            pal.accent
-        };
-        p.stroke_path(
-            &button::rounded(r.inset(0.5), (button::RADIUS - 0.5).max(0.0)),
-            1.0,
-            line,
-            1.0,
         );
     }
     p.icon(
@@ -394,7 +426,8 @@ pub fn draw_split(
         h.chevron.cy(),
         chev_ink,
     );
-    p.text_center(button::face(kind), button::TEXT, h.main, label, main_ink);
+    let face = button::face(kind);
+    p.text_center(face, button::TEXT, h.main, label, main_ink);
 }
 
 /// Whether a rectangle can be drawn at all: every number finite and both sides positive.

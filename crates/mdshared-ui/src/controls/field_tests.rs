@@ -1,16 +1,29 @@
 //! Tests for [`crate::controls::field`]: the box and the error band, the leading icon's and the
-//! clear button's room, the press on the clear button and the focus it keeps, the error's colour
-//! and message, the focused edge, Escape, the editing keys and a quiet disabled look.
+//! clear button's room, a press held on the clear button and let go on or off it, the real focus
+//! after a clear, the error's ink on all four palettes, the focused edge, Escape and repeat,
+//! the editing keys and a quiet disabled look.
 
 use super::*;
+use crate::controls::button::high_contrast;
+use crate::cover::contrast;
 use crate::gfx::{Gfx, Rect};
 use crate::textfield::FieldColors;
 use crate::theme::{DARK, LIGHT};
+use crate::tokens::{HIGH_CONTRAST_DARK, HIGH_CONTRAST_LIGHT};
 use mdshared_text::Bitmap;
 
 const PAGE_W: u32 = 260;
 const PAGE_H: u32 = 80;
 const R: Rect = Rect::new(10.0, 10.0, 220.0, HEIGHT);
+
+fn palettes() -> [(&'static str, &'static Palette); 4] {
+    [
+        ("light", &LIGHT),
+        ("dark", &DARK),
+        ("high-contrast light", &HIGH_CONTRAST_LIGHT),
+        ("high-contrast dark", &HIGH_CONTRAST_DARK),
+    ]
+}
 
 fn blank(pal: &Palette) -> Bitmap {
     let mut bmp = Bitmap::new(PAGE_W, PAGE_H);
@@ -73,6 +86,16 @@ fn filled(text: &str) -> FramedField {
     let mut f = FramedField::new();
     f.field_mut().set_text(text);
     f
+}
+
+fn type_key(f: &mut FramedField, text: &str) -> Outcome {
+    f.key(
+        &KeyName::Char('x'),
+        Mods::default(),
+        Some(text),
+        false,
+        false,
+    )
 }
 
 #[test]
@@ -144,102 +167,152 @@ fn a_leading_icon_and_the_clear_button_leave_their_room_beside_the_text() {
 }
 
 #[test]
-fn pressing_the_clear_button_empties_the_field_and_the_text_area_does_not() {
+fn the_clear_button_empties_the_field_on_release_over_it_not_on_press() {
     let mut f = filled("abc");
     let c = f.clear_rect(R).unwrap();
     let t = f.text_rect(R);
     // The text area places the caret and leaves the text alone.
     assert_eq!(f.press(R, t.cx(), t.cy()), Hit::Text);
     assert_eq!(f.text(), "abc");
-    // The clear button empties it and puts the caret at the start.
-    assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Cleared);
+    // A press on the clear button only holds it...
+    assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Clear);
+    assert!(f.clear_held());
+    assert_eq!(f.text(), "abc", "a press cleared before the button went up");
+    // ...and letting go off it clears nothing.
+    assert!(
+        !f.release(R, R.cx(), R.cy()),
+        "a release off the button cleared it"
+    );
+    assert_eq!(f.text(), "abc");
+    assert!(!f.clear_held());
+    // A press that began in the text and was let go on the clear button clears nothing either.
+    assert_eq!(f.press(R, t.cx(), t.cy()), Hit::Text);
+    assert!(!f.release(R, c.cx(), c.cy()));
+    assert_eq!(f.text(), "abc");
+    // The press held and let go on the button empties it.
+    assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Clear);
+    assert!(f.release(R, c.cx(), c.cy()));
     assert_eq!(f.text(), "");
     assert_eq!(f.field().caret(), (0, 0));
+    assert!(
+        !f.release(R, c.cx(), c.cy()),
+        "an empty field cleared again"
+    );
     // Off the box nothing happens.
     assert_eq!(f.press(R, R.right() + 1.0, R.cy()), Hit::Outside);
     assert_eq!(
         f.press(R, R.cx(), f.error_rect(R).map_or(R.bottom(), |b| b.cy())),
         Hit::Outside
     );
-    // A press on the box of a field with no text is the text area, not a clear button.
-    assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Text);
     // Nonsense is outside.
     assert_eq!(f.press(R, f32::NAN, R.cy()), Hit::Outside);
 }
 
 #[test]
-fn the_field_keeps_the_focus_after_the_clear_button() {
-    for pal in [&LIGHT, &DARK] {
+fn the_clear_button_keeps_the_fields_real_focus() {
+    use crate::focus::Focus;
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum W {
+        Field,
+        Next,
+    }
+    for (name, pal) in palettes() {
         let mut f = filled("abc");
+        // The real focus model: the field is focused, its neighbour comes next on Tab.
+        let mut focus: Focus<W> = Focus::new();
+        focus.begin_frame();
+        focus.add(W::Field);
+        focus.add(W::Next);
+        focus.end_frame();
+        focus.focus(W::Field);
         let focused = Look {
             focused: true,
             ..Look::default()
         };
         let before = drawn(pal, &mut f, focused, true);
         let c = f.clear_rect(R).unwrap();
-        assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Cleared);
+        assert_eq!(f.press(R, c.cx(), c.cy()), Hit::Clear);
+        focus.pointer_used();
+        assert!(f.release(R, c.cx(), c.cy()));
+        assert!(
+            focus.is_focused(W::Field),
+            "the clear button moved the focus in {name}"
+        );
+        // The field still has the keyboard: Tab goes on to its neighbour, not from scratch.
+        focus.tab(false);
+        assert!(
+            focus.is_focused(W::Next),
+            "the focus did not continue from the field in {name}"
+        );
+        // And the focused, empty field still draws its caret at the start of the text area; an
+        // unfocused one draws nothing there.
         let after = drawn(pal, &mut f, focused, true);
         assert_ne!(
             before.pixels, after.pixels,
             "the clear button changed nothing"
         );
-        // The focused, empty field still draws its caret at the start of the text area; an
-        // unfocused one draws nothing there. That is the focus still being on the field.
         let area = f.text_rect(R);
         let mut same = FramedField::new();
         let unfocused = drawn(pal, &mut same, Look::default(), false);
         assert_eq!(
             count_in(&unfocused, pal.text, area),
             0,
-            "an unfocused empty field drew ink"
+            "an unfocused empty field drew ink in {name}"
         );
         assert!(
             count_in(&after, pal.text, area) > 0,
-            "the caret went away with the focus"
+            "the caret went away with the focus in {name}"
         );
         assert_eq!(
             at(&after, area.x as usize, area.cy() as usize),
             pal.text,
-            "the caret is not at the start"
+            "the caret is not at the start in {name}"
         );
-        assert_eq!(at(&after, area.cx() as usize, R.cy() as usize), pal.field);
     }
 }
 
 #[test]
 fn an_error_turns_the_frame_and_draws_its_message_under_the_box() {
-    for pal in [&LIGHT, &DARK] {
-        let theme = if pal.dark { "dark" } else { "light" };
+    for (name, pal) in palettes() {
         let mut plain = FramedField::new();
         let clean = drawn(pal, &mut plain, Look::default(), false);
         let band = Rect::new(R.x, R.bottom(), R.w, ERROR_H);
         assert_eq!(
             count_in(&clean, pal.danger, band),
             0,
-            "a field without an error drew a message in {theme}"
+            "a field without an error drew a message in {name}"
         );
         let mut e = FramedField::new();
         e.set_error("A name is needed");
-        let with = drawn(pal, &mut e, Look::default(), false);
+        let with = drawn(
+            pal,
+            &mut e,
+            Look {
+                high_contrast: high_contrast(pal, false),
+                ..Look::default()
+            },
+            false,
+        );
+        let ink = error_ink(pal, high_contrast(pal, false));
         assert_ne!(
             clean.pixels, with.pixels,
-            "the error drew nothing in {theme}"
+            "the error drew nothing in {name}"
         );
         assert!(
-            count_in(&with, pal.danger, band) > 0,
-            "no red message in the band in {theme}"
+            count_in(&with, ink, band) > 0,
+            "no message in the error's ink in {name}"
         );
-        // The frame itself is the danger colour.
+        // The frame itself is the error's ink.
         assert_eq!(
             at(&with, R.cx() as usize, R.y as usize),
-            pal.danger,
-            "the frame is not red in {theme}"
+            ink,
+            "the frame is not the error's ink in {name}"
         );
         // Nothing was drawn below the error's band.
         assert_eq!(
             count_in(
                 &with,
-                pal.danger,
+                ink,
                 Rect::new(0.0, band.bottom() + 1.0, PAGE_W as f32, 1.0)
             ),
             0
@@ -248,9 +321,33 @@ fn an_error_turns_the_frame_and_draws_its_message_under_the_box() {
 }
 
 #[test]
+fn the_error_message_and_its_frame_read_on_every_palette() {
+    for (name, pal) in palettes() {
+        let hc = high_contrast(pal, false);
+        let ink = error_ink(pal, hc);
+        let on_page = contrast(ink, pal.page);
+        let on_field = contrast(ink, pal.field);
+        assert!(
+            on_page >= 4.5,
+            "the error message is {on_page:.2}:1 on the page in {name}"
+        );
+        assert!(
+            on_field >= 3.0,
+            "the error frame is {on_field:.2}:1 on the field in {name}"
+        );
+        // A dark palette that is not high contrast takes the info bar's ink; the others take
+        // their own danger colour.
+        if pal.dark && !hc {
+            assert_eq!(ink, crate::infobar::DARK_ERROR_INK);
+        } else {
+            assert_eq!(ink, pal.danger);
+        }
+    }
+}
+
+#[test]
 fn the_focused_field_draws_the_accent_edge_and_a_line_along_the_bottom() {
-    for pal in [&LIGHT, &DARK] {
-        let theme = if pal.dark { "dark" } else { "light" };
+    for (name, pal) in palettes() {
         let mut f = filled("abc");
         let rest = drawn(pal, &mut f, Look::default(), true);
         let focused = drawn(
@@ -262,24 +359,74 @@ fn the_focused_field_draws_the_accent_edge_and_a_line_along_the_bottom() {
             },
             true,
         );
-        assert_ne!(rest.pixels, focused.pixels, "no focus mark in {theme}");
+        assert_ne!(rest.pixels, focused.pixels, "no focus mark in {name}");
         assert_eq!(
             at(&focused, R.cx() as usize, R.y as usize),
             pal.accent,
-            "the focused frame is not the accent in {theme}"
+            "the focused frame is not the accent in {name}"
         );
+        let edge = if high_contrast(pal, false) {
+            pal.line
+        } else {
+            mix(pal.line, pal.text, 0.3)
+        };
         assert_eq!(
             at(&rest, R.cx() as usize, R.y as usize),
-            mix(pal.line, pal.text, 0.3),
-            "the resting frame is not the quiet edge in {theme}"
+            edge,
+            "the resting frame is not the quiet edge in {name}"
         );
-        // The thicker bottom line sits just inside the frame.
+        // The thicker bottom line sits inside the frame's one device pixel.
         assert_eq!(
             at(&focused, R.cx() as usize, (R.bottom() - 2.0) as usize),
             pal.accent,
-            "no accent line along the bottom in {theme}"
+            "no accent line along the bottom in {name}"
         );
     }
+}
+
+#[test]
+fn a_high_contrast_palette_takes_the_lines_own_colour_for_the_resting_edge() {
+    // The two toolkit high-contrast palettes are recognised without the flag; the flag does the
+    // same for a system contrast theme on an ordinary palette.
+    for (name, pal) in palettes() {
+        let mut f = FramedField::new();
+        let hc = high_contrast(pal, false);
+        let b = drawn(
+            pal,
+            &mut f,
+            Look {
+                high_contrast: hc,
+                ..Look::default()
+            },
+            false,
+        );
+        let edge = if hc {
+            pal.line
+        } else {
+            mix(pal.line, pal.text, 0.3)
+        };
+        assert_eq!(
+            at(&b, R.cx() as usize, R.y as usize),
+            edge,
+            "the resting edge in {name}"
+        );
+    }
+    let mut f = FramedField::new();
+    let flagged = drawn(
+        &LIGHT,
+        &mut f,
+        Look {
+            high_contrast: true,
+            ..Look::default()
+        },
+        false,
+    );
+    assert_eq!(at(&flagged, R.cx() as usize, R.y as usize), LIGHT.line);
+    let plain = drawn(&LIGHT, &mut f, Look::default(), false);
+    assert_ne!(
+        flagged.pixels, plain.pixels,
+        "the high-contrast flag changed nothing"
+    );
 }
 
 #[test]
@@ -287,15 +434,30 @@ fn escape_clears_only_when_it_is_turned_on_and_only_with_text() {
     let none = Mods::default();
     let mut f = filled("abc");
     assert!(!f.escape_clears(), "Escape clears by default");
-    assert_eq!(f.key(&KeyName::Escape, none, None, false), Outcome::Unused);
+    assert_eq!(
+        f.key(&KeyName::Escape, none, None, false, false),
+        Outcome::Unused
+    );
     assert_eq!(f.text(), "abc", "Escape cleared an ordinary field");
     f.set_escape_clears(true);
     assert!(f.escape_clears());
-    assert_eq!(f.key(&KeyName::Escape, none, None, false), Outcome::Cleared);
+    // A held Escape clears once: the repeat is ignored and the text stays cleared.
+    assert_eq!(
+        f.key(&KeyName::Escape, none, None, false, true),
+        Outcome::Unused
+    );
+    assert_eq!(f.text(), "abc", "a repeat of Escape cleared the field");
+    assert_eq!(
+        f.key(&KeyName::Escape, none, None, false, false),
+        Outcome::Cleared
+    );
     assert!(f.is_empty());
     // An empty field's Escape is the caller's, so a dialog still closes.
-    assert_eq!(f.key(&KeyName::Escape, none, None, false), Outcome::Unused);
-    // Ctrl or Alt with Escape is somebody else's key, even with text.
+    assert_eq!(
+        f.key(&KeyName::Escape, none, None, false, false),
+        Outcome::Unused
+    );
+    // Ctrl, Alt or the Mac's Control with Escape is somebody else's key, even with text.
     f.field_mut().set_text("x");
     for mods in [
         Mods {
@@ -306,8 +468,15 @@ fn escape_clears_only_when_it_is_turned_on_and_only_with_text() {
             alt: true,
             ..Mods::default()
         },
+        Mods {
+            control: true,
+            ..Mods::default()
+        },
     ] {
-        assert_eq!(f.key(&KeyName::Escape, mods, None, false), Outcome::Unused);
+        assert_eq!(
+            f.key(&KeyName::Escape, mods, None, false, false),
+            Outcome::Unused
+        );
         assert_eq!(f.text(), "x");
     }
 }
@@ -316,36 +485,35 @@ fn escape_clears_only_when_it_is_turned_on_and_only_with_text() {
 fn editing_keys_go_to_the_field_and_the_rest_is_the_callers() {
     let none = Mods::default();
     let mut f = FramedField::new();
-    assert_eq!(
-        f.key(&KeyName::Char('a'), none, Some("a"), false),
-        Outcome::Used(true)
-    );
+    assert_eq!(type_key(&mut f, "a"), Outcome::Used(true));
     assert_eq!(f.text(), "a");
-    assert_eq!(
-        f.key(&KeyName::Char('b'), none, Some("b"), false),
-        Outcome::Used(true)
-    );
+    assert_eq!(type_key(&mut f, "b"), Outcome::Used(true));
     assert_eq!(f.text(), "ab");
     assert_eq!(
-        f.key(&KeyName::Left, none, None, false),
+        f.key(&KeyName::Left, none, None, false, false),
         Outcome::Used(false)
     );
     assert_eq!(f.field().caret(), (1, 1));
+    // A repeat of Backspace keeps deleting: it is the field's own key.
     assert_eq!(
-        f.key(&KeyName::Backspace, none, None, false),
+        f.key(&KeyName::Backspace, none, None, false, true),
         Outcome::Used(true)
     );
     assert_eq!(f.text(), "b");
     // Enter, Tab and the arrows are the caller's.
     for k in [KeyName::Enter, KeyName::Tab, KeyName::Up, KeyName::Down] {
-        assert_eq!(f.key(&k, none, None, false), Outcome::Unused, "{k:?}");
+        assert_eq!(
+            f.key(&k, none, None, false, false),
+            Outcome::Unused,
+            "{k:?}"
+        );
     }
     assert_eq!(f.text(), "b");
 }
 
 #[test]
 fn the_field_shows_its_placeholder_while_empty_and_not_after() {
-    for pal in [&LIGHT, &DARK] {
+    for (name, pal) in palettes() {
         // An empty field with no placeholder draws nothing but its frame: its text area, inside
         // the frame, is the field's own fill.
         let mut bare = FramedField::new();
@@ -354,7 +522,7 @@ fn the_field_shows_its_placeholder_while_empty_and_not_after() {
         assert_eq!(
             ink_in(&quiet, pal.field, inner),
             0,
-            "an empty field with no placeholder drew ink"
+            "an empty field with no placeholder drew ink in {name}"
         );
         let mut f = FramedField::new().with_placeholder("Search");
         let area = f.text_rect(R);
@@ -364,7 +532,12 @@ fn the_field_shows_its_placeholder_while_empty_and_not_after() {
         let mut rf = FramedField::new();
         {
             let mut p = Painter::new(&mut reference, &mut gfx, 1.0);
-            p.frame(R, RADIUS, pal.field, mix(pal.line, pal.text, 0.3));
+            let edge = if high_contrast(pal, false) {
+                pal.line
+            } else {
+                mix(pal.line, pal.text, 0.3)
+            };
+            p.frame(R, RADIUS, pal.field, edge);
             let colors = FieldColors {
                 text: pal.text,
                 placeholder: pal.muted,
@@ -384,24 +557,24 @@ fn the_field_shows_its_placeholder_while_empty_and_not_after() {
         }
         assert_eq!(
             empty.pixels, reference.pixels,
-            "the placeholder is not the muted colour, or is not drawn"
+            "the placeholder is not the muted colour, or is not drawn, in {name}"
         );
         f.field_mut().set_text("abc");
         let filled = drawn(pal, &mut f, Look::default(), false);
         assert!(
-            ink_in(&filled, pal.field, area) > 0,
-            "the text is not drawn"
+            ink_in(&filled, pal.field, inner_of(area)) > 0,
+            "the text is not drawn in {name}"
         );
         assert_ne!(
             empty.pixels, filled.pixels,
-            "a filled field still shows its placeholder"
+            "a filled field still shows its placeholder in {name}"
         );
     }
 }
 
 #[test]
 fn a_disabled_field_is_quiet_and_offers_no_clear_button() {
-    for pal in [&LIGHT, &DARK] {
+    for (name, pal) in palettes() {
         let mut f = filled("abc");
         let quiet = Look {
             disabled: true,
@@ -417,10 +590,14 @@ fn a_disabled_field_is_quiet_and_offers_no_clear_button() {
                 hovered_clear: true,
                 pressed_clear: true,
                 focused: true,
+                high_contrast: true,
             },
             true,
         );
-        assert_eq!(loud.pixels, base.pixels, "a disabled field took a mark");
+        assert_eq!(
+            loud.pixels, base.pixels,
+            "a disabled field took a mark in {name}"
+        );
         // The text is the faint colour: a disabled field drawn by hand is the same picture.
         let area = f.text_rect(R);
         assert_eq!(count_in(&base, pal.text, area), 0, "the text is not faint");
@@ -447,7 +624,7 @@ fn a_disabled_field_is_quiet_and_offers_no_clear_button() {
                 false,
             );
         }
-        assert_eq!(base.pixels, reference.pixels);
+        assert_eq!(base.pixels, reference.pixels, "in {name}");
         assert_eq!(at(&base, R.cx() as usize, R.y as usize), pal.line);
     }
 }
@@ -479,6 +656,7 @@ fn a_field_with_no_room_draws_nothing() {
                     hovered_clear: true,
                     pressed_clear: true,
                     disabled: false,
+                    high_contrast: true,
                 },
                 true,
             );

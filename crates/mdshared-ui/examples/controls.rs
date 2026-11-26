@@ -101,7 +101,7 @@ impl Demo {
             pal: LIGHT,
             focus,
             buttons: kinds.map(|(text, kind)| Button::new(text, kind)),
-            icon: IconButton::new(mdshared_ui::glyph::SEARCH).tip("Search (Ctrl+F)"),
+            icon: IconButton::new(mdshared_ui::glyph::SEARCH, "Search (Ctrl+F)"),
             menu_button: MenuButton::new("Sort by", Kind::Secondary),
             split: SplitButton::new("Run", Kind::Primary),
             field: {
@@ -222,7 +222,7 @@ impl Demo {
                 if acc.w == 0.0 {
                     r
                 } else {
-                    Rect::new(acc.x, acc.y, acc.right() - acc.x, acc.h)
+                    Rect::new(acc.x, acc.y, r.right() - acc.x, acc.h)
                 }
             })
     }
@@ -305,7 +305,14 @@ impl App for Demo {
                     }
                     println!("a press outside the menu closes it");
                     self.menu = None;
-                    self.menu_from = None;
+                    let from = self.menu_from.take();
+                    if from == self.target_at(x, y) {
+                        // The press that closes a menu on the button that opened it does not
+                        // press that button again.
+                        self.pressed = None;
+                        cx.request_redraw_all();
+                        return;
+                    }
                 }
                 self.tip.hide();
                 if self.field_rect().contains(x, y) {
@@ -313,9 +320,11 @@ impl App for Demo {
                     self.focus.pointer_used();
                     let r = self.field_rect();
                     match self.field.press(r, x, y) {
-                        field::Hit::Cleared => {
-                            self.say("the clear button emptied the field; it keeps the keyboard");
-                            self.pressed = None;
+                        field::Hit::Clear => {
+                            println!(
+                                "the clear button is held; letting go on it empties the field"
+                            );
+                            self.pressed = Some(Target::Clear);
                         }
                         field::Hit::Text => {
                             self.pressed = Some(Target::Field);
@@ -331,7 +340,13 @@ impl App for Demo {
                 let t = self.target_at(x, y);
                 self.pressed = t;
                 if let Some(t) = t {
-                    self.focus.focus(t);
+                    // A split button is one Tab stop: its chevron takes the focus to the main
+                    // half, which is declared, not to an id the focus model has never seen.
+                    let focused = match t {
+                        Target::Split(_) => Target::Split(Half::Main),
+                        t => t,
+                    };
+                    self.focus.focus(focused);
                     self.focus.pointer_used();
                 }
                 cx.request_redraw_all();
@@ -348,6 +363,22 @@ impl App for Demo {
                     }
                     cx.request_redraw_all();
                     return;
+                }
+                if self
+                    .pressed
+                    .is_some_and(|p| matches!(p, Target::Field | Target::Clear))
+                {
+                    let r = self.field_rect();
+                    if self.field.release(r, x, y) {
+                        // A preedit, if the input method was composing one, is the caller's to
+                        // reset: this model cannot reach the window's IME.
+                        println!("the clear button emptied the field; it keeps the keyboard");
+                    }
+                    if self.pressed == Some(Target::Clear) {
+                        self.pressed = None;
+                        cx.request_redraw_all();
+                        return;
+                    }
                 }
                 let t = self.target_at(x, y);
                 if let (Some(pressed), Some(released)) = (self.pressed, t)
@@ -392,7 +423,9 @@ impl App for Demo {
                 if self.focus.is_focused(Target::Field)
                     && let Some(name) = &k.name
                 {
-                    let outcome = self.field.key(name, k.mods, k.text.as_deref(), true);
+                    let outcome = self
+                        .field
+                        .key(name, k.mods, k.text.as_deref(), true, k.repeat);
                     match outcome {
                         field::Outcome::Cleared => {
                             println!("Escape cleared the field; it keeps the keyboard");
@@ -412,6 +445,10 @@ impl App for Demo {
                     return;
                 };
                 let Some(name) = &k.name else { return };
+                // A held Enter or Space presses the control once.
+                if k.repeat && matches!(name, KeyName::Enter | KeyName::Space) {
+                    return;
+                }
                 match t {
                     Target::Menu => {
                         if menu_button::key(name, k.mods) != menu_button::Press::None {
@@ -499,6 +536,7 @@ impl App for Demo {
             self.frames, damage.x, damage.y, damage.w, damage.h
         );
         let pal = self.pal;
+        let hc = cx.high_contrast();
         p.fill(damage, pal.page);
         let page = Rect::new(0.0, 0.0, W, H);
         self.focus.begin_frame();
@@ -526,7 +564,8 @@ impl App for Demo {
                 pressed: self.pressed == Some(Target::Button(i)),
                 focused: self.focus.ring_visible(Target::Button(i)),
                 default: i == 0,
-                disabled: false,
+                high_contrast: hc,
+                ..ButtonLook::default()
             };
             button::draw(p, &pal, r, b.text(), b.kind(), look);
             if i == 3 {
@@ -591,8 +630,8 @@ impl App for Demo {
                 hovered: self.hover == Some(Target::Icon),
                 pressed: self.pressed == Some(Target::Icon),
                 focused: self.focus.ring_visible(Target::Icon),
-                default: false,
-                disabled: false,
+                high_contrast: hc,
+                ..ButtonLook::default()
             },
         );
         let mr = self.menu_button.rect(p, X0 + 48.0, ROW_Y);
@@ -605,10 +644,11 @@ impl App for Demo {
             self.menu_button.kind(),
             ButtonLook {
                 hovered: self.hover == Some(Target::Menu),
-                pressed: self.menu_from == Some(Target::Menu),
+                pressed: self.pressed == Some(Target::Menu),
+                open: self.menu_from == Some(Target::Menu),
                 focused: self.focus.ring_visible(Target::Menu),
-                default: false,
-                disabled: false,
+                high_contrast: hc,
+                ..ButtonLook::default()
             },
         );
         let sr = self.split.rect(p, X0 + 200.0, ROW_Y);
@@ -627,16 +667,16 @@ impl App for Demo {
                     hovered: self.hover == Some(Target::Split(Half::Main)),
                     pressed: self.pressed == Some(Target::Split(Half::Main)),
                     focused: self.focus.ring_visible(Target::Split(Half::Main)),
-                    default: false,
-                    disabled: false,
+                    high_contrast: hc,
+                    ..ButtonLook::default()
                 },
                 chevron: ButtonLook {
                     hovered: self.hover == Some(Target::Split(Half::Chevron)),
-                    pressed: self.pressed == Some(Target::Split(Half::Chevron))
-                        || self.menu_from == Some(Target::Split(Half::Chevron)),
+                    pressed: self.pressed == Some(Target::Split(Half::Chevron)),
+                    open: self.menu_from == Some(Target::Split(Half::Chevron)),
                     focused: self.focus.ring_visible(Target::Split(Half::Chevron)),
-                    default: false,
-                    disabled: false,
+                    high_contrast: hc,
+                    ..ButtonLook::default()
                 },
             },
         );
@@ -650,8 +690,9 @@ impl App for Demo {
         let field_look = field::Look {
             focused: self.focus.is_focused(Target::Field) && cx.focused(),
             hovered_clear: self.hover == Some(Target::Clear),
-            pressed_clear: self.pressed == Some(Target::Clear),
-            disabled: false,
+            pressed_clear: self.field.clear_held(),
+            high_contrast: hc,
+            ..field::Look::default()
         };
         field::draw_blinking(
             p,
@@ -679,8 +720,8 @@ impl App for Demo {
                 hovered: self.hover == Some(Target::Validate),
                 pressed: self.pressed == Some(Target::Validate),
                 focused: self.focus.ring_visible(Target::Validate),
-                default: false,
-                disabled: false,
+                high_contrast: hc,
+                ..ButtonLook::default()
             },
         );
 
@@ -740,11 +781,17 @@ impl App for Demo {
         };
         tree.add(
             a11y::id("Search"),
-            a11y::button(self.icon.tip_text(), "Search", rect_of(Target::Icon), false),
+            a11y::button(self.icon.name(), "Search", rect_of(Target::Icon), false),
         );
         tree.add(
             a11y::id("Sort"),
-            a11y::button("Sort by", "Sort", rect_of(Target::Menu), false),
+            a11y::menu_button(
+                "Sort by",
+                "Sort",
+                rect_of(Target::Menu),
+                self.menu_from == Some(Target::Menu),
+                false,
+            ),
         );
         tree.add(
             a11y::id("Run"),
@@ -752,10 +799,11 @@ impl App for Demo {
         );
         tree.add(
             a11y::id("RunMenu"),
-            a11y::button(
+            a11y::menu_button(
                 "Run options",
                 "RunMenu",
                 rect_of(Target::Split(Half::Chevron)),
+                self.menu_from == Some(Target::Split(Half::Chevron)),
                 false,
             ),
         );
@@ -782,7 +830,16 @@ impl App for Demo {
             a11y::id("Validate"),
             a11y::button("Validate", "Validate", rect_of(Target::Validate), false),
         );
-        a11y::id("Field")
+        // The tree's focus is the window's focus, so a reader and the ring agree.
+        match self.focus.focused() {
+            Some(Target::Button(i)) => ids[i],
+            Some(Target::Icon) => a11y::id("Search"),
+            Some(Target::Menu) => a11y::id("Sort"),
+            Some(Target::Split(_)) => a11y::id("Run"),
+            Some(Target::Field) | Some(Target::Clear) => a11y::id("Field"),
+            Some(Target::Validate) => a11y::id("Validate"),
+            None => root,
+        }
     }
 }
 

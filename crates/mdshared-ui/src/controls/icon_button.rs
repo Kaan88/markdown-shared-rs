@@ -1,6 +1,12 @@
-//! An icon button: a square button that shows one glyph from [`crate::glyph`] and carries the
-//! text of its tooltip. It is drawn as a subtle [`crate::controls::button`] (no fill until the
-//! pointer is over it), so a toolbar of them reads as one row.
+//! An icon button: a square button that shows one glyph from [`crate::glyph`] and carries its
+//! name, which is also the text of its tooltip. It is drawn as a subtle
+//! [`crate::controls::button`] (no fill until the pointer is over it), so a toolbar of them
+//! reads as one row.
+//!
+//! The name is required rather than optional: a button with only a glyph has no other name for
+//! a screen reader, so [`IconButton::new`] takes it, [`IconButton::name`] gives it back, and
+//! [`IconButton::over`] puts it in the tooltip. An empty name is allowed but is a poor one; a
+//! caller with nothing to say about a square of pixels has the wrong control.
 //!
 //! The tooltip's timing is [`crate::tooltip`]'s and its drawing is
 //! [`crate::overlay::Bubble::tip`]; [`IconButton::over`] builds the [`Over`] a caller passes to
@@ -9,8 +15,8 @@
 //!
 //! Deliberately not here: the tooltip's delay and its drawing, the pointer's tracking, the
 //! keyboard focus (the caller passes [`Look`](crate::controls::button::Look) flags) and the
-//! accessible node, which the caller builds with [`crate::a11y::button`], naming it with the
-//! tooltip's text.
+//! accessible node, which the caller builds with [`crate::a11y::button`], naming it with
+//! [`IconButton::name`].
 
 use crate::gfx::{Painter, Rect};
 use crate::keys::{KeyName, Mods};
@@ -26,26 +32,21 @@ pub const SIZE: f32 = button::HEIGHT;
 /// The size of the glyph, in logical px.
 pub const ICON: f32 = 16.0;
 
-/// An icon button: the glyph it shows and the text of its tooltip.
+/// An icon button: the glyph it shows and its name (which is its tooltip's text too).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IconButton {
     icon: &'static str,
-    tip: String,
+    name: String,
 }
 
 impl IconButton {
-    /// A button with `icon` (a path from [`crate::glyph`]) and no tooltip text.
-    pub fn new(icon: &'static str) -> IconButton {
+    /// A button with `icon` (a path from [`crate::glyph`]), named `name` for a tooltip and a
+    /// screen reader alike. An empty name is kept as it is given.
+    pub fn new(icon: &'static str, name: impl Into<String>) -> IconButton {
         IconButton {
             icon,
-            tip: String::new(),
+            name: name.into(),
         }
-    }
-
-    /// The same button with `text` as its tooltip (and, for a screen reader, its name).
-    pub fn tip(mut self, text: impl Into<String>) -> IconButton {
-        self.tip = text.into();
-        self
     }
 
     /// The glyph the button shows.
@@ -53,9 +54,9 @@ impl IconButton {
         self.icon
     }
 
-    /// The tooltip's text ("" for none).
-    pub fn tip_text(&self) -> &str {
-        &self.tip
+    /// The button's name: its tooltip's text, and the name a screen reader announces.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The button's square with its top left at `x`, `y`: [`SIZE`] on each side.
@@ -69,22 +70,22 @@ impl IconButton {
     }
 
     /// What this button does with a key, by [`button::key`]: `true` for Enter and Space without
-    /// Ctrl or Alt.
+    /// Ctrl, Alt or the Mac's Control. A repeat is the caller's to ignore.
     pub fn key(&self, k: &KeyName, mods: Mods) -> bool {
         button::key(k, mods)
     }
 
     /// The tooltip this button shows while the pointer rests on it: its key (the caller's) as
-    /// `key`, its text, and its rectangle as the anchor. Pass it to
+    /// `key`, its name as the text, and its rectangle as the anchor. Pass it to
     /// [`Tooltip::hover`](crate::tooltip::Tooltip::hover) or
     /// [`hover_at`](crate::tooltip::Tooltip::hover_at); draw the tip with
     /// [`Bubble::tip`](crate::overlay::Bubble::tip) or, for its fade,
-    /// [`Bubble::draw_presence`](crate::overlay::Bubble::draw_presence). It is built even when
-    /// the text is empty, so the caller's own `Option` decides whether a tip exists.
+    /// [`Bubble::draw_presence`](crate::overlay::Bubble::draw_presence). An empty name gives an
+    /// empty tip, which a caller may choose not to show.
     pub fn over<K>(&self, key: K, r: Rect) -> Over<K> {
         Over {
             key,
-            text: self.tip.clone(),
+            text: self.name.clone(),
             anchor: r,
         }
     }

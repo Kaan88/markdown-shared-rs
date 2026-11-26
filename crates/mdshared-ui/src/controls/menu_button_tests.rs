@@ -70,8 +70,12 @@ fn a_menu_button_leaves_room_for_its_chevron_after_the_label() {
     assert_eq!(c.right(), r.right() - button::PAD);
     assert_eq!(c.cy(), r.cy());
     let l = label_rect(r);
-    assert_eq!(l.x, r.x);
-    assert!(l.right() <= c.x);
+    // 12 px from the left edge, and 6 px short of the chevron: the label's exact width.
+    assert_eq!(l.x, r.x + button::PAD);
+    assert_eq!(l.right(), c.x - GAP);
+    // The width is rounded with the whole button, so it may differ by less than a pixel.
+    let measured = p.measure(button::face(Kind::Secondary), button::TEXT, label);
+    assert!((l.w - measured).abs() <= 1.0);
     // The model asks the same questions and keeps its text and kind.
     let b = MenuButton::new(label, Kind::Subtle);
     assert_eq!(b.text(), label);
@@ -310,8 +314,10 @@ fn a_menu_button_draws_its_chevron_and_lights_up_with_the_pointer() {
             disabled: true,
             hovered: true,
             pressed: true,
+            open: true,
             focused: true,
             default: true,
+            high_contrast: true,
         };
         assert_eq!(
             drawn_menu(pal, loud).pixels,
@@ -447,15 +453,19 @@ fn a_disabled_split_button_is_quiet_whatever_half_asks() {
                         disabled: true,
                         hovered: true,
                         pressed: true,
+                        open: true,
                         focused: true,
                         default: true,
+                        high_contrast: true,
                     },
                     chevron: button::Look {
                         disabled: true,
                         hovered: true,
                         pressed: true,
+                        open: true,
                         focused: true,
                         default: true,
+                        high_contrast: true,
                     },
                 },
             );
@@ -517,6 +527,155 @@ fn a_menu_or_split_button_with_no_room_draws_nothing() {
         }
         assert_eq!(bmp.pixels, page.pixels, "drew {r:?}");
     }
+}
+
+#[test]
+fn a_menu_button_whose_menu_is_open_is_drawn_pressed() {
+    for (name, pal) in palettes() {
+        let open = drawn_menu(
+            pal,
+            button::Look {
+                open: true,
+                ..button::Look::default()
+            },
+        );
+        let pressed = drawn_menu(
+            pal,
+            button::Look {
+                hovered: true,
+                pressed: true,
+                ..button::Look::default()
+            },
+        );
+        assert_eq!(
+            open.pixels, pressed.pixels,
+            "an open menu button is not drawn pressed in {name}"
+        );
+        assert_ne!(
+            open.pixels,
+            drawn_menu(pal, button::Look::default()).pixels,
+            "an open menu button is at rest in {name}"
+        );
+    }
+}
+
+#[test]
+fn a_split_chevron_whose_menu_is_open_is_drawn_pressed() {
+    for (name, pal) in palettes() {
+        for kind in Kind::ALL {
+            let open = drawn_split(
+                pal,
+                kind,
+                SplitLook {
+                    chevron: button::Look {
+                        open: true,
+                        ..button::Look::default()
+                    },
+                    ..SplitLook::default()
+                },
+            );
+            let pressed = drawn_split(
+                pal,
+                kind,
+                SplitLook {
+                    chevron: button::Look {
+                        hovered: true,
+                        pressed: true,
+                        ..button::Look::default()
+                    },
+                    ..SplitLook::default()
+                },
+            );
+            let rest = drawn_split(pal, kind, SplitLook::default());
+            assert_eq!(
+                open.pixels,
+                pressed.pixels,
+                "an open {} chevron is not drawn pressed in {name}",
+                kind.name()
+            );
+            assert_ne!(
+                open.pixels,
+                rest.pixels,
+                "an open {} chevron is at rest in {name}",
+                kind.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn the_split_border_and_default_mark_are_one_device_pixel_wide() {
+    for (name, pal) in palettes() {
+        for scale in [1.0f32, 1.25, 1.5] {
+            // The secondary edge, scanned down a column through the main half.
+            let b = drawn_split_at(pal, Kind::Secondary, SplitLook::default(), scale);
+            let x = ((R.x + 30.0) * scale).floor() as usize;
+            assert_eq!(
+                first_run(&b, x, pal.popup_line),
+                1,
+                "the split's border is not one device pixel at scale {scale} in {name}"
+            );
+            // And the default mark, in the accent.
+            let d = drawn_split_at(
+                pal,
+                Kind::Secondary,
+                SplitLook {
+                    main: button::Look {
+                        default: true,
+                        ..button::Look::default()
+                    },
+                    ..SplitLook::default()
+                },
+                scale,
+            );
+            assert_eq!(
+                first_run(&d, x, pal.accent),
+                1,
+                "the split's default mark is not one device pixel at scale {scale} in {name}"
+            );
+        }
+    }
+}
+
+/// The four palettes the pixel tests run over.
+fn palettes() -> [(&'static str, &'static Palette); 4] {
+    use crate::theme::{DARK, LIGHT};
+    use crate::tokens::{HIGH_CONTRAST_DARK, HIGH_CONTRAST_LIGHT};
+    [
+        ("light", &LIGHT),
+        ("dark", &DARK),
+        ("high-contrast light", &HIGH_CONTRAST_LIGHT),
+        ("high-contrast dark", &HIGH_CONTRAST_DARK),
+    ]
+}
+
+/// A split button drawn at `scale`, for the device-pixel tests.
+fn drawn_split_at(pal: &Palette, kind: Kind, look: SplitLook, scale: f32) -> Bitmap {
+    let mut bmp = Bitmap::new(
+        (PAGE_W as f32 * scale) as u32,
+        (PAGE_H as f32 * scale) as u32,
+    );
+    let area = Rect::new(0.0, 0.0, bmp.width as f32, bmp.height as f32);
+    let mut gfx = Gfx::new();
+    {
+        let mut p = Painter::new(&mut bmp, &mut gfx, scale);
+        p.fill(area, pal.page);
+        draw_split(&mut p, pal, R, "Run", kind, look);
+    }
+    bmp
+}
+
+/// The first run of pixels holding exactly `c`, scanned down column `x` from the top.
+fn first_run(bmp: &Bitmap, x: usize, c: [u8; 3]) -> usize {
+    let mut run = 0;
+    for y in 0..bmp.height as usize {
+        if at(bmp, x, y) == c {
+            run += 1;
+        } else if run > 0 {
+            break;
+        }
+    }
+    run
 }
 
 /// The colour of a pixel as RGB.

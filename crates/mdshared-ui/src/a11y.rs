@@ -75,8 +75,8 @@ use std::ops::Range;
 
 pub use accesskit;
 use accesskit::{
-    Action, ActionData, ActionRequest, Affine, Node, NodeId, Rect as AkRect, Role, Toggled, TreeId,
-    TreeInfo, TreeUpdate,
+    Action, ActionData, ActionRequest, Affine, HasPopup, Node, NodeId, Rect as AkRect, Role,
+    Toggled, TreeId, TreeInfo, TreeUpdate,
 };
 
 use crate::gfx::Rect;
@@ -427,6 +427,20 @@ pub fn expander(label: &str, author: &str, header: Rect, expanded: bool) -> Node
     n.add_action(Action::Collapse);
     n.add_action(Action::Click);
     n.add_action(Action::Focus);
+    n
+}
+
+/// A button that opens a menu (`controls::menu_button`): UIA ExpandCollapse, the state `open`,
+/// and the popup kind — a menu button and a split button's chevron are both this. `disabled`
+/// leaves out every action but keeps the state, as [`button`] does.
+pub fn menu_button(label: &str, author: &str, r: Rect, open: bool, disabled: bool) -> Node {
+    let mut n = button(label, author, r, disabled);
+    n.set_expanded(open);
+    n.set_has_popup(HasPopup::Menu);
+    if !disabled {
+        n.add_action(Action::Expand);
+        n.add_action(Action::Collapse);
+    }
     n
 }
 

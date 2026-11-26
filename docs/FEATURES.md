@@ -2178,9 +2178,9 @@ functions that change nothing.
   default (the button Enter presses). The colours are one shared `Style` per kind, so the menu
   and split buttons in `menu_button` look the same. The filled kinds are drawn in
   `Face::Semibold`, as a dialog's primary button is, and the other two in `Face::Ui`.
-- `icon_button`: a square subtle button with one glyph and the text of its tooltip;
-  `IconButton::over(key, rect)` builds the `tooltip::Over` the caller hands to
-  `Tooltip::hover`, and drawing stays `overlay::Bubble::tip`.
+- `icon_button`: a square subtle button with one glyph and a required name, which is its
+  tooltip's text too; `IconButton::over(key, rect)` builds the `tooltip::Over` the caller hands
+  to `Tooltip::hover`, and drawing stays `overlay::Bubble::tip`.
 - `menu_button`: `MenuButton`, whose whole face opens a menu, and `SplitButton`, whose label
   acts and whose `CHEVRON_W`-wide chevron opens it. `menu_under(menu, button)` is
   `Menu::around(button)`; the menu itself, its items, its keys and its Escape stay the caller's.
@@ -2195,12 +2195,20 @@ Look decisions the owner should see:
 - A disabled button of **any** kind is the one quiet `field` frame with a faint label, in
   semibold, whatever its kind — exactly `overlay::draw_dialog_button_disabled`'s behaviour,
   which ignores the role once a button cannot be pressed. The kind no longer shows.
-- The destructive fill is `palette::danger` with white text (`button::ON_DANGER`): the palette
-  has no "on danger" colour, and `on_accent` is a dark navy in the dark palette (1.7:1 on the
-  dark red), while white is 5.6:1 in both.
-- A default button is marked with a line just inside its edge: the accent, except on the two
-  filled kinds, where it is a lighter line mixed from `on_accent` and the fill so it reads
-  against the fill.
+- The destructive fill is `palette::danger`, and its label ink is **chosen per palette by
+  contrast** (`destructive_ink`) out of the palette's own inks and the white `ON_DANGER`: white
+  on the dark palette's red (5.6:1, where its `text` is 4.48:1), the palette's black on a light
+  high-contrast red (8.9:1). Hover and press move the fill *away* from that ink (`shade`), so
+  the label never reads worse than at rest; the old lightening of the light red on a press
+  (4.0:1) is gone. Under high contrast the destructive button is an outlined danger button:
+  the page as its fill, the window text as its label and `danger` as its frame, since the
+  system's contrast palettes guarantee the text on the page, the hover and the press. The
+  toolkit's two high-contrast palettes are recognised by identity, like `infobar`'s, and the
+  `high_contrast` flag covers a system contrast theme on an ordinary palette.
+- A default button is marked with a line just inside its edge, drawn with `frame` so it is one
+  device pixel at any scale: the label's ink on the two filled kinds (white on the dark red,
+  black on the light HC red — 3:1 or better on the fill by construction), the accent on the
+  others.
 - The framed field always reserves the clear button's room at the right, so the text does not
   shift when the first character is typed or the field is cleared. Focused, the frame and a
   2 px line along the bottom are the accent; with an error, both are `danger`.
@@ -2211,67 +2219,90 @@ Look decisions the owner should see:
   caller's Escape still closes what it closes.
 
 **New public API:** `controls::button::{Button, Kind, Look, draw, key, hit, cursor, width,
-button_rect, HEIGHT, RADIUS, PAD, TEXT, ON_DANGER}`; `controls::icon_button::{IconButton, draw,
-rect, SIZE, ICON}`; `controls::menu_button::{MenuButton, SplitButton, Half, Halves, SplitLook,
-Press, draw, draw_split, key, menu_under, menu_button_w, split_button_w, chevron_rect,
-label_rect, halves, hit, CHEVRON, GAP, CHEVRON_W}`; `controls::field::{FramedField, Look, Hit,
-Outcome, draw, draw_blinking, HEIGHT, ERROR_H, ICON_W, CLEAR, CLEAR_PAD, PAD, RADIUS, TEXT,
-ERROR_TEXT}`. No existing signature, public field or drawing changed; the new module is
-declared in `lib.rs` and the example in `Cargo.toml`. No dependency was added.
+button_rect, HEIGHT, RADIUS, PAD, TEXT, ON_DANGER}` where `Look` also carries `open` (drawn as
+pressed whatever the pointer does) and `high_contrast`; `controls::icon_button::{IconButton,
+draw, rect, SIZE, ICON}` (`new(icon, name)`, and the name is required); `controls::menu_button::{
+MenuButton, SplitButton, Half, Halves, SplitLook, Press, draw, draw_split, key, menu_under,
+menu_button_w, split_button_w, chevron_rect, label_rect, halves, hit, CHEVRON, GAP, CHEVRON_W}`;
+`controls::field::{FramedField, Look, Hit, Outcome, draw, draw_blinking, HEIGHT, ERROR_H,
+ICON_W, CLEAR, CLEAR_PAD, PAD, RADIUS, TEXT, ERROR_TEXT}` with `press` holding the clear button,
+`release` doing the clearing, `clear_held`, and `Look::high_contrast`; and `a11y::menu_button`
+under the `a11y` feature. No existing signature, public field or drawing of an existing widget
+changed; the new module is declared in `lib.rs` and the example in `Cargo.toml`. No dependency
+was added.
 
-Tests, 40 and one `#[ignore]`d sheet:
+Tests, 48 and one `#[ignore]`d sheet, all over the four palettes (light, dark, and both
+high-contrast ones):
 
-- `button_tests.rs` (13): `the_rectangle_is_as_wide_as_the_label_plus_its_padding`,
-  `a_hit_is_inside_the_button_and_not_outside_it`,
-  `enter_and_space_activate_a_button_and_the_other_keys_do_not`,
-  `a_button_asks_for_the_hand_cursor`,
-  `every_kind_and_state_draws_differently_in_both_palettes`,
-  `the_four_kinds_differ_at_rest_in_both_palettes`, `each_kind_is_filled_in_its_own_colour`,
-  `a_press_counts_only_while_the_pointer_is_on_the_button`,
-  `the_keyboard_draws_the_ring_outside_the_button`,
-  `a_disabled_button_is_the_same_quiet_frame_whatever_its_kind`,
-  `a_default_button_has_an_accent_line_and_primary_a_lighter_one`,
-  `a_button_with_no_room_draws_nothing`, and
-  `the_destructive_label_reads_against_the_red_in_both_palettes` (4.5:1 or better).
-- `icon_button_tests.rs` (5): the square, its hit and keys, the glyph and six states in both
-  palettes, the quiet disabled look, the empty rectangle, and
-  `the_icon_button_gives_the_tooltip_model_its_text_and_anchor` (the delay, the "shows at the
-  anchor" answer and the bubble under the square).
-- `menu_button_tests.rs` (10): the width and the chevron's room, the menu button's keys, the
-  split button's keys and two halves, `the_two_halves_share_the_button_and_hit_where_they_are`,
-  `the_menu_opens_around_the_button_below_and_above_near_an_edge` (below, above near the
-  bottom, left near the right), the chevron and hover pixels, the halves lighting on their
-  own, the focus ring and default mark on the whole button, the quiet disabled split, and an
-  empty rectangle.
-- `field_tests.rs` (12): the height and the error band, the clear button's place and when it
-  shows, the icon's and the clear button's room (and that the text does not shift), the press
-  on the clear button against the text area, `the_field_keeps_the_focus_after_the_clear_button`
-  (the caret is still drawn at the start of the text area), the error's colour and message
-  under the box, the focused edge and bottom line, Escape on and off, the editing keys,
-  the placeholder, the quiet disabled field, and an empty rectangle.
-- `controls_sheet` (`#[ignore]`): four kinds in six states, the icon, menu and split buttons
-  and three framed fields, light and dark, at scale 1 and 1.5, written to
-  `target/specimen/controls.png` and `controls-150.png`
+- `button_tests.rs` (17): the rectangle, the hit, the keys (the Mac's Control included), the
+  cursor, `every_kind_and_state_draws_differently_in_every_palette`,
+  `the_four_kinds_differ_at_rest_in_every_palette`,
+  `each_kind_and_state_is_filled_in_its_exact_colour` (the fill rules written out a second time
+  and pinned at a pixel), `an_open_button_is_drawn_pressed_wherever_the_pointer_is`,
+  `a_press_counts_only_while_the_pointer_is_on_the_button`, the ring outside, the quiet
+  disabled frame, the default mark, `a_default_line_reads_against_its_fill_and_is_one_device_pixel_wide`
+  (scales 1, 1.25 and 1.5), `the_destructive_label_reads_against_its_fill_in_every_state`
+  (rest, hover, press), `the_four_palettes_are_told_apart_and_the_high_contrast_flag_is_honoured`,
+  the empty rectangle, and the sheet.
+- `icon_button_tests.rs` (5): the square and its required name, the hit and keys, the glyph and
+  six states in the four palettes, the quiet disabled look, the empty rectangle, and the
+  tooltip model's text and anchor.
+- `menu_button_tests.rs` (13): the width and the chevron's room (12 px from the left, 6 px to
+  the chevron), the keys, the split keys, the two halves and their hit,
+  `the_menu_opens_around_the_button_below_and_above_near_an_edge`, the chevron and hover
+  pixels, `a_menu_button_whose_menu_is_open_is_drawn_pressed`,
+  `a_split_chevron_whose_menu_is_open_is_drawn_pressed`, the halves lighting on their own, the
+  ring and default mark, `the_split_border_and_default_mark_are_one_device_pixel_wide` (scales
+  1, 1.25, 1.5), the quiet disabled split, and an empty rectangle.
+- `field_tests.rs` (14): the height and the error band, the clear button's place and when it
+  shows, the icon's and the clear button's room, `the_clear_button_empties_the_field_on_release_over_it_not_on_press`
+  (a drag off it clears nothing), `the_clear_button_keeps_the_fields_real_focus` (a `Focus`
+  model: the field keeps the keyboard and Tab continues from it), the error's frame and
+  message, `the_error_message_and_its_frame_read_on_every_palette`,
+  `a_high_contrast_palette_takes_the_lines_own_colour_for_the_resting_edge`, the focused edge,
+  Escape on, off and repeated, the editing keys (a repeated Backspace still deletes), the
+  placeholder, the quiet disabled field, and an empty rectangle.
+- `controls_sheet` (`#[ignore]`): four kinds in seven states, the icon, menu (open) and split
+  (chevron open) buttons and three framed fields, in the four palettes, at scales 1, 1.25 and
+  1.5, written to `target/specimen/controls.png`, `controls-125.png` and `controls-150.png`
   (`cargo test -p mdshared-ui controls_sheet -- --ignored`).
 
-Fail-before evidence. Every test is new API, so it does not compile before the branch. Each was
-then shown to fail with its behaviour removed, in two mutations. First, every public model and
-drawing was neutered (widths 0, hits false, keys false, draws empty, `menu_under` unconverted,
-`halves` empty, `over` with no text, the field's `height` 0, `clear_rect` and `error_rect` none,
-`press` outside, `key` unused): 34 of the 40 failed. The six that survived assert that
-nonsense draws **nothing**, that a disabled control takes no mark (five tests), and that the
-destructive label's contrast is 4.5:1 (a colour constant). The second mutation — the `sane`
-guards answering true and the disabled branches removed — failed the first five as well (plus
-six more); setting `ON_DANGER` to black failed the contrast test in the light palette. So each
-of the 40 has a run in which it failed.
+Fail-before evidence. Every test is new API, so it does not compile before the branch. The
+first forty were shown to fail with their behaviour removed, as the commit before the review
+records: every public model and drawing neutered failed 34 of them; the six that assert
+"nothing is drawn" or "a disabled control takes no mark" failed with the `sane` guards and the
+disabled branches removed; and the destructive contrast test failed with `ON_DANGER` set to
+black.
+
+The tests the review added or rewrote were shown to fail with the review's fixes reverted in
+one mutation: `state` without `open`; the destructive ink and fills back to white and the
+popup mixes; the default mark back to the mixed line drawn by `stroke_path`; the split's
+border back to `stroke_path`; `error_ink` back to `danger` always; the field's resting edge
+without the high-contrast branch; the clear button clearing on the press; and
+`a11y::menu_button` without its expanded state. Fourteen controls tests failed —
+`an_open_button_is_drawn_pressed_wherever_the_pointer_is`,
+`each_kind_and_state_is_filled_in_its_exact_colour`,
+`the_destructive_label_reads_against_its_fill_in_every_state`,
+`a_default_line_reads_against_its_fill_and_is_one_device_pixel_wide`,
+`the_four_palettes_are_told_apart_and_the_high_contrast_flag_is_honoured`,
+`a_menu_button_whose_menu_is_open_is_drawn_pressed`,
+`a_split_chevron_whose_menu_is_open_is_drawn_pressed`,
+`the_split_border_and_default_mark_are_one_device_pixel_wide`,
+`the_clear_button_empties_the_field_on_release_over_it_not_on_press`,
+`the_clear_button_keeps_the_fields_real_focus`,
+`the_error_message_and_its_frame_read_on_every_palette`,
+`a_high_contrast_palette_takes_the_lines_own_colour_for_the_resting_edge`,
+`the_field_shows_its_placeholder_while_empty_and_not_after` and
+`the_focused_field_draws_the_accent_edge_and_a_line_along_the_bottom` — and the a11y node test
+failed. Every new test is in that list.
 
 Run on Windows (branch `feat/k4-controls`, `CARGO_TARGET_DIR=E:/mds-target/k4`):
 `cargo fmt --all --check` (clean); `cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0);
 `cargo test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
-explorer_tests` (exit 0; mdshared-ui 1199 passed, 35 ignored; the other crates all passed);
-`cargo run -p mdshared-ui --features host,a11y --example controls -- --seconds 2` (exit 0, two
-frames drawn, the timer woke it and it closed); the sheet test wrote both PNGs.
+explorer_tests` (exit 0; mdshared-ui 1207 passed, 35 ignored; the other crates all passed);
+`cargo run -p mdshared-ui --features host,a11y --example controls -- --seconds 2` (exit 0, the
+timer woke it and it closed); the sheet test wrote the three PNGs.
 
 Not run: the rest of the seventeen-command matrix (the `recycle`, `media-session`, `notify`,
 `a11y`, `host`, `term` single-feature forms and the Linux type-check), release builds, and
@@ -2279,3 +2310,45 @@ everything on Linux and macOS (CI will). **Not seen by a person**: the example h
 for two seconds with no pointer or keyboard on it, and no application draws these controls yet;
 the sheet PNGs were generated and looked at by the agent, which is not the owner's approval of
 how they look.
+## Review of the controls (0b64318): the fixes
+
+A review found three blocking problems and a list of smaller ones; the second commit answers
+every item.
+
+- **A button whose menu is open is drawn pressed.** `button::Look::open` selects the press fill
+  without the pointer having to be on the button, and `state` reads it for both buttons and
+  split halves; the menu button and the split chevron each have a test, and the example uses it
+  (the menu button and the chevron stay lit while their menu is open, from the keyboard or with
+  the pointer inside the menu).
+- **Contrast.** The destructive label is chosen per palette (see above), hover and press move
+  the fill away from it, the default mark is the label's ink on filled kinds, and the field
+  takes `infobar::DARK_ERROR_INK` on a dark palette that is not high contrast. Under high
+  contrast (`Look::high_contrast`, or the two high-contrast palettes by identity) the
+  destructive button is the outlined danger button and the field's edge is the palette's
+  `line`; the old destructive default mark was under 2:1 in the dark palette. The contrast
+  tests run over all four palettes and the hover and press fills.
+- **The field's error** is `DARK_ERROR_INK` on a dark non-high-contrast palette (8:1 on the
+  page rather than 2.9:1), `danger` elsewhere; its message, glyph and frame have a contrast
+  test of their own. The message is drawn under the box in the `height()` band; the module doc
+  says to lay out with `height()` each frame or to reserve `HEIGHT + ERROR_H` always.
+- **Smaller library fixes:** the menu button's label sits 12 px from the left and 6 px from the
+  chevron (it was 6 and 6 by centring); the field's focus line is placed with `p.px()`; the
+  split's frame and the default mark are `frame` lines, one device pixel at 1.25 and 1.5 (a
+  test scans the column); the clear button is *held* by a press (`Hit::Clear`, `clear_held`)
+  and clears on a release over it (`release`), so a drag off it cancels; a preedit the clear or
+  Escape drops is the application's to reset with its IME, as the module doc says; `key` takes
+  the repeat flag (a repeated Escape clears once; a repeated Backspace still deletes); the keys
+  check `mods.control` as `toggle` does; Space acts on the key-down because `host` has no
+  key-release event, which `button::key` documents; the doc sketch checks a key on the focus,
+  not the hit.
+- **Accessibility:** `a11y::menu_button` (a button with UIA ExpandCollapse, its `open` state and
+  a menu popup) for the menu button and the split chevron; the icon button's name is now
+  required (`IconButton::new(icon, name)`), so a screen reader never gets an unnamed button.
+- **Example:** a chevron press focuses the split's main half (one Tab stop, declared) instead
+  of an id the focus model never saw; a menu button clicked while its menu is open closes it
+  instead of reopening; `split_rect` takes the union to the chevron's right edge; the a11y
+  tree's focus follows the real focus; a held Enter or Space activates once.
+
+Not run for the fix: the rest of the CI matrix, release builds, Linux and macOS; the example
+still has not been driven by a person, and the high-contrast panels of the sheet have not been
+seen on a real contrast theme.

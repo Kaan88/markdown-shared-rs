@@ -6,13 +6,32 @@
 //! The caller passes every key to [`FramedField::key`] while the field has the focus: the editing
 //! keys go to the [`TextField`], and Escape may clear the whole text when the caller has turned
 //! that on ([`FramedField::set_escape_clears`]). It passes presses inside the box to
-//! [`FramedField::press`], which answers whether the clear button took it, and it keeps the
-//! focus on the field in either case: nothing here moves the focus, so clearing a field never
-//! hands the keyboard away.
+//! [`FramedField::press`] and the matching button-up to [`FramedField::release`], which is what
+//! empties the field when the pointer is still on the clear button; a press dragged off the
+//! button and let go anywhere else clears nothing. It keeps the focus on the field in either
+//! case: nothing here moves the focus, so clearing a field never hands the keyboard away.
 //!
 //! Escape is **off** by default because it already means "close" in this toolkit's dialogs,
 //! dropdowns, colour picker and command palette; a search field that wants Windows' clear-on-
 //! Escape turns it on and an empty field's Escape still reaches the caller.
+//!
+//! # The error band
+//!
+//! [`FramedField::height`] is [`HEIGHT`] while there is no message and [`HEIGHT`] + [`ERROR_H`]
+//! while there is one, and the message is drawn **outside** the box, in that band under it. A
+//! caller that lays out the rows below the field should therefore either use `field.height()`
+//! every frame (the rows below move when the message comes and goes, as WinUI's do) or always
+//! reserve `HEIGHT + ERROR_H` whether or not there is a message (nothing moves; the band is
+//! empty until an error fills it). Drawing with a rectangle shorter than `HEIGHT` still works;
+//! the message is not cut to `r`.
+//!
+//! # Input methods
+//!
+//! Clearing drops a preedit the input method was composing over the text (the field keeps none,
+//! and its caret and selection move to the start). This model never talks to the window system,
+//! so it cannot tell the input method; the application that sees [`Outcome::Cleared`] or a clear
+//! on release should reset its own composition (winit's IME state) the way it does when it
+//! cancels a composition.
 //!
 //! Deliberately not here: the caret's blink ([`FramedField::draw_blinking`] takes it from an
 //! [`Animator`](crate::anim::Animator), as [`TextField::draw`] does), the clipboard's contents
@@ -21,8 +40,9 @@
 //! which the caller builds with [`crate::a11y::text_input`] and [`crate::a11y::button`].
 
 use crate::anim::{Animator, AsId};
-use crate::gfx::{Face, Painter, Rect, mix};
+use crate::gfx::{Face, Painter, Rect, Rgb, mix};
 use crate::glyph;
+use crate::infobar::DARK_ERROR_INK;
 use crate::keys::{KeyName, Mods};
 use crate::textfield::{FieldColors, TextField};
 use crate::theme::Palette;
@@ -66,8 +86,10 @@ pub enum Hit {
     Outside,
     /// The text area: place the caret, as the field's own `press` does.
     Text,
-    /// The clear button: the text was cleared; keep the focus where it was.
-    Cleared,
+    /// The clear button: it is held, and the text is still there. Pass the button-up to
+    /// [`FramedField::release`]; one that lands on the button empties the text, and one anywhere
+    /// else does nothing. Draw the button pressed while it is held.
+    Clear,
 }
 
 /// What a key did.
@@ -92,6 +114,8 @@ pub struct FramedField {
     placeholder: String,
     error: Option<String>,
     escape_clears: bool,
+    /// A press that began on the clear button is held; its release decides.
+    clear_held: bool,
 }
 
 impl FramedField {
@@ -132,11 +156,19 @@ impl FramedField {
         self.field.is_empty()
     }
 
-    /// Empties the text, as the clear button does. `true` when there was text.
+    /// Empties the text, as the clear button does, and drops a preedit with it (see the module's
+    /// note on input methods). `true` when there was text. A held clear button is let go.
     pub fn clear(&mut self) -> bool {
         let had = !self.field.is_empty();
+        self.clear_held = false;
         self.field.clear();
         had
+    }
+
+    /// Whether a press began on the clear button and has not been let go: draw the button
+    /// pressed, and pass the button-up to [`FramedField::release`].
+    pub fn clear_held(&self) -> bool {
+        self.clear_held
     }
 
     /// The icon before the text, if any.
@@ -182,6 +214,7 @@ impl FramedField {
     }
 
     /// The height the field wants: [`HEIGHT`], plus [`ERROR_H`] when there is an error message.
+    /// See the module's note on the error band for how to lay out around it.
     pub fn height(&self) -> f32 {
         HEIGHT + if self.error.is_some() { ERROR_H } else { 0.0 }
     }
@@ -221,36 +254,59 @@ impl FramedField {
             .map(|_| Rect::new(r.x, r.bottom(), r.w, ERROR_H))
     }
 
-    /// A press at `x`, `y` inside the box: on the clear button it empties the text and answers
-    /// [`Hit::Cleared`]; elsewhere inside the box it answers [`Hit::Text`], and the caller places
-    /// the caret with the field's own `press`. Off the box it answers [`Hit::Outside`] and
-    /// changes nothing. The caller keeps the focus on the field for both `Text` and `Cleared`.
+    /// A press at `x`, `y` inside the box: on the clear button it is held and answers
+    /// [`Hit::Clear`] (the text is still there until [`FramedField::release`]); elsewhere inside
+    /// the box it answers [`Hit::Text`], and the caller places the caret with the field's own
+    /// `press`. Off the box it answers [`Hit::Outside`] and changes nothing. The caller keeps
+    /// the focus on the field for all three.
     pub fn press(&mut self, r: Rect, x: f32, y: f32) -> Hit {
+        self.clear_held = false;
         if !r.contains(x, y) {
             return Hit::Outside;
         }
         if let Some(c) = self.clear_rect(r)
             && c.contains(x, y)
         {
-            self.field.clear();
-            return Hit::Cleared;
+            self.clear_held = true;
+            return Hit::Clear;
         }
         Hit::Text
+    }
+
+    /// The button-up after [`FramedField::press`]: when the press began on the clear button and
+    /// this point is still on it, the text is emptied and `true` is answered. A release anywhere
+    /// else, including off the button after a drag, clears nothing and answers `false`.
+    pub fn release(&mut self, r: Rect, x: f32, y: f32) -> bool {
+        let over = self.clear_held && self.clear_rect(r).is_some_and(|c| c.contains(x, y));
+        self.clear_held = false;
+        if over {
+            self.field.clear();
+        }
+        over
     }
 
     /// A key press; `typed` is the text the key event produced. Editing keys go to the
     /// [`TextField`] (`clipboard` lets Ctrl+C, Ctrl+X and Ctrl+V read and write the clipboard, as
     /// the field does). Escape clears the text when [`FramedField::set_escape_clears`] is on and
     /// there is text; with an empty field it is [`Outcome::Unused`], so the caller's own Escape
-    /// still works. Everything the field does not take is [`Outcome::Unused`].
+    /// still works. `repeat` is the event's repeat flag: a held Escape clears once, and every
+    /// repeat is ignored (holding Backspace keeps deleting, since that is the field's own key).
+    /// Everything the field does not take is [`Outcome::Unused`].
     pub fn key(
         &mut self,
         key: &KeyName,
         mods: Mods,
         typed: Option<&str>,
         clipboard: bool,
+        repeat: bool,
     ) -> Outcome {
-        if self.escape_clears && !mods.ctrl && !mods.alt && *key == KeyName::Escape {
+        if self.escape_clears
+            && !repeat
+            && !mods.ctrl
+            && !mods.alt
+            && !mods.control
+            && *key == KeyName::Escape
+        {
             return if self.clear() {
                 Outcome::Cleared
             } else {
@@ -273,10 +329,29 @@ pub struct Look {
     /// It cannot be used: the frame is the palette's line, the text and icon are faint, and the
     /// clear button is not drawn.
     pub disabled: bool,
-    /// The pointer is over the clear button: it takes the hover fill and the text colour.
+    /// The pointer is over the clear button, or it is held: it takes the hover fill and the
+    /// text colour.
     pub hovered_clear: bool,
-    /// A press on the clear button is held: the deeper fill.
+    /// A press on the clear button is held: the deeper fill. See [`FramedField::clear_held`].
     pub pressed_clear: bool,
+    /// The palette is a high-contrast one (the host's `Cx::high_contrast`, or
+    /// [`crate::platform::system_high_contrast`]), so the resting edge is the palette's `line`
+    /// itself rather than a mix of it and the text, as [`crate::infobar`] takes the system's
+    /// colours under high contrast. The toolkit's two high-contrast palettes are recognised by
+    /// identity without it.
+    pub high_contrast: bool,
+}
+
+/// The ink an error's message, glyph and frame are drawn in: `danger`, except on a dark palette
+/// that is not high contrast, where [`DARK_ERROR_INK`] is used as [`crate::infobar`] does
+/// (the palette's `danger` is the close button's hover fill and reads at less than 3:1 on a
+/// dark surface).
+pub(crate) fn error_ink(pal: &Palette, high_contrast: bool) -> Rgb {
+    if pal.dark && !high_contrast {
+        DARK_ERROR_INK
+    } else {
+        pal.danger
+    }
 }
 
 /// Draws the field's box in `r`, its icon, its text (or placeholder), the clear button while
@@ -285,10 +360,11 @@ pub struct Look {
 /// focused and `caret_on`. It changes nothing in the field's text, but the field scrolls to keep
 /// its caret in view, as [`TextField::draw`] does.
 ///
-/// The frame is the palette's `field` with an edge mixed from the line and the text; focused, the
-/// edge and a 2 px line along the bottom are the accent; with an error, both are the danger
-/// colour (an error shows whatever the focus). The text is the placeholder colour while empty.
-/// Nothing is drawn outside `r` except the error message under it.
+/// The frame is the palette's `field` with an edge mixed from the line and the text (the line
+/// itself under high contrast); focused, the edge and a line along the bottom are the accent;
+/// with an error, both are [`error_ink`] (an error shows whatever the focus). The text is the
+/// placeholder colour while empty. Nothing is drawn outside `r` except the error message under
+/// it.
 pub fn draw(
     p: &mut Painter,
     pal: &Palette,
@@ -300,24 +376,30 @@ pub fn draw(
     if !sane(r) {
         return;
     }
+    let hc = crate::controls::button::high_contrast(pal, look.high_contrast);
     let error = field.error.is_some();
+    let ink = error_ink(pal, hc);
     let edge = if look.disabled {
         pal.line
     } else if error {
-        pal.danger
+        ink
     } else if look.focused {
         pal.accent
+    } else if hc {
+        pal.line
     } else {
         mix(pal.line, pal.text, 0.3)
     };
     p.frame(r, RADIUS, pal.field, edge);
     if look.focused && !look.disabled {
+        // The line sits inside the frame's one device pixel.
         let px = 2.0f32.min((r.h / 2.0).max(0.0));
+        let corner = RADIUS.min(r.w / 2.0);
         p.fill(
             Rect::new(
-                r.x + RADIUS.min(r.w / 2.0),
-                (r.bottom() - 1.0 - px).max(r.y),
-                (r.w - 2.0 * RADIUS.min(r.w / 2.0)).max(0.0),
+                r.x + corner,
+                (r.bottom() - p.px() - px).max(r.y),
+                (r.w - 2.0 * corner).max(0.0),
                 px,
             ),
             edge,
@@ -369,14 +451,14 @@ pub fn draw(
     );
     if let Some(message) = field.error.as_deref() {
         let cy = r.bottom() + ERROR_H / 2.0;
-        p.icon(glyph::WARN, 12.0, r.x + 7.0, cy, pal.danger);
+        p.icon(glyph::WARN, 12.0, r.x + 7.0, cy, ink);
         p.text(
             Face::Ui,
             ERROR_TEXT,
             r.x + 17.0,
             cy,
             message,
-            pal.danger,
+            ink,
             (r.w - 17.0).max(0.0),
         );
     }

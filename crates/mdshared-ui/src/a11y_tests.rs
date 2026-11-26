@@ -629,6 +629,18 @@ fn the_widget_nodes_have_their_roles_and_states() {
     assert_eq!((d.value(), d.is_expanded()), (Some("Dark"), Some(true)));
     let e = expander("Details", "DebugExpander", r, false);
     assert_eq!(e.is_expanded(), Some(false));
+    let mb = menu_button("Sort by", "SortMenu", r, true, false);
+    assert_eq!(
+        (mb.role(), mb.is_expanded(), mb.has_popup()),
+        (Role::Button, Some(true), Some(HasPopup::Menu))
+    );
+    assert!(mb.supports_action(Action::Expand));
+    assert!(!mb.is_disabled());
+    // A disabled menu button keeps its state and offers no action.
+    let quiet = menu_button("Sort by", "SortMenu", r, true, true);
+    assert!(quiet.is_disabled());
+    assert!(!quiet.supports_action(Action::Click));
+    assert!(!quiet.supports_action(Action::Expand));
     let p = progress("Scan", "ScanProgress", r, Some(0.25));
     assert_eq!(p.numeric_value(), Some(25.0));
     assert_eq!(progress("Scan", "x", r, None).numeric_value(), None);

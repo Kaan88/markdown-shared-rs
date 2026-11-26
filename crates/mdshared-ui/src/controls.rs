@@ -19,8 +19,19 @@
 //!
 //! Each draws at rest, hovered, pressed, focused (a ring through [`crate::focus`]) and disabled,
 //! and can be marked as the default button (the one Enter presses) with
-//! [`button::Look::default`]. A disabled button of any kind is the one quiet frame, as
+//! [`button::Look::default`]. A button whose menu or popover is open is drawn
+//! [`button::Look::open`], which is the pressed fill whatever the pointer is doing. A disabled
+//! button of any kind is the one quiet frame, as
 //! [`crate::overlay::draw_dialog_button_disabled`] draws it: the kind no longer shows.
+//!
+//! # High contrast
+//!
+//! [`button::Look::high_contrast`] and [`field::Look::high_contrast`] take the system's own
+//! colours, as [`crate::infobar::Look::high_contrast`] does: the destructive button becomes an
+//! outlined danger button (the page as its fill, the window text as its label, `danger` as its
+//! frame) and the field's resting edge is the palette's `line` rather than a mix. The toolkit's
+//! two high-contrast palettes are recognised by identity without the flag. On a dark palette
+//! that is not high contrast the field's error takes [`crate::infobar::DARK_ERROR_INK`].
 //!
 //! The framed text field is built on [`crate::textfield::TextField`]: it owns the text and hands
 //! the caret's blink to the caller, as the field does; it adds the frame, an optional leading
@@ -38,8 +49,12 @@
 //! focus.begin_frame();
 //! focus.add(Ctl::Save);
 //! let r = save.rect(&mut p, 24.0, 72.0);
-//! button::draw(&mut p, pal, r, save.text(), save.kind(), button::Look { focused: focus.is_focused(Ctl::Save), ..Default::default() });
-//! if button::hit(r, x, y) && button::key(&key, mods) { save_it(); }
+//! let look = button::Look {
+//!     focused: focus.ring_visible(Ctl::Save),
+//!     ..Default::default()
+//! };
+//! button::draw(&mut p, pal, r, save.text(), save.kind(), look);
+//! if focus.is_focused(Ctl::Save) && button::key(&key, mods) { save_it(); }
 //! focus.end_frame();
 //! ```
 

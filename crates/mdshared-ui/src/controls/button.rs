@@ -1,6 +1,6 @@
 //! Push buttons: primary, secondary, subtle and destructive, with the states a person sees
-//! (rest, hovered, pressed, focused, disabled) and the mark of the default button. The model is
-//! the label and the kind; the drawing is a free function that changes nothing.
+//! (rest, hovered, pressed, open, focused, disabled) and the mark of the default button. The
+//! model is the label and the kind; the drawing is a free function that changes nothing.
 //!
 //! The caller owns the pointer, the hit, the keyboard and the focus. It asks [`hit`] whether a
 //! press belongs to the button, draws with the flags it knows ([`Look`]), and calls [`key`] with
@@ -10,15 +10,18 @@
 //!
 //! Deliberately not here: the click itself and what it does; motion (each state is the pixels of
 //! the frame it is drawn on, and no frame is asked for); the pointer's tracking and the focus
-//! model, which the caller runs and passes in as [`Look`] flags; and the accessible node, which
-//! the caller builds with [`crate::a11y::button`] (the label as the name, [`Button::rect`] as
-//! the bounds).
+//! model, which the caller runs and passes in as [`Look`] flags; key repeat, which [`key`] knows
+//! nothing of (the caller decides whether a repeat activates again); and the accessible node,
+//! which the caller builds with [`crate::a11y::button`] (the label as the name, [`Button::rect`]
+//! as the bounds).
 
+use crate::cover::contrast;
 use crate::cursor::Cursor;
 use crate::focus::draw_ring;
 use crate::gfx::{Face, Painter, Path, Rect, Rgb, mix, rgb};
 use crate::keys::{KeyName, Mods};
 use crate::theme::Palette;
+use crate::tokens::{HIGH_CONTRAST_DARK, HIGH_CONTRAST_LIGHT};
 
 /// The height every push button wants, in logical px. A shorter rectangle still draws; a taller
 /// one is filled and centred the same way.
@@ -35,8 +38,10 @@ pub const PAD: f32 = 12.0;
 /// dialog button's label.
 pub const TEXT: f32 = 13.0;
 
-/// The label colour on the destructive button's red fill. White is 5.6:1 against
-/// [`Palette::danger`] in both palettes, which the palette has no "on danger" colour for.
+/// A light label ink, considered for the destructive fill when the palette's own light inks do
+/// not reach 4.5:1 on it. The dark palette's `text` is 4.48:1 on its danger red, just under
+/// WCAG's AA, and white is 5.6:1; there is no "on danger" colour in the palette, so this is the
+/// one constant, and [`destructive_ink`] still picks whichever ink reads best.
 pub const ON_DANGER: Rgb = rgb(0xffffff);
 
 /// The four kinds of push button.
@@ -130,7 +135,7 @@ impl Button {
     }
 
     /// What this button does with a key, by [`key`]: `true` for Enter and Space with neither
-    /// Ctrl nor Alt held, `false` for everything else.
+    /// Ctrl, Alt nor the Mac's Control held, `false` for everything else.
     pub fn key(&self, k: &KeyName, mods: Mods) -> bool {
         key(k, mods)
     }
@@ -183,11 +188,18 @@ pub fn cursor() -> Cursor {
 }
 
 /// Whether the key activates a button: Enter and Space do, with or without Shift, when neither
-/// Ctrl nor Alt is held (as [`crate::link::key`] and `toggle` read them); every other key does
-/// not. The caller decides whether the keyboard is on the button at all, and leaves a disabled
-/// button out of the keys as it leaves it out of the hits.
+/// Ctrl, Alt nor the Mac's Control ([`Mods::control`]) is held, as [`crate::toggle`] reads them;
+/// every other key does not. The caller decides whether the keyboard is on the button at all,
+/// and leaves a disabled button out of the keys as it leaves it out of the hits.
+///
+/// Repeat is not here: the key event carries no such flag in this API. A caller that gets one
+/// (the window host's [`KeyPress::repeat`](crate::host::KeyPress::repeat)) should ignore a
+/// repeat for Enter or Space, so a held key does not press the button again. Space acts on the
+/// key-down event: the toolkit's window host sends no key-release event (`Event::Key` is a press
+/// or a repeat), so a caller with a loop of its own that wants Windows' "act when Space goes up"
+/// tracks the release itself.
 pub fn key(key: &KeyName, mods: Mods) -> bool {
-    !mods.ctrl && !mods.alt && matches!(key, KeyName::Enter | KeyName::Space)
+    !mods.ctrl && !mods.alt && !mods.control && matches!(key, KeyName::Enter | KeyName::Space)
 }
 
 /// How a button is drawn just now, from the caller's own state.
@@ -199,16 +211,34 @@ pub struct Look {
     /// still over it ([`Look::hovered`]), as a dialog button's does: dragging off the button
     /// puts it back to its hover look, and letting go outside does nothing.
     pub pressed: bool,
+    /// What it opened (a menu, a popover) is open: drawn as pressed whatever the pointer is
+    /// doing, so a menu opened from the keyboard, or one whose menu the pointer is inside, keeps
+    /// its button lit. [`Look::pressed`] alone is not enough for that: it needs
+    /// [`Look::hovered`].
+    pub open: bool,
     /// The keyboard is on it: a focus ring lies just outside the rectangle, through
     /// [`draw_ring`].
     pub focused: bool,
     /// It cannot be used: drawn as the one quiet frame, with a faint label, whatever the other
     /// flags and whatever the kind.
     pub disabled: bool,
-    /// It is the default button, the one Enter presses: an accent line runs just inside its
-    /// edge (a lighter one on a primary button, whose edge is the accent already). Disabled, the
+    /// It is the default button, the one Enter presses: a line runs just inside its edge, in the
+    /// label's own ink on the two filled kinds and in the accent on the other two. Disabled, the
     /// mark is left out: no mark promises something the button cannot do.
     pub default: bool,
+    /// The palette is a high-contrast one (the host's `Cx::high_contrast`, or
+    /// [`crate::platform::system_high_contrast`]), so the destructive button takes the system's
+    /// own colours: the page as its fill, the window text as its label and `danger` as its
+    /// frame. The system's own contrast theme ([`crate::tokens::Tokens::from_system_colors`])
+    /// needs this flag; [`HIGH_CONTRAST_LIGHT`] and [`HIGH_CONTRAST_DARK`] are recognised by
+    /// identity without it, as [`crate::infobar`] recognises them.
+    pub high_contrast: bool,
+}
+
+/// Whether `pal` is a high-contrast palette: the caller's `flag`, or one of the toolkit's two
+/// high-contrast palettes, recognised by identity as [`crate::infobar::severity_colors_in`] does.
+pub(crate) fn high_contrast(pal: &Palette, flag: bool) -> bool {
+    flag || *pal == HIGH_CONTRAST_LIGHT || *pal == HIGH_CONTRAST_DARK
 }
 
 /// The colours a kind is drawn with, before the state is applied. Shared with the menu and split
@@ -218,16 +248,18 @@ pub(crate) struct Style {
     pub fill: Option<Rgb>,
     /// The fill under the pointer.
     pub hover: Rgb,
-    /// The fill while pressed.
+    /// The fill while pressed or open.
     pub press: Rgb,
-    /// The label at rest.
+    /// The label in every state.
     pub ink: Rgb,
     /// The edge at rest; `None` for a kind without one.
     pub border: Option<Rgb>,
 }
 
-/// The colours `kind` is drawn with in `pal`.
-pub(crate) fn style(pal: &Palette, kind: Kind) -> Style {
+/// The colours `kind` is drawn with in `pal`. Under `high_contrast` the destructive kind takes
+/// the palette's own page, text and danger — no mixes — as an outlined danger button: the
+/// system's contrast palettes are built so text reads on the page, the hover and the press.
+pub(crate) fn style(pal: &Palette, kind: Kind, high_contrast: bool) -> Style {
     match kind {
         Kind::Primary => Style {
             fill: Some(pal.accent),
@@ -250,19 +282,71 @@ pub(crate) fn style(pal: &Palette, kind: Kind) -> Style {
             ink: pal.text,
             border: None,
         },
-        Kind::Destructive => Style {
-            fill: Some(pal.danger),
-            hover: mix(pal.danger, pal.popup, 0.12),
-            press: mix(pal.danger, pal.popup, 0.22),
-            ink: ON_DANGER,
-            border: None,
+        Kind::Destructive if high_contrast => Style {
+            fill: Some(pal.page),
+            hover: pal.hover,
+            press: pal.press,
+            ink: pal.text,
+            border: Some(pal.danger),
         },
+        Kind::Destructive => {
+            let ink = destructive_ink(pal, pal.danger);
+            // The hover and the press move the fill away from the label's ink, so the label
+            // reads at least as well as it does at rest: darker where the ink is light, lighter
+            // where it is dark.
+            let away = shade(pal, ink);
+            Style {
+                fill: Some(pal.danger),
+                hover: mix(pal.danger, away, 0.1),
+                press: mix(pal.danger, away, 0.2),
+                ink,
+                border: None,
+            }
+        }
+    }
+}
+
+/// The ink that reads best on `fill`, from the palette's own light and dark inks and
+/// [`ON_DANGER`]: the dark palette's danger red is a light red, so its label must be dark or
+/// white at more than its own `text` gives (4.48:1); the toolkit's dark high-contrast red is
+/// lighter still, and takes the palette's black `on_accent`.
+pub(crate) fn destructive_ink(pal: &Palette, fill: Rgb) -> Rgb {
+    let mut best = ON_DANGER;
+    let mut best_by = contrast(best, fill);
+    for c in [pal.on_accent, pal.text, pal.page] {
+        let by = contrast(c, fill);
+        if by > best_by {
+            best = c;
+            best_by = by;
+        }
+    }
+    best
+}
+
+/// The palette colour farthest from `ink`, out of `text` and `page`: the direction a hover or a
+/// press moves a fill so that `ink` reads better on it.
+pub(crate) fn shade(pal: &Palette, ink: Rgb) -> Rgb {
+    if contrast(pal.text, ink) >= contrast(pal.page, ink) {
+        pal.text
+    } else {
+        pal.page
+    }
+}
+
+/// The colour of a default button's line: the label's `ink` on the two filled kinds, where the
+/// ink is already known to read on the fill, and the accent on the other two, whose fill is
+/// quiet.
+pub(crate) fn default_line(pal: &Palette, kind: Kind, ink: Rgb) -> Rgb {
+    if matches!(kind, Kind::Primary | Kind::Destructive) {
+        ink
+    } else {
+        pal.accent
     }
 }
 
 /// The fill and label colour `look` asks for, from a kind's `style`.
 pub(crate) fn state(style: &Style, look: Look) -> (Option<Rgb>, Rgb) {
-    if look.pressed && look.hovered {
+    if look.open || (look.pressed && look.hovered) {
         (Some(style.press), style.ink)
     } else if look.hovered {
         (Some(style.hover), style.ink)
@@ -292,7 +376,7 @@ pub(crate) fn draw_box(
     if look.focused {
         draw_ring(p, pal, r, RADIUS);
     }
-    let style = style(pal, kind);
+    let style = style(pal, kind, high_contrast(pal, look.high_contrast));
     let (fill, ink) = state(&style, look);
     if let Some(fill) = fill {
         match style.border {
@@ -301,25 +385,11 @@ pub(crate) fn draw_box(
         }
     }
     if look.default {
-        // Primary's edge is the accent already, so its mark must be lighter than the fill.
-        let line = if matches!(kind, Kind::Primary | Kind::Destructive) {
-            mix(
-                pal.on_accent,
-                match fill {
-                    Some(fill) => fill,
-                    None => pal.accent,
-                },
-                0.5,
-            )
-        } else {
-            pal.accent
-        };
-        p.stroke_path(
-            &rounded(r.inset(0.5), (RADIUS - 0.5).max(0.0)),
-            1.0,
-            line,
-            1.0,
-        );
+        // Crisp, one device pixel, as the frame is: the fill is drawn again under the line, so
+        // nothing else is touched. A subtle button with no fill takes the field's, which is the
+        // colour a filled box would use.
+        let line = default_line(pal, kind, ink);
+        p.frame(r, RADIUS, fill.unwrap_or(pal.field), line);
     }
     (fill, ink)
 }
@@ -329,10 +399,13 @@ pub(crate) fn draw_box(
 ///
 /// At rest a primary button is the accent fill with `on_accent` text, a secondary one a quiet
 /// fill with an edge and the text colour, a subtle one its label and no fill, and a destructive
-/// one the danger fill with white text. Hovered it lightens or takes the hover fill; pressed,
-/// while the pointer is still on it, it takes the deeper one. Focused, [`draw_ring`] draws the
-/// accent ring one pixel outside the rectangle. Disabled, every kind is the quiet field frame
-/// with a faint label, and neither the ring, the hover, the press nor the default mark is drawn.
+/// one the danger fill with the ink [`destructive_ink`] picked (white on the dark palette's red,
+/// the palette's black on a light high-contrast red). Hovered it moves the fill one way and
+/// pressed the other, so the label keeps reading. Pressed counts only while the pointer is
+/// still on the button; open draws the pressed fill whatever the pointer does. Focused,
+/// [`draw_ring`] draws the accent ring one pixel outside the rectangle. Disabled, every kind is
+/// the quiet field frame with a faint label, and neither the ring, the hover, the press, the
+/// open nor the default mark is drawn.
 ///
 /// A label wider than `r` is clipped at `r`'s width (and centred, so both its ends are cut); an
 /// empty label draws the box alone. A rectangle with a side that is not positive or not finite,
@@ -356,50 +429,6 @@ pub fn draw(p: &mut Painter, pal: &Palette, r: Rect, label: &str, kind: Kind, lo
 /// Whether a rectangle can be drawn at all: every number finite and both sides positive.
 fn sane(r: Rect) -> bool {
     [r.x, r.y, r.w, r.h].iter().all(|v| v.is_finite()) && r.w > 0.0 && r.h > 0.0
-}
-
-/// A closed rounded rectangle through the corners of `r`, each corner a quarter circle of
-/// `radius` approximated by a cubic (the same constant as [`crate::focus`]'s ring).
-pub(crate) fn rounded(r: Rect, radius: f32) -> Path {
-    const KAPPA: f32 = 0.552_284_8;
-    let (x0, y0, x1, y1) = (r.x, r.y, r.right(), r.bottom());
-    let radius = if radius.is_finite() {
-        radius.min(r.w / 2.0).min(r.h / 2.0).max(0.0)
-    } else {
-        0.0
-    };
-    let k = radius * KAPPA;
-    Path::new()
-        .move_to(x0 + radius, y0)
-        .line_to(x1 - radius, y0)
-        .curve_to(
-            (x1 - radius + k, y0),
-            (x1, y0 + radius - k),
-            x1,
-            y0 + radius,
-        )
-        .line_to(x1, y1 - radius)
-        .curve_to(
-            (x1, y1 - radius + k),
-            (x1 - radius + k, y1),
-            x1 - radius,
-            y1,
-        )
-        .line_to(x0 + radius, y1)
-        .curve_to(
-            (x0 + radius - k, y1),
-            (x0, y1 - radius + k),
-            x0,
-            y1 - radius,
-        )
-        .line_to(x0, y0 + radius)
-        .curve_to(
-            (x0, y0 + radius - k),
-            (x0 + radius - k, y0),
-            x0 + radius,
-            y0,
-        )
-        .close()
 }
 
 /// The left or the right half of a rounded rectangle, its outer side rounded and its inner side
