@@ -7,7 +7,8 @@
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
 //! of lists, grids and selections, a scroll area ([`scrollarea`]), the keyboard focus over the
 //! widgets a frame declares
-//! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), and with the
+//! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), pictures kept
+//! at their drawn size ([`picture`]), and with the
 //! feature `a11y` an accessibility tree built from the same models (`a11y`). No window loop; the
 //! application owns that, or hands it for one window to `host` (feature `host`).
 //! `docs/CATALOGUE.md` lists every module with its
@@ -53,6 +54,7 @@ pub mod open_documents;
 pub mod overlay;
 pub mod palette;
 pub mod pane;
+pub mod picture;
 pub mod pins;
 pub mod place;
 pub mod plan;
