@@ -12,7 +12,7 @@
 //! byte, the selection, and the colour of a squiggle (the caller asks for one).
 
 use super::{Brush, Painter, Path, Rect, Rgb};
-use parley::Layout;
+use parley::{Layout, PositionedLayoutItem};
 
 /// The path of a spelling squiggle: one wave across the whole of `band`, `thickness` thick, that
 /// begins and ends on the band's middle line.
@@ -23,7 +23,13 @@ use parley::Layout;
 /// stroke fills the band from edge to edge. A wavelength that is not a number, is zero or is
 /// negative gives one arch, as wide as the band; a band with no width or height gives an empty
 /// path.
-fn squiggle(band: Rect, thickness: f32, wavelength: f32) -> Path {
+///
+/// Only the part of the wave between `show.0` and `show.1` (logical px, cut to the band) is put
+/// in the path, and the half waves that the cut falls inside are shortened exactly, by the
+/// quadratic's own reparametrization, so the drawn curve is the one the whole band would give
+/// there. That keeps a mask as wide as the window rather than as wide as a band that may run far
+/// past it, and a caller that repaints one region sees the wave the whole frame has.
+fn squiggle(band: Rect, thickness: f32, wavelength: f32, show: (f32, f32)) -> Path {
     if !(band.w.is_finite() && band.w > 0.0 && band.h.is_finite() && band.h > 0.0) {
         return Path::new();
     }
@@ -38,9 +44,23 @@ fn squiggle(band: Rect, thickness: f32, wavelength: f32) -> Path {
     // in a wide band, and nothing on a screen would show the difference.
     let turns = (band.w / half).round().clamp(1.0, 1000.0);
     let step = band.w / turns;
-    let mut path = Path::new().move_to(band.x, mid);
-    for i in 0..turns as usize {
-        let x = band.x + step * i as f32;
+    let (xs, xe) = (show.0.max(band.x), show.1.min(band.right()));
+    let visible = xs.is_finite() && xe.is_finite() && xe > xs;
+    if !visible {
+        return Path::new();
+    }
+    let last = turns as usize - 1;
+    let band_x = |x: f32| (((x - band.x) / step).floor().clamp(0.0, last as f32)) as usize;
+    let (first, end) = (band_x(xs), band_x(xe));
+    let mut path = Path::new();
+    let mut started = false;
+    for i in first..=end {
+        let xa = band.x + step * i as f32;
+        let xb = xa + step;
+        let (a, b) = (xs.max(xa), xe.min(xb));
+        if b <= a {
+            continue;
+        }
         // A quadratic from the middle line up (or down) and back: its top is exactly `amp`
         // above (or below) the middle line, since the control point is twice as far out.
         let peak = if i % 2 == 0 {
@@ -48,7 +68,28 @@ fn squiggle(band: Rect, thickness: f32, wavelength: f32) -> Path {
         } else {
             mid + 2.0 * amp
         };
-        path = path.quad_to(x + step / 2.0, peak, x + step, mid);
+        let (p0, c, p2) = ((xa, mid), (xa + step / 2.0, peak), (xb, mid));
+        let at = |t: f32| {
+            let u = 1.0 - t;
+            (
+                u * u * p0.0 + 2.0 * t * u * c.0 + t * t * p2.0,
+                u * u * p0.1 + 2.0 * t * u * c.1 + t * t * p2.1,
+            )
+        };
+        let (t0, t1) = ((a - xa) / step, (b - xa) / step);
+        let (s, e) = (at(t0), at(t1));
+        // The piece of the quadratic between two parameters is a quadratic with these ends and
+        // this control point.
+        let d = (t1 - t0) * (t1 - t0);
+        let control = (
+            (s.0 + e.0 - d * (p0.0 - 2.0 * c.0 + p2.0)) / 2.0,
+            (s.1 + e.1 - d * (p0.1 - 2.0 * c.1 + p2.1)) / 2.0,
+        );
+        if !started {
+            path = path.move_to(s.0, s.1);
+            started = true;
+        }
+        path = path.quad_to(control.0, control.1, e.0, e.1);
     }
     path
 }
@@ -60,27 +101,32 @@ impl Painter<'_> {
     /// The layout is drawn in its own units, which are the device pixels it was shaped at: a
     /// caller that shaped at `size * scale` passes the logical px it wants, as every draw here
     /// takes them, and the painter moves the layout to whole device pixels at its scale, adds its
-    /// offset and honours its clip. A line that does not meet the clip is skipped, as
-    /// `TextEngine::draw_layout_clipped` skips it, so an off-screen layout costs almost nothing.
+    /// offset and honours its clip. The glyph engine skips a line that is above or below the
+    /// clip; a line beside it still costs one clipped blit a glyph, which writes nothing.
     ///
-    /// Returns the rectangle the lines occupy, so a caller can draw a background, a caret or a
-    /// squiggle against it without measuring again: from `x` plus each line's own inline start
-    /// (the alignment's offset) to the furthest end of a line, `y` down for the layout's height,
-    /// in logical px. A line placed to the right by a centred or end alignment, or by a
-    /// right-to-left direction, is therefore covered where it is drawn, not at `x`. The
-    /// rectangle is the lines' own, not their ink: a raised or lowered run, a rounded glyph or a
+    /// Returns the rectangle the glyph runs advance over, so a caller can draw a background, a
+    /// caret or a squiggle against it without measuring again: the union of the boxes
+    /// [`runs`](crate::richtext::runs) gives, with its left edge at `x` plus the leftmost run's
+    /// inline start, its right edge at `x` plus the rightmost run's end, and `y` down for the
+    /// layout's height, in logical px. A line's alignment, a right-to-left direction and a
+    /// justification's added spacing are all in the runs' places and widths, so a centred,
+    /// end-aligned, justified or right-to-left line is covered where it is drawn. The rectangle
+    /// is the runs' advance box, not their ink: a raised or lowered run, a rounded glyph or a
     /// swash may reach past it. A place that is not a number draws nothing and answers no size;
-    /// a layout with no lines draws nothing and answers no size.
+    /// a layout with no glyph run draws nothing and answers no size.
     pub fn rich_text(&mut self, layout: &Layout<Brush>, x: f32, y: f32) -> Rect {
         if !x.is_finite() || !y.is_finite() {
             return Rect::new(x, y, 0.0, 0.0);
         }
         let (mut left, mut right) = (f32::MAX, f32::MIN);
         for line in layout.lines() {
-            let metrics = line.metrics();
-            let start = metrics.inline_min_coord + metrics.offset;
-            left = left.min(start);
-            right = right.max(start + metrics.advance);
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                left = left.min(glyph_run.offset());
+                right = right.max(glyph_run.offset() + glyph_run.advance());
+            }
         }
         if left > right {
             return Rect::new(x, y, 0.0, 0.0);
@@ -113,6 +159,11 @@ impl Painter<'_> {
     /// height is held to it (the stroke would only be cut back to the band anyway, and a mask
     /// taller than the band is wasted work). A wavelength that is not a positive length draws
     /// one arch across the band.
+    ///
+    /// The wave is built over the part of the band the painter's clip can show, cut exactly
+    /// where the clip cuts it (the half waves it lands in the middle of are shortened, not
+    /// restarted), so a band far wider than the window costs a mask only as wide as the window
+    /// and a repainted region shows the wave the whole frame has.
     pub fn wavy_underline(
         &mut self,
         band: Rect,
@@ -131,15 +182,25 @@ impl Painter<'_> {
             return;
         }
         let thickness = thickness.min(band.h);
-        let path = squiggle(band, thickness, wavelength);
-        if path.is_empty() {
-            return;
-        }
         // The band is the clip as well: nothing of the stroke, its round ends included, may land
         // outside it, whatever the scale rounds the band's edges to.
         let old = self.clip;
         let (x0, y0, x1, y1) = self.dev_rect(band);
         self.clip = (old.0.max(x0), old.1.max(y0), old.2.min(x1), old.3.min(y1));
+        if self.clip.0 >= self.clip.2 || self.clip.1 >= self.clip.3 {
+            self.clip = old;
+            return;
+        }
+        let scale = self.scale;
+        let shown = (
+            (self.clip.0 - self.origin.0) as f32 / scale,
+            (self.clip.2 - self.origin.0) as f32 / scale,
+        );
+        let path = squiggle(band, thickness, wavelength, shown);
+        if path.is_empty() {
+            self.clip = old;
+            return;
+        }
         self.stroke_path(&path, thickness, c, alpha);
         self.clip = old;
     }
@@ -276,10 +337,30 @@ mod tests {
         }
         // A brush change does not split shaping, so `fi` may stay one glyph with the `i` in
         // another colour, and parley's glyph runs group by shaped cluster, not by grapheme. The
-        // font must have the ligature for this test to mean anything, so the families this
-        // machine may have are tried in turn, the Arabic lam-alef last (its ligature is not
-        // optional in any font that has Arabic).
-        let cases = [
+        // Arabic lam-alef is a required ligature wherever Arabic is shaped, so that case is
+        // tried on every machine; the Latin `fi` cases are tried too and skipped where the font
+        // does not form the ligature, with a note, since the test may not depend on the machine.
+        let arabic = [
+            Case {
+                family: "Cambria, Georgia, serif",
+                text: "لا",
+                split: 2,
+                ranges: &[(0, 4)],
+            },
+            Case {
+                family: "Times New Roman, Liberation Serif, serif",
+                text: "لا",
+                split: 2,
+                ranges: &[(0, 4)],
+            },
+            Case {
+                family: "DejaVu Sans, Noto Naskh Arabic, FreeSerif, serif",
+                text: "لا",
+                split: 2,
+                ranges: &[(0, 4)],
+            },
+        ];
+        let latin = [
             Case {
                 family: "Calibri, Carlito, sans-serif",
                 text: "find",
@@ -298,19 +379,13 @@ mod tests {
                 split: 1,
                 ranges: &[(0, 2), (2, 4)],
             },
-            Case {
-                family: UI_FAMILY,
-                text: "لا",
-                split: 2,
-                ranges: &[(0, 4)],
-            },
         ];
-        for case in cases {
+        let check = |case: &Case| -> bool {
             let layout = layout_in(case.family, case.text, 26.0, RED_BRUSH, |b| {
                 b.push(StyleProperty::Brush(BLUE_BRUSH), case.split..)
             });
             if !ligates(&layout) {
-                continue;
+                return false;
             }
             let boxes = crate::richtext::runs(&layout);
             let ranges: Vec<_> = boxes.iter().map(|b| b.range.clone()).collect();
@@ -324,9 +399,16 @@ mod tests {
             for pair in boxes.windows(2) {
                 assert!((pair[0].rect.right() - pair[1].rect.x).abs() < 0.5);
             }
-            return;
+            true
+        };
+        if !arabic.iter().any(&check) {
+            eprintln!(
+                "note: no Arabic font with the lam-alef ligature here; the Arabic case was skipped"
+            );
         }
-        panic!("no font here has the ligature this test needs (`fi` or the Arabic lam-alef)");
+        if !latin.iter().any(&check) {
+            eprintln!("note: no font with an fi ligature here; the fi cases were skipped");
+        }
     }
 
     #[test]
@@ -504,7 +586,18 @@ mod tests {
                 let in_clip = x < 70 && y < 30;
                 let got = at(&cut, x, y);
                 if in_clip {
-                    assert_eq!(got, at(&whole, x, y), "{x},{y}");
+                    let want = at(&whole, x, y);
+                    // The text is the engine's own drawing, cut exactly. The wave is a stroked
+                    // path cut where the clip cuts it, and the stroke's end and the join of the
+                    // shortened half wave sit there, so the pixels within a half wave of the cut
+                    // may differ by a few levels; elsewhere the same curve is drawn.
+                    let near_cut = y >= 26 && x + 6 >= 70;
+                    let allowed = if near_cut { 8 } else { 0 };
+                    let worst = (0..3)
+                        .map(|i| (got[i] as i32 - want[i] as i32).abs())
+                        .max()
+                        .unwrap_or(0);
+                    assert!(worst <= allowed, "{x},{y}: {got:?} of {want:?}");
                     inside += (got != WHITE) as usize;
                 } else {
                     assert_eq!(got, WHITE, "{x},{y} is outside the clip");
@@ -568,6 +661,40 @@ mod tests {
             "{narrow:?} of {line:?}"
         );
         assert!((narrow.h - layout.height()).abs() < 0.01, "{narrow:?}");
+    }
+
+    #[test]
+    fn a_justified_line_answers_the_width_its_words_were_spread_over() {
+        let text = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let mut layout = layout(text, 16.0, BLACK_BRUSH, |_| ());
+        layout.break_all_lines(Some(200.0));
+        layout.align(Alignment::Justify, AlignmentOptions::default());
+        let (bmp, rect) = scale_page(240, 140, 1.0, |p| p.rich_text(&layout, 4.0, 4.0));
+        // The justified lines are spread to the 200 px the text was broken into, which a line's
+        // own `advance` leaves out.
+        let unjustified = layout
+            .lines()
+            .map(|line| {
+                let m = line.metrics();
+                m.inline_min_coord + m.offset + m.advance
+            })
+            .fold(f32::MIN, f32::max);
+        assert!(
+            rect.right() > 4.0 + unjustified + 0.5,
+            "justification spacing is not in the rect: {} of {}",
+            rect.right(),
+            4.0 + unjustified
+        );
+        // And the runs, which is where the width comes from, say the same.
+        let end = crate::richtext::runs(&layout)
+            .iter()
+            .map(|b| b.rect.right())
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (rect.right() - (4.0 + end)).abs() < 0.5,
+            "{rect:?} of {end}"
+        );
+        assert!(ink(&bmp, WHITE).0 > 0);
     }
 
     #[test]

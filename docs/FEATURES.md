@@ -1817,14 +1817,14 @@ Decisions:
 
 - **The layout is in device units.** Parley is shaped at a size, so a caller shapes at
   `size * scale`, as `Painter::paragraph` already does internally, and passes the place in
-  logical px. The returned rectangle is measured in logical px, from the leftmost line's own
-  inline start (its alignment offset) to the furthest line's end, so a line placed to the right
-  by a centred or end alignment, or by a right-to-left direction, is covered where it is drawn;
-  the rectangle is the lines' own, not their ink, so a raised or lowered run may reach past it.
-  Earlier the rectangle was the layout's width from `x`, and the drawing itself was skipped when
-  a box around that width missed the clip, which lost an end-aligned line to a clip that held
-  it; the review found it, and the early skip is gone (the engine skips each line that misses
-  the clip anyway).
+  logical px. The returned rectangle is the union of the glyph runs' advance boxes (the same
+  rectangles `runs` gives), measured in logical px: the leftmost run's inline start (its
+  alignment offset) to the rightmost run's end. A centred or end-aligned line, a right-to-left
+  one and a justified one's added spacing are all in those places and widths, so the rectangle
+  covers them where they are drawn; it is the runs' advance box, not their ink, so a raised or
+  lowered run may reach past it. Earlier it was the layout's width from `x` (which left out
+  alignment and justification), then each line's `advance` (which leaves out justification);
+  the review found both, and the blocks' own widths are used now.
 - **The band is the squiggle's clip.** A round stroke end reaches half its thickness past the
   path's end, so a squiggle that must not paint outside its band (the test's requirement, and a
   spelling checker's) is drawn with the band intersected into the painter's clip for the one
@@ -1840,19 +1840,28 @@ Decisions:
   which is what "continuous under a run" means here. A wavelength that is zero, negative or not
   a number gives one arch, as wide as the band (a half wave, not a whole one); a wavelength far
   below a pixel is cut at a thousand half waves, since nothing on a display would show the
-  rest. A band with no width or height is refused before a path is built.
+  rest. A band with no width or height is refused before a path is built. Only the half waves
+  the clip can show are put in the path, and the two the cut falls in the middle of are
+  shortened by the quadratic's own reparametrization, so a band far wider than the window costs
+  a mask only as wide as the window while the curve inside the clip is the one the whole band
+  would give there. At the cut, the stroke's end and the shortened half wave's join make a few
+  pixels differ from the unclipped drawing by a few levels (the test allows 8 there), and the
+  text above is exact.
 - **Where `runs` gets a byte range.** Parley places glyph runs, split at style changes, but a
   glyph run carries no byte range of its own: `Run::text_range` is the part of the shaped run on
   that line, which a style change does not split. Parley groups by shaped cluster (atom), not by
   grapheme, and a brush change is not a shaping change, so a ligature's second letter can carry
-  another style while belonging to the first letter's glyph. A shaped run's visual clusters are
-  therefore grouped in the same visual order as its glyph runs, with two rules: a cluster that
-  is a ligature's continuation extends the group being built whatever its style, and a cluster
-  with no glyph of its own starts none. The k-th group is then the k-th glyph run, and its
-  clusters' byte ranges are its own. A right-to-left line is tested because a pairing that
-  ignored visual order would still give both ranges while swapping their boxes; a ligature
-  across a brush change is tested because the older, style-only grouping gave `0..1` and `1..4`
-  for `find` where the glyph runs are `fi` and `nd`.
+  another style while belonging to the first letter's glyph. So the run's clusters are walked in
+  **logical** order and gathered into atoms: a cluster that is not a continuation opens one, and
+  continuations extend it; an atom takes the style of its first cluster and notes whether it has
+  glyphs. A right-to-left run's atoms are then turned round, because parley places that run's
+  glyph runs in visual order, and neighbouring atoms of one style are grouped. An atom with no
+  glyph of its own (a soft hyphen) makes no glyph run: its bytes join the group before it, or
+  wait for the one after it, so no byte is lost. The k-th group is then the k-th glyph run.
+  Walking *visual* clusters instead fails two ways: a ligature's continuation comes before the
+  cluster that starts it, so `لا` with the alef in another brush gave `2..4` and lost `0..2`, and
+  `بلا` with the alef alone blue gave `4..6` for a box covering the whole word. Both are in the
+  tests, which fail with that grouping.
 - **Mixed families need no code.** Each run's font, size and normalized coordinates come from
   the layout, as `TextEngine` already reads them, so a run in the mono family is drawn with it;
   the test checks that parley shaped the two runs in two different fonts and that the pixels
@@ -1875,13 +1884,20 @@ against the tree before this change; each assertion was also shown failing under
 - `a_run_of_another_family_is_drawn_as_that_family_shaped_it`: the mono family on the second
   half; `runs` reports two ranges, parley resolved two different fonts, and the pixels are the
   engine's.
-- `a_ligature_across_a_brush_change_keeps_its_bytes_in_one_run`: tries `find` with the `fi`
-  halves in two brushes in Calibri, Georgia and DejaVu (the first family on the machine that
-  shapes the ligature), the Arabic lam-alef last; the ranges must be `0..2` and `2..4` (or
-  `0..4` when the ligature is the whole text) and the boxes must follow each other. It fails
-  with the style-only grouping, which gives `[0..1, 1..4]` — seen on this machine with Calibri.
-  If no font on a machine has either ligature the test says so and fails rather than passing
-  unnoticed.
+- `a_ligature_across_a_brush_change_keeps_its_bytes_in_one_run`: two sets of cases. The Arabic
+  lam-alef is tried on every machine, in Cambria, Times and DejaVu/Noto Naskh Arabic, because
+  its ligature is not optional wherever Arabic is shaped; the Latin `find` with the `fi` halves
+  in two brushes is tried in Calibri, Georgia and DejaVu. The first family of each set that
+  shapes the ligature is used and its ranges asserted (`0..4` for the lam-alef, `0..2` and
+  `2..4` for `find`). If no Arabic font forms the lam-alef, or no font forms `fi`, the test
+  prints a note and goes on without that set, so it does not depend on the machine. With the
+  style-only grouping the Arabic case gives `[2..4]` and `find` gives `[0..1, 1..4]` — both seen
+  on this machine.
+- `richtext::tests::a_ligature_in_a_right_to_left_line_keeps_its_bytes` and
+  `a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole`: `لا` with the alef
+  in another brush is one run `0..4`, and `بلا` with only the alef blue is one run `0..6` whose
+  box is as wide as the word; both skip with a note where no Arabic font ligates. With the
+  visual-cluster grouping they fail with `2..4` and `4..6`.
 - `a_wavy_underline_is_continuous_across_its_band_and_stays_inside_it`: every device column of
   the band has ink in it, nothing outside the band is touched, the crest and the trough reach
   the band's first and last row, the two halves of one wavelength are on opposite sides of the
@@ -1890,14 +1906,19 @@ against the tree before this change; each assertion was also shown failing under
   band, or a NaN of either or of a place, draw nothing. A straight line instead of a wave fails
   it ("no crest").
 - `the_painter_clip_cuts_the_layout_and_the_wave`: outside the clip the bitmap is the page
-  before the draw, inside it is the unclipped drawing pixel for pixel, the text ink is on both
-  sides of the clip's edge, the clipped one keeps its share and some of the text was cut off. A
-  `rich_text` that draws nothing fails it.
+  before the draw; inside it the text is the unclipped drawing pixel for pixel and the wave is
+  the same to within 8 levels in the pixels a half wave from the cut, where the stroke's end
+  sits; the text ink is on both sides of the clip's edge, the clipped one keeps its share and
+  some of the text was cut off. A `rich_text` that draws nothing fails it.
 - `a_line_placed_by_its_alignment_is_drawn_and_the_rect_covers_it`: `OK` broken at 300 and
   aligned to the end sits at about 270, and a clip over only 150 to 320 keeps all of it; the
   pixels inside the clip are the unclipped ones and nothing is drawn left of 150. The answered
   rectangle is the line's own place, the same with and without the clip. It fails with the
   earlier box taken from the layout's width ("the aligned line was not drawn inside the clip").
+- `a_justified_line_answers_the_width_its_words_were_spread_over`: a paragraph broken at 200 and
+  justified; the answered rectangle reaches past the widest line's `advance`, by the
+  justification's own spacing, and agrees with the runs. It fails with a rectangle measured from
+  the lines' `advance`.
 - `the_offset_moves_the_text_and_the_squiggle_by_whole_pixels`: with `Painter::offset(7, 9)` the
   text and the wave are the un-offset drawing moved by seven across and nine down, whole
   device pixels, and the answered rectangle does not move.
@@ -1918,7 +1939,7 @@ against the tree before this change; each assertion was also shown failing under
 Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
 --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
 --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
-test binary passes; the `mdshared-ui` library alone ran 1128 tests with 34 ignored and 4
+test binary passes; the `mdshared-ui` library alone ran 1131 tests with 34 ignored and 4
 filtered, and the doctests passed); and the sheet
 `cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
 `target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
@@ -1936,3 +1957,20 @@ end where the style does, the clip test asserts that some text was cut off, nega
 thickness and alpha joined the nonsense inputs, `MARKED` is written down as a split that draws
 no highlight, `RunBox` is `#[non_exhaustive]`, a `Painter::offset` test was added, and the
 parley re-export is recorded above as an owner decision.
+
+The re-review found two more blockers, fixed in the third commit of the branch. First, `runs`
+grouped clusters in visual order, which is right to left for an RTL run, so a ligature's
+continuation came before the cluster that starts it: `لا` with the alef in another brush lost
+`0..2`, and `بلا` with only the alef blue answered a box as wide as the alef. The grouping now
+walks the clusters in logical order into atoms, turns them round for a right-to-left run and
+folds an atom with no glyph into the group next to it, which is what parley's own glyph runs
+are; the two cases are tests, and both failed with the old grouping (`2..4`, `4..6`). Second,
+the ligature test made the Arabic case depend on the Latin fonts it tried first and failed the
+whole test on a machine without either; the Arabic lam-alef is now tried on every machine and
+the Latin `fi` cases are skipped with a note when no font forms them (as is the Arabic case
+when no Arabic font is there). From the non-blocking list: the answered rectangle now comes
+from the glyph runs, so a justified line's added spacing is in it (with a test); the drawing
+doc says what the engine really skips (lines above or below the clip, not beside it); the wave
+is built only over the half waves the clip can show, its cut half waves shortened rather than
+restarted, so a band far wider than the window costs a mask only as wide as the window; and
+this section's sentences about the Arabic fallback say what the test now does.

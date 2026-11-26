@@ -41,6 +41,14 @@ pub struct RunBox {
     pub baseline: f32,
 }
 
+/// One atom of a run: a shaped cluster (one grapheme, or a whole ligature), the style its first
+/// character asks for, and whether it has a glyph of its own.
+struct Atom {
+    range: Range<usize>,
+    style: u16,
+    glyphs: bool,
+}
+
 /// The runs of `layout`, line by line and in reading order, with their byte ranges and boxes.
 ///
 /// A run is a stretch of text parley placed in one style: a change of colour, of family, of size
@@ -48,41 +56,71 @@ pub struct RunBox {
 /// with the rest of its range. Two things do not begin one, because parley shapes them as one
 /// piece: the second half of a ligature, whatever style it asks for (a brush change does not
 /// split shaping, so `fi` may stay one glyph with the `i` in another colour), and a cluster with
-/// no glyph of its own (a soft hyphen), whose bytes join the run being built. The work is
-/// linear in the layout's length.
+/// no glyph of its own (a soft hyphen), whose bytes join the run next to it. The work is linear
+/// in the layout's length.
 pub fn runs(layout: &Layout<Brush>) -> Vec<RunBox> {
     let mut out = Vec::new();
     for line in layout.lines() {
         let metrics = line.metrics();
         let top = metrics.content_block_min_coord;
         let height = (metrics.content_block_max_coord - top).max(0.0);
-        // Parley places a shaped run's glyph runs in visual order and keeps the clusters of each
-        // glyph run together in that same order, so the k-th group of a run's visual clusters is
-        // its k-th glyph run: that is where the byte ranges come from, while the boxes come from
-        // the placed glyph runs themselves. Parley groups by shaped cluster (atom), not by
-        // grapheme, which is why a ligature's continuation extends the group whatever its style,
-        // and why a cluster without glyphs starts none.
         let mut ranges: Vec<(usize, Vec<Range<usize>>)> = Vec::new();
         for run in line.runs() {
-            let mut groups: Vec<Range<usize>> = Vec::new();
-            let mut style = None;
-            for cluster in run.visual_clusters() {
+            // Parley groups its glyph runs by shaped cluster (an atom: one grapheme, or a whole
+            // ligature) and by style, and places them in visual order. The clusters come in
+            // logical order, so the atoms are built the same way and then turned round for a
+            // right-to-left run; grouping them by style gives the runs the glyph runs were made
+            // from, in their order.
+            let mut atoms: Vec<Atom> = Vec::new();
+            for cluster in run.clusters() {
                 let range = cluster.text_range();
-                let joins = groups.last().is_some_and(|_| {
-                    cluster.is_ligature_continuation() || style == Some(cluster.style_index())
-                });
-                if joins {
-                    let last = groups.last_mut().expect("a group");
-                    last.start = last.start.min(range.start);
-                    last.end = last.end.max(range.end);
+                let glyphs = cluster.glyphs().next().is_some();
+                match atoms.last_mut() {
+                    Some(atom) if cluster.is_ligature_continuation() => {
+                        atom.range.start = atom.range.start.min(range.start);
+                        atom.range.end = atom.range.end.max(range.end);
+                        atom.glyphs |= glyphs;
+                    }
+                    _ => atoms.push(Atom {
+                        range,
+                        style: cluster.style_index(),
+                        glyphs,
+                    }),
+                }
+            }
+            if run.is_rtl() {
+                atoms.reverse();
+            }
+            let mut groups: Vec<Range<usize>> = Vec::new();
+            let mut style: Option<u16> = None;
+            let mut waiting: Option<Range<usize>> = None;
+            for atom in atoms {
+                let mut range = atom.range;
+                if let Some(before) = waiting.take() {
+                    range.start = range.start.min(before.start);
+                    range.end = range.end.max(before.end);
+                }
+                if !atom.glyphs {
+                    // An atom without a glyph of its own has no glyph run: its bytes join the
+                    // group before it, or wait for the one after it, so no byte is left out.
+                    match groups.last_mut() {
+                        Some(last) => {
+                            last.start = last.start.min(range.start);
+                            last.end = last.end.max(range.end);
+                        }
+                        None => waiting = Some(range),
+                    }
                     continue;
                 }
-                // A cluster whose glyphs belong to the one before it (a ligature's second
-                // letter) has no glyphs of its own; the first cluster of a run cannot be one,
-                // so this only guards a layout parley would not build.
-                if cluster.is_ligature_continuation() || cluster.glyphs().next().is_some() {
-                    style = Some(cluster.style_index());
-                    groups.push(range);
+                match groups.last_mut() {
+                    Some(last) if style == Some(atom.style) => {
+                        last.start = last.start.min(range.start);
+                        last.end = last.end.max(range.end);
+                    }
+                    _ => {
+                        style = Some(atom.style);
+                        groups.push(range);
+                    }
                 }
             }
             ranges.push((run.index(), groups));
@@ -126,12 +164,27 @@ mod tests {
         base: Brush,
         add: impl FnOnce(&mut parley::RangedBuilder<'_, Brush>),
     ) -> Layout<Brush> {
+        layout_in(
+            "Segoe UI, Noto Sans, DejaVu Sans, sans-serif",
+            text,
+            size,
+            base,
+            add,
+        )
+    }
+
+    /// [`layout`] in the family list `family`.
+    fn layout_in(
+        family: &str,
+        text: &str,
+        size: f32,
+        base: Brush,
+        add: impl FnOnce(&mut parley::RangedBuilder<'_, Brush>),
+    ) -> Layout<Brush> {
         let mut fonts = mdshared_text::shared_fonts();
         let mut layouts = LayoutContext::<Brush>::new();
         let mut b = layouts.ranged_builder(&mut fonts, text, 1.0, true);
-        b.push_default(StyleProperty::FontFamily(FontFamily::from(
-            "Segoe UI, Noto Sans, DejaVu Sans, sans-serif",
-        )));
+        b.push_default(StyleProperty::FontFamily(FontFamily::from(family)));
         b.push_default(StyleProperty::FontSize(size));
         b.push_default(StyleProperty::Brush(base));
         add(&mut b);
@@ -139,6 +192,15 @@ mod tests {
         layout.break_all_lines(None);
         layout.align(Alignment::Start, AlignmentOptions::default());
         layout
+    }
+
+    /// Whether any cluster of `layout` is the second half of a ligature, i.e. whether the font
+    /// the text was shaped in has the ligature a test needs.
+    fn ligates(layout: &Layout<Brush>) -> bool {
+        layout
+            .lines()
+            .flat_map(|line| line.runs())
+            .any(|run| run.clusters().any(|c| c.is_ligature_continuation()))
     }
 
     #[test]
@@ -239,6 +301,73 @@ mod tests {
         // Visual order: the logically first run is placed after the logically last one.
         assert!(short.rect.x > long.rect.x, "{boxes:?}");
         assert_eq!(short.baseline, long.baseline);
+    }
+
+    /// A layout of `text` in the first family list on this machine that shapes it with a
+    /// ligature, or `None` when no font here forms one. `add` says where the style changes.
+    fn ligating(
+        text: &str,
+        add: impl Fn(&mut parley::RangedBuilder<'_, Brush>) + Copy,
+    ) -> Option<Layout<Brush>> {
+        const FAMILIES: [&str; 5] = [
+            "Cambria, Georgia, serif",
+            "Times New Roman, Liberation Serif, serif",
+            "Calibri, Carlito, sans-serif",
+            "DejaVu Sans, Noto Naskh Arabic, FreeSerif, serif",
+            "Consolas, Courier New, monospace",
+        ];
+        for family in FAMILIES {
+            let layout = layout_in(family, text, 26.0, RED, add);
+            if ligates(&layout) {
+                return Some(layout);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_ligature_in_a_right_to_left_line_keeps_its_bytes() {
+        // The lam-alef is one shaped cluster, and a right-to-left run walks its clusters
+        // backwards: the alef, the continuation, comes before the lam that starts the glyph. A
+        // machine without a font that ligates it skips this, with a note.
+        let Some(layout) = ligating("لا", |b| b.push(StyleProperty::Brush(BLUE), 2..)) else {
+            eprintln!("note: no Arabic font with the lam-alef ligature here; skipped one test");
+            return;
+        };
+        let whole = ligating("لا", |_| ()).expect("the same font");
+        let boxes = runs(&layout);
+        let plain = runs(&whole);
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
+        assert_eq!(boxes[0].range, 0..4, "the lam's bytes were lost: {boxes:?}");
+        assert!(
+            (boxes[0].rect.w - plain[0].rect.w).abs() < 0.5,
+            "the box is {} wide of the word's {}",
+            boxes[0].rect.w,
+            plain[0].rect.w
+        );
+    }
+
+    #[test]
+    fn a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole() {
+        // Blue on the alef alone, inside the lam-alef: the run is the whole word, so its box
+        // must be as wide as the word, not as wide as the alef.
+        let Some(layout) = ligating("بلا", |b| b.push(StyleProperty::Brush(BLUE), 4..)) else {
+            eprintln!("note: no Arabic font with the lam-alef ligature here; skipped one test");
+            return;
+        };
+        let whole = ligating("بلا", |_| ()).expect("the same font");
+        let boxes = runs(&layout);
+        let plain = runs(&whole);
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert_eq!(boxes.len(), 1, "{boxes:?}");
+        assert_eq!(boxes[0].range, 0..6, "{boxes:?}");
+        assert!(
+            (boxes[0].rect.w - plain[0].rect.w).abs() < 0.5,
+            "the box is {} wide of the word's {}",
+            boxes[0].rect.w,
+            plain[0].rect.w
+        );
     }
 
     #[test]
