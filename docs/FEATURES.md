@@ -1784,3 +1784,77 @@ reviewing session, not by the owner), the speed test (`termview_speed`, release)
 `cargo clippy -p mdshared-ui --features term --all-targets -- -D warnings`, and
 `cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
 has been seen only through the application that uses it.
+
+## A scroll area, and a dialog whose body scrolls (`scrollarea`, 2026-11-26, `feat/k11-scroll-area`, roadmap K11, Barbican BT1)
+
+`mdshared_ui::scrollarea::ScrollArea` is one model that ties the pieces a scrolling region
+already had together: a `viewport::Viewport` (content and view sizes, both offsets), both
+overlay scrollbars (`scroll::scrollbars`), the painter's clip and offset, the wheel and the
+keys, and the reveal of a focused control. It is the dialog whose body is taller than the card;
+it also suits a form, a pane or a page.
+
+Decisions:
+
+- **Content pixels, one space for everything.** `layout_column` lays the body out in a rectangle
+  `Flex::natural(&items)` long — its own length, not the view's, so flexible items keep their
+  natural sizes instead of squeezing into the card — and returns the rectangles with the
+  content's top left at (0, 0). `scrolled(p, area)` clips the painter to the area and moves it
+  by the area's top left less the offset, so a caller draws with those rectangles directly.
+  `reveal`, `reveal_focus` and `to_content` speak the same space.
+- **The offset is always inside the limits.** `set_view`, `set_content` and `set_offset` clamp
+  at once, so content that shrinks pulls the view back in the frame it is told, and no question
+  about what is visible can be off the end. A size that is negative or not finite is 0; a NaN
+  offset moves nothing, an infinite one goes to the end (as `Viewport` clamps).
+- **Wheel and keys answer whether they moved.** A wheel that does not move the area is one for
+  a parent. Shift turns a vertical wheel across (`viewport::wheel_delta`). Page Down and Space
+  move a page (the view less `LINE`), Page Up and Shift+Space back; arrows move `LINE`; Home and
+  End go to the vertical ends, with Ctrl to the content's top left and bottom right; Alt chords
+  are left to menus. Deltas arrive in the caller's unit (`host::Event::Wheel` already gives
+  pixels).
+- **The focus is passed in, not held.** `reveal_focus(&focus, id, at, extent)` reveals the
+  control only when `focus::Focus` holds it there; the application still draws the body with
+  its own widgets.
+- **Drawing is two calls.** `draw_bars` draws only the bars that are needed (a bar `None` when
+  the content fits that way), clear of the corner when both show; `draw_bars_animated` is the
+  same with each bar's fade, and at rest is pixel for pixel `draw_bars`.
+- **Gliding is opt-in and stays outside.** The model's offsets are plain `f64`; an application
+  that wants the wheel to glide keeps a `scroll::SmoothScroll` per axis and gives
+  `set_offset` what it draws each frame, as `viewport` already documents.
+
+Added: `scrollarea::{ScrollArea, Scrolled, draw_bars, draw_bars_animated, LINE}`; the example
+`scroll_dialog` (feature `host`): a card whose body of fourteen rows scrolls with the wheel,
+Page Up / Page Down, Home and End, with Tab moving the focus and the area revealing it. No
+existing signature, field or drawing changed.
+
+Tests (in `scrollarea.rs`, 14 and the ignored sheet). Model: content shorter than the view,
+exact fit and a pixel more (no scroll, no bars), a content that shrinks pulling the offset in,
+the wheel's delta and Shift, the page keys and Home/End, reveal above, below and taller than
+the view, `reveal_focus` for the focused id only, `layout_column` keeping a flexible item at its
+natural size and the rectangles still in content pixels after a scroll, points between content
+and area, and NaN/infinite sizes, offsets and deltas. Drawing, in both palettes where colour
+matters: the body draws nothing outside the area and everything inside it, a bar shows only on
+the axis that overflows (vertical, horizontal, both, and none) with the thumb's pixel differing
+from the page, a frame at offset 40 shows rows 2 to 5 and the page above and below, and
+`draw_bars_animated` at rest is `draw_bars` pixel for pixel with no frame asked for. Each was
+seen failing under a broken implementation: with the clamp, clip, layout length, reveal, page
+step, Shift, bar-drawing, `scrolls` and offset each neutered in turn, every test of the set
+failed (13 of 14 in one pass; the exact-fit test needed `scrolls` to answer `>=` instead of
+`>`, and failed then too), and the file was restored byte for byte afterwards.
+
+The sheet `cargo test -p mdshared-ui --lib scrollarea_sheet -- --ignored` writes
+`target/specimen/scrollarea.png`: the dialog at the top and scrolled to row 6, light above and
+dark below; the writing agent looked at it.
+
+Run on Windows 11: `cargo test -p mdshared-ui --lib scrollarea::` (14 pass, the sheet ignored);
+`cargo run -p mdshared-ui --features host --example scroll_dialog -- --seconds 2` opened the
+window, drew two frames at offset 0 and closed; `cargo fmt --all --check`, and the workspace
+clippy and test commands listed in AGENTS.md (results in the commit message). Not run on Linux
+or macOS. Not seen in a real window by the owner, and the wheel, the keys, Tab and the click
+were not driven in the example by a person or a machine: only the drawing path ran.
+
+Left for later: momentum and rubber-banding at the ends; dragging a thumb and the bar's hover
+fade (`scroll::draw_scrollbar_animated` is ready for it, `draw_bars_animated` takes `active`
+from the caller); a scroll area that also reports how much is left to a screen reader (roadmap
+K12); and an application or Barbican screen using it, which is what would show it to a person
+first.
+
