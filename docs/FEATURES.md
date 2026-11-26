@@ -1499,6 +1499,38 @@ focus, the system asked nothing more); `cargo clippy --workspace --all-targets -
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo fmt --all --check`; on Windows only.
 Not seen on a frosted window.
 
+## Apply and Cancel in a colour picker popup (`colour_picker`, `settings::Form`)
+
+Use `confirmation_flyout`, `ConfirmationLayout`, `draw_picker_with_confirmation` and the
+picker's `*_with_confirmation` methods. The caller closes on `Confirmation::Applied(rgb)`
+or `Confirmation::Cancelled`; `Open` leaves the preview on screen. Apply and Cancel act on
+release over the pressed button. Tab goes from the square to hue, hex, Apply and Cancel;
+Shift+Tab goes back, and Space activates the focused button. Enter always applies the last
+valid colour; Escape restores the opening colour and cancels. The drawer uses the toolkit's
+dialog buttons with the caller's palette and keeps their base colours under high contrast.
+
+There is no shared commit rule: menus and dropdowns dismiss without making a new selection,
+the settings dialog closes without undoing its already-reported changes, and the legacy
+colour row rolls back live edits. The confirming picker uses the requested WinUI-style rule:
+an outside press applies, Escape cancels. In settings the press closes only the picker and
+does not act on the control underneath.
+
+`Form::show_as_colour_with_confirmation(id)` stages changes in the popup and reports one
+`Outcome::Changed` if applying changes the row's value. `picker_confirmation_layout`
+adds access to the two hit rectangles. `show_as_colour`, the plain picker and their
+existing behavior stay unchanged. The single-page `colour_picker` example uses the
+confirming row: `cargo run -p mdshared-ui --features host --example colour_picker`.
+
+Verification on Windows (Rust 1.99.1): formatting, workspace Clippy with `host,a11y`,
+catalogue check and the enabled examples build passed. Workspace tests passed with
+`explorer_tests` skipped (2,409 with `host,a11y`; 2,324 in the default release build).
+Release Clippy and the filtered feature tests also passed for `recycle`, `media-session`,
+`notify`, `a11y`, `host`, `host,a11y` and `term`.
+Tests cover activation, cancellation and restore, outside presses, Tab order, settings
+value reports and button pixels in light, dark and a high-contrast palette at 1× and 1.5×.
+The pixel test failed with button drawing disabled. The example was not launched or seen
+by a person. Linux, macOS and downstream applications were not run.
+
 ## While a colour picker is open (`settings::Form`, 2026-11-26, `fix/colour-open`, asked by mdplay)
 
 Two follow-ups to the colour row, from mdplay's Look dialog, whose picker card covers three rows:

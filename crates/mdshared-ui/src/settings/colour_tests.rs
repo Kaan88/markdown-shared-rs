@@ -119,6 +119,71 @@ fn text(id: u32, t: &str) -> Outcome {
 }
 
 #[test]
+fn a_confirming_colour_row_reports_only_on_apply_or_outside_press() {
+    for apply_with_button in [true, false] {
+        let mut f = told();
+        assert!(f.show_as_colour_with_confirmation(UPPER));
+        f.set_rows(rows());
+        shot(&mut f, &LIGHT);
+        let swatch = f.swatch_rect(index(&f, UPPER));
+        click(&mut f, swatch.cx(), swatch.cy());
+        let l = f.picker_confirmation_layout().unwrap();
+        assert_eq!(f.picker_layout(), Some(l.picker));
+        let sq = l.picker.square;
+        assert_eq!(f.press(sq.x, sq.y, NONE, 1), Outcome::Redraw);
+        assert_eq!(f.pointer(sq.x, sq.bottom()), Outcome::Redraw);
+        assert_eq!(f.release(sq.x, sq.bottom()), Outcome::Redraw);
+        assert_eq!(f.colour(UPPER), Some([0xcc, 0x88, 0x00]));
+
+        if apply_with_button {
+            assert_eq!(
+                click(&mut f, l.apply.cx(), l.apply.cy()),
+                (Outcome::Redraw, text(UPPER, "000000")),
+            );
+        } else {
+            // A press on the anchor applies instead of reopening or acting on the form.
+            assert_eq!(
+                click(&mut f, swatch.cx(), swatch.cy()),
+                (text(UPPER, "000000"), Outcome::None),
+            );
+        }
+        assert_eq!(f.colour(UPPER), Some([0; 3]));
+        assert_eq!(f.colour_open(), None);
+        assert!(f.picker_confirmation_layout().is_none());
+    }
+}
+
+#[test]
+fn a_confirming_colour_row_cancels_without_rewriting_even_an_invalid_original() {
+    for cancel_with_button in [true, false] {
+        let mut f = told();
+        assert!(f.show_as_colour_with_confirmation(BAD));
+        shot(&mut f, &LIGHT);
+        assert!(f.focus_row(BAD));
+        assert_eq!(f.key(&KeyName::Enter, NONE, None), Outcome::Redraw);
+        let l = f.picker_confirmation_layout().unwrap();
+        click(&mut f, l.picker.hex.cx(), l.picker.hex.cy());
+        f.key(&KeyName::Char('a'), Mods { ctrl: true, ..NONE }, None);
+        for ch in "00cc44".chars() {
+            assert_eq!(
+                f.key(&KeyName::Char(ch), NONE, Some(&ch.to_string())),
+                Outcome::Redraw,
+            );
+        }
+        if cancel_with_button {
+            assert_eq!(
+                click(&mut f, l.cancel.cx(), l.cancel.cy()),
+                (Outcome::Redraw, Outcome::Redraw),
+            );
+        } else {
+            assert_eq!(f.key(&KeyName::Escape, NONE, None), Outcome::Redraw);
+        }
+        assert_eq!(f.value(BAD), Some(Value::Text("not a colour".into())));
+        assert_eq!(f.colour_open(), None);
+    }
+}
+
+#[test]
 fn a_form_never_told_draws_and_answers_as_the_frozen_form_with_hex_rows() {
     use super::frozen as old;
     macro_rules! run {
