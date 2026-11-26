@@ -861,7 +861,8 @@ impl DirWatcher {
 
     /// The settled reports waiting, in the order they were settled, and forgets them.
     ///
-    /// A pending rescan supersedes incremental changes; a lost watch supersedes both.
+    /// A pending rescan can supersede incremental changes. A rescan deferred for a
+    /// native rename follows that rename in the report instead. A lost watch supersedes both.
     /// This method discards any attached snapshot; recovery cannot assume an independent
     /// reread installed the same entries. With periodic recovery, that can mean reading the
     /// folder twice every interval, once by the worker and once by the caller in response to

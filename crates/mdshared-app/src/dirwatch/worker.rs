@@ -1,7 +1,7 @@
 //! One metadata worker serializes incremental reads and periodic scans. Its inbox
 //! wait ends at either deadline, so a silent backend does not prevent recovery.
 
-use super::queues::{Batch, Inbox, LIMIT, RestartAck, Shared};
+use super::queues::{Batch, Inbox, LIMIT, RestartAck, ScanPublication, Shared};
 use super::reconcile::{self, Periodic, Scan};
 use super::resolve::{Identity, lost_signal, signal_of};
 use super::{Coalescer, RawChange, Read, Signal, Verdict};
@@ -69,17 +69,22 @@ impl Worker {
         }
         feed_batch(&mut self.coalescer, batch, seen);
         let verdicts = self.coalescer.flush((io.now)());
-        if !verdicts.is_empty() {
+        let signals = if verdicts.is_empty() {
+            Vec::new()
+        } else {
             *seen = 0;
             let Some(signals) = self.resolve(verdicts) else {
                 return false;
             };
-            if let Some(periodic) = &mut self.periodic {
-                periodic.observe(&signals);
-            }
-            if self.publish(signals, io.wake) {
-                return false;
-            }
+            signals
+        };
+        let mut reset_after = false;
+        if let Some(periodic) = &mut self.periodic {
+            periodic.observe(&signals);
+            reset_after = self.coalescer.is_idle() && periodic.finish_deferred_reset((io.now)());
+        }
+        if (!signals.is_empty() || reset_after) && self.publish(signals, reset_after, io.wake) {
+            return false;
         }
         if self.coalescer.is_idle()
             && !self.inbox.stopped()
@@ -91,15 +96,19 @@ impl Worker {
             let result = (io.scan)(self);
             let periodic = self.periodic.as_mut().unwrap();
             let (mut signals, snapshot) = periodic.report(&result);
-            if let Some(exact) =
-                self.inbox
-                    .publish_scan(&self.shared, epoch, &mut signals, snapshot, io.wake)
+            match self
+                .inbox
+                .publish_scan(&self.shared, epoch, &mut signals, snapshot, io.wake)
             {
-                periodic.committed(result, &signals, exact, (io.now)());
-                if signals.first() == Some(&Signal::Lost) {
-                    self.inbox.stop();
-                    return false;
+                ScanPublication::ResetAfterNative => periodic.defer_reset(),
+                ScanPublication::Published { exact } => {
+                    periodic.committed(result, &signals, exact, (io.now)());
+                    if signals.first() == Some(&Signal::Lost) {
+                        self.inbox.stop();
+                        return false;
+                    }
                 }
+                ScanPublication::Skipped => {}
             }
         }
         !self.inbox.stopped()
@@ -136,9 +145,9 @@ impl Worker {
     }
 
     /// Returns whether the worker should stop after publishing.
-    fn publish(&self, signals: Vec<Signal>, wake: &dyn Fn()) -> bool {
+    fn publish(&self, signals: Vec<Signal>, reset_after: bool, wake: &dyn Fn()) -> bool {
         let lost = signals.first() == Some(&Signal::Lost);
-        self.inbox.publish(&self.shared, signals, wake);
+        self.inbox.publish(&self.shared, signals, reset_after, wake);
         if lost {
             self.inbox.stop();
         }
@@ -459,5 +468,96 @@ mod tests {
         tick(&mut worker, &mut seen, &io, Some(true));
         assert_eq!(scans.get(), 2);
         assert_eq!(restarts.get(), 1);
+    }
+
+    #[test]
+    fn without_a_baseline_a_rename_during_every_scan_still_yields_a_reset_after_the_burst() {
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let scans = Cell::new(0usize);
+        let mut worker = worker(start, None);
+        let io = Cycle {
+            wake: &|| {},
+            restart: &|| {},
+            scan: &|worker| {
+                let (from, to) = if scans.get().is_multiple_of(2) {
+                    ("a", "b")
+                } else {
+                    ("b", "a")
+                };
+                scans.set(scans.get() + 1);
+                worker.inbox.push(
+                    RawChange::Renamed {
+                        from: path(from),
+                        to: path(to),
+                    },
+                    clock.get(),
+                    None,
+                );
+                Ok(Some(snapshot(to)))
+            },
+            now: &|| clock.get(),
+        };
+        let mut seen = 0;
+        let quiet = Duration::from_millis(100);
+        let mut at = start;
+        for (round, (from, to)) in [("a", "b"), ("b", "a"), ("a", "b")].into_iter().enumerate() {
+            clock.set(at);
+            tick(&mut worker, &mut seen, &io, None);
+            tick(&mut worker, &mut seen, &io, Some(true));
+            clock.set(at + quiet - Duration::from_millis(1));
+            tick(&mut worker, &mut seen, &io, None);
+            assert!(
+                worker.shared.take().is_empty(),
+                "no reset before the rename settles"
+            );
+
+            clock.set(at + quiet);
+            tick(&mut worker, &mut seen, &io, None);
+            assert_eq!(
+                worker.shared.take_with_snapshot(),
+                (
+                    vec![
+                        Signal::Changed(Change::Renamed {
+                            from: path(from),
+                            to: entry(to)
+                        }),
+                        Signal::Rescan,
+                    ],
+                    None
+                ),
+            );
+            assert_eq!(scans.get(), round + 1, "no retry before the reset");
+            at = clock.get() + Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn confirmed_loss_during_scan_overflow_is_reported_once_and_exits_the_worker() {
+        let mut worker = worker(Instant::now(), None);
+        let inbox = Arc::clone(&worker.inbox);
+        let shared = Arc::clone(&worker.shared);
+        let for_ack = Arc::clone(&inbox);
+        let (done, exited) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            worker.run_with_scan(&|| {}, &|| for_ack.restart_finished(true), &|worker| {
+                for i in 0..=LIMIT {
+                    worker.inbox.push(
+                        RawChange::Modified(path(&i.to_string())),
+                        Instant::now(),
+                        None,
+                    );
+                }
+                Ok(None)
+            });
+            _ = done.send(());
+        });
+        let result = exited.recv_timeout(Duration::from_secs(3));
+        let stopped = inbox.stopped();
+        inbox.stop();
+        thread.join().unwrap();
+        assert_eq!(shared.take(), [Signal::Lost]);
+        assert!(stopped, "the worker stopped its own inbox");
+        result.expect("the worker exited without an external stop");
     }
 }

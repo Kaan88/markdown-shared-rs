@@ -2879,8 +2879,9 @@ burst settles first. If callbacks arrive during the read or diff, the worker rec
 untouched paths and leaves the touched paths (both ends of a rename) to native events or
 a later scan. This lets a native rename transfer selection without hiding missed changes
 to unrelated paths. The event queue bounds how many paths can be tracked; overflow falls
-back to one plain `Rescan` without installing a racing snapshot. A full snapshot also waits
-behind a queued rename rather than replacing the selected row.
+back to one plain `Rescan` without installing a racing snapshot. Confirmed `Lost` takes
+precedence over that reset. When an exact snapshot races a rename, the worker reports the
+settled native changes followed by a plain `Rescan`, without waiting for a rename-free scan.
 
 With `initial_entries` from the caller's unfiltered list, the worker starts with that
 baseline and keeps it in step with the changes it reports. When it needs a new baseline,

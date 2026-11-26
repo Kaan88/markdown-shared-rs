@@ -35,6 +35,7 @@ pub(super) struct Periodic {
     known: Option<Snapshot>,
     epoch: u64,
     stage: Stage,
+    reset_after_native: bool,
 }
 
 impl Periodic {
@@ -56,6 +57,7 @@ impl Periodic {
             known: initial.map(snapshot),
             epoch: 0,
             stage: Stage::Start,
+            reset_after_native: false,
         })
     }
 
@@ -133,6 +135,20 @@ impl Periodic {
         }
     }
 
+    pub(super) fn defer_reset(&mut self) {
+        self.reset_after_native = true;
+    }
+
+    /// After the native burst, request a plain rescan without another attempt at an exact snapshot.
+    pub(super) fn finish_deferred_reset(&mut self, now: Instant) -> bool {
+        if !std::mem::take(&mut self.reset_after_native) {
+            return false;
+        }
+        self.known = None;
+        self.schedule_next(now);
+        true
+    }
+
     /// Prepare a report without mutating the baseline: events or queue resets may
     /// invalidate it between reading the directory and publishing the result.
     pub(super) fn report(&self, result: &Scan) -> (Vec<Signal>, Option<Vec<Entry>>) {
@@ -165,6 +181,10 @@ impl Periodic {
         } else {
             self.observe(signals);
         }
+        self.schedule_next(end);
+    }
+
+    fn schedule_next(&mut self, end: Instant) {
         self.deadline = end.checked_add(self.interval);
         if self.stage == Stage::Read {
             self.stage = Stage::Start;
