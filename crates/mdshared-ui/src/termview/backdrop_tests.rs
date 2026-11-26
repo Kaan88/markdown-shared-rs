@@ -315,7 +315,84 @@ fn the_padding_option_controls_both_edges_and_clipped_rows_match_the_full_frame(
 }
 
 #[test]
-fn full_opacity_and_no_active_backdrop_are_pixel_identical_to_the_original_draw() {
+fn translucent_glyph_overhang_does_not_enter_a_neighbour_or_disappear_on_repaint() {
+    let s = Screen::new(2, 1, 0);
+    let mut ink = Screen::new(2, 1, 0);
+    ink.feed(b"\x1b[38;2;120;120;120mW");
+    let mut scheme = Scheme::from_palette(&DARK);
+    scheme.background = [0; 3];
+    scheme.foreground = [255; 3];
+    let view = View::new().cursor_shown(false);
+    let m = Metrics::fixed(24.0, 1.0, 6.0, 32.0);
+    let area = Rect::new(0.0, 0.0, 12.0, 32.0);
+    let mut gfx = Gfx::new();
+    let mut font = CellFont::new();
+    let opacity = BackgroundOpacity::new(0.0);
+    let mut draw = |bmp: &mut Bitmap, screen: &Screen, opacity| {
+        let mut p = Painter::new(bmp, &mut gfx, 1.0);
+        p.set_frost_key(Some(key()));
+        draw_screen_with_background(
+            &mut p, &mut font, &scheme, &m, area, screen, None, view, opacity,
+        );
+    };
+    let mut blank = Bitmap::new(12, 32);
+    draw(&mut blank, &s, opacity);
+    let mut full = Bitmap::new(12, 32);
+    draw(&mut full, &ink, opacity);
+    let mut opaque = Bitmap::new(12, 32);
+    draw(&mut opaque, &ink, BackgroundOpacity::new(1.0));
+    let mut legacy = Bitmap::new(12, 32);
+    legacy.clear([0; 3]);
+    font.draw(
+        &mut legacy,
+        (0, 0, 12, 32),
+        'W',
+        (false, false),
+        &m,
+        (0, 6, m.baseline()),
+        [120; 3],
+        false,
+    );
+    if !(0..32).any(|y| (6..12).any(|x| pixel(&legacy, x, y)[0] > 0)) {
+        eprintln!("skipping overhang test: system font did not produce an overhang");
+        return;
+    }
+    assert_eq!(
+        opaque.pixels, legacy.pixels,
+        "opaque retains row-wide glyph drawing"
+    );
+    assert_eq!(pixel(&blank, 6, 0), [0, 0, 0, 137]);
+    assert!((0..32).any(|y| (0..6).any(|x| pixel(&full, x, y)[0] > 0)));
+    let mut repainted = Bitmap::new(12, 32);
+    repainted.pixels.copy_from_slice(&full.pixels);
+    let mut p = Painter::new(&mut repainted, &mut gfx, 1.0);
+    p.set_frost_key(Some(key()));
+    p.clip(Rect::new(6.0, 0.0, 6.0, 32.0));
+    draw_rows_with_background(
+        &mut p,
+        &mut font,
+        &scheme,
+        &m,
+        area,
+        &ink,
+        None,
+        view,
+        std::slice::from_ref(&(0..1)),
+        opacity,
+    );
+    assert!(
+        repainted.pixels == full.pixels,
+        "neighbour-only repaint changed the frame"
+    );
+    for y in 0..32 {
+        for x in 6..12 {
+            assert_eq!(pixel(&full, x, y), pixel(&blank, x, y), "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn full_opacity_and_no_active_backdrop_match_draw_screen() {
     for pal in [LIGHT, DARK] {
         let s = screen(" ╳W\x1b[41m \x1b[0m");
         let scheme = Scheme::from_palette(&pal);
