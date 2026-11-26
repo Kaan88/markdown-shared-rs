@@ -519,7 +519,7 @@ impl Row<'_> {
             }
         }
         if self.background.is_some() {
-            backdrop::finish(p, clip);
+            crate::frost::finish_premultiplied(p.bmp, clip);
         }
     }
 }

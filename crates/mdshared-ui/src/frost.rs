@@ -75,6 +75,35 @@ pub fn mark(bmp: &mut Bitmap, rect: (i32, i32, i32, i32)) {
     }
 }
 
+/// Protects a region drawn with ordinary premultiplied blending from the chrome key pass.
+/// Changes alpha 254 to 255, leaving colours and all other alpha values alone. Use it after
+/// blending premultiplied ink, including text, and before presenting with [`key_out`].
+///
+/// The device rectangle `(x0, y0, x1, y1)` has exclusive far edges and is cut to the bitmap.
+/// Pass only a region that holds premultiplied pixels, not intentionally marked chrome:
+/// the two uses of alpha 254 cannot be distinguished after drawing.
+pub fn finish_premultiplied(bmp: &mut Bitmap, (x0, y0, x1, y1): (i32, i32, i32, i32)) {
+    let width = bmp.width as usize;
+    let (x0, x1) = (x0.max(0) as usize, (x1.max(0) as usize).min(width));
+    if x0 >= x1 {
+        return;
+    }
+    let Some(stride) = width.checked_mul(4) else {
+        return;
+    };
+    let end = (y1.max(0) as usize).min(bmp.height as usize);
+    for row in bmp
+        .pixels
+        .chunks_exact_mut(stride)
+        .take(end)
+        .skip(y0.max(0) as usize)
+    {
+        for pixel in row[x0 * 4..x1 * 4].as_chunks_mut::<4>().0 {
+            pixel[3] = avoid_mark(pixel[3]);
+        }
+    }
+}
+
 /// A key colour and a veil, with what [`key_out`] needs worked out once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
@@ -321,6 +350,30 @@ impl System for BlurSystem<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finishing_premultiplied_ink_preserves_it_through_key_out() {
+        let mut bmp = Bitmap::new(3, 1);
+        bmp.pixels
+            .copy_from_slice(&[0, 0, 0, 253, 0, 0, 0, 254, 1, 2, 3, 100]);
+        let pixel = &mut bmp.pixels.as_chunks_mut::<4>().0[0];
+        mdshared_text::bitmap::blend_premultiplied(pixel, [0; 3], 128);
+        assert_eq!(*pixel, [0, 0, 0, MARK]);
+        finish_premultiplied(&mut bmp, (-5, 0, 1, 10));
+        finish_premultiplied(&mut bmp, (2, 0, 3, 1));
+        finish_premultiplied(&mut bmp, (2, 0, 1, 1));
+        finish_premultiplied(&mut Bitmap::new(0, 1), (0, 0, 1, 1));
+        let mut presented: Vec<_> = bmp
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect();
+        key_out(&Key::new([0; 3], 0), &mut presented, 3, (0, 0, 3, 1));
+        assert_eq!(presented, [0xff00_0000, 0, 0x6403_0201]);
+    }
     use crate::theme::{DARK, LIGHT};
 
     fn parts(px: u32) -> (u32, [u32; 3]) {
