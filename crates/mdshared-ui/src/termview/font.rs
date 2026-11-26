@@ -245,7 +245,7 @@ impl CellFont {
         metrics: &Metrics,
         (x0, span_w, baseline_y): (i32, i32, i32),
         rgb: [u8; 3],
-        opaque_ink: bool,
+        premultiplied: bool,
     ) {
         let size = metrics.font_device();
         self.shaped(ch, bold, italic, size);
@@ -260,8 +260,8 @@ impl CellFont {
         };
         let ox = x0 + ((span_w as f32 - shaped.advance) / 2.0).round() as i32;
         let oy = baseline_y as f32 - shaped.baseline;
-        if opaque_ink {
-            self.engine.draw_layout_clipped_tinted_opaque_ink(
+        if premultiplied {
+            self.engine.draw_layout_clipped_tinted_premultiplied(
                 bmp,
                 &shaped.layout,
                 ox as f32,

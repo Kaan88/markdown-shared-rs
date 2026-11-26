@@ -358,12 +358,12 @@ impl TextEngine {
         self.draw_runs(fb, layout, (ox, oy), clip, Some(rgb), false);
     }
 
-    /// Draws tinted glyphs on a flat, straight-colour background as
-    /// [`Self::draw_layout_clipped_tinted`] does, and writes alpha 255 at every pixel covered by
-    /// a glyph mask, including its antialiased edges. Leaves alpha alone where there is no ink.
-    /// This lets a caller composite the finished background separately without thinning the ink.
+    /// Draws tinted glyphs as [`Self::draw_layout_clipped_tinted`] does on opaque pixels.
+    /// On a premultiplied translucent destination, blends ink with a single coverage for
+    /// all three channels so the edge composites correctly over an unknown backdrop. Colour
+    /// glyphs use their own colours and alpha. Pixels with zero coverage are left alone.
     #[allow(clippy::too_many_arguments)] // same coordinates and tint as the existing draw
-    pub fn draw_layout_clipped_tinted_opaque_ink(
+    pub fn draw_layout_clipped_tinted_premultiplied(
         &mut self,
         fb: &mut Bitmap,
         layout: &Layout<Brush>,
@@ -383,7 +383,7 @@ impl TextEngine {
         (ox, oy): (f32, f32),
         clip: (i32, i32, i32, i32),
         tint: Option<[u8; 3]>,
-        opaque_ink: bool,
+        premultiplied: bool,
     ) {
         let clip = (
             clip.0.max(0),
@@ -441,7 +441,7 @@ impl TextEngine {
                             (floor_x as i32, y as i32),
                             brush,
                             &self.lut,
-                            opaque_ink,
+                            premultiplied,
                         );
                         continue;
                     }
@@ -462,7 +462,7 @@ impl TextEngine {
                         (floor_x as i32, y as i32),
                         brush,
                         &self.lut,
-                        opaque_ink,
+                        premultiplied,
                     );
                 }
             }
@@ -478,7 +478,7 @@ fn blit(
     (gx, gy): (i32, i32),
     brush: Brush,
     lut: &Lut,
-    opaque_ink: bool,
+    premultiplied: bool,
 ) {
     if entry.w == 0 || entry.h == 0 {
         return;
@@ -513,14 +513,15 @@ fn blit(
                 if a == 0 {
                     continue;
                 }
+                if premultiplied && d[3] < 255 {
+                    crate::bitmap::blend_premultiplied(d, [s[0], s[1], s[2]], s[3]);
+                    continue;
+                }
                 let ia = 255 - a;
                 // swash emits straight-alpha RGBA; the framebuffer is BGRA.
                 d[0] = ((s[2] as u32 * a + d[0] as u32 * ia + 127) / 255) as u8;
                 d[1] = ((s[1] as u32 * a + d[1] as u32 * ia + 127) / 255) as u8;
                 d[2] = ((s[0] as u32 * a + d[2] as u32 * ia + 127) / 255) as u8;
-                if opaque_ink {
-                    d[3] = 255;
-                }
             }
         } else {
             for (s, d) in src
@@ -537,12 +538,15 @@ fn blit(
                     lg[s[1] as usize] as u32,
                     lb[s[2] as usize] as u32,
                 );
+                if premultiplied && d[3] < 255 {
+                    // Collapse the effective subpixel mask; LCD fringes assume a known ground.
+                    let a = ((ar + ag + ab + 1) / 3) as u8;
+                    crate::bitmap::blend_premultiplied(d, [brush[0], brush[1], brush[2]], a);
+                    continue;
+                }
                 d[0] = ((brush[2] as u32 * ab + d[0] as u32 * (255 - ab) + 127) / 255) as u8;
                 d[1] = ((brush[1] as u32 * ag + d[1] as u32 * (255 - ag) + 127) / 255) as u8;
                 d[2] = ((brush[0] as u32 * ar + d[2] as u32 * (255 - ar) + 127) / 255) as u8;
-                if opaque_ink {
-                    d[3] = 255;
-                }
             }
         }
     }
@@ -573,11 +577,14 @@ mod tests {
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
 
     #[test]
-    fn nonzero_ink_masks_restore_alpha_even_when_the_rgb_does_not_change() {
-        let lut = Lut::new(1.0, 1.0);
-        for (color, data) in [
-            (false, vec![0, 0, 0, 0, 1, 0]),
-            (true, vec![0, 0, 0, 0, 37, 37, 37, 1]),
+    fn partial_glyph_coverage_composites_over_black_and_white_without_a_halo() {
+        let lut = Lut(Box::new(std::array::from_fn(|_| {
+            std::array::from_fn(|i| if i == 1 { 0 } else { i as u8 })
+        })));
+        let ink = [220, 200, 180];
+        for (color, data, a) in [
+            (false, vec![1, 1, 1, 32, 64, 96], 64),
+            (true, vec![0, 0, 0, 0, 220, 200, 180, 64], 64),
         ] {
             let entry = Entry {
                 left: 0,
@@ -590,17 +597,33 @@ mod tests {
             };
             let mut bmp = Bitmap::new(2, 1);
             bmp.pixels
-                .copy_from_slice(&[37, 37, 37, 190, 37, 37, 37, 190]);
+                .copy_from_slice(&[21, 21, 21, 179, 21, 21, 21, 179]);
             blit(
                 &mut bmp,
                 (0, 0, 2, 1),
                 &entry,
                 (0, 0),
-                [37, 37, 37, 255],
+                [ink[0], ink[1], ink[2], 255],
                 &lut,
                 true,
             );
-            assert_eq!(bmp.pixels, [37, 37, 37, 190, 37, 37, 37, 255]);
+            assert_eq!(&bmp.pixels[..4], &[21, 21, 21, 179]);
+            assert_eq!(
+                bmp.pixels[7],
+                179 + (76.0 * f64::from(a) / 255.0).round() as u8
+            );
+            for (bgr, fg) in ink.into_iter().rev().enumerate() {
+                for desktop in [0.0, 255.0] {
+                    let actual = f64::from(bmp.pixels[4 + bgr])
+                        + f64::from(255 - bmp.pixels[7]) * desktop / 255.0;
+                    let back = 21.0 + 76.0 * desktop / 255.0;
+                    let expected = back + (f64::from(fg) - back) * f64::from(a) / 255.0;
+                    assert!(
+                        (actual - expected).abs() <= 1.0,
+                        "{color}: {actual} vs {expected}"
+                    );
+                }
+            }
         }
     }
 

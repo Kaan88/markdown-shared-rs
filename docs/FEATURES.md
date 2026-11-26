@@ -1800,27 +1800,31 @@ On Windows the host asks DWM for per-pixel alpha through the blur-behind setup, 
 or Acrylic through the system backdrop attribute. It copies damaged BGRA pixels into
 softbuffer's Win32 DIB, keys out alpha-254 chrome, and softbuffer copies the DIB to the window
 with `BitBlt`. The terminal does not use that chrome key colour or its veil. Each affected row
-first draws over straight RGB; the background carries its own alpha, and each glyph mask
-(including antialiased and colour glyphs), box-drawing shape, decoration and cursor ink writes
-opaque coverage. Explicit backgrounds, inverse cells, selection and a filled block cursor stay
-opaque even if their colour equals the default. The finished row premultiplies only the
-translucent pixels, skipping alpha 254 so the host's chrome key pass leaves it alone. There is
-no separate surface, mask buffer, or change to the present path.
+replaces its background with premultiplied pixels. Over translucent pixels, glyphs use
+grayscale coverage instead of subpixel colour masks. Partial coverage of glyphs, colour emoji,
+box edges and shades blends both colour and alpha, leaving the uncovered fraction for DWM to
+composite. Fully covered ink, explicit backgrounds, inverse cells, selection and a filled block
+cursor stay opaque. The row's finish and the animation blends avoid producing alpha 254 from
+premultiplied pixels, so the chrome key does not key them out. There is no separate surface,
+mask buffer, or change to the present path.
 
 The floor keeps the nominal ink at least 4.5:1 against the default background in the 8-bit
 composite if it already had that contrast when opaque. Black and white bound the possible
 composited background in each channel, so checking the near bound in luminance covers
 intermediate desktop colours too. Ink that starts below 4.5:1 (for example dim ANSI colours)
-keeps its original opaque background instead of being recoloured. This is a floor for the
-foreground colour, not a contrast claim for every antialiased sample or colour-emoji palette.
+keeps its original opaque background instead of being recoloured. This can make individual
+`ls --color` cells look like solid rectangles; that is expected and avoids making those
+colours harder to read. This is a floor for the foreground colour, not a contrast claim for
+every antialiased sample or colour-emoji palette.
 
 The stock host uses the opaque path when the backdrop is off, unavailable or refused, when
 the window loses focus, under high contrast, and on Linux and macOS. If an application owns
 its own loop, only give the painter a frost key while its present path supports premultiplied
 alpha and a backdrop is active. These pixels are ready to present: do not pass the terminal
-area through the chrome's `Cx::frost`, or use ordinary blended drawing directly on it
-afterwards. Opaque fills can cover it; repaint the terminal before presenting uncovered areas
-again.
+area through the chrome's `Cx::frost`. Ordinary scrollbars (including animated and horizontal
+variants) and `Painter::text` for IME or search labels are not safe directly over these pixels.
+Reserve an opaque gutter or fill an opaque backing under the full overlay bounds, including
+its antialiased edges. Repaint the terminal when removing the overlay.
 
 Verified on Windows: requested debug lint and test commands, the release lint and test
 matrix (the workspace runs skipped `explorer_tests`), the two-second host example,
@@ -1829,6 +1833,11 @@ desktops, light and dark, at 1 and 1.5). The two-second `term_backdrop` runs log
 backdrop active while focused for Acrylic and Mica, and inactive with `--off` and on focus
 loss. No compositor screenshot or human visual approval; high contrast was not toggled
 live. Linux and macOS were not run.
+
+The review fix was checked with the Windows debug commands, the specimen, and two-second
+terminal runs with Acrylic, Mica and the backdrop off. Pixel regressions check the edges
+over black and white, the frost marker throughout a fade, and repeat repaint of an already
+translucent row. The release matrix was not rerun for the review fix.
 
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 

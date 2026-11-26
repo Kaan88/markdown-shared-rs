@@ -133,7 +133,8 @@ pub fn draw_screen(
 /// (including high contrast, loss of focus, Linux and macOS in `host`) this draws exactly like
 /// `draw_screen`. The terminal opacity is independent of the chrome's veil.
 ///
-/// Glyph coverage, explicit backgrounds, inverse cells, selection and cursor ink are opaque.
+/// Fully covered glyph pixels, explicit backgrounds, inverse cells, selection and cursor ink
+/// are opaque. Partial glyph coverage is blended over the translucent background.
 /// The renderer raises opacity as needed for 4.5:1 against any backdrop for text that meets
 /// that contrast with the original opaque background. Program colours that do not meet it
 /// stay unchanged on an opaque background. Opacity 1 gives the original pixels.
@@ -163,8 +164,7 @@ pub fn draw_screen_with_background(
         if let Some(background) = background.filter(|b| b.opacity.padding) {
             let clip = p.clip(area);
             let rect = (clip.0, clip.1.max(below as i32), clip.2, clip.3);
-            backdrop::mark(p, rect, background.normal);
-            backdrop::finish(p, rect);
+            backdrop::replace(p, rect, scheme.background, background.normal);
         }
         p.restore(old);
     }
@@ -341,11 +341,10 @@ fn paint_background_run(
     alpha: u8,
     default: Rgb,
 ) {
-    if color != default {
-        p.fill_dev(rect.0, rect.1, rect.2, rect.3, color, 1.0);
-    }
     if alpha != 255 {
-        backdrop::mark(p, rect, alpha);
+        backdrop::replace(p, rect, color, alpha);
+    } else if color != default {
+        p.fill_dev(rect.0, rect.1, rect.2, rect.3, color, 1.0);
     }
 }
 
@@ -391,6 +390,7 @@ impl Row<'_> {
         // Only the columns inside the clip are visited.
         let first = ((clip.0 - self.ax0).max(0) / cw) as usize;
         let last = ((((clip.2 - self.ax0).max(0) + cw - 1) / cw) as usize).min(cols);
+        // Replace the last frame, including cells that now need an opaque default background.
         p.fill_dev(clip.0, y0, clip.2, y1, scheme.background, 1.0);
         if let Some(background) = self.background.filter(|b| b.opacity.padding) {
             let right = self.ax0 as i64 + cols as i64 * cw as i64;
@@ -400,12 +400,9 @@ impl Row<'_> {
                 clip.2,
                 clip.3,
             );
-            backdrop::mark(p, padding, background.normal);
+            backdrop::replace(p, padding, scheme.background, background.normal);
         }
         if first >= last {
-            if self.background.is_some() {
-                backdrop::finish(p, clip);
-            }
             return;
         }
         let span = selection.and_then(|s| s.span_on(abs));
@@ -537,14 +534,13 @@ fn draw_box(
     ch: i32,
     light: i32,
     fg: Rgb,
-    opaque_ink: Option<(i32, i32, i32, i32)>,
+    premultiplied_clip: Option<(i32, i32, i32, i32)>,
 ) {
     let Some(shapes) = pieces(c, cw, ch, light) else {
         return;
     };
-    let fill = |p: &mut Painter, x0, y0, x1, y1, a: f32| {
-        p.fill_dev(x0, y0, x1, y1, fg, a);
-        if let Some(clip) = opaque_ink
+    let fill = |p: &mut Painter, x0: i32, y0: i32, x1: i32, y1: i32, a: f32| {
+        if let Some(clip) = premultiplied_clip
             && a > 0.0
             && a < 1.0
         {
@@ -555,8 +551,10 @@ fn draw_box(
                 y1.min(clip.3),
             );
             if rect.0 < rect.2 && rect.1 < rect.3 {
-                backdrop::mark(p, rect, 255);
+                backdrop::blend_piece(p, rect, fg, a);
             }
+        } else {
+            p.fill_dev(x0, y0, x1, y1, fg, a);
         }
     };
     for piece in &shapes {

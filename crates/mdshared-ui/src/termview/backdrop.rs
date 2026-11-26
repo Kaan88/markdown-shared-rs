@@ -1,13 +1,18 @@
-//! The terminal's own background opacity, independent of the chrome's key and veil. While a
-//! row is drawn its RGB is straight, so the usual glyph masks blend against the flat colour.
-//! The alpha byte holds the desired opacity until the row is finished and premultiplied.
+//! The terminal's own background opacity, independent of the chrome's key and veil. Background
+//! runs replace pixels with premultiplied colour before the ink is composited over them.
 
 use crate::cover::luminance;
-use crate::frost::MARK;
+use crate::frost::avoid_mark;
 use crate::gfx::{Painter, Rgb};
+use mdshared_text::bitmap::blend_premultiplied;
 
 /// How much of the terminal's default background to keep over the window backdrop. Pass this
 /// to [`super::draw_screen_with_background`] or [`super::draw_rows_with_background`].
+///
+/// The result is already premultiplied. The toolkit's ordinary scrollbars (including animated
+/// and horizontal variants) and [`Painter::text`] are not safe directly over those pixels.
+/// Reserve an opaque gutter for a scrollbar or paint an opaque backing under the overlay,
+/// including its antialiased edges, before drawing it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BackgroundOpacity {
     requested: u8,
@@ -73,34 +78,42 @@ impl BackgroundOpacity {
     }
 }
 
-/// Alpha 254 belongs to the host's chrome, not to an already composited pixel.
-fn avoid_mark(alpha: u8) -> u8 {
-    if alpha == MARK { 255 } else { alpha }
-}
-
 fn premul(channel: u8, alpha: u8) -> u8 {
     ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8
 }
 
-/// Sets alpha in an already clipped device rectangle, keeping the colours straight for ink.
-pub(super) fn mark(p: &mut Painter, rect: (i32, i32, i32, i32), alpha: u8) {
+/// Replaces an already clipped device rectangle instead of stacking on last frame's alpha.
+pub(super) fn replace(p: &mut Painter, rect: (i32, i32, i32, i32), [r, g, b]: Rgb, alpha: u8) {
+    let pixel = [premul(b, alpha), premul(g, alpha), premul(r, alpha), alpha];
     for row in rows(p, rect) {
         for px in row.as_chunks_mut::<4>().0 {
-            px[3] = alpha;
+            *px = pixel;
         }
     }
 }
 
-/// Finishes a device rectangle after the ink has been drawn. Existing `key_out` leaves these
-/// pixels alone and the Windows host passes them through to DWM unchanged.
+/// Makes sure the chrome key pass does not mistake already composited ink for chrome.
 pub(super) fn finish(p: &mut Painter, rect: (i32, i32, i32, i32)) {
     for row in rows(p, rect) {
         for px in row.as_chunks_mut::<4>().0 {
-            let alpha = px[3];
-            if alpha != 255 {
-                for c in &mut px[..3] {
-                    *c = premul(*c, alpha);
+            px[3] = avoid_mark(px[3]);
+        }
+    }
+}
+
+/// Blends a partly covered box-drawing piece. On opaque pixels keep the painter's exact
+/// rounding; on translucent pixels the source covers RGB and alpha together.
+pub(super) fn blend_piece(p: &mut Painter, rect: (i32, i32, i32, i32), rgb: Rgb, alpha: f32) {
+    let coverage = (alpha * 255.0).round() as u8;
+    let opaque = (alpha * 256.0) as u32;
+    for row in rows(p, rect) {
+        for px in row.as_chunks_mut::<4>().0 {
+            if px[3] == 255 {
+                for (d, s) in px.iter_mut().zip(rgb.into_iter().rev()) {
+                    *d = ((u32::from(s) * opaque + u32::from(*d) * (256 - opaque)) >> 8) as u8;
                 }
+            } else {
+                blend_premultiplied(px, rgb, coverage);
             }
         }
     }

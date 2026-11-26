@@ -36,12 +36,23 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     Some((rgba, frame.width, frame.height))
 }
 
-/// Opaque 8-bit BGRA pixels, top-down, stride `width * 4`. Alpha is always 255.
+/// 8-bit BGRA pixels, top-down, stride `width * 4`. Ordinary drawing assumes opaque pixels.
 #[derive(Clone)]
 pub struct Bitmap {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+}
+
+/// Lays straight RGB ink with coverage `0..=255` over one premultiplied BGRA pixel, rounding
+/// each channel to the nearest byte. Zero coverage leaves the destination unchanged.
+#[inline]
+pub fn blend_premultiplied(dst: &mut [u8; 4], rgb: [u8; 3], coverage: u8) {
+    let a = u32::from(coverage);
+    let keep = 255 - a;
+    for (d, s) in dst.iter_mut().zip([rgb[2], rgb[1], rgb[0], 255]) {
+        *d = ((u32::from(s) * a + u32::from(*d) * keep + 127) / 255) as u8;
+    }
 }
 
 impl Bitmap {

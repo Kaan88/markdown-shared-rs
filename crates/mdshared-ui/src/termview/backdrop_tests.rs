@@ -119,8 +119,8 @@ fn only_default_background_is_translucent_even_when_highlights_and_explicit_colo
 }
 
 #[test]
-fn font_edges_box_edges_decorations_and_cursor_lines_keep_the_original_opaque_pixels() {
-    let s = screen("R╳\x1b[4;9m \x1b[0m\x1b[1;5H\x1b[6 q");
+fn box_shades_and_edges_composite_over_black_and_white_without_darkening_the_ground() {
+    let s = screen("░▒▓╳╭\x1b[4;9m \x1b[0m\x1b[1;7H\x1b[6 q");
     let scheme = Scheme::from_palette(&DARK);
     let view = View::new().focused(true);
     let old = paint(&s, &scheme, None, true, None, view);
@@ -132,30 +132,97 @@ fn font_edges_box_edges_decorations_and_cursor_lines_keep_the_original_opaque_pi
         None,
         view,
     );
-    let back = pixel(&old, 6 * W + 1, 0);
+    let back = pixel(&got, W + 1, H + 1);
     let [r, g, b] = scheme.foreground;
-    for col in [0, 1, 2, 4] {
-        let (mut ink, mut edges, mut clear) = (0, 0, 0);
+    for (col, ch) in ['░', '▒', '▓', '╳', '╭'].into_iter().enumerate() {
+        let pieces = super::boxes::pieces(ch, W, H, metrics().stroke()).unwrap();
+        let mut partial = 0;
         for y in 0..H {
-            for x in col * W..(col + 1) * W {
-                let was = pixel(&old, x, y);
-                let now = pixel(&got, x, y);
-                if was != back {
-                    assert_eq!(now, was, "ink at ({x}, {y})");
-                    ink += 1;
-                    edges += usize::from(was != [b, g, r, 255]);
-                } else {
-                    clear += usize::from(now[3] == 204);
+            for x in 0..W {
+                let now = pixel(&got, col as i32 * W + x, y);
+                assert_ne!(now[3], crate::frost::MARK);
+                let covers: Vec<_> = pieces
+                    .iter()
+                    .map(|p| match *p {
+                        super::boxes::Piece::Fill {
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            alpha,
+                        } if (x0..x1).contains(&x) && (y0..y1).contains(&y) => alpha,
+                        _ => super::boxes::coverage(p, x, y, W, H),
+                    })
+                    .filter(|&a| a > 0.0)
+                    .collect();
+                // Check single-piece samples independently; intersections can accumulate ink.
+                if let [a] = covers.as_slice()
+                    && *a < 1.0
+                {
+                    let a = (*a * 255.0).round() / 255.0;
+                    let alpha = (204.0 + 51.0 * a).round() as u8;
+                    let alpha = if alpha == 254 { 255 } else { alpha };
+                    assert_eq!(now[3], alpha, "{ch} at ({x},{y})");
+                    for (i, ink) in [b, g, r].into_iter().enumerate() {
+                        let expected = f32::from(ink) * a + f32::from(back[i]) * (1.0 - a);
+                        assert!((f32::from(now[i]) - expected).abs() <= 1.0);
+                        for desktop in [0.0, 255.0] {
+                            let got = f32::from(now[i]) + desktop * f32::from(255 - alpha) / 255.0;
+                            let want = expected + desktop * 51.0 * (1.0 - a) / 255.0;
+                            assert!((got - want).abs() <= 1.6, "{ch}: {got} vs {want}");
+                        }
+                    }
+                    partial += 1;
                 }
             }
         }
-        if col == 0 && ink == 0 {
-            eprintln!("No font for R; checked shape, decoration and cursor pixels instead");
-            continue;
+        assert!(partial > 0, "{ch} did not exercise partial coverage");
+    }
+    for x in 5 * W..7 * W {
+        for y in 0..H {
+            let was = pixel(&old, x, y);
+            if was != pixel(&old, W + 1, H + 1) {
+                assert_eq!(pixel(&got, x, y), was, "decoration or cursor");
+            }
         }
-        assert!(ink > 0 && clear > 0, "col {col}");
-        if col <= 1 {
-            assert!(edges > 0, "no antialiasing in col {col}");
+    }
+}
+
+#[test]
+fn repainting_a_finished_translucent_row_replaces_coverage_instead_of_stacking_it() {
+    let old = screen("╳▓\r\n▒");
+    let new = screen("\x1b[38;2;30;30;30m╳\x1b[0m░\r\n▒");
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_shown(false);
+    let opacity = BackgroundOpacity::new(0.8).with_padding(true);
+    let mut bmp = paint(&old, &scheme, Some(opacity), true, None, view);
+    let want = paint(&new, &scheme, Some(opacity), true, None, view);
+    assert_ne!(bmp.pixels, want.pixels);
+    let mut gfx = Gfx::new();
+    let mut font = CellFont::new();
+    for _ in 0..3 {
+        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+        p.set_frost_key(Some(key()));
+        draw_rows_with_background(
+            &mut p,
+            &mut font,
+            &scheme,
+            &metrics(),
+            AREA,
+            &new,
+            None,
+            view,
+            std::slice::from_ref(&(0..1)),
+            opacity,
+        );
+        for y in 0..bmp.height as i32 {
+            for x in 0..bmp.width as i32 {
+                assert_eq!(
+                    pixel(&bmp, x, y),
+                    pixel(&want, x, y),
+                    "repaint at ({x}, {y})"
+                );
+            }
         }
     }
 }

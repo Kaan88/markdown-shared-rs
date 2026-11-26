@@ -41,6 +41,15 @@
 //! tests says how many on the machine it runs on); the damaged rows of a shell's output, a
 //! fraction of that.
 //!
+//! # A translucent background
+//!
+//! [`draw_screen_with_background`] and [`draw_rows_with_background`] produce premultiplied
+//! pixels ready to present. Ordinary scrollbars (including animated and horizontal variants)
+//! and [`Painter::text`](crate::gfx::Painter::text), for example for IME preedit or search labels,
+//! assume an opaque destination. Put them in an opaque gutter or paint an opaque backing under
+//! their full bounds, including antialiased edges, before drawing them. Do not mark a
+//! translucent terminal area as frosted chrome.
+//!
 //! # A frame, and the pointer
 //!
 //! ```ignore
