@@ -1856,3 +1856,51 @@ matrix after that point. Linux: `cargo check -p mdshared-ui --all-targets --targ
 x86_64-unknown-linux-gnu` type-checked with a stub `pkg-config` (exit 0); nothing was linked.
 **Not run on a real Linux desktop**: the portal thread, the `SettingChanged` listener and the
 wake are type-checked only, and Linux CI runs the rest. macOS was not compiled.
+
+## Escape closes the submenu, not the menu (`submenu::Cascade`, 2026-11-26, `fix/cascade-cancel-wait`, asked by mdview)
+
+A cascade whose submenu is open, with the pointer moved onto another row of the main menu (or
+onto its padding) less than `DELAY` ago, has a close waiting. `Cascade::key` made that waiting
+change first, before acting on the key, so Escape then found only the root open and returned
+`Outcome::Close`: the application closed the whole menu, where before `Cascade` its Escape
+closed only the submenu. Left lost the menu too, because the waiting close ran first and Left
+then fell through to `Outcome::Ignored`, which a menu bar takes as "move to the menu beside".
+
+Two additions, both opt-in; a caller that uses neither behaves exactly as before:
+
+- `Cascade::cancel_wait(&mut self)` drops a waiting pointer change without making it:
+  `deadline()` is `None` afterwards, nothing opens or closes, no lit row moves, and nothing
+  drawn changes. The host calls it before forwarding Escape or Left.
+- `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` itself drop the wait for
+  Escape and Left, and has Left close the innermost open submenu even when the keys are in the
+  menu before it (where it is `Ignored` otherwise), so Left means "back one level" before "the
+  menu beside". Every other key still makes a waiting change first.
+
+Tests, in `submenu_tests.rs`:
+
+- `cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu` and
+  `cancel_wait_drops_a_waiting_close_from_the_padding_too`: submenu open, a close waiting from
+  a pointer onto another main-menu row (resp. onto the padding above the first row);
+  `cancel_wait()` then Escape closes the submenu only, the root stays open with the pointer's
+  row lit, and a second Escape is `Close`.
+- `with_the_switch_left_closes_only_the_submenu_after_a_cancelled_wait`: the same with Left and
+  the switch on; with nothing open, Left is `Ignored` again.
+- `with_the_switch_escape_and_left_drop_the_wait_by_themselves`: the switch alone, no
+  `cancel_wait` call.
+- `without_the_wait_cancelled_the_pointer_change_runs_first_as_before`: the old behaviour kept
+  as a guard: Escape returns `Close` and takes the menu, Left returns `Ignored` after the
+  waiting close has run, and Down still makes the waiting change first with the switch off and
+  on.
+
+Fail-before evidence: with `key` restored to its old body (the two new methods kept, so the
+tests compile), the two switch tests failed, Left giving `Ignored` where `Changed` was
+expected and Escape giving `Close`. With `cancel_wait` made a no-op, the three tests that call
+it failed on `deadline()` still being set and on the depth after Escape. The regression guard
+passes on both old and new code, as it must.
+
+Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
+test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests` (exit 0; mdshared-ui 1125 passed, 33 ignored; doctests pass). Not run: the
+release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
+feature clippy/test lines, Linux and macOS. Not seen by a person in a window.

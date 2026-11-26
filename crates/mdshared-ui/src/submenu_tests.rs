@@ -663,6 +663,131 @@ fn moving_in_a_menu_closes_its_submenu_opened_by_the_pointer() {
     assert_eq!(c.depth(), 1);
 }
 
+/// The cascade with Open recent open, the switch on, and the pointer resting on its row near
+/// the right edge.
+fn recent_open_keys(t0: Instant) -> Cascade<u8> {
+    let mut c = Cascade::at(tree(), 100.0, 100.0).keys_cancel_wait(true);
+    place(&mut c, AREA);
+    let (x, y) = on(&c, 0, 1);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    let r = c.menu(0).unwrap().row_rect(1);
+    c.pointer(r.right() - 10.0, r.cy(), t0);
+    assert_eq!(c.deadline(), None);
+    c
+}
+
+#[test]
+fn cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = recent_open(t0);
+    // Onto Print, which opens nothing: a close of the submenu waits.
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(c.deadline(), Some(t0 + ms(50) + DELAY));
+    c.cancel_wait();
+    assert_eq!(c.deadline(), None);
+    assert_eq!(
+        (c.depth(), hover(&c, 0)),
+        (2, Some(3)),
+        "nothing was applied: the lit row is the pointer's, the submenu is open"
+    );
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
+    assert_eq!(
+        (c.depth(), c.path(), hover(&c, 0)),
+        (1, &[][..], Some(3)),
+        "only the submenu closed; the root stays open"
+    );
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Close);
+    // Nothing waiting, nothing to drop.
+    c.cancel_wait();
+    assert_eq!(c.deadline(), None);
+}
+
+#[test]
+fn cancel_wait_drops_a_waiting_close_from_the_padding_too() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = recent_open(t0);
+    // The padding above the root's first row: inside the menu, on none of its rows.
+    let (x, y) = {
+        let m = c.menu(0).unwrap();
+        (m.rect().x + 20.0, m.rect().y + 2.0)
+    };
+    assert!(!c.menu(0).unwrap().row_rect(0).contains(x, y));
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!((c.focus(), c.deadline()), (0, Some(t0 + ms(50) + DELAY)));
+    c.cancel_wait();
+    assert_eq!(c.deadline(), None);
+    assert_eq!(c.depth(), 2, "nothing was applied");
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
+    assert_eq!((c.depth(), c.path()), (1, &[][..]));
+}
+
+#[test]
+fn with_the_switch_left_closes_only_the_submenu_after_a_cancelled_wait() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = recent_open_keys(t0);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert!(c.deadline().is_some());
+    c.cancel_wait();
+    assert_eq!(c.deadline(), None, "cancel_wait dropped it");
+    assert_eq!(c.key(&KeyName::Left), Outcome::Changed);
+    assert_eq!(
+        (c.depth(), c.focus()),
+        (1, 0),
+        "the root stays open and keeps the keys"
+    );
+    // With nothing open, Left is the menu bar's again.
+    assert_eq!(c.key(&KeyName::Left), Outcome::Ignored);
+}
+
+#[test]
+fn with_the_switch_escape_and_left_drop_the_wait_by_themselves() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = recent_open_keys(t0);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
+    assert_eq!((c.depth(), hover(&c, 0)), (1, Some(3)));
+    let mut c = recent_open_keys(t0);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(c.key(&KeyName::Left), Outcome::Changed);
+    assert_eq!((c.depth(), c.focus()), (1, 0));
+}
+
+#[test]
+fn without_the_wait_cancelled_the_pointer_change_runs_first_as_before() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    // Escape: the waiting close runs first, so only the root is open and Escape is Close, which
+    // takes the whole menu. This is the reported bug, kept as the old behaviour.
+    let mut c = recent_open(t0);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Close);
+    assert_eq!((c.depth(), hover(&c, 0)), (1, Some(3)));
+    // Left: the same, and with the root alone open it is Ignored.
+    let mut c = recent_open(t0);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(c.key(&KeyName::Left), Outcome::Ignored);
+    assert_eq!(c.depth(), 1);
+    // Every other key still makes the waiting change first, with the switch off and on.
+    for mut c in [recent_open(t0), recent_open_keys(t0)] {
+        let (x, y) = on(&c, 0, 3);
+        c.pointer(x, y, t0 + ms(50));
+        assert!(c.deadline().is_some());
+        assert_eq!(c.key(&KeyName::Down), Outcome::Changed);
+        assert_eq!((c.depth(), hover(&c, 0)), (1, Some(4)));
+    }
+}
+
 #[test]
 fn an_access_key_chooses_its_item_or_opens_its_submenu() {
     let mut c = Cascade::at(tree(), 100.0, 100.0).access_keys(true);
