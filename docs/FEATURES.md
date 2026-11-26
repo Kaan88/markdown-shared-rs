@@ -2864,6 +2864,11 @@ The new direct registry dependencies are `pulldown-cmark` 0.13.6, `unicase` 2.10
 registry pin, not a git revision), with the source's 31 diagram features and `svg`.
 The already-locked `memchr`, `regex-syntax`, `serde_json` (test-only), `parley`, `png` and
 `zune-jpeg` are reused. No new CI system package is needed; Linux already installs Fontconfig.
+The owner accepted the new third-party dependencies on 2026-11-26.
+
+Left open: versioning the engine protocol, and giving callers a way to distinguish an
+engine that was not found from other failures. Today an engine that is not found gives
+only a placeholder for SVG, TeX or Mermaid; the rest of the page still renders.
 
 The copied suites include parser specs/fuzzing, fixed Windows pixel goldens, raster jobs
 and preview server tests. The parser, preview server, HTML export, raster store and two
@@ -2884,6 +2889,11 @@ compiled, not linked or run there. The output was pixel-tested on Windows, not s
 person in an application.
 
 After the split and merge with main, Windows debug format, Clippy and workspace tests
-passed again: 195 core and 148 render tests passed, unchanged, with their three existing
-ignores. Preview with `server` enabled passed all 20 tests after the split. Release and
-cross-target checks were not rerun for this follow-up.
+passed again: 195 core and 148 render tests passed, unchanged. Across all five Markdown
+crates (including preview with `server`), the total remained 388 passed, zero failed and
+five ignored. Release and cross-target checks were not rerun for the split.
+
+The review follow-up ran Windows debug format, workspace Clippy and workspace tests
+again (2,364 passed, zero failed, four Explorer tests excluded). Clippy also passed for
+preview with `server` (20 tests passed) and app without default features (41 tests passed).
+The catalogue check exited zero. Release and other platforms were not rerun locally.

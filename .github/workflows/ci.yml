@@ -65,6 +65,9 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
       - run: cargo test --release -p mdshared-ui --features term termview
+      - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-md-preview --features server
+      - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
 
   windows:
     runs-on: windows-latest
@@ -96,6 +99,9 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
       - run: cargo test --release -p mdshared-ui --features term termview
+      - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-md-preview --features server
+      - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings
       # A smoke run of the host: a real window, a few frames, closed on its timer.
       - run: cargo run --release -p mdshared-ui --features host,a11y --example host -- --seconds 2
 
@@ -109,7 +115,7 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -136,3 +142,6 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
       - run: cargo test --release -p mdshared-ui --features term termview
+      - run: cargo clippy --release -p mdshared-md-preview --features server --all-targets -- -D warnings
+      - run: cargo test --release -p mdshared-md-preview --features server
+      - run: cargo clippy --release -p mdshared-app --no-default-features --all-targets -- -D warnings

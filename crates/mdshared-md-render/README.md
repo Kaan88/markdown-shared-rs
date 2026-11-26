@@ -34,9 +34,24 @@ features and the full application plumbing still builds.
 
 ## Ship the engine
 
-Build it with `cargo build --release -p mdshared-md-engine --bin mdview-engine`. Ship
-`mdview-engine` (`mdview-engine.exe` on Windows) next to your executable, or supply its
-location using `set_engine_path`. The renderer looks in this order:
+A third app must build or ship `mdview-engine` itself. The renderer and preview server do
+not build it as a dependency. Add `mdshared-md-engine` to your build dependencies at the
+same revision and explicitly build and bundle its binary; a regular Cargo library
+dependency does not build the binary. From the toolkit checkout, run
+`cargo build --release -p mdshared-md-engine --bin mdview-engine`; or install it with:
+
+```sh
+cargo install --git https://github.com/Kaan88/markdown-shared-rs --rev <rev> mdshared-md-engine --bin mdview-engine
+```
+
+Replace `<rev>` with your renderer's toolkit revision. Without the engine, SVG, TeX and
+Mermaid show as placeholders; the rest of the page still renders.
+
+The engine protocol has no version handshake, and every app shares the same binary name
+and `MDV_ENGINE` environment variable. Ship the matching `mdview-engine`
+(`mdview-engine.exe` on Windows) next to your own executable rather than relying on a
+shared installation. If you need to override an inherited `MDV_ENGINE`, call
+`set_engine_path` with the bundled path. The renderer looks in this order:
 
 1. The path passed to `mdshared_md_render::set_engine_path`.
 2. The `MDV_ENGINE` environment variable.
@@ -44,10 +59,8 @@ location using `set_engine_path`. The renderer looks in this order:
 4. A development fallback: walking up from the executable directory, it checks for a binary
    directly in each directory and in its `target/release`, at most six directories in all.
 
-An explicit path that does not exist does not fall back. A third app must set the engine
-path or ship the binary for SVG, TeX and Mermaid to render; the rest of the page does not
-require the engine. Neither the renderer nor the preview server builds it as a dependency.
-`cargo test --workspace` builds it for the workspace tests. If testing only the renderer,
+An explicit path that does not exist does not fall back. `cargo test --workspace` builds
+the engine for the workspace tests. If testing only the renderer,
 build the engine first in the same Cargo target directory and profile.
 
 ## Release settings

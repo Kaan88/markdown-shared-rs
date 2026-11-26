@@ -9,6 +9,16 @@ default = ["full"]
 # With default features off, parsing needs only notes, wiki-links and their file/path helpers.
 full = ["dep:notify", "dep:windows-sys"]
 
+[[test]]
+name = "crash_hook"
+path = "tests/crash_hook.rs"
+required-features = ["full"]
+
+[[example]]
+name = "crash"
+path = "examples/crash.rs"
+required-features = ["full"]
+
 [dependencies]
 notify = { version = "=8.2.1", default-features = false, optional = true }
 
