@@ -989,7 +989,7 @@ mod imp {
             let value = NSPasteboard::generalPasteboard().stringForType(string)?;
             // The pasteboard supplies an NSString; cap the UTF-16 length before scanning for
             // the UTF-8 byte count, then cap again before copying into a Rust String.
-            (value.length() <= limit && value.len_utf8() <= limit).then(|| value.to_string())
+            (value.length() <= limit && value.len() <= limit).then(|| value.to_string())
         }
     }
     pub fn set_clipboard_text(text: &str) -> bool {
