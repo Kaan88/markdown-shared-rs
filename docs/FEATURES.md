@@ -12,9 +12,14 @@ the hinted draw can use different scaling precision. Skrifa can return a rounded
 advance from that draw; swash uses only the outline and discards the returned metrics. The
 rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
 commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
-rather than risking a bad point match. The existing quarter-pixel X phases, subpixel offsets,
-colour glyph sources, and blending are unchanged. Parley still supplies all positions and
-advances; no API or dependency was added.
+rather than risking a bad geometric match. A fit is also rejected if any Y moves more than
+four ems or if the combined outline leaves a box extending four ems from the origin in every
+direction. Both monochrome paths reject coordinates outside ±4096 device px, masks with a
+side over 8192 px, and masks over 4 MiB (one byte per alpha pixel or four per LCD pixel).
+The fitter keeps the unhinted outline if only the fit fails; if neither can be rasterized,
+the glyph draws no ink. The existing quarter-pixel X phases, subpixel offsets, colour glyph
+sources, and blending are unchanged. Parley still supplies all positions and advances;
+no API or dependency was added.
 
 At fractional device sizes, the fitter first checks bit 3 of the font's OpenType
 `head.flags`. If it is set (or cannot be read), the fitter skips hinting: skrifa's
@@ -44,12 +49,33 @@ grid in both themes. See `E:/mds-target/vhint/shots/review/{unhinted,before,afte
 The review fix changed 143 pixels on the 125% UI sheet; the other five sheets did not
 change from the pre-fix render.
 
-**Left open for review:**
+### Left open from the Astra review (2026-11-26)
 
-- The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only runs on
-  Windows; the UI asks for Segoe UI Variable Text first. All the hinting tests, including the
-  cache-key test that needs no Segoe UI, are `cfg(windows)`, so Linux and macOS CI check none
-  of this.
+- **Finding 1 — Waiting for the owner: pedantic glyph draws.** Swash 0.2.10 can return a partly fitted
+   TrueType outline after a glyph-program error and has no pedantic setting. A plausible
+   partial fit can still pass the geometric checks. The recommended option is a direct
+   `skrifa = "=0.44.0"` dependency naming the version already in `Cargo.lock`, for a
+   pedantic draw that falls back on error. The alternative is a swash patch exposing that
+   setting.
+- **Finding 3 — Point correspondence.** Matching commands and point counts with X within 1/16 px is a
+   geometric check, not proof of point identity. TrueType on-curve flags can change contour
+   construction, and in CFF/CFF2 different degenerate segments can disappear after scaling.
+   An accepted path has the hinted commands and Y and the exact unhinted X. Source-point
+   correspondence would be needed if point identity became a requirement.
+- **Finding 4 — Grayscale hint target.** `Subpixel::None` produces one coverage value, but still uses
+   the same smooth horizontal LCD hint target as RGB and BGR. A font can choose different
+   stem adjustments for a grayscale hint target; that target is not selected here.
+- **Finding 5 — Fractional CFF/CFF2.** The `head.flags` check can skip fitting for these outlines even
+   though skrifa supports fractional sizes for them. The fallback is the unhinted mask at
+   the requested size.
+- **Finding 6 — Portable coverage.** The cache-key test no longer has a Windows gate. A synthetic
+   TrueType fixture checks a rejected fit against the legacy alpha, RGB and BGR masks at
+   all four X phases. The installed-Segoe tests remain Windows-only and exercise static
+   Segoe UI, not Segoe UI Variable Text. Portable comparisons for composite, variable and
+   CFF/CFF2 outlines are still open.
+
+**Other open questions:**
+
 - Outline-matching fallback happens glyph by glyph and is not counted.
 - A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
   hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
@@ -64,6 +90,10 @@ Windows verification: formatting, workspace Clippy and tests with `host,a11y` (t
 excluded `explorer_tests`), `term` Clippy and `termview` tests, and the UI ignored tests
 without a specimen directory override passed. No existing pixel test expectation needed
 updating. The full release CI matrix was not run.
+
+For the Astra bounds fix, the Windows workspace Clippy and test checks with `host,a11y`
+(`explorer_tests` excluded), formatting and the catalogue check passed on Rust 1.99.1.
+The synthetic regressions fail without the corresponding geometry or mask-size guards.
 The sheets have not been judged by a person or checked in a running application. Linux and
 macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
 
