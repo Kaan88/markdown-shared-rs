@@ -315,27 +315,29 @@ impl<A: App> Host<A> {
 
     /// Shows a window the application hid: draw and present it while it is still hidden, then
     /// show it, then read the keyboard. Called from `after`, which the host runs after every
-    /// call, so the draw happens before the window is on screen.
+    /// call, so the draw happens before the window is on screen. A window shown this way is
+    /// drawn as it will be when active, so the frosted chrome does not flip after the map.
     fn show(&mut self, now: Instant) {
         if !self.st.vis.app_hidden() {
             return;
         }
         self.st.vis.set_app_hidden(false);
         self.st.touched = true;
-        self.reveal(now);
+        self.reveal(now, true);
     }
 
     /// Draws the whole window and presents it to a window that is still hidden, then shows it
     /// and presents it again, so its client area is never seen undrawn. The first call (the
-    /// launch) also builds the accessibility tree before showing. Then the keyboard is read
-    /// again: a window hidden from launch has none.
-    fn reveal(&mut self, now: Instant) {
+    /// launch) also builds the accessibility tree before showing. `assume_active` is true when
+    /// reached from [`Cx::show_window`](super::cx::Cx::show_window): the window is drawn as the
+    /// system will activate it, then the keyboard is read again and corrected. The launch path
+    /// (`assume_active` false) keeps its old behaviour exactly: it draws as `focused` says and
+    /// only sends `Focus(false)` when the system refuses the activation.
+    fn reveal(&mut self, now: Instant, assume_active: bool) {
         let first = !self.st.shown;
         self.st.shown = true;
-        // Shown again, assume the system activates it, as launch does: the chrome is drawn
-        // frosted from the first presented frame instead of flipping once the focus arrives.
         let was = self.st.focused;
-        let assumed = if first { was } else { true };
+        let assumed = assume_active || was;
         self.st.focused = assumed;
         self.st.damage.all();
         self.frame(now);
@@ -350,13 +352,22 @@ impl<A: App> Host<A> {
             return;
         };
         let has = win.window.has_focus();
-        self.st.focused = has;
-        if has != assumed {
-            // The frame drew the other focus, and the chrome may look different by it.
-            self.st.damage.all();
-        }
-        if has != was {
-            self.call(now, |app, cx| app.event(cx, Event::Focus(has)));
+        if assume_active {
+            self.st.focused = has;
+            if has != assumed {
+                // The frame drew the other focus, and the chrome may look different by it.
+                self.st.damage.all();
+            }
+            if has != was {
+                self.call(now, |app, cx| app.event(cx, Event::Focus(has)));
+            }
+        } else if self.st.focused && !has {
+            // The system refused the activation the first frame was drawn for.
+            self.st.focused = false;
+            if self.st.backdrop != Backdrop::Off {
+                self.st.damage.all();
+            }
+            self.call(now, |app, cx| app.event(cx, Event::Focus(false)));
         }
     }
 
@@ -868,7 +879,7 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         // launch to the tray) is not shown; one that showed itself there has already been
         // drawn and shown by `after`.
         if !self.st.vis.app_hidden() && !self.st.shown {
-            self.reveal(now);
+            self.reveal(now, false);
         }
         // The contrast switch reaches no winit event on Windows: the host watches it (a no-op
         // elsewhere). After the first frame: it waits a few ms for its window.

@@ -2007,6 +2007,11 @@ exactly as before.
   `Occluded`, so a resize while application-hidden is then swallowed as OS-hidden and the
   first frame after showing comes on `Occluded(false)`; this is not verified. On X11 the first
   present may come before the map; an Expose heals it (also not verified here).
+
+Known limits on the platforms not run here: on X11 a re-show can flip focused → unfocused →
+focused, because focus arrives after the map; and `Focus(true)` can be delivered twice on a
+successful re-show, once from `reveal` and once from winit's buffered event.
+
 - **Regions with their own damage.** `App::damage_regions()`, a new defaulted method answering
   false and read once before `App::start`, opts an application into one `draw` call per damage
   rectangle instead of one for their union. An application that does not opt in keeps the old
