@@ -13,8 +13,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{ResizeDirection, Window, WindowId};
 
 use super::cx::{Cx, Shared};
-use super::frame::{Damage, Deadlines, Visibility, minimized, present};
+use super::frame::{Damage, Deadlines, Visibility, minimized, next_wake, present, wants_frame};
 use super::input::{Clicks, button, clean_scale, click_slop, logical, wheel};
+use super::timers::NamedTimers;
 use super::{App, Button, Config, Event, KeyPress, Proxy, Wake};
 use crate::anim::Animator;
 use crate::corners::Corners;
@@ -42,6 +43,8 @@ struct Host<A: App> {
     win: Option<Win>,
     gfx: Gfx,
     anim: Animator,
+    /// The application's named timers ([`Cx::timer_at`]).
+    timers: NamedTimers,
     st: Shared,
     cursor: CursorState,
     frost: Frost,
@@ -80,6 +83,7 @@ struct Access {
 /// on the main thread (macOS requires it), once per process. Fails when winit cannot make its
 /// event loop or the loop ends with an error.
 pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoopError> {
+    let collect = app.damage_regions();
     let event_loop = EventLoop::<Wake<A::Message>>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = Proxy(event_loop.create_proxy());
@@ -94,8 +98,8 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         dark: config.dark,
         corners: config.corners,
         high_contrast: false,
-        damage: Damage::default(),
-        animated: Damage::default(),
+        damage: Damage::with_pieces(collect),
+        animated: Damage::with_pieces(collect),
         deadlines: Deadlines::default(),
         cursor: Cursor::Default,
         snap: None,
@@ -104,6 +108,8 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         pal: LIGHT,
         exit: false,
         touched: false,
+        show: false,
+        shown: false,
         no_resize: Vec::new(),
     };
     let mut host = Host {
@@ -113,6 +119,7 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         win: None,
         gfx: Gfx::new(),
         anim: Animator::new(),
+        timers: NamedTimers::default(),
         st,
         cursor: CursorState::new(),
         frost: Frost::default(),
@@ -183,6 +190,87 @@ pub(super) fn style(w: &Window, dark: bool, corners: Corners) {
     let _ = (w, dark, corners);
 }
 
+/// `d` (device px, x0, y0, x1, y1) as a rectangle in logical px at `scale`.
+fn region_rect(d: (u32, u32, u32, u32), scale: f32) -> Rect {
+    Rect::new(
+        d.0 as f32 / scale,
+        d.1 as f32 / scale,
+        (d.2 - d.0) as f32 / scale,
+        (d.3 - d.1) as f32 / scale,
+    )
+}
+
+/// Paints `pieces` (device px) into `bmp`, one call each, with the painter clipped to that
+/// piece: the loop [`Host::frame`] runs for an application that draws regions. `draw` is given
+/// the painter, the animator, the piece in logical px and its device clip. The animator's group
+/// is reset before each call, as `begin_frame` does for the one-call frame, so a group set in
+/// one region's draw does not leak into the next.
+#[allow(clippy::too_many_arguments)] // a drawing loop: bitmap, animator, timers and pieces
+pub(super) fn paint_regions(
+    bmp: &mut Bitmap,
+    gfx: &mut Gfx,
+    anim: &mut Animator,
+    timers: &mut NamedTimers,
+    key: Option<crate::frost::Key>,
+    scale: f32,
+    pieces: &[(u32, u32, u32, u32)],
+    mut draw: impl FnMut(&mut Painter, &mut Animator, &mut NamedTimers, Rect, (i32, i32, i32, i32)),
+) {
+    for &dev in pieces {
+        let clip = (dev.0 as i32, dev.1 as i32, dev.2 as i32, dev.3 as i32);
+        let region = region_rect(dev, scale);
+        anim.ungroup();
+        let mut p = Painter::new(bmp, gfx, scale);
+        p.set_frost_key(key);
+        p.clip(region);
+        draw(&mut p, anim, timers, region, clip);
+    }
+}
+
+/// Fires the named timers of one turn: the names due when the turn began (earliest first, set
+/// order at one instant), each only while it is still waiting and still due — a callback may
+/// have cancelled or moved it. Anything set during the turn, even at `now`, is not in the
+/// snapshot and waits for the next turn, so a callback that re-arms itself cannot spin the
+/// loop. `fire` answers whether to go on (false stops, for an application that exited). True
+/// when at least one timer fired.
+pub(super) fn fire_due_timers(
+    timers: &mut NamedTimers,
+    now: Instant,
+    mut fire: impl FnMut(&mut NamedTimers, &str) -> bool,
+) -> bool {
+    let mut fired = false;
+    for name in timers.due_at(now) {
+        if !timers.take_if_due(&name, now) {
+            continue;
+        }
+        fired = true;
+        if !fire(timers, &name) {
+            break;
+        }
+    }
+    fired
+}
+
+/// Whether the window can be hidden with `set_visible` and drawn again later. On Wayland a
+/// window is a surface of its own and winit's `set_visible` is a no-op there, so hiding it
+/// would only freeze it: [`Cx::hide_window`](super::cx::Cx::hide_window) does nothing and the
+/// window keeps drawing.
+pub(super) fn can_hide(w: &Window) -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        !matches!(
+            w.window_handle().map(|h| h.as_raw()),
+            Ok(RawWindowHandle::Wayland(_))
+        )
+    }
+    #[cfg(any(not(unix), target_os = "macos"))]
+    {
+        let _ = w;
+        true
+    }
+}
+
 /// Whether high contrast is on, read where it is cheap: Windows (`SPI_GETHIGHCONTRAST`). Off
 /// Windows the portal read can wait half a second, and the host shows no backdrop there to turn
 /// off, so it is not read (the application reads it itself).
@@ -202,6 +290,7 @@ impl<A: App> Host<A> {
         let mut cx = Cx {
             window: &win.window,
             anim: &mut self.anim,
+            timers: &mut self.timers,
             proxy: &self.proxy,
             st: &mut self.st,
             now,
@@ -215,9 +304,70 @@ impl<A: App> Host<A> {
     /// the frame when one is coming, so that it reads the layout that frame draws.
     fn after(&mut self) {
         self.sync_window();
-        let frame_coming = !self.st.damage.is_empty() && !self.st.vis.hidden();
+        if std::mem::take(&mut self.st.show) {
+            self.show(Instant::now());
+        }
+        let frame_coming = wants_frame(self.st.vis.hidden(), &self.st.damage);
         if self.st.touched && !frame_coming {
             self.refresh_tree(false);
+        }
+    }
+
+    /// Shows a window the application hid: draw and present it while it is still hidden, then
+    /// show it, then read the keyboard. Called from `after`, which the host runs after every
+    /// call, so the draw happens before the window is on screen. A window shown this way is
+    /// drawn as it will be when active, so the frosted chrome does not flip after the map.
+    fn show(&mut self, now: Instant) {
+        if !self.st.vis.app_hidden() {
+            return;
+        }
+        self.st.vis.set_app_hidden(false);
+        self.st.touched = true;
+        self.reveal(now, true);
+    }
+
+    /// Draws the whole window and presents it to a window that is still hidden, then shows it
+    /// and presents it again, so its client area is never seen undrawn. The first call (the
+    /// launch) also builds the accessibility tree before showing. `assume_active` is true when
+    /// reached from [`Cx::show_window`](super::cx::Cx::show_window): the window is drawn as the
+    /// system will activate it, then the keyboard is read again and corrected. The launch path
+    /// (`assume_active` false) keeps its old behaviour exactly: it draws as `focused` says and
+    /// only sends `Focus(false)` when the system refuses the activation.
+    fn reveal(&mut self, now: Instant, assume_active: bool) {
+        let first = !self.st.shown;
+        self.st.shown = true;
+        let was = self.st.focused;
+        let assumed = assume_active || was;
+        self.st.focused = assumed;
+        self.st.damage.all();
+        self.frame(now);
+        if first {
+            self.refresh_tree(true);
+        }
+        if let Some(win) = self.win.as_ref() {
+            win.window.set_visible(true);
+        }
+        self.present_all();
+        let Some(win) = self.win.as_ref() else {
+            return;
+        };
+        let has = win.window.has_focus();
+        if assume_active {
+            self.st.focused = has;
+            if has != assumed {
+                // The frame drew the other focus, and the chrome may look different by it.
+                self.st.damage.all();
+            }
+            if has != was {
+                self.call(now, |app, cx| app.event(cx, Event::Focus(has)));
+            }
+        } else if self.st.focused && !has {
+            // The system refused the activation the first frame was drawn for.
+            self.st.focused = false;
+            if self.st.backdrop != Backdrop::Off {
+                self.st.damage.all();
+            }
+            self.call(now, |app, cx| app.event(cx, Event::Focus(false)));
         }
     }
 
@@ -277,6 +427,7 @@ impl<A: App> Host<A> {
         let mut cx = Cx {
             window,
             anim: &mut self.anim,
+            timers: &mut self.timers,
             proxy: &self.proxy,
             st: &mut self.st,
             now: Instant::now(),
@@ -406,8 +557,8 @@ impl<A: App> Host<A> {
             self.st.damage.all();
         }
         let scale = self.st.scale;
-        let damage = std::mem::take(&mut self.st.damage);
-        let Some(dev) = damage.device(scale, w, h) else {
+        let damage = self.st.damage.take();
+        let Some(union) = damage.device(scale, w, h) else {
             // The damage fell wholly outside the window: no frame, but `after` kept the tree
             // for one, so it is built now.
             if self.st.touched {
@@ -415,19 +566,55 @@ impl<A: App> Host<A> {
             }
             return;
         };
-        self.st.animated = Damage::default();
+        let pieces = if damage.collects() {
+            damage.pieces(scale, w, h)
+        } else {
+            Vec::new()
+        };
+        // One call per rectangle only when the application asked for it and there is more than
+        // one; otherwise the old one-call frame with the union, unchanged.
+        let regioned = pieces.len() > 1;
+        self.st.animated.reset();
         let Some(win) = self.win.as_mut() else {
             return;
         };
-        let clip = (dev.0 as i32, dev.1 as i32, dev.2 as i32, dev.3 as i32);
-        let damage = Rect::new(
-            dev.0 as f32 / scale,
-            dev.1 as f32 / scale,
-            (dev.2 - dev.0) as f32 / scale,
-            (dev.3 - dev.1) as f32 / scale,
-        );
         self.anim.begin_frame(now);
-        {
+        if regioned {
+            let key = self.frost.key().copied();
+            let frosted = key.is_some();
+            let Win { window, bmp, .. } = win;
+            let st = &mut self.st;
+            let proxy = &self.proxy;
+            let app = &mut self.app;
+            paint_regions(
+                bmp,
+                &mut self.gfx,
+                &mut self.anim,
+                &mut self.timers,
+                key,
+                scale,
+                &pieces,
+                |p, anim, timers, region, clip| {
+                    let mut cx = Cx {
+                        window,
+                        anim: &mut *anim,
+                        timers: &mut *timers,
+                        proxy,
+                        st: &mut *st,
+                        now,
+                        drawing: Some((clip, frosted)),
+                    };
+                    app.draw(&mut cx, p, region);
+                },
+            );
+        } else {
+            let clip = (
+                union.0 as i32,
+                union.1 as i32,
+                union.2 as i32,
+                union.3 as i32,
+            );
+            let damage = region_rect(union, scale);
             let Win { window, bmp, .. } = win;
             let mut p = Painter::new(bmp, &mut self.gfx, scale);
             p.set_frost_key(self.frost.key().copied());
@@ -435,6 +622,7 @@ impl<A: App> Host<A> {
             let mut cx = Cx {
                 window,
                 anim: &mut self.anim,
+                timers: &mut self.timers,
                 proxy: &self.proxy,
                 st: &mut self.st,
                 now,
@@ -443,7 +631,8 @@ impl<A: App> Host<A> {
             self.app.draw(&mut cx, &mut p, damage);
         }
         self.st.deadlines.anim = self.anim.end_frame();
-        present(&mut win.surface, &win.bmp, dev, self.frost.key());
+        let presented: &[(u32, u32, u32, u32)] = if regioned { &pieces } else { &[union] };
+        present(&mut win.surface, &win.bmp, presented, self.frost.key());
         self.sync_window();
         // Asked for before the frame (and kept for it by `after`), or said during it: the tree
         // reads the layout just drawn. A redraw asked for while drawing does not count.
@@ -456,7 +645,12 @@ impl<A: App> Host<A> {
     fn present_all(&mut self) {
         if let Some(win) = self.win.as_mut() {
             let (w, h) = (win.bmp.width, win.bmp.height);
-            present(&mut win.surface, &win.bmp, (0, 0, w, h), self.frost.key());
+            present(
+                &mut win.surface,
+                &win.bmp,
+                &[(0, 0, w, h)],
+                self.frost.key(),
+            );
         }
     }
 
@@ -488,9 +682,16 @@ impl<A: App> Host<A> {
             WindowEvent::Resized(_) => {
                 self.read_window();
                 if self.st.vis.hidden() {
-                    // Minimized: nothing to lay out, and the size kept is the last real one.
-                    // A tree kept for a frame that will not come now is built at once.
+                    // Minimized or covered: nothing to lay out, and the size kept is the last
+                    // real one. A tree kept for a frame that will not come now is built at
+                    // once. A window the application hid is not OS-hidden: its new size is
+                    // still delivered, so it can lay out while away.
+                    let tell = self.st.vis.app_hidden() && !self.st.vis.os_hidden();
                     self.after();
+                    if tell {
+                        let (w, h) = self.st.size;
+                        return Some(Event::Resize { w, h });
+                    }
                     return None;
                 }
                 self.st.damage.all();
@@ -674,20 +875,11 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         let now = Instant::now();
         self.call(now, |app, cx| app.start(cx));
         // The first frame, to the hidden window; then the tree, read from what it laid out;
-        // then shown, and presented again.
-        self.st.damage.all();
-        self.frame(now);
-        self.refresh_tree(true);
-        window.set_visible(true);
-        self.present_all();
-        // The system decides about the focus; if the window did not get it, the frame drawn
-        // focused is drawn again (winit sends no `Focused(false)` for a focus it never gave).
-        if self.st.focused && !window.has_focus() {
-            self.st.focused = false;
-            if self.st.backdrop != Backdrop::Off {
-                self.st.damage.all();
-            }
-            self.call(now, |app, cx| app.event(cx, Event::Focus(false)));
+        // then shown, and presented again. An application that hid the window in `start` (a
+        // launch to the tray) is not shown; one that showed itself there has already been
+        // drawn and shown by `after`.
+        if !self.st.vis.app_hidden() && !self.st.shown {
+            self.reveal(now, false);
         }
         // The contrast switch reaches no winit event on Windows: the host watches it (a no-op
         // elsewhere). After the first frame: it waits a few ms for its window.
@@ -766,10 +958,14 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
+        // A show asked for from a draw (where `after` does not run) is done here.
+        if std::mem::take(&mut self.st.show) {
+            self.show(now);
+        }
         let hidden = self.st.vis.hidden();
         let due = self.st.deadlines.take_due(now, hidden);
         if due.anim {
-            let moving = self.st.animated;
+            let moving = self.st.animated.take();
             let (w, h) = self
                 .win
                 .as_ref()
@@ -785,19 +981,51 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         if due.timer {
             self.call(now, |app, cx| app.event(cx, Event::Wake(now)));
         }
+        // Named timers come whether or not the window is seen: the names due when the turn
+        // begins, each still waiting and due when its turn comes. Anything set meanwhile,
+        // even at `now`, waits for the next turn, so re-arming from a callback cannot spin.
+        let fired = if let Some(win) = self.win.as_ref() {
+            let window = &win.window;
+            let st = &mut self.st;
+            let anim = &mut self.anim;
+            let proxy = &self.proxy;
+            let app = &mut self.app;
+            fire_due_timers(&mut self.timers, now, |timers, name| {
+                {
+                    let mut cx = Cx {
+                        window,
+                        anim: &mut *anim,
+                        timers: &mut *timers,
+                        proxy,
+                        st: &mut *st,
+                        now,
+                        drawing: None,
+                    };
+                    app.timer_fired(&mut cx, name);
+                }
+                !st.exit
+            })
+        } else {
+            false
+        };
+        if fired {
+            self.after();
+        }
         if self.st.exit {
             el.exit();
             return;
         }
-        if !self.st.damage.is_empty()
-            && !hidden
+        // An application that hid or showed the window in a timer callback changed this.
+        let hidden = self.st.vis.hidden();
+        if wants_frame(hidden, &self.st.damage)
             && !self.requested
             && let Some(win) = self.win.as_ref()
         {
             self.requested = true;
             win.window.request_redraw();
         }
-        el.set_control_flow(match self.st.deadlines.next(hidden) {
+        let next = next_wake(&self.st.deadlines, &self.timers, hidden);
+        el.set_control_flow(match next {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
         });

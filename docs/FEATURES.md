@@ -1029,8 +1029,9 @@ directory: `host.rs` (the events, the trait, the config, the proxy), `host/cx.rs
   optional dependency.
 
 Deliberately not here (row W1b): tabs and several windows, the Linux client-drawn shadow and
-corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases,
-regions with their own damage.
+corners, a backdrop off Windows (it needs a present with alpha), macOS specifics, key releases.
+(Regions with their own damage, named timers and a hidden-but-alive window came later; see the
+K1 section below.)
 
 Run: 34 unit tests of the pure parts with `host,a11y` (33 with `host`): the damage join
 against a plain min and max over random rectangles, the outward device rounding against fine
@@ -2161,3 +2162,102 @@ Known limits, for later: `Painter::dev_x`/`dev_y` saturate a product to `i32::MA
 add the painter's offset, which overflows in debug for a coordinate near 2.2e9. That was
 already true before this branch; `Picture` only inherits it. A tall source scaled down can
 still make `prepare_image` allocate hundreds of MiB, as above.
+
+## Named timers, a hidden window and separate damage regions (`mdshared_ui::host`, roadmap K1/BT3, 2026-11-26, `feat/k1-host-one-window`)
+
+Three additive pieces of the one-window host. Every existing public signature, `host::Event`
+and every other enum stayed as it was: the new behaviour is new methods on `Cx`, two new
+defaulted methods on `App`, and a new module. An application that changes nothing behaves
+exactly as before.
+
+- **Named timers.** `Cx::timer_at(name, at)` sets a timer under a name, or moves it when that
+  name already waits; `Cx::cancel_timer(name)` removes it and answers whether one was waiting.
+  When one is due the application gets `App::timer_fired(cx, name)`, a new defaulted trait
+  method (nothing by default). A turn takes a snapshot of the names due when it begins
+  (earliest first, set order at one instant) and fires each only while it is still waiting and
+  still due: a callback may cancel a sibling that was also due, or move it later, and that is
+  obeyed. Anything set during the turn, even at `now`, waits for the next turn, so a callback
+  that re-arms its own name at `now` fires once per turn instead of spinning the loop. They
+  join the one wake-up: the loop takes the earliest of the animator's deadline,
+  `Cx::wake_at` and every named timer, so any number of timers is still one
+  `ControlFlow::WaitUntil`. A timer set in the past is due at the next turn of the loop. The
+  model is `host/timers.rs` (`NamedTimers`: `set`, `cancel`, `at`, `next`, `len`,
+  `due_at`, `take_if_due`), pure and on passed instants; the turn's loop is
+  `run::fire_due_timers`, and the fold with the animator is `frame::next_wake`.
+- **A window hidden but alive.** `Cx::hide_window` hides the window for a close to a tray;
+  `Cx::show_window` asks the host to show it again; `Cx::hidden` answers whether the application
+  hid it. `Visibility` gained an `app` flag beside `occluded` and `minimized`, so every check
+  that reads `hidden()` (`frame`, `after`, `about_to_wait`, the redraw request) now also covers
+  an application-hidden window: no frame is drawn or presented, no redraw is asked of winit, but
+  the animator's deadline is dropped while timers, named timers and worker messages still come.
+  Hiding also clears `focused` (a window off screen has no keyboard). A `Resized` while
+  application-hidden is still delivered as `Event::Resize`, so the application can lay out
+  while away; while OS-minimized it is swallowed as before. Showing is done by the loop, after
+  the call: it draws the whole window and presents it while still hidden, then calls
+  `set_visible(true)` and presents again, so the client area is never seen undrawn (the same
+  path as the first show at launch). The keyboard is read again after showing, and
+  `Event::Focus` is sent when it differs; a window hidden in `App::start` is not focused. No
+  tray icon is provided: an application adds one with `crate::tray` (or a second launch, or a
+  shortcut) and calls `show_window` from it. The window keeps its place, size and state; it is
+  not minimized or closed. **On Wayland `hide_window` does nothing** and the flag is not set:
+  winit's `set_visible` is a no-op on a Wayland surface, so hiding would only freeze the
+  window; it keeps drawing and `hidden` stays false. On macOS, `orderOut` is likely reported as
+  `Occluded`, so a resize while application-hidden is then swallowed as OS-hidden and the
+  first frame after showing comes on `Occluded(false)`; this is not verified. On X11 the first
+  present may come before the map; an Expose heals it (also not verified here).
+
+Known limits on the platforms not run here: on X11 a re-show can flip focused → unfocused →
+focused, because focus arrives after the map; and `Focus(true)` can be delivered twice on a
+successful re-show, once from `reveal` and once from winit's buffered event.
+
+- **Regions with their own damage.** `App::damage_regions()`, a new defaulted method answering
+  false and read once before `App::start`, opts an application into one `draw` call per damage
+  rectangle instead of one for their union. An application that does not opt in keeps the old
+  O(1) union and allocates nothing: no pieces are collected at all. `Damage` keeps each
+  rectangle as a piece beside the union, joining overlaps as they are added (a join that grows
+  a piece restarts the scan, so pieces are pairwise disjoint in logical px) and capping the list
+  at 16; beyond that the union is drawn as one rectangle, so a long-hidden or minimized window
+  cannot grow it without bound. `Damage::pieces` rounds each piece outwards to device px on its
+  own; at a fractional scale two logical neighbours can round to share one device column, which
+  is copied twice (the same pixels). `present` copies and presents several device rectangles
+  with `present_with_damage`, so the gap between a caret's blink and a list's scroll is neither
+  drawn nor sent to the window. The animator's group is reset before each region's `draw`, as
+  `begin_frame` does for the one-call frame, so a group set in one does not leak into the next.
+  A frame with one piece, or an application that did not opt in, keeps the old one-call,
+  one-rectangle path exactly.
+
+New public API: `Cx::{timer_at, cancel_timer, hide_window, show_window, hidden}`,
+`App::{timer_fired, damage_regions}`. Everything else is private: `NamedTimers`, the pieces of
+`Damage`, `paint_regions`, `next_wake`, `can_hide` and `present`.
+
+Tests (all in `host_tests.rs` and the new `timers_tests.rs`): the earliest named timer wins; a
+name is moved rather than duplicated; a cancelled one is gone (and cancelling twice is false);
+a turn snapshots its due names in firing order and takes each once; a timer moved later
+mid-turn is not taken by that turn; a timer in the past is due at once and a later one waits;
+the loop's wake is the earliest of the animator and a named timer, and a hidden window drops
+only the animator's; the firing loop (`run::fire_due_timers`) fires a callback that re-arms
+itself at `now` once per turn and ends, obeys a callback that cancels a sibling, and fires a
+moved sibling once later; an application-hidden window is hidden until shown (also while
+covered) and `wants_frame` — the function both `after` and the loop use — says no draw while it
+is hidden, with timers still coming; two far-apart rectangles stay two pieces with the gap in
+the union but in neither piece; a growing join restarts the scan; random adds leave pairwise
+disjoint pieces; 10,000 disjoint rectangles stay at most 16 pieces and fall back to the union,
+while a non-opted-in application keeps no pieces; a whole window is one piece and pieces outside
+the bitmap are left out; and the host's region loop (`paint_regions`, the code `Host::frame`
+runs) paints two pieces into a bitmap with a real clip each, leaving the gap at the old frame.
+Each new or changed test was seen failing under a deliberately broken implementation before it
+passed: appending instead of moving, `next` answering the maximum, ignoring the application's
+hidden flag, `pieces` answering the union, no cap, the old non-restarting join, and the old
+open-ended firing loop (the re-arm test panicked on its iteration guard instead of hanging, so
+a re-armed timer was fired again and again in one turn). The files were restored afterwards.
+
+Run on Windows 11, `CARGO_TARGET_DIR=E:/mds-target/k1`: `cargo run -p mdshared-ui --features
+host --example host_regions -- --seconds 2` drew two full frames (the first, and the unfocused
+redraw), then at every 530 ms tick one *frame* whose two `draw` calls were `24,72 360x32` (the
+field's caret) and `24,136 480x260` (the list), printed by the application, and closed on the
+one-shot timer; the gap between the two rectangles was never drawn. `cargo fmt --all --check`,
+the workspace clippy and the workspace tests with `host,a11y` all passed (counts in the commit
+message). Not run on Linux or macOS, so `can_hide`'s Wayland branch is compiled only there and
+was not run. **Not seen by a person**: the window itself, the blink and the scroll, and the
+close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
+makes close-to-tray usable is out of scope and is the application's to add.

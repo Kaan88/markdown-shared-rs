@@ -145,3 +145,7 @@ required-features = ["host"]
 [[example]]
 name = "host"
 required-features = ["host"]
+
+[[example]]
+name = "host_regions"
+required-features = ["host"]
