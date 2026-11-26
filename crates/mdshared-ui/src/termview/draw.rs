@@ -479,7 +479,13 @@ impl Row<'_> {
                 );
                 font.draw(
                     p.bmp,
-                    clip,
+                    // Each span has its own contrast floor. Keeping ink inside it also lets a
+                    // narrow repaint reproduce the full frame without visiting its neighbours.
+                    if self.background.is_some() {
+                        rect(x, x + w)
+                    } else {
+                        clip
+                    },
                     cl.ch,
                     style,
                     self.metrics,
