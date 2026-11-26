@@ -85,16 +85,15 @@ impl Screen {
     /// the screen is not cut and nothing is lost when the screen widens again.
     ///
     /// - A hard line break, one whose line is not marked as wrapped, stays where it is.
-    /// - The blank cells at the end of a line are not text and are dropped, so the padding of a
-    ///   row does not grow a space each time the width changes. The blank cells at the end of a
-    ///   line that goes on in the next one are text, though (a space written where the line
-    ///   broke off), and are kept; only the one cell a wide character was moved out of is
-    ///   dropped. A blank cell the program gave a colour is something on the screen and is kept.
+    /// - Only the cells a line holds text in ([`Line::text_len`]) are text, so the padding of a
+    ///   row does not grow a space each time the width changes, whatever its colour, while a
+    ///   space written where the line broke off is kept.
     /// - A character two cells wide is never cut: when it does not fit in the last column of the
     ///   row, that column stays empty and the character goes in the row below.
     /// - The cursor stays on the same character of the same line of text; a cursor past the end
     ///   of that text keeps its place as far as the new width has columns for it, and a cursor
-    ///   that hangs past the right edge keeps its pending wrap.
+    ///   that hangs past the right edge keeps its pending wrap. The saved cursor of `ESC 7`,
+    ///   `CSI s` and mode 1048 follows its text the same way.
     /// - The grid stays at the end of the buffer, so the rows the new wrapping saved come back
     ///   out of the scrollback and the rows it added go into it, up to the scrollback's limit
     ///   (the oldest go when the new wrapping needs more lines than it keeps). The cursor's line
@@ -106,8 +105,9 @@ impl Screen {
     ///
     /// The alternate screen is not reflowed: it is a picture the program drew cell by cell, and
     /// it is cut and padded exactly as [`resize`](Self::resize) does, which is also what a change
-    /// of height alone gives. The two are the same call then, so a caller that wants no reflow at
-    /// all uses [`resize`](Self::resize).
+    /// of height alone gives. The primary screen behind it is a text, though, and is joined and
+    /// wrapped again as if it were shown, its cursor and scrollback included, so that leaving the
+    /// alternate screen gives it back re-wrapped rather than cut.
     ///
     /// A selection cannot survive the re-wrap: its line numbers and columns point into a buffer
     /// that was joined and wrapped again, so [`Selection::follow`](crate::select::Selection::follow)
@@ -118,17 +118,88 @@ impl Screen {
         if (cols, rows) == (self.cols, self.rows) {
             return;
         }
-        // A picture drawn cell by cell is not a text to re-wrap, and a new height alone leaves
-        // every line of text as it was.
-        if self.modes.alt_screen || cols == self.cols {
+        // A new height alone leaves every line of text as it was.
+        if cols == self.cols {
             self.resize(cols, rows);
             return;
         }
-        let cursor = self.scrollback.len() + self.row;
-        let grid = std::mem::take(&mut self.grid);
+        let alt = self.modes.alt_screen;
+        if alt {
+            // The picture the program drew is cut and padded, and what falls off its top is
+            // not history.
+            let mut row = self.row;
+            let _ = fit_rows(&mut self.grid, rows, cols, &mut row);
+            self.row = row;
+            for line in &mut self.grid {
+                line.resize(cols);
+            }
+        }
+        // The buffer that is the primary one: the grid when it is shown, the stored one when
+        // the alternate screen is. Its cursor's column is the saved one, which is where the
+        // program left it, unless it never saved one.
+        let saved = self.saved[0].map(|s| (s.row, s.col, s.pending));
+        let (grid, cursor) = if alt {
+            let (col, pending) = self.saved[0].map_or((self.col, false), |s| (s.col, s.pending));
+            let main = self.main.take().unwrap_or_default();
+            (main, (self.main_row, col, pending))
+        } else {
+            (
+                std::mem::take(&mut self.grid),
+                (self.row, self.col, self.pending),
+            )
+        };
+        let out = self.reflow_buffer(grid, cursor, saved, cols, rows);
+        if alt {
+            self.main = Some(out.grid);
+            self.main_row = out.row;
+        } else {
+            self.grid = out.grid;
+            self.row = out.row;
+            self.col = out.col;
+            self.pending = out.pending && self.modes.autowrap;
+        }
+        if let (Some(saved), Some((row, col, pending))) = (self.saved[0].as_mut(), out.saved) {
+            saved.row = row;
+            saved.col = col;
+            saved.pending = pending;
+        }
+        self.fit_tabs(cols);
+        (self.cols, self.rows) = (cols, rows);
+        (self.top, self.bottom) = (0, rows - 1);
+        if alt {
+            self.row = self.row.min(rows - 1);
+            self.col = self.col.min(cols - 1);
+            self.pending = false;
+        }
+        self.dirty = vec![true; rows];
+        self.reflows = self.reflows.wrapping_add(1);
+    }
+
+    /// Re-wraps one buffer, its scrollback first, at `cols` by `rows`: the grid that is shown,
+    /// or the main screen while the alternate one is. `cursor` and `saved` are places in `grid`
+    /// (a row, a column and whether the place hangs past a full row), and the result gives the
+    /// grid that fits, where the cursor is on it and, when it was given, where the saved place
+    /// is. The lines that do not fit the grid go into the scrollback.
+    fn reflow_buffer(
+        &mut self,
+        grid: Vec<Line>,
+        cursor: (usize, usize, bool),
+        saved: Option<(usize, usize, bool)>,
+        cols: usize,
+        rows: usize,
+    ) -> Reflowed {
         let mut lines: Vec<Line> = self.scrollback.drain(..).collect();
+        let first = lines.len();
         lines.extend(grid);
-        let (mut lines, place) = reflow::reflow(lines, cursor, self.col, self.pending, cols);
+        let last = lines.len().saturating_sub(1);
+        let spot = |(row, col, pending): (usize, usize, bool)| reflow::Spot {
+            line: (first + row).min(last),
+            col,
+            pending,
+        };
+        let (mut lines, places) =
+            reflow::reflow(lines, [Some(spot(cursor)), saved.map(spot)], cols);
+        let place = places[0].unwrap_or_default();
         // The grid shows the end of the buffer, or the cursor's line at its top when the text
         // below it is longer than the screen: then the lines past the bottom are lost, as the
         // lines below the cursor are when rows go.
@@ -141,16 +212,19 @@ impl Screen {
         while grid.len() < rows {
             grid.push(Line::blank(cols, Cell::BLANK));
         }
-        let row = place.line - start;
-        self.grid = grid;
-        self.fit_tabs(cols);
-        (self.cols, self.rows) = (cols, rows);
-        (self.top, self.bottom) = (0, rows - 1);
-        self.row = row.min(rows - 1);
-        self.col = place.col.min(cols - 1);
-        self.pending = place.pending && self.modes.autowrap;
-        self.dirty = vec![true; rows];
-        self.reflows = self.reflows.wrapping_add(1);
+        Reflowed {
+            row: place.line.saturating_sub(start),
+            col: place.col,
+            pending: place.pending,
+            saved: places[1].map(|p| {
+                (
+                    p.line.saturating_sub(start).min(rows.saturating_sub(1)),
+                    p.col,
+                    p.pending,
+                )
+            }),
+            grid,
+        }
     }
 
     /// How many times the width of the screen was reflowed. A selection made under an older
@@ -168,4 +242,14 @@ impl Screen {
             *stop = c % 8 == 0;
         }
     }
+}
+
+/// What a re-wrap of one buffer gave: the grid that fits the screen, and where the cursor and
+/// the saved place are on it.
+struct Reflowed {
+    grid: Vec<Line>,
+    row: usize,
+    col: usize,
+    pending: bool,
+    saved: Option<(usize, usize, bool)>,
 }

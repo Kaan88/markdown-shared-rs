@@ -289,21 +289,55 @@ fn the_scrollback_is_reflowed_and_the_ring_keeps_its_limit() {
 }
 
 #[test]
-fn the_alternate_screen_is_resized_as_a_plain_resize_resizes_it() {
+fn the_alternate_screen_is_cut_and_the_main_screen_behind_it_is_reflowed() {
     let text = "main line that is long\r\nsecond\x1b[?1049h\
         the alternate screen text is long enough to wrap\r\nand more";
-    let mut a = fed(20, 4, text);
-    let mut b = fed(20, 4, text);
-    assert!(a.modes().alt_screen);
-    a.resize_reflow(8, 4);
-    b.resize(8, 4);
-    assert_same(&a, &b);
-    // The main screen behind it was cut too, so it comes back as it always did.
-    a.feed(b"\x1b[?1049l");
-    b.feed(b"\x1b[?1049l");
-    assert!(!a.modes().alt_screen);
-    assert_same(&a, &b);
-    assert_eq!(grid(&a), "main lin\nng\nsecond\n");
+    let mut s = fed(20, 4, text);
+    let mut plain = fed(20, 4, text);
+    assert!(s.modes().alt_screen);
+    s.resize_reflow(8, 4);
+    plain.resize(8, 4);
+    // The alternate screen's own picture is cut, as `resize` cuts it: the same rows.
+    assert_eq!(grid(&s), grid(&plain));
+    // The main screen behind it is joined and wrapped again, so leaving it gives it back whole.
+    s.feed(b"\x1b[?1049l");
+    plain.feed(b"\x1b[?1049l");
+    assert_eq!(
+        grid(&plain),
+        "main lin\nng\nsecond\n",
+        "the plain call cut it"
+    );
+    assert_eq!(logical(&s), ["main line that is long", "second"]);
+    assert_eq!(
+        s.scrollback_line(0).map(Line::text).as_deref(),
+        Some("main lin"),
+        "and the rest of the line is on the screen below it"
+    );
+    check(&s);
+}
+
+#[test]
+fn the_saved_cursor_follows_its_text_through_a_reflow() {
+    // ESC 7 keeps a place and ESC 8 goes back to it: after a re-wrap the place is on the same
+    // character, not on the same row.
+    let mut s = fed(20, 4, "line one\r\nline two\r\nprompt$ \x1b7");
+    s.resize_reflow(6, 4);
+    s.feed(b"\x1b8");
+    let c = s.cursor();
+    assert_eq!(s.row_text(c.row), "$");
+    assert_eq!(c.col, 2);
+}
+
+#[test]
+fn the_main_screen_behind_the_alternate_one_is_reflowed_with_its_saved_cursor() {
+    let mut s = fed(20, 4, "line one\r\nline two\r\nprompt$ \x1b[?1049h");
+    s.resize_reflow(6, 4);
+    s.feed(b"\x1b[?1049l");
+    let c = s.cursor();
+    assert_eq!(s.row_text(c.row), "$");
+    assert_eq!(c.col, 2);
+    assert_eq!(logical(&s), ["line one", "line two", "prompt$"]);
+    check(&s);
 }
 
 #[test]
