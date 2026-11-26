@@ -59,6 +59,7 @@ pub mod pins;
 pub mod place;
 pub mod plan;
 pub mod platform;
+pub mod richtext;
 pub mod rows;
 pub mod scroll;
 pub mod scrollarea;
