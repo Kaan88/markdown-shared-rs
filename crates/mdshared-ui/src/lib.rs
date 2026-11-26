@@ -5,6 +5,10 @@
 //! lists and toggle switches ([`dropdown`], [`toggle`]), a colour picker ([`colour_picker`]),
 //! expanders, anchored flyouts, table
 //! columns and splitters, link buttons, the cursors the widgets ask for, the models
+//! of lists, grids and selections, a scroll area ([`scrollarea`]), the keyboard focus over the
+//! widgets a frame declares
+//! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), and with the
+
 //! of lists, grids and selections, the keyboard focus over the widgets a frame declares
 //! ([`focus`]), animation ([`anim`]), the look as a user setting ([`appearance`]), pictures kept
 //! at their drawn size ([`picture`]), and with the
@@ -60,6 +64,7 @@ pub mod plan;
 pub mod platform;
 pub mod rows;
 pub mod scroll;
+pub mod scrollarea;
 pub mod sections;
 pub mod seek;
 pub mod segments;
