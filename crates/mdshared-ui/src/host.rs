@@ -22,16 +22,17 @@
 //! any thread with the [`Proxy`] that [`Cx::proxy`] gives.
 //!
 //! **Frames.** The application asks for a redraw of a rectangle ([`Cx::request_redraw`]); the
-//! rectangles asked for before a frame are kept, a frame draws them ([`App::draw`] is given one
-//! at a time and the painter is clipped to it when [`App::damage_regions`] answers true, else
-//! once with the one rectangle that holds them all), and each is sent to the window
-//! (softbuffer's `present_with_damage`). Rectangles that overlap are joined, so a frame never
-//! draws a pixel twice. The bitmap keeps the rest of the last frame. A resize, a change of
-//! scale, a change of the backdrop or of its palette, and the window coming back from being
-//! covered, minimized or hidden by the application repaint everything. A window that is
-//! covered (winit's `Occluded`), minimized (a size of zero, or `is_minimized`; winit 0.30 never
-//! says `Occluded` on Windows) or hidden by the application ([`Cx::hide_window`]) is not drawn
-//! until it is seen again.
+//! rectangles asked for before a frame are kept. An application that did not ask for regions
+//! ([`App::damage_regions`] is false, the default) is drawn once and sent one rectangle, the
+//! one that holds them all, as before. One that did gets one `draw` call and one presented
+//! rectangle per piece, the painter clipped to each (softbuffer's `present_with_damage`).
+//! Pieces are disjoint in logical px and overlap is joined; at a fractional scale two
+//! neighbours can round to share one device column, which is copied twice harmlessly. The
+//! bitmap keeps the rest of the last frame. A resize, a change of scale, a change of the
+//! backdrop or of its palette, and the window coming back from being covered, minimized or
+//! hidden by the application repaint everything. A window that is covered (winit's `Occluded`),
+//! minimized (a size of zero, or `is_minimized`; winit 0.30 never says `Occluded` on Windows)
+//! or hidden by the application ([`Cx::hide_window`]) is not drawn until it is seen again.
 //!
 //! **Every animated value on every frame.** A frame that draws only its damage still ends the
 //! animator's frame, and [`Animator::end_frame`](crate::anim::Animator::end_frame) forgets every
@@ -59,9 +60,10 @@
 //! is the application's, which drags the window by [`Cx::drag_window`] and gets snap layouts by
 //! [`Cx::set_maximize_button`]. The application may hide the window but keep it alive, for a
 //! close to a tray ([`Cx::hide_window`], [`Cx::show_window`]): timers and messages still come,
-//! nothing is drawn while it is hidden, and it is drawn whole when shown again. The tray icon
-//! that would bring it back is the application's to add ([`crate::tray`]); the host provides no
-//! icon of its own.
+//! nothing is drawn while it is hidden, and it is drawn whole when shown again. On Wayland
+//! `set_visible` is a no-op, so there `hide_window` does nothing and the window keeps drawing.
+//! The tray icon that would bring it back is the application's to add ([`crate::tray`]); the
+//! host provides no icon of its own.
 //!
 //! **The backdrop** (Windows only). Mica or Acrylic ([`Cx::set_backdrop`]) is asked for through
 //! [`frost::Frost`](crate::frost::Frost): never under high contrast
@@ -277,22 +279,28 @@ pub trait App: 'static {
     }
 
     /// The named timer `name`, set with [`Cx::timer_at`], came due. It is gone: ask for another
-    /// with [`Cx::timer_at`] for a repeating timer. When several come at once this is called
-    /// once per name, in the order the timers were set. Nothing by default.
+    /// with [`Cx::timer_at`] for a repeating timer. Timers due in the same turn come one at a
+    /// time, earliest first and in the order they were set at one instant: cancelling or moving
+    /// a sibling from here is obeyed, and the loop looks again after every call. Nothing by
+    /// default.
     fn timer_fired(&mut self, cx: &mut Cx<'_, Self::Message>, name: &str) {
         let _ = (cx, name);
     }
 
     /// Whether [`draw`](Self::draw) wants one call per damage rectangle instead of one call for
     /// the rectangle holding them all. False by default, which draws once with the union and is
-    /// what every application did before this existed.
+    /// what every application did before this existed; the host then pays one rectangle and no
+    /// allocation for the damage, as before.
     ///
     /// When true, a frame with two far-apart rectangles (a blinking caret and a scrolling list)
     /// makes two `draw` calls, each given one rectangle and clipped to it, and presents the two
     /// rectangles with `present_with_damage`: the gap between them is neither drawn nor sent to
-    /// the window. Rectangles that overlap are joined, so no pixel is drawn twice. Drawing the
-    /// whole scene in every call is correct (the clip cuts it); draw only the rectangle to
-    /// save the work. `damage_regions` is read once per frame.
+    /// the window. Overlapping rectangles are joined, so the pieces are disjoint in logical px;
+    /// at a fractional scale the outward rounding can still make two neighbours share one
+    /// device column, which is copied twice (the same pixels). At most sixteen pieces are kept;
+    /// beyond that the union is drawn as one rectangle, so a long-hidden window cannot grow the
+    /// list without bound. Drawing the whole scene in every call is correct (the clip cuts it);
+    /// draw only the rectangle to save the work. Read once, when the host starts, not per frame.
     fn damage_regions(&self) -> bool {
         false
     }

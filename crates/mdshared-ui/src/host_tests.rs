@@ -171,7 +171,7 @@ fn merging_joins_the_rectangles_and_keeps_a_whole_window() {
 fn two_far_apart_rectangles_stay_two_pieces_with_the_gap_between_them() {
     let a = Rect::new(10.0, 10.0, 20.0, 10.0);
     let b = Rect::new(200.0, 100.0, 20.0, 10.0);
-    let mut d = Damage::default();
+    let mut d = Damage::with_pieces(true);
     d.add(a);
     d.add(b);
     assert_eq!(d.regions(), &[a, b][..]);
@@ -192,13 +192,13 @@ fn two_far_apart_rectangles_stay_two_pieces_with_the_gap_between_them() {
 
 #[test]
 fn overlapping_rectangles_join_into_one_piece_and_touching_ones_do_not() {
-    let mut d = Damage::default();
+    let mut d = Damage::with_pieces(true);
     d.add(Rect::new(0.0, 0.0, 20.0, 20.0));
     d.add(Rect::new(10.0, 10.0, 20.0, 20.0));
     assert_eq!(d.regions(), &[Rect::new(0.0, 0.0, 30.0, 30.0)][..]);
     assert_eq!(d.pieces(1.0, 100, 100), vec![(0, 0, 30, 30)]);
 
-    let mut touching = Damage::default();
+    let mut touching = Damage::with_pieces(true);
     touching.add(Rect::new(0.0, 0.0, 10.0, 10.0));
     touching.add(Rect::new(10.0, 0.0, 10.0, 10.0));
     assert_eq!(
@@ -208,14 +208,90 @@ fn overlapping_rectangles_join_into_one_piece_and_touching_ones_do_not() {
 }
 
 #[test]
-fn a_whole_window_is_one_piece_and_pieces_outside_the_bitmap_are_left_out() {
+fn a_join_that_grows_the_rectangle_restarts_the_scan_so_no_pieces_overlap() {
+    // D, then A, then C: joining C with A grows it to reach D, which the scan had passed.
+    let mut d = Damage::with_pieces(true);
+    d.add(Rect::new(0.0, 0.0, 10.0, 5.0));
+    d.add(Rect::new(20.0, 0.0, 10.0, 10.0));
+    d.add(Rect::new(0.0, 8.0, 22.0, 22.0));
+    assert_eq!(d.regions(), &[Rect::new(0.0, 0.0, 30.0, 30.0)][..]);
+}
+
+#[test]
+fn random_rectangles_leave_pieces_that_never_overlap() {
+    let mut rng = Lcg(19);
+    for _ in 0..100 {
+        let mut d = Damage::with_pieces(true);
+        for _ in 0..10 {
+            d.add(Rect::new(
+                rng.below(200) as f32,
+                rng.below(200) as f32,
+                1.0 + rng.below(80) as f32,
+                1.0 + rng.below(80) as f32,
+            ));
+        }
+        let rs = d.regions();
+        for i in 0..rs.len() {
+            for j in i + 1..rs.len() {
+                let (a, b) = (rs[i], rs[j]);
+                let overlap =
+                    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom();
+                assert!(!overlap, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ten_thousand_disjoint_rectangles_stay_at_most_sixteen_pieces_and_the_union_holds_them() {
+    let mut d = Damage::with_pieces(true);
+    for i in 0..10_000 {
+        d.add(Rect::new(
+            (i % 100) as f32 * 20.0,
+            (i / 100) as f32 * 20.0,
+            5.0,
+            5.0,
+        ));
+    }
+    assert!(d.regions().len() <= KEEP_PIECES);
+    let pieces = d.pieces(1.0, 5000, 5000);
+    assert_eq!(
+        pieces.len(),
+        1,
+        "ten thousand pieces fall back to the union"
+    );
+    assert_eq!(pieces[0], (0, 0, 1985, 1985));
+    assert_eq!(d.device(1.0, 5000, 5000), Some((0, 0, 1985, 1985)));
+
+    // An application that did not ask keeps no pieces at all, as before.
+    let mut plain = Damage::default();
+    for i in 0..10_000 {
+        plain.add(Rect::new(i as f32 % 700.0, i as f32 / 700.0, 5.0, 5.0));
+    }
+    assert!(plain.regions().is_empty());
+    assert!(plain.pieces(1.0, 1000, 1000).is_empty());
+}
+
+#[test]
+fn an_application_that_did_not_ask_for_regions_keeps_no_pieces() {
     let mut d = Damage::default();
+    d.add(Rect::new(0.0, 0.0, 10.0, 10.0));
+    d.add(Rect::new(20.0, 20.0, 10.0, 10.0));
+    assert!(d.regions().is_empty());
+    assert!(d.pieces(1.0, 100, 100).is_empty());
+    // The frame still gets the union, exactly as before.
+    assert_eq!(d.device(1.0, 100, 100), Some((0, 0, 30, 30)));
+}
+
+#[test]
+fn a_whole_window_is_one_piece_and_pieces_outside_the_bitmap_are_left_out() {
+    let mut d = Damage::with_pieces(true);
     d.add(Rect::new(1.0, 1.0, 2.0, 2.0));
     d.all();
     assert!(d.regions().is_empty());
     assert_eq!(d.pieces(1.0, 100, 80), vec![(0, 0, 100, 80)]);
 
-    let mut far = Damage::default();
+    let mut far = Damage::with_pieces(true);
     far.add(Rect::new(5000.0, 5000.0, 10.0, 10.0));
     far.add(Rect::new(2.0, 3.0, 4.0, 5.0));
     assert_eq!(far.pieces(1.0, 100, 80), vec![(2, 3, 6, 8)]);
@@ -223,7 +299,8 @@ fn a_whole_window_is_one_piece_and_pieces_outside_the_bitmap_are_left_out() {
 }
 
 #[test]
-fn two_damage_regions_are_painted_without_the_union_between_them() {
+fn the_hosts_region_loop_paints_each_piece_and_leaves_the_gap() {
+    use super::run::paint_regions;
     use crate::gfx::{Gfx, Painter};
     use mdshared_text::Bitmap;
 
@@ -235,22 +312,54 @@ fn two_damage_regions_are_painted_without_the_union_between_them() {
     let hot = [200u8, 10, 10];
     let mut bmp = Bitmap::new(240, 120);
     let mut gfx = Gfx::new();
+    let mut anim = Animator::new();
+    anim.begin_frame(Instant::now());
     {
         let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
         p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), base);
     }
-    let mut d = Damage::default();
+    let mut d = Damage::with_pieces(true);
     d.add(Rect::new(10.0, 10.0, 20.0, 10.0));
     d.add(Rect::new(200.0, 80.0, 20.0, 10.0));
     let pieces = d.pieces(1.0, 240, 120);
     assert_eq!(pieces.len(), 2);
-    // The host's regioned frame: one painter and clip per piece.
-    for &(x0, y0, x1, y1) in &pieces {
-        let region = Rect::new(x0 as f32, y0 as f32, (x1 - x0) as f32, (y1 - y0) as f32);
-        let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
-        p.clip(region);
-        p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), hot);
-    }
+    // The loop `Host::frame` runs for a regions application, with a closure standing in for
+    // `App::draw`: one painter and clip per piece, the animator's group reset each time.
+    let mut drawn = Vec::new();
+    paint_regions(
+        &mut bmp,
+        &mut gfx,
+        &mut anim,
+        None,
+        1.0,
+        &pieces,
+        |p, anim, region, _clip| {
+            if drawn.is_empty() {
+                // A group set in the first region must not leak into the second.
+                anim.group("first");
+            }
+            drawn.push(region);
+            let _: f32 = anim.value_from(
+                format!("v{}", drawn.len()),
+                0.0,
+                1.0,
+                Motion::tween_ms(100, crate::anim::Easing::Linear),
+            );
+            p.fill(Rect::new(0.0, 0.0, 240.0, 120.0), hot);
+        },
+    );
+    let _ = anim.end_frame();
+    assert!(
+        anim.ungrouped_deadline().is_some(),
+        "the second region's value is not in the first region's group"
+    );
+    assert_eq!(
+        drawn,
+        vec![
+            Rect::new(10.0, 10.0, 20.0, 10.0),
+            Rect::new(200.0, 80.0, 20.0, 10.0)
+        ]
+    );
     for (x, y) in [(15, 15), (205, 85)] {
         assert_eq!(px(&bmp, x, y), hot, "a changed region at ({x}, {y})");
     }
@@ -423,31 +532,29 @@ fn a_timer_asked_of_the_animator_comes_back_as_its_deadline() {
 }
 
 #[test]
-fn named_timers_are_moved_cancelled_and_two_due_together_come_together() {
+fn the_loop_wakes_at_the_earliest_of_the_animator_and_a_named_timer() {
     let t0 = Instant::now();
     let ms = Duration::from_millis;
-    let mut t = NamedTimers::default();
-    t.set("caret", t0 + ms(500));
-    t.set("autosave", t0 + ms(200));
-    assert_eq!(t.next(), Some(t0 + ms(200)));
-    // Moving one by name keeps one timer of that name.
-    t.set("autosave", t0 + ms(900));
-    assert_eq!(t.next(), Some(t0 + ms(500)));
-    assert_eq!(t.at("autosave"), Some(t0 + ms(900)));
-    // A timer set in the past is due at the next turn.
-    t.set("late", t0 - ms(1));
-    assert_eq!(t.take_due(t0), vec!["late".to_string()]);
-    // Two due at once: both, in the order they were set.
-    t.set("a", t0 + ms(10));
-    t.set("b", t0 + ms(10));
+    let mut timers = NamedTimers::default();
+    timers.set("autosave", t0 + ms(500));
+    let anim = t0 + ms(16);
+    let d = Deadlines {
+        anim: Some(anim),
+        timer: None,
+    };
+    // The animator's deadline comes first.
+    assert_eq!(next_wake(&d, &timers, false), Some(anim));
+    // A named timer sooner than it wins.
+    timers.set("caret", t0 + ms(2));
+    assert_eq!(next_wake(&d, &timers, false), Some(t0 + ms(2)));
+    // Hidden, the animator's deadline is left out but the named timers stay.
+    assert_eq!(next_wake(&d, &timers, true), Some(t0 + ms(2)));
+    timers.cancel("caret");
+    assert_eq!(next_wake(&d, &timers, true), Some(t0 + ms(500)));
     assert_eq!(
-        t.take_due(t0 + ms(10)),
-        vec!["a".to_string(), "b".to_string()]
+        next_wake(&Deadlines::default(), &NamedTimers::default(), true),
+        None
     );
-    // Cancelling one leaves the other.
-    assert!(t.cancel("caret"));
-    assert_eq!(t.next(), Some(t0 + ms(900)));
-    assert!(!t.cancel("caret"));
 }
 
 // ---- clicks ----
@@ -597,6 +704,7 @@ fn a_window_the_application_hides_is_hidden_until_it_is_shown_again() {
     assert!(!v.set_app_hidden(true));
     assert!(v.hidden());
     assert!(v.app_hidden());
+    assert!(!v.os_hidden());
     // A repeat changes nothing.
     assert!(!v.set_app_hidden(true));
     // Shown: seen again once, which redraws everything.

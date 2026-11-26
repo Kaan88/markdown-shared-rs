@@ -58,19 +58,19 @@ impl NamedTimers {
         self.timers.len()
     }
 
-    /// Takes the timers due at or before `now`, in the order they were set. They are removed:
-    /// a repeating timer is asked for again by its application.
-    pub(super) fn take_due(&mut self, now: Instant) -> Vec<String> {
-        let mut fired = Vec::new();
-        self.timers.retain(|(name, at)| {
-            if *at <= now {
-                fired.push(name.clone());
-                false
-            } else {
-                true
-            }
-        });
-        fired
+    /// Takes the earliest timer due at or before `now`, if any. One at a time, so an
+    /// application that cancels or moves a sibling from [`App::timer_fired`](super::App::timer_fired)
+    /// is obeyed: the loop looks again after each callback. Timers due at the same instant come
+    /// in the order they were set.
+    pub(super) fn take_earliest_due(&mut self, now: Instant) -> Option<String> {
+        let i = self
+            .timers
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, at))| *at <= now)
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(i, _)| i)?;
+        Some(self.timers.remove(i).0)
     }
 }
 

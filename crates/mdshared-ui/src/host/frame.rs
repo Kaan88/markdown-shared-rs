@@ -11,26 +11,71 @@ use mdshared_text::Bitmap;
 use winit::window::Window;
 
 use super::input::clean_scale;
+use super::timers::NamedTimers;
 use crate::frost;
 use crate::gfx::Rect;
+
+/// The most pieces a frame keeps before it falls back to their union. Every `request_redraw`
+/// adds a piece when the application draws regions, and a window left minimized or hidden for
+/// long would otherwise collect them without end.
+pub(super) const KEEP_PIECES: usize = 16;
 
 /// The rectangles asked for before the next frame: the one that holds them all (what a frame
 /// drawn whole is given) and each rectangle on its own (what an application that draws regions
 /// separately is given, one call each).
 ///
-/// Rectangles that overlap are joined into one as they are added, so the pieces never overlap:
-/// an application drawing them one at a time paints every changed pixel once. Rectangles that
-/// only touch, or that are apart, stay pieces of their own.
+/// Pieces are kept only for an application that asked ([`Damage::with_pieces`]); every other
+/// one pays one rectangle and no allocation, as before, and its pieces are empty. Pieces that
+/// overlap are joined into one as they are added, and the list is capped at [`KEEP_PIECES`]:
+/// beyond that the union is drawn as one rectangle, so a long-hidden window cannot grow it
+/// without bound.
+///
+/// Pieces are disjoint in logical px. At a fractional scale the outward rounding can make two
+/// neighbours share one device column: the present then copies that column twice (the same
+/// pixels), which is harmless. Rectangles that only touch, or that are apart, stay pieces of
+/// their own.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Damage {
     /// The rectangle holding every piece; what the old one-rectangle frame drew.
     pub(super) rect: Option<Rect>,
     pub(super) full: bool,
-    /// The pieces, overlapping ones already joined. Empty while `full` is set.
+    /// The pieces, overlapping ones already joined. Empty while `full` is set, while the list
+    /// overflowed, and for an application that did not ask for regions.
     regions: Vec<Rect>,
+    /// Whether pieces are kept at all (the application's `damage_regions`).
+    collect: bool,
+    /// More than [`KEEP_PIECES`] disjoint pieces were asked for: the union is drawn instead.
+    capped: bool,
 }
 
 impl Damage {
+    /// Damage for an application that does (`true`) or does not draw regions separately.
+    pub(super) fn with_pieces(collect: bool) -> Damage {
+        Damage {
+            collect,
+            ..Damage::default()
+        }
+    }
+
+    /// Whether this damage keeps pieces.
+    pub(super) fn collects(&self) -> bool {
+        self.collect
+    }
+
+    /// Empties it for the next frame, keeping whether pieces are collected.
+    pub(super) fn reset(&mut self) {
+        self.rect = None;
+        self.full = false;
+        self.capped = false;
+        self.regions.clear();
+    }
+
+    /// Takes what was asked for and leaves it empty for the next frame, keeping whether pieces
+    /// are collected.
+    pub(super) fn take(&mut self) -> Damage {
+        std::mem::replace(self, Damage::with_pieces(self.collect))
+    }
+
     /// Adds `r`. A rectangle with a side that is not a positive number, or with a corner that
     /// is not a number, adds nothing.
     pub(super) fn add(&mut self, r: Rect) {
@@ -43,20 +88,28 @@ impl Damage {
             Some(o) => join(o, r),
         });
         // A whole-window frame already covers everything; only the union is needed then.
-        if !self.full {
+        if self.collect && !self.full && !self.capped {
             self.add_piece(r);
         }
     }
 
-    /// Adds `r` to the pieces, joining it with every piece it overlaps.
+    /// Adds `r` to the pieces, joining it with every piece it overlaps. A join makes `r` larger,
+    /// which can reach a piece the scan has already passed, so the scan restarts from the top.
     fn add_piece(&mut self, mut r: Rect) {
         let mut i = 0;
         while i < self.regions.len() {
             if overlaps(self.regions[i], r) {
                 r = join(self.regions.remove(i), r);
+                i = 0;
             } else {
                 i += 1;
             }
+        }
+        if self.regions.len() >= KEEP_PIECES {
+            // Too many to be worth several draws: the union, one rectangle.
+            self.capped = true;
+            self.regions.clear();
+            return;
         }
         self.regions.push(r);
     }
@@ -64,6 +117,7 @@ impl Damage {
     /// The whole window.
     pub(super) fn all(&mut self) {
         self.full = true;
+        self.capped = false;
         self.regions.clear();
     }
 
@@ -72,7 +126,7 @@ impl Damage {
     }
 
     /// The pieces asked for, in the order they were added (overlaps joined). Empty while the
-    /// whole window is due.
+    /// whole window is due, after the list overflowed, and when pieces are not collected.
     pub(super) fn regions(&self) -> &[Rect] {
         &self.regions
     }
@@ -87,7 +141,7 @@ impl Damage {
             return;
         }
         // `other`'s pieces carry its union too; the fallback covers a union set without a
-        // piece (nothing in this crate builds one, but the type allows it).
+        // piece (a full window, an overflowed list, or an application that kept none).
         if other.regions.is_empty() {
             if let Some(r) = other.rect {
                 self.add(r);
@@ -111,14 +165,18 @@ impl Damage {
         rect_device(self.rect?, scale, w, h)
     }
 
-    /// The damage in device px, one rectangle per piece (the whole bitmap when `full`), each
-    /// rounded outwards and cut to the bitmap. Pieces wholly outside the bitmap are left out.
+    /// The damage in device px, one rectangle per piece (the whole bitmap when `full`, the
+    /// union when the list overflowed), each rounded outwards and cut to the bitmap. Pieces
+    /// wholly outside the bitmap are left out.
     pub(super) fn pieces(&self, scale: f32, w: u32, h: u32) -> Vec<(u32, u32, u32, u32)> {
         if w == 0 || h == 0 {
             return Vec::new();
         }
         if self.full {
             return vec![(0, 0, w, h)];
+        }
+        if self.capped {
+            return self.device(scale, w, h).into_iter().collect();
         }
         self.regions()
             .iter()
@@ -151,9 +209,24 @@ fn rect_device(r: Rect, scale: f32, w: u32, h: u32) -> Option<(u32, u32, u32, u3
 }
 
 /// Whether a frame is wanted now: there is damage and the window can be seen. A window the
-/// application hid is not drawn, though its timers still come.
+/// application hid is not drawn, though its timers still come. Both the redraw request and
+/// `after` read this one decision.
 pub(super) fn wants_frame(hidden: bool, damage: &Damage) -> bool {
     !hidden && !damage.is_empty()
+}
+
+/// When the loop must wake next: the earliest of the animator's and one-shot deadlines
+/// ([`Deadlines::next`]) and the earliest named timer. A hidden window leaves out the
+/// animator's deadline inside `Deadlines::next`; named timers always count.
+pub(super) fn next_wake(
+    deadlines: &Deadlines,
+    timers: &NamedTimers,
+    hidden: bool,
+) -> Option<Instant> {
+    match (deadlines.next(hidden), timers.next()) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Whether the window can be seen: not covered (winit's `Occluded`, which winit 0.30 sends on
@@ -185,6 +258,11 @@ impl Visibility {
     /// Whether the application hid the window (whether or not it is also covered or minimized).
     pub(super) fn app_hidden(self) -> bool {
         self.app
+    }
+
+    /// Whether the system hid it: covered or minimized, whatever the application asked.
+    pub(super) fn os_hidden(self) -> bool {
+        self.occluded || self.minimized
     }
 
     /// The window was covered (`true`) or uncovered. True when that makes it seen again: the

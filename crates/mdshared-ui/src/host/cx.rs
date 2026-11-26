@@ -45,6 +45,11 @@ pub(super) struct Shared {
     pub(super) exit: bool,
     /// A call asked for a redraw or said the accessibility tree changed.
     pub(super) touched: bool,
+    /// The application asked to be shown again ([`Cx::show_window`]); the loop draws first and
+    /// then shows.
+    pub(super) show: bool,
+    /// The window has been shown once already (the first frame's show).
+    pub(super) shown: bool,
     /// Where the resize band is off ([`Cx::set_no_resize`]).
     pub(super) no_resize: Vec<Rect>,
 }
@@ -64,11 +69,13 @@ pub struct Cx<'a, M: 'static> {
 
 impl<M: 'static> Cx<'_, M> {
     /// Asks for `r` (logical px) to be drawn again. Rectangles asked for before the frame are
-    /// joined. One that is empty or not made of numbers asks for nothing. Outside
-    /// [`App::draw`](super::App::draw) it also has the accessibility tree asked for again; during
-    /// a draw (the next frame of an animation) it does not: say
-    /// [`accessibility_changed`](Self::accessibility_changed) when a frame moved what the tree
-    /// reports.
+    /// joined where they overlap; an application whose
+    /// [`damage_regions`](super::App::damage_regions) is true gets each piece as its own `draw`
+    /// call and present, while every other one frame draws the union. One that is empty or not
+    /// made of numbers asks for nothing. Outside [`App::draw`](super::App::draw) it also has the
+    /// accessibility tree asked for again; during a draw (the next frame of an animation) it
+    /// does not: say [`accessibility_changed`](Self::accessibility_changed) when a frame moved
+    /// what the tree reports.
     pub fn request_redraw(&mut self, r: Rect) {
         self.st.damage.add(r);
         if self.drawing.is_none() {
@@ -142,20 +149,31 @@ impl<M: 'static> Cx<'_, M> {
     /// closed: its place, size and state stay as they were. This needs no tray icon of its
     /// own; showing the window again is the application's (a tray icon, a second launch, a
     /// global shortcut), which the host does not provide.
+    ///
+    /// **On Wayland this does nothing.** A Wayland window is a surface of its own and winit's
+    /// `set_visible` is a no-op there, so hiding it would only freeze it. The flag is not set
+    /// and the window keeps drawing; an application that offers close to tray must not rely on
+    /// it hiding there ([`hidden`](Self::hidden) stays false). Windows and macOS hide it.
     pub fn hide_window(&mut self) {
+        if !super::run::can_hide(self.window) {
+            return;
+        }
         if !self.st.vis.app_hidden() {
             self.st.vis.set_app_hidden(true);
             self.window.set_visible(false);
+            // A window that is not on screen has no keyboard.
+            self.st.focused = false;
         }
     }
 
-    /// Shows a window hidden by [`hide_window`](Self::hide_window) again. It is drawn whole, as
-    /// the window may have been covered or resized while it was away. Nothing when it was not
-    /// hidden by the application.
+    /// Shows a window hidden by [`hide_window`](Self::hide_window) again. The host draws and
+    /// presents it once while it is still hidden, then shows it, so the client area is never
+    /// seen undrawn; the whole window is drawn because it may have been resized or covered
+    /// while away. The keyboard is read again (a window hidden from launch has none). Nothing
+    /// when the window was not hidden by the application.
     pub fn show_window(&mut self) {
         if self.st.vis.app_hidden() {
-            self.st.vis.set_app_hidden(false);
-            self.window.set_visible(true);
+            self.st.show = true;
             self.st.damage.all();
         }
     }
