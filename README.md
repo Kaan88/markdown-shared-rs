@@ -21,6 +21,7 @@ terminal): widgets, list models, animation and a terminal emulator's model.
 | `mdshared-app` | Path helpers, file reading, recent files, the settings file layer, single-instance hand-over, file watching, a worker thread and a worker pool, fuzzy matching, the texts of sizes, counts, times and dates (`fmt`), the hand-off between the two apps (`sister`), and updating in place: the release manifest, SHA-256, the file swap and the state behind the update bar (`updater::App` names the application; on Linux only an AppImage updates itself) |
 | `mdshared-fetch` | Downloads over WinHTTP (the system libcurl off Windows) with strict limits: the image fetcher with its disk cache, and `fetch_file` for an update. No dependency on the other crates |
 | `mdshared-term` | The model of a terminal emulator: a VT parser, the screen (cells, colours, scrollback, alternate screen, modes), cell selection, and keys and mouse events as bytes. No window, no process, no dependency at all; no application uses it yet |
+| `mdshared-pty` | A pseudo-terminal: a program started with a terminal of its own (ConPTY on Windows, `openpty` on Unix), its output as bytes, its input, resize and exit status, on threads with one wake. The system side of a terminal; depends on none of the other crates |
 
 **Linux.** Branch `feat/linux` (at `7cd6461` for mdedit 0.5.0 and mdview 0.3.0; to become `main`)
 makes the crates work off Windows: downloads through the system libcurl loaded at run time, file

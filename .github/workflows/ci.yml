@@ -61,6 +61,8 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features term termview
 
   windows:
     runs-on: windows-latest
@@ -90,6 +92,8 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features term termview
       # A smoke run of the host: a real window, a few frames, closed on its timer.
       - run: cargo run --release -p mdshared-ui --features host,a11y --example host -- --seconds 2
 
@@ -128,3 +132,5 @@ jobs:
       - run: 'cargo test --release -p mdshared-ui --features host host::'
       - run: cargo clippy --release -p mdshared-ui --all-targets --features host,a11y -- -D warnings
       - run: 'cargo test --release -p mdshared-ui --features host,a11y host::'
+      - run: cargo clippy --release -p mdshared-ui --all-targets --features term -- -D warnings
+      - run: cargo test --release -p mdshared-ui --features term termview

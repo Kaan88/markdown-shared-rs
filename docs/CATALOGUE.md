@@ -75,6 +75,7 @@ the row says the widget holds state.
 | `thumbs` | Thumbnails of picture files made on a `pool` and kept: in memory (LRU with a byte cap, so drawing does no I/O) and on disk as PNG keyed by path, length, change time and size bucket (provisional) | `Thumbnails::new(workers, memory_cap, Some(DiskCache::new(dir, cap)), wake)`, `request(path, side, priority, generation) -> Lookup { Ready, Pending, Failed }`, `collect` (after a wake), `invalidate(path)`, `set_generation`; `MemoryCache`, `DiskCache::{load, store, trim}`, `make`, `bucket`, `SIZES` |
 | `scroll` | The overlay scrollbar, upright and on its side, and an offset that glides (kept as `f64`) | `scrollbar(area, content, view, offset)`, `offset_for_thumb`, `draw_scrollbar`, `draw_scrollbar_animated`; `hscrollbar`, `offset_for_hthumb`, `draw_hscrollbar`, `draw_hscrollbar_animated`; `scrollbars` (both, clear of the corner); `SmoothScroll` (`scroll_by`, `jump_to`, `offset` / `offset_f64`, `current` for hit tests during a glide) |
 | `viewport` | A view that scrolls both ways (a wide table, a terminal, a large picture): content and view sizes and both offsets as `f64`, clamped; the offset that reveals a rectangle; points between the content and the screen; both scrollbars (provisional) | `Viewport::new(content, view)`, `max`, `clamp`, `at`, `scroll_to`, `scroll_by`, `scrolls`, `visible`, `reveal(at, extent)`, `to_area`, `to_content`, `bars(area)`; `wheel_delta(across, down, shift)` |
+| `termview` (feature `term`) | A terminal's grid drawn with the painter: a `mdshared_term::Screen` in a rectangle, one character a cell on a whole-device-pixel grid; colours and attributes from each `Cell`, wide characters over two cells, U+2500 to U+259F drawn as shapes that join, block, bar, underline or hollow cursor, the selection, a scrollback offset, and only the changed rows redrawn | `CellFont` (`metrics`), `Metrics` (`grid_size`, `cell_at`, `cell_clamped`, `cell_rect`, `row_rect`), `Scheme` (`from_palette`, `cell_colors`), `View` (`scrolled`, `focused`, `point_at`, `cursor_row`, `damage`), `draw_screen`, `draw_rows`, `draw_screen_animated`, `draw_rows_animated`, `cursor_blinks_on`, `is_box_char`; also `mdshared_text::TextEngine::draw_layout_clipped_tinted` |
 | `textfield` | A single-line text field: text, caret, selection, IME preedit. Holds state. Its caret blinks at the system's rate on an `Animator` the caller owns, waking the window only while focused with no selection (the blink provisional) | `TextField`, `EditKey`, `FieldColors`, `Preedit`; `TextField::blink_caret(anim, id, blink, focused) -> bool`, `draw_blinking(p, anim, id, blink, area, …)` |
 | `seltext` | Read-only selectable text: a wrapped paragraph with a selection by drag, double click or Shift, carets only on cluster edges, Ctrl+C as an action for the caller's clipboard and a context menu; hit testing from the same parley layout that draws, wrapped and monospace (provisional) | `SelectableText::new()`, `with_wrap`, `set_wrap`, `seltext::lines`, `set_text`, `set_lines`, `press(lines, x, y, mods, clicks)`, `drag`, `release`, `key(KeyName, Mods) -> Option<Action>`, `select_all`, `clear_selection`, `selected_text`, `selection`, `caret`, `caret_line`, `context_menu_items`; `Action::{Copy, SelectAll}`; `draw(p, pal, area, face, size, &model, focused)` |
 | `palette` | The command palette: a text field over a ranked list. Holds state | `Palette`, `Entry::new(id, label).hint().icon().group()`, `Outcome`, `draw_presence` and `presence_bounds` (its entrance) |
@@ -179,6 +180,17 @@ the kitty keyboard protocol, images).
 | `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block; a word and a line run across a soft wrap (a row whose text went on in the next) and stop at a hard break; the selection holds the text it was made on, so it follows the screen after output (`follow`, `is_intact`) and is dropped when the program rewrote or erased it, or when its first line left the ring | `Selection::start(&screen, point, kind, clicks)`, `extend`, `span_on`, `contains`, `range`, `text`, `clip`, `is_intact`, `follow` |
 | `input` | Keys, pastes, mouse events and focus changes as the bytes a program expects | `encode_key(Key, Mods, &modes)`, `encode_paste`, `encode_mouse`, `encode_focus` |
 | `width` | How many cells a character takes | `char_width`, `str_width` |
+
+## Pseudo-terminal (`mdshared-pty`)
+
+The system side of a terminal: a program started with a terminal of its own, ConPTY on Windows
+and `openpty` on Unix. Bytes out for `mdshared_term::Screen::feed`, bytes in from
+`mdshared_term::input`. Three threads a terminal (read, write, wait) and one wake closure, as
+`job` has; no call blocks. The only crate with `unsafe` system calls for processes.
+
+| Module | For | Start at |
+|---|---|---|
+| (crate root) | Starting a program in a terminal and talking to it | `Command::new(program)` (`arg`, `args`, `cwd`, `env`, `env_remove`), `Pty::spawn(&command, cols, rows, wake)`, `take_output`, `write`, `resize`, `exit` -> `Exit { code, signal }`, `running`, `kill`, `pid`, `HIGH_WATER` |
 
 ## What an application still writes itself
 

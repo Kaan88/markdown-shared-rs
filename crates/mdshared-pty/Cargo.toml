@@ -1,0 +1,27 @@
+[package]
+name = "mdshared-pty"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# A pseudo-terminal is system calls and nothing else, so this crate has none of the other shared
+# crates in it and only the two system bindings the workspace already has in its lock.
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+# The crate's doc example and one test put a `Screen` on the other side, as an application does.
+[dev-dependencies]
+mdshared-term = { path = "../mdshared-term" }

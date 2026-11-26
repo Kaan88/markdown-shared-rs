@@ -337,6 +337,37 @@ impl TextEngine {
         oy: f32,
         clip: (i32, i32, i32, i32),
     ) {
+        self.draw_runs(fb, layout, ox, oy, clip, None);
+    }
+
+    /// [`draw_layout_clipped`](Self::draw_layout_clipped) with every glyph in the colour `rgb`
+    /// instead of its run's own brush (the brush's fourth byte, the baseline shift, is kept).
+    /// The pixels are exactly those of a layout built with `rgb` as its brush, so one shaped
+    /// layout can be drawn in any colour: a terminal's grid shapes each character once and
+    /// draws it in whatever colour each cell asks for. The glyph cache does not depend on the
+    /// colour, so a colour never drawn before costs no rasterizing.
+    pub fn draw_layout_clipped_tinted(
+        &mut self,
+        fb: &mut Bitmap,
+        layout: &Layout<Brush>,
+        ox: f32,
+        oy: f32,
+        clip: (i32, i32, i32, i32),
+        rgb: [u8; 3],
+    ) {
+        self.draw_runs(fb, layout, ox, oy, clip, Some(rgb));
+    }
+
+    /// The drawing of both: each run's brush, or `tint` in its place.
+    fn draw_runs(
+        &mut self,
+        fb: &mut Bitmap,
+        layout: &Layout<Brush>,
+        ox: f32,
+        oy: f32,
+        clip: (i32, i32, i32, i32),
+        tint: Option<[u8; 3]>,
+    ) {
         let clip = (
             clip.0.max(0),
             clip.1.max(0),
@@ -366,7 +397,8 @@ impl TextEngine {
                 let coord_hash = coords.iter().fold(0u64, |h, c| {
                     (h ^ (c.to_bits() as u16 as u64)).wrapping_mul(0x0000_0100_0000_01b3)
                 });
-                let brush = glyph_run.style().brush;
+                let own = glyph_run.style().brush;
+                let brush = tint.map_or(own, |c| [c[0], c[1], c[2], own[3]]);
                 let shift = baseline_shift(brush, size);
                 for glyph in glyph_run.positioned_glyphs() {
                     let (x, y) = (ox + glyph.x, (oy + glyph.y).round() + shift);
@@ -541,6 +573,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_tinted_draw_is_the_draw_of_a_layout_built_in_that_colour() {
+        let red = paragraph(SAMPLE, 15.0, 300.0, [200, 30, 30, 255]);
+        let blue = paragraph(SAMPLE, 15.0, 300.0, [20, 60, 220, 255]);
+        let (w, h) = (320u32, red.height().ceil() as u32 + 10);
+        let mut engine = TextEngine::new(4 << 20);
+        let clip = (0, 0, w as i32, h as i32);
+        let mut want = Bitmap::new(w, h);
+        want.clear([250, 245, 230]);
+        engine.draw_layout_clipped(&mut want, &blue, 3.25, 2.0, clip);
+        let mut got = Bitmap::new(w, h);
+        got.clear([250, 245, 230]);
+        engine.draw_layout_clipped_tinted(&mut got, &red, 3.25, 2.0, clip, [20, 60, 220]);
+        assert!(got.pixels == want.pixels);
+        // The masks were shared: the tinted draw rasterized nothing new.
+        let misses = engine.stats.misses;
+        engine.draw_layout_clipped_tinted(&mut got, &red, 3.25, 2.0, clip, [0, 160, 0]);
+        assert_eq!(engine.stats.misses, misses);
     }
 
     #[test]

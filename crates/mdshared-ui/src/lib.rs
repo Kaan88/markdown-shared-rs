@@ -72,6 +72,8 @@ pub mod splitter;
 pub mod stale;
 pub mod submenu;
 pub mod table;
+#[cfg(feature = "term")]
+pub mod termview;
 pub mod textfield;
 pub mod theme;
 pub mod thumbs;
