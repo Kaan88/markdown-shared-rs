@@ -3,9 +3,8 @@
 //! turns animation on; the format comes from the magic bytes, never the extension); SVG through
 //! `mdview-engine`, so its rasterizer and fonts never live in the viewer.
 //!
-//! The plan caps an image at 12 MiB on disk and 24 M pixels once decoded, so a document cannot make
-//! the viewer allocate without bound. Anything over a limit, unreadable, or in another format is
-//! left to the text placeholder the layout already draws.
+//! The input is capped at 12 MiB and the decoded image at 24 million pixels. An unreadable,
+//! unsupported or oversized image leaves the text placeholder the layout already draws.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -157,6 +156,9 @@ pub fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
 /// Picks the decoder from the leading bytes. A decoder that panics on hostile input counts as a
 /// failed decode (where the build unwinds), so the page shows the placeholder.
 pub(crate) fn decode(bytes: &[u8]) -> Option<DecodedImage> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return None;
+    }
     std::panic::catch_unwind(|| decode_unchecked(bytes))
         .ok()
         .flatten()
@@ -423,6 +425,16 @@ mod tests {
         assert!(!fits(0, 100));
         assert_eq!(MAX_BYTES, 12 * 1024 * 1024);
         assert_eq!(MAX_PIXELS, 24_000_000);
+    }
+
+    #[test]
+    fn oversized_decoder_input_is_rejected_even_if_the_image_is_valid() {
+        let mut bytes = asset("badge.png");
+        assert!(decode_image(&bytes).is_some());
+        bytes.resize(MAX_BYTES as usize, 0);
+        assert!(decode_image(&bytes).is_some());
+        bytes.push(0);
+        assert!(decode_image(&bytes).is_none());
     }
 
     fn asset(name: &str) -> Vec<u8> {

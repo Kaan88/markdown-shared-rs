@@ -7,10 +7,10 @@
 //!
 //! Release builds use the binary beside this executable or an explicit absolute override.
 
-use crate::image::{DecodedImage, MAX_PIXELS};
+use crate::image::{DecodedImage, MAX_BYTES, MAX_PIXELS};
 use mdshared_md_engine_proto::{
-    KIND_MATH, KIND_MERMAID, KIND_SVG, KIND_SVG_AT, MAX_REPLY, Request, STATUS_OK, math_payload,
-    mermaid_payload, read_reply, svg_at_payload, write_request,
+    KIND_MATH, KIND_MERMAID, KIND_SVG, KIND_SVG_AT, MAX_REPLY, MAX_REQUEST, Request, STATUS_OK,
+    math_payload, mermaid_payload, read_reply, svg_at_payload, write_request,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -139,6 +139,9 @@ fn invalidate(handle: &Handle) {
 /// Renders SVG bytes through the shared engine. `None` when the engine is missing, times out,
 /// fails, or returns something the image cache cannot use.
 pub fn render_svg(bytes: &[u8]) -> Option<DecodedImage> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return None;
+    }
     let reply = submit(KIND_SVG, bytes.to_vec())?;
     decode(reply)
 }
@@ -146,7 +149,7 @@ pub fn render_svg(bytes: &[u8]) -> Option<DecodedImage> {
 /// Renders SVG bytes at `scale` device pixels per SVG unit, so a vector image is drawn sharp at
 /// the device scale rather than stretched from its natural size.
 pub fn render_svg_at(bytes: &[u8], scale: f32) -> Option<DecodedImage> {
-    if !scale.is_finite() || scale < 0.05 || scale > 8.0 {
+    if !scale.is_finite() || scale < 0.05 || scale > 8.0 || bytes.len() as u64 > MAX_BYTES {
         return None;
     }
     let reply = submit(KIND_SVG_AT, svg_at_payload(scale, bytes))?;
@@ -161,7 +164,11 @@ pub fn render_math(
     font_size: f32,
     color: [u8; 3],
 ) -> Option<DecodedImage> {
-    if !font_size.is_finite() || font_size < 4.0 || font_size > 512.0 {
+    if !font_size.is_finite()
+        || font_size < 4.0
+        || font_size > 512.0
+        || source.len() > MAX_REQUEST as usize - 8
+    {
         return None;
     }
     let reply = submit(KIND_MATH, math_payload(font_size, display, color, source))?;
@@ -171,7 +178,7 @@ pub fn render_math(
 /// Renders a Mermaid diagram. `scale` is device pixels per SVG unit; the renderer asks for twice
 /// its own scale and halves the box, as it does for math.
 pub fn render_mermaid(source: &str, scale: f32, dark: bool) -> Option<DecodedImage> {
-    if !scale.is_finite() || scale < 0.1 || scale > 8.0 {
+    if !scale.is_finite() || scale < 0.1 || scale > 8.0 || source.len() > MAX_REQUEST as usize - 8 {
         return None;
     }
     let reply = submit(KIND_MERMAID, mermaid_payload(scale, dark, source))?;
@@ -343,10 +350,6 @@ mod tests {
             )),
             None
         );
-    }
-
-    fn badge() -> &'static [u8] {
-        include_bytes!("../../../fixtures/md/assets/badge.svg")
     }
 
     #[test]
