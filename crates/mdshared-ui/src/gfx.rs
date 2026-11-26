@@ -14,9 +14,11 @@ use std::rc::Rc;
 mod covered;
 #[cfg(test)]
 pub(crate) use covered::WHOLE_SHADOW;
+mod painted;
 mod rich;
 mod rounding;
 mod shapes;
+pub(crate) use painted::prepare_image;
 pub use shapes::{Along, Path};
 mod soft;
 mod turned;
