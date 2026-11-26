@@ -4,6 +4,50 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Mouse editing in a single-line field (`mdshared_ui::textfield`)
+
+Keep one `Pointer::system(scale)` per `TextField`. Pass the same text rectangle, face, font
+size and scale to `FieldHit` that the field draws with. `FieldHit::cursor` requests the I-beam;
+`Pointer::press` accepts a primary press inside the field, which the caller can then focus.
+The field uses Parley's visual clusters from one shaped line for hits, carets, and selection
+bands; one logical range can draw as several bands in bidi text. The pointer won't split
+a grapheme inside a shaping run (for example, decomposed `e` plus an accent). Parley 0.12
+can split a grapheme at a font-run boundary, and the existing password display still uses
+one dot per character. `pointer_move` extends the selection from the initial click or Shift anchor; double
+click selects a word and triple click selects all. The caller routes moves and releases even
+outside the field, schedules a wake at `deadline()` for `tick()`, and cancels on loss of focus.
+At a horizontal edge the drag advances through hidden text, even with the pointer at rest,
+and stops at the end or on release. `clicks::ClickCounter`, also used by the host, can be used
+directly for a multi-line composer or the `seltext` paragraph.
+
+On a right press, cancel the drag and open a `menu::Menu` or `submenu::Cascade` with
+`TextField::context_menu()`. The right press need not change the selection. Hand the chosen
+item back to `apply_context_action`. Cut deletes only after a successful clipboard write.
+Paste fetches text once, rejects more than `MAX_PASTE_BYTES` (64 KiB of UTF-8 before
+cleaning) without changing the selection, and turns line separators and tabs into spaces.
+Opening the menu never reads the paste payload: Windows and macOS ask for its format;
+Linux's arboard backend lacks that query, so it offers Paste and checks the size after its
+single fetch. Windows limits the UTF-16 scan before decoding and writes with a private
+message-only owner window. macOS checks the native string length before converting it.
+Keyboard paste checks permission and the secret flag before any read; it still takes the
+first line. `selection_for_export` returns nothing for a secret; `text()` and
+`selected_text()` are raw owner access. Debug hides secret field and settings row values,
+and hides IME text and settings text values whose types carry no secret flag. `set_preedit`
+discards invalid cursor offsets. The old low-level pointer signatures are unchanged;
+applications opt into shaped mouse hits by routing events to `Pointer`.
+
+Try `cargo run -p mdshared-ui --features host --example textfield` with the mixed-direction
+and secret fields. On Windows with Rust 1.99.1, formatting, workspace Clippy and tests with
+`host,a11y`, the catalogue check, and the example build passed. The review workspace run
+passed 2,387 tests; 45 were ignored and four `explorer_tests` cases were explicitly skipped.
+Tests cover selection and click thresholds, auto-scroll wake-ups, and clipboard actions with
+a fake clipboard. The drag's selection pixels match the equivalent keyboard selection; the
+test failed with the drag update bypassed. The review added RTL and accent hit tests, a
+pixel test that fails if two selection bands are merged, and a check that field drawing
+doesn't shape prefixes. The native Windows clipboard round-trip test is not ignored in
+CI; the requested local test command excludes it under `explorer_tests`. The example was
+not launched, and Linux and macOS were not run.
+
 ## Vertical-only text hinting (`mdshared_text::text`)
 
 On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks

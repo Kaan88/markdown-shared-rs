@@ -22,6 +22,7 @@ pub mod blur;
 pub mod cf_html;
 pub mod check;
 pub mod chrome;
+pub mod clicks;
 pub mod colour_picker;
 pub mod commands;
 pub mod corners;

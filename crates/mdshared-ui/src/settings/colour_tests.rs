@@ -120,19 +120,20 @@ fn text(id: u32, t: &str) -> Outcome {
 
 #[test]
 fn a_form_never_told_draws_and_answers_as_the_frozen_form_with_hex_rows() {
+    use super as live;
     use super::frozen as old;
     macro_rules! run {
-        ($Form:ty, $Row:ty) => {{
+        ($api:ident) => {{
             let mut out: Vec<(String, Vec<u8>)> = Vec::new();
             let rows = vec![
-                <$Row>::header("Look"),
-                <$Row>::text(1, "Accent", "#3366cc"),
-                <$Row>::text(2, "colour.x", "CC8800"),
-                <$Row>::toggle(3, "Wrap", true),
+                $api::Row::header("Look"),
+                $api::Row::text(1, "Accent", "#3366cc"),
+                $api::Row::text(2, "colour.x", "CC8800"),
+                $api::Row::toggle(3, "Wrap", true),
             ];
             for (dark, scale) in [(false, 1.0f32), (true, 1.0), (false, 1.5), (true, 1.5)] {
-                let mut f = <$Form>::new("Look", rows.clone()).single_page();
-                let snap = |f: &mut $Form, what: &str, out: &mut Vec<(String, Vec<u8>)>| {
+                let mut f = $api::Form::new("Look", rows.clone()).single_page();
+                let snap = |f: &mut $api::Form, what: &str, out: &mut Vec<(String, Vec<u8>)>| {
                     let mut bmp = Bitmap::new((640.0 * scale) as u32, (420.0 * scale) as u32);
                     let mut gfx = Gfx::new();
                     {
@@ -152,15 +153,23 @@ fn a_form_never_told_draws_and_answers_as_the_frozen_form_with_hex_rows() {
                 snap(&mut f, &format!("clicked {a:?} {b:?}"), &mut out);
                 let e = f.key(&KeyName::Enter, NONE, None);
                 let k = f.key(&KeyName::Char('f'), NONE, Some("f"));
+                // Compare the actual owner-visible value, not the diagnostic rendering.
+                assert_eq!(
+                    k,
+                    $api::Outcome::Changed {
+                        id: 1,
+                        value: $api::Value::Text("f#3366cc".into()),
+                    }
+                );
                 let d = f.key(&KeyName::Down, ALT, None);
                 let w = f.wheel(c.x, c.cy(), 30.0);
-                snap(&mut f, &format!("keys {e:?} {k:?} {d:?} {w}"), &mut out);
+                snap(&mut f, &format!("keys {e:?} {d:?} {w}"), &mut out);
             }
             out
         }};
     }
-    let now = run!(Form, Row);
-    let was = run!(old::Form, old::Row);
+    let now = run!(live);
+    let was = run!(old);
     assert_eq!(now.len(), was.len());
     for ((what, a), (what_was, b)) in now.iter().zip(&was) {
         assert_eq!(what, what_was);

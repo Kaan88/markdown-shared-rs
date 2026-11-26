@@ -641,13 +641,7 @@ impl<'a> Painter<'a> {
 
     /// The width of one line of text, in logical px.
     pub fn measure(&mut self, face: Face, size: f32, text: &str) -> f32 {
-        if text.is_empty() {
-            return 0.0;
-        }
-        self.gfx
-            .layout(face, size * self.scale, [0, 0, 0], 0.0, text)
-            .width()
-            / self.scale
+        self.gfx.measure_at(face, size, text, self.scale)
     }
 
     /// `text` shortened with an ellipsis so it fits `max` logical px.
@@ -1052,14 +1046,11 @@ impl<'a> Painter<'a> {
     /// The x offset of each character boundary of `text` (one entry per `char`, plus the end), in
     /// logical px, for carets and selections in a text field.
     pub fn caret_stops(&mut self, face: Face, size: f32, text: &str) -> Vec<f32> {
-        let mut stops = Vec::with_capacity(text.len() + 1);
-        for (i, _) in text.char_indices() {
-            stops.push(self.measure(face, size, &text[..i]));
-        }
-        stops.push(self.measure(face, size, text));
-        stops
+        self.gfx.caret_stops_at(face, size, text, self.scale)
     }
 }
+
+mod metrics;
 
 #[cfg(test)]
 mod tests {

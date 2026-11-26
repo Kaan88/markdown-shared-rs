@@ -1,14 +1,15 @@
 //! winit's input reduced to the toolkit's: device positions to logical px, buttons, the wheel,
 //! and the click count. Pure, so `host_tests.rs` tests it without a window.
 
-use std::time::{Duration, Instant};
-
 use winit::event::{MouseButton, MouseScrollDelta};
 
 use super::{Button, Event, WHEEL_LINE};
+use crate::clicks::ClickCounter;
 
-/// Where the click count stops: a triple click is the most anything reads.
-pub(super) const MAX_CLICKS: u32 = 3;
+#[cfg(test)]
+pub(super) use crate::clicks::MAX_CLICKS;
+pub(super) use crate::clicks::click_slop;
+pub(super) type Clicks = ClickCounter<Button>;
 
 /// A scale that is a positive number, else 1.
 pub(super) fn clean_scale(s: f64) -> f32 {
@@ -59,47 +60,5 @@ pub(super) fn wheel(delta: MouseScrollDelta, scale: f32, shift: bool) -> Event {
         dx: dx as f32,
         dy: dy as f32,
         precise,
-    }
-}
-
-/// How far, in logical px each way, a press may be from the one before and still count towards
-/// a double click: half the system's double-click rectangle (`size`, device px) at `scale`.
-pub(super) fn click_slop(size: (u32, u32), scale: f32) -> (f32, f32) {
-    let s = clean_scale(f64::from(scale));
-    (size.0 as f32 / 2.0 / s, size.1 as f32 / 2.0 / s)
-}
-
-/// Counts the presses of one button that make a double or triple click.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Clicks {
-    last: Option<(Instant, (f32, f32), Button)>,
-    count: u32,
-}
-
-impl Clicks {
-    /// A press of `button` at `at` (logical px) at `now`: 1 for a first press, one more for each
-    /// that follows within `interval` and `slop` px each way of the one before, up to
-    /// [`MAX_CLICKS`], where it stays while the run goes on.
-    pub(super) fn press(
-        &mut self,
-        now: Instant,
-        at: (f32, f32),
-        button: Button,
-        interval: Duration,
-        slop: (f32, f32),
-    ) -> u32 {
-        let again = self.last.is_some_and(|(t, p, b)| {
-            b == button
-                && now.saturating_duration_since(t) <= interval
-                && (at.0 - p.0).abs() <= slop.0
-                && (at.1 - p.1).abs() <= slop.1
-        });
-        self.count = if again {
-            (self.count + 1).min(MAX_CLICKS)
-        } else {
-            1
-        };
-        self.last = Some((now, at, button));
-        self.count
     }
 }
