@@ -1911,6 +1911,36 @@ Left open from the re-review:
   a destination alpha below 255 that is not the chrome value, or an opaque-backing option on
   the scrollbar.
 
+The Astra review fixes keep Swash colour outlines premultiplied over translucent pixels and
+leave bitmap strikes and the legacy opaque glyph path unchanged. Terminal glyph ink is clipped
+to its owning one- or two-cell span only with backdrop translucency active. Outside termview,
+finish plain premultiplied drawing with `frost::finish_premultiplied(bitmap, device_rect)` before
+the key pass; that rectangle must not include deliberately marked chrome. Page crossfades and
+slide-fades use the painter's frost key to decode mixed chrome and premultiplied endpoints.
+
+On Windows with Rust 1.99.1, the requested debug checks passed: formatting, both Clippy
+checks, the catalogue check, the workspace suite (2,373 passed, excluding `explorer_tests`)
+and the terminal suite (58 passed). Each blocking regression failed before its fix. The
+default Rust 1.100 run instead hit a Clippy warning in `sections_tests.rs` and an updater
+test that assumes Cargo puts test binaries in `deps`. No live compositor pixels, visual
+approval, Linux or macOS runs were part of these fixes.
+
+### Left open from the Astra review (2026-11-26)
+
+- **5 — Transition fallback:** A saved translucent page can be blended into an opaque frame
+  after focus loss or another change to the backdrop. Until snapshots track the key, callers
+  should cancel the switch or redraw and rebase its saved page when the frost key changes.
+- **6 — Stale availability:** Power saver or the system transparency preference can change
+  while the window stays focused. Backdrop availability is cached; invalidating it on system
+  changes and repainting when the effective state changes still needs OS-level work.
+- **7 — Win32 presentation:** The locked softbuffer 0.4.8 backend uses a 32-bit DIB and
+  `BitBlt(SRCCOPY)`, but softbuffer's public buffer contract says the high byte must be zero.
+  Alpha preservation is not guaranteed. Check pixels at the compositor before upgrading the
+  backend, or move to one with an explicit alpha contract.
+- **8 — Opaque baseline:** The fallback test is now named for what it compares: two current
+  entry points. An independent row-wide glyph reference covers the narrow-cell overhang case,
+  not the full pre-CS1 renderer.
+
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 
 `platform::system_is_dark` used to ask the settings portal on the calling thread with a 500 ms
