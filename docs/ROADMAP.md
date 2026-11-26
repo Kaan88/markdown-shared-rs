@@ -32,6 +32,7 @@ something that cannot be tested headless).
 
 | Question | Answer |
 |---|---|
+| Markdown viewing (X13) | 2026-11-26: “markdown viewing is useful for many apps. shared it is.” Move the page renderer into this toolkit. |
 | JPEG and other decoders (F6, M5, F5) | `zune-jpeg =0.5.15`, pure Rust, behind the image module's decoder slot |
 | Accessibility (W8) | AccessKit: `accesskit` + `accesskit_winit`, behind an opt-in feature `a11y` |
 | WinRT for the media session (M1) and notifications (W7) | The `windows` crate at `=0.62.2` (already in `Cargo.lock` through fontique) with the WinRT features, behind opt-in features (`media-session`, `notify`); on macOS `objc2-media-player` and `objc2-user-notifications` 0.3 (the objc2 0.6 family); on Linux MPRIS and `org.freedesktop.Notifications` over zbus, which is there |
@@ -287,6 +288,7 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 
 | Id | What | Size | Risk | Builds on | Status |
 |---|---|---|---|---|---|
+| X13 | **Share the Markdown page renderer.** From [mdview `01f67b2`](https://github.com/Kaan88/markdown-viewer-rs/tree/01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99): `mdshared-md-core` (parser, document model, find, selection and task marks), `mdshared-md-render` (headless layout and paint), `mdshared-md-preview` (wire format and render loop), `mdshared-md-engine` (SVG, TeX and Mermaid; binary still `mdview-engine`), and `mdshared-md-engine-proto` (helper wire format). Keep mdview's window, commands, tabs, session and presentation mode in the app; use existing `mdshared-app` plumbing for files, watching, single instance and updates. | M | medium | `mdshared-text`, `mdshared-highlight`, `mdshared-app` | Done on `feat/md-renderer`; switching mdview and mdedit to the toolkit copy and moving their pins is mdapps' step. |
 | X1 | **See the animations in a window.** mdmix runs the motion (the owner has seen it and likes it); still unseen: the spinner and bar on `cycle`, a caret on `blink`, a page switch cut short by a resize | S | medium | `docs/ANIMATION.md` | open |
 | X2 | **Check the Linux reduced-motion reading on a real desktop.** KDE Plasma and GNOME: the three portal keys, the `SettingChanged` signal, the wake | S | low | `platform`, LINUX.md | open |
 | X3 | **Motion for the rest.** `notice` bars, the command palette, the tree's disclosure, the tab strip, a menu's hover row | M | medium | `anim`, each widget | done, on main, and the tree's disclosure on main (`Painter::icon_rotated`, `glyph::draw_disclosure`, `disclosure_turn`, `draw_disclosure_animated`, and the opt-in `expander::draw_expander_turning`; each the plain `RIGHT` or `DOWN` icon at rest; not seen by a person in an application): `Menu::draw_in_animated` (the hover row fades; at once under high contrast), `Palette::draw_presence` and `presence_bounds`, `notice::draw_sliding` and `bar_height`; the tab strip's hover is D4. Pixel-tested: each is its plain draw at rest |
@@ -299,7 +301,6 @@ lands on `main`, tell the Claude Switch session the commit, so the app can raise
 | X10 | **A page switch that survives a resize.** Redraw the old page at the new size and `begin_with` it | S | low | W1, `anim::PageTransition` | done: `PageTransition::fits` and `rebase` (feat/x10-page-resize); not seen in a real window (no application or example drives `PageTransition`), pixel-tested |
 | X11 | **A veil strength for the backdrop.** The veil over Mica and Acrylic is fixed (Mica 0, Acrylic 150); Purge, whose Mica and Acrylic strength is a setting, re-keys the frost itself. A setter on the host or a veil on `frost::Key`, opt-in. Asked for by Purge, 2026-11-25, not blocking | S | low | `frost`, `host` | done: `Frost::set_veil` and `Cx::set_backdrop_veil(Option<u8>)`, f94d1b6 (PR #27); not seen on a frosted window |
 | X12 | **Faster region blends.** `anim::region::Snapshot::crossfade` and `moved` work one pixel at a time on one core: 3.5-6 ms for an 860k-pixel region on Purge's machine. Whole words at once and bands of rows across cores would bring it to about 1-1.5 ms, and Purge could go back to `PageTransition` from its own transitions; `PageEffect` could also gain Scale and Depth. Pixel-identical to today's blends. Asked for by Purge, 2026-11-25, not blocking | M | medium | `anim::region`, `anim::PageTransition`, `pool` | open |
-| X13 | **Share mdview's Markdown page renderer.** | M | medium | mdview `01f67b2` | done on `feat/md-renderer`: five `mdshared-md-*` crates; switching mdview and mdedit over is mdapps' step |
 
 ## The owner's numbering
 

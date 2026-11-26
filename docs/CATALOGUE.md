@@ -10,6 +10,32 @@ events and the hits; a model answers questions and takes events, a `draw_*` func
 changes nothing; a function that ends in `_animated` or `_presence` is the same drawing with
 motion ([ANIMATION.md](ANIMATION.md)).
 
+## I want to ...
+
+- **Show a Markdown page:** [`mdshared-md-preview`](#markdown-pages) for an embedded preview, or [`mdshared-md-render`](#markdown-pages) for headless layout and drawing.
+- **Show a terminal:** [`termview`](#widgets-mdshared-ui) (feature `term`) draws the [`mdshared-term`](#terminal-mdshared-term) screen.
+- **Run a shell in a pseudo-terminal (PTY):** [`mdshared-pty`](#pseudo-terminal-mdshared-pty).
+- **Draw rich or styled text:** [`richtext` and `Painter::rich_text`](#painting-mdshared-ui-mdshared-text).
+- **Edit text in a field:** [`textfield`](#widgets-mdshared-ui); a multi-line editor is not yet shared ([ROADMAP K9](ROADMAP.md#barbican-fast-track-2026-11-25)).
+- **Pick a colour:** [`colour_picker`](#widgets-mdshared-ui).
+- **Show a settings form:** [`settings::Form` or `settings::pages::Form`](#widgets-mdshared-ui).
+- **Open a menu, submenu or context menu:** [`menu` and `submenu`](#widgets-mdshared-ui).
+- **Show a file list or directory listing:** [`dirlist`](#application-plumbing-mdshared-app-mdshared-fetch) with [`rows`](#list-and-layout-models-mdshared-ui).
+- **Watch a folder for changes:** [`dirwatch`](#application-plumbing-mdshared-app-mdshared-fetch).
+- **Handle file drops:** use winit's file events; toolkit drag-and-drop is not yet built ([ROADMAP L7/L8](ROADMAP.md#lists-menus-and-input)).
+- **Use the clipboard:** [`platform`](#platform-mdshared-ui) for text and HTML; files and images are not yet supported ([ROADMAP L9](ROADMAP.md#lists-menus-and-input)).
+- **Draw images or pictures:** [`mdshared_text::image`, `Painter::image` and `picture`](#painting-mdshared-ui-mdshared-text).
+- **Make thumbnails:** [`thumbs`](#widgets-mdshared-ui) for pictures; shell icons and thumbnails are not yet provided ([ROADMAP F5](ROADMAP.md#files)).
+- **Animate a control or transition between pages:** [`anim::Animator` and `PageTransition`](#animation-mdshared-uianim).
+- **Make a scroll area:** [`scrollarea`, `viewport` and `scroll`](#widgets-mdshared-ui).
+- **Lay out controls:** [`layout`](#list-and-layout-models-mdshared-ui) for flexible rows and columns.
+- **Draw buttons and controls:** [`overlay::draw_dialog_button`, `link`, `check`, `toggle`, `dropdown` and `slider`](#widgets-mdshared-ui); the broader set is not yet on this branch ([ROADMAP K4](ROADMAP.md#barbican-fast-track-2026-11-25)).
+- **Put an icon in the tray:** [`tray`](#widgets-mdshared-ui) (Windows and Linux).
+- **Send a system notification:** [`notify`](#widgets-mdshared-ui) (feature `notify`, Windows and Linux).
+- **Expose accessibility:** [`a11y`](#accessibility-mdshared-ui-feature-a11y) (feature `a11y`; Windows adapter today).
+- **Host a window:** [`host`](#platform-mdshared-ui) (feature `host`, one window).
+- **Give a window frosted chrome:** [`frost`](#platform-mdshared-ui) (the host supports it on Windows).
+
 ## Painting (`mdshared-ui`, `mdshared-text`)
 
 | Module | For | Start at |
@@ -36,7 +62,7 @@ motion ([ANIMATION.md](ANIMATION.md)).
 | `mdshared_highlight::incremental` | Highlighting line by line for an editor, with checkpoints and limits | `LineHighlighter`, `Language::for_path` / `by_token`, `Limits`, `Span` |
 | `mdshared_highlight::scan`, `sfc` | The hand-written scanners behind the above (Kotlin, Swift, PowerShell, TypeScript, Vue, Svelte, ...) | `scan::Lang` |
 
-## Markdown pages (`mdshared-md-*`)
+## Markdown pages
 
 **I want to show a Markdown page:** parse it with `mdshared_md_core::parse`, then render
 it with `mdshared_md_render::render` or keep a `DocumentRenderer` for a view that scrolls.
@@ -234,3 +260,87 @@ match anim.end_frame() {
     None => event_loop.set_control_flow(ControlFlow::Wait),
 }
 ```
+
+## What exists outside these crates
+
+These libraries live in sibling repositories, not in this workspace. For a Cargo dependency,
+use the package name with `git =` the repository URL and `rev =` its full commit below. Paths
+are relative to that repository; Cargo finds the package in its checkout. **Toolkit pin** is
+the revision the library actually uses, including transitive dependencies. “None” means the
+library does not pull in the toolkit, even if its app does.
+
+### Markdown viewer
+
+[markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) ·
+`https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`.
+All five reusable crates have moved into this toolkit ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+For new dependencies, use the `mdshared-md-*` packages above and pin them and any other
+toolkit crates to the full toolkit commit that merges `feat/md-renderer`. The table below
+records the old mdview revision and its actual pins until mdview switches over.
+
+| Crate | Path | For | Toolkit pin |
+|---|---|---|---|
+| `mdview-preview` | `crates/preview` | Markdown page pixels for another window; enable `server` to embed it | `48eb3ce` with `server`; none without it |
+| `mdview-render` | `crates/render` | Headless page layout, raster drawing, images, hit testing and HTML export | `48eb3ce` |
+| `mdview-core` | `crates/core` | Markdown parser, document model, search and selection; also contains viewer session glue | `48eb3ce` |
+| `mdview-engine` | `crates/engine` | SVG, TeX and Mermaid rasterizers; build and ship the `mdview-engine` binary for these in previews | None |
+| `mdview-engine-proto` | `crates/engine-proto` | Request and reply frames shared by the renderer and helper process | None |
+
+```toml
+mdview-preview = { git = "https://github.com/Kaan88/markdown-viewer-rs", rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99", features = ["server"] }
+```
+
+**Known revision pair:** mdview `01f67b2` uses toolkit
+[`48eb3ce`](https://github.com/Kaan88/markdown-shared-rs/commit/48eb3cefb17f5025f3ac418f7a01b31b7a914779).
+Pin your app's toolkit dependencies to the same URL and full revision when sharing types.
+`preview/server` pulls in `render` and `core`: `render` pins `mdshared-text` and
+`mdshared-highlight`, and `core` pins `mdshared-app`. Without `server`, preview is just the
+wire format for `mdview --preview-server` and has no toolkit pin.
+
+Cargo treats different Git revisions as separate crates. If your app also uses `mdshared-text`
+and `mdshared-highlight` from newer toolkit `main`, Cargo builds two copies of each. Their
+types do not mix: `mdview_render::Bitmap` is the older `mdshared_text::Bitmap`, so it cannot
+be passed to a newer toolkit's `Painter::blit`. `mdshared-ui` brings in `mdshared-text` even if
+your app does not name it directly. Separate revisions can coexist if you exchange bytes or
+other revision-independent values instead of those types.
+
+For example, [Claude Switch](https://github.com/Kaan88/claude-switch) at `fd1d3ad` uses mdview
+`01f67b2` with its own toolkit pin at `d1cca33`. Its lockfile has both copies of `mdshared-text`;
+it gives `Painter::image` RGBA bytes rather than handing it the renderer's `Bitmap`.
+
+[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `9898d24` uses mdview `e2b3e31` for
+its preview (toolkit pin `49de4ec`). The editor itself pins `48eb3ce`; its lockfile has two
+copies each of `mdshared-text` and `mdshared-highlight`. Its preview applies wire updates to
+the editor's own bitmap before blitting.
+
+### Other sibling libraries
+
+| Repository (`git`) | Repository `rev` |
+|---|---|
+| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `9898d24d85ed06b46b7a91f5dd1b194224af25b1` |
+| [mdmix](https://github.com/Kaan88/mdmix) (Rust port on `f/g0-proto`, not `main`) | `adb10855c95a5f2b39c10da05f214827da6f5a29` |
+| [purge](https://github.com/Kaan88/purge) | `7022fde4771ab6762a3f7111fae6e94c83aff0df` |
+| [claude-switch](https://github.com/Kaan88/claude-switch) | `fd1d3ad86119dd866b64d25691f2accb161ef947` |
+| [mdhub](https://github.com/Kaan88/mdhub) | `f0e0c93d3360eaf5f72cc33b1b0aaf099c59576e` |
+
+| Repository | Crate | Path | For | Toolkit pin |
+|---|---|---|---|---|
+| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `48eb3ce` (`mdshared-app`) |
+| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `48eb3ce` (`mdshared-highlight`) |
+| mdedit | `mdedit-outline` | `crates/mdedit-outline` | Find headings, functions and types for an outline | None |
+| mdmix | `g6-proto` | `rust/g6-proto` | Sound BlasterX G6 packet builders and status parsers, without I/O | None |
+| mdmix | `g6-device` | `rust/g6-device` | G6 device access over HID | None |
+| mdmix | `g6-osaudio` | `rust/g6-osaudio` | Read G6 mixer state and output levels on Windows | None |
+| purge | `purge-model` | `crates/purge-model` | Shared engine data types and JSON schemas | None |
+| purge | `purge-rpc` | `crates/purge-rpc` | Engine JSON-RPC framing and message types | None |
+| purge | `purge-client` | `crates/purge-client` | Windows clients for the Purge engine and broker | None |
+| purge | `purge-ui-model` | `crates/purge-ui-model` | Purge-specific view state and requests, without I/O | None |
+| claude-switch | `claude-switch-core` | `crates/core` | Discover Claude Code sessions and accounts without a window | None |
+| mdhub | `hub-core` | `crates/hub-core` | Hub app catalogue, install detection and updates | `b4b2182` (`mdshared-app` and `mdshared-fetch`) |
+
+The app pins are separate: mdmix's `g6-gui` pins `6017fcd` at the Rust port revision above,
+Purge's UI pins `f45a71c`, and Claude Switch's UI pins `d1cca33`. None of those pins is inherited
+by the libraries in the table. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust
+library or toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins
+`95bbf87`, but `ui-rs` builds a static library for the foobar2000 C++ shim, not a Rust library
+for another toolkit app.

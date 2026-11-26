@@ -6,6 +6,10 @@ hand-drawn window chrome, the painter, the text engine and syntax highlighting. 
 into the toolkit for further applications (a mixer panel, a music player, a file manager, a
 terminal): widgets, list models, animation and a terminal emulator's model.
 
+**Building an app?** Start with [I want to ...](docs/CATALOGUE.md#i-want-to-).
+For Markdown page rendering and other reusable sibling crates, see
+[What exists outside these crates](docs/CATALOGUE.md#what-exists-outside-these-crates).
+
 **Working here?** Read [AGENTS.md](AGENTS.md) (rules, build and test commands), then
 [docs/CATALOGUE.md](docs/CATALOGUE.md) (every module and its entry points),
 [docs/NEW-MODULE.md](docs/NEW-MODULE.md) (the checklist for adding one) and
