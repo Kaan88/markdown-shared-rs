@@ -274,9 +274,22 @@ impl Painter<'_> {
     }
 
     /// Lays prepared straight RGBA pixels, `w` by `h`, at the device position `dx, dy`: what
-    /// [`prepare_image`] gives, drawn without sampling it again. The clip and `alpha` apply as
-    /// they do to [`image`](Self::image), and a buffer too short for the size draws nothing.
-    pub(crate) fn blit_rgba(&mut self, rgba: &[u8], w: u32, h: u32, dx: i32, dy: i32, alpha: f32) {
+    /// [`prepare_image`] gives, drawn without sampling it again. The painter's clip, the
+    /// rectangle ending at `right, bottom` and `alpha` apply as they do to
+    /// [`image`](Self::image), and a buffer too short for the size draws nothing. The bound is
+    /// the placed rectangle's far edge, so cached pixels are not painted into what lies past it.
+    #[allow(clippy::too_many_arguments)] // prepared pixels, where they go, and how far
+    pub(crate) fn blit_rgba(
+        &mut self,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+        dx: i32,
+        dy: i32,
+        right: i32,
+        bottom: i32,
+        alpha: f32,
+    ) {
         if w == 0 || h == 0 || alpha.is_nan() {
             return;
         }
@@ -292,9 +305,9 @@ impl Painter<'_> {
             return;
         }
         let x0 = dx.max(self.clip.0);
-        let x1 = dx.saturating_add(w as i32).min(self.clip.2);
+        let x1 = dx.saturating_add(w as i32).min(self.clip.2).min(right);
         let y0 = dy.max(self.clip.1);
-        let y1 = dy.saturating_add(h as i32).min(self.clip.3);
+        let y1 = dy.saturating_add(h as i32).min(self.clip.3).min(bottom);
         if x0 >= x1 || y0 >= y1 {
             return;
         }

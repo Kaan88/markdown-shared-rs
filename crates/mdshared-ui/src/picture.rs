@@ -170,8 +170,10 @@ impl Picture {
     /// `round(dst.w * scale)` by `round(dst.h * scale)`, which is a property of the rectangle
     /// and not of where it sits, so moving a picture by whole or fractional logical px does
     /// not prepare it again. `dev_rect` rounds the two edges separately and can place it a
-    /// pixel narrower or wider than that; the cached pixels are then blitted at the left edge,
-    /// up to a pixel short or a pixel over at the far edge.
+    /// pixel narrower or wider than that; the blit is clipped to the placed rectangle, so a
+    /// placement a pixel narrower loses the cached picture's last column or row, and one a
+    /// pixel wider leaves that column or row of the rectangle unpainted. Nothing is painted
+    /// past `dst`.
     ///
     /// An empty or non-finite rectangle, or a zero or NaN alpha, draws nothing; a target over
     /// 1024 device px a side or a million pixels, and one under a device pixel, is handed to
@@ -243,7 +245,7 @@ impl Picture {
             self.prepares += 1;
         }
         if let Some(prepared) = &self.prepared {
-            painter.blit_rgba(&prepared.rgba, w, h, x0, y0, alpha);
+            painter.blit_rgba(&prepared.rgba, w, h, x0, y0, x1, y1, alpha);
         }
     }
 
@@ -268,6 +270,7 @@ mod tests {
     use mdshared_text::image::{Error, Format, Limits};
 
     const WHITE: [u8; 3] = [255, 255, 255];
+    const MARKER: [u8; 3] = [255, 0, 255];
 
     /// A white page `w` by `h` with `draw` on it, at a scale.
     fn page(w: u32, h: u32, scale: f32, draw: impl FnOnce(&mut Painter<'_>)) -> Bitmap {
@@ -475,6 +478,28 @@ mod tests {
                 assert_eq!(rgba_at(&moved, x, y - 3), rgba_at(&whole, x - 7, y));
             }
         }
+    }
+
+    #[test]
+    fn a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle() {
+        // At scale 1.5, Rect(1, 6, 15, 15) is placed at device x 2..24, 22 px wide, while
+        // round(15 * 1.5) is 23: the cached picture is one pixel wider than the placement.
+        let mut pic = Picture::new(pixels(30, 20, |_, _| [10, 20, 30, 255]));
+        let dst = Rect::new(1.0, 6.0, 15.0, 15.0);
+        let bmp = page(60, 40, 1.5, |p| {
+            // A marker in the device pixel just past the placement's right edge.
+            p.fill_dev(24, 15, 25, 16, MARKER, 1.0);
+            pic.draw(p, dst, 0.0, 1.0);
+        });
+        assert_eq!(pic.prepared.as_ref().unwrap().key.0, 23, "cached width");
+        assert_eq!(
+            rgba_at(&bmp, 24, 15),
+            [MARKER[0], MARKER[1], MARKER[2], 255],
+            "the pixel past the rectangle was painted"
+        );
+        // The last cached column that fits is drawn, and the picture starts at the left edge.
+        assert_eq!(rgba_at(&bmp, 23, 15), [10, 20, 30, 255]);
+        assert_eq!(rgba_at(&bmp, 2, 15), [10, 20, 30, 255]);
     }
 
     #[test]

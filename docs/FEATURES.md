@@ -1872,17 +1872,18 @@ and a later draw at the same size, scale and corner radius only blends them.
   display scale's bits and the device corner radius's bits. The prepared size is a property
   of the rectangle, not of where it sits: `dev_rect` rounds the left and right edges
   separately, so at 1.25 and 1.5 the placed device width can be a pixel different from the
-  same rectangle moved by one logical px. The cached pixels are blitted at the left edge and
-  the far edge may then be a pixel short or a pixel over. A move, a clip change or an alpha
-  change therefore does not prepare, even at fractional scales. A size, scale or radius
-  change replaces the one prepared size; there is no cache of several sizes, which is the
-  caller's decision if it wants one.
+  same rectangle moved by one logical px. The blit is clipped to the placed rectangle, so a
+  placement a pixel narrower loses the cached picture's last column or row, and one a pixel
+  wider leaves that column or row unpainted: nothing is painted past `dst`, into the next
+  item of a row. A move, a clip change or an alpha change therefore does not prepare, even at
+  fractional scales. A size, scale or radius change replaces the one prepared size; there is
+  no cache of several sizes, which is the caller's decision if it wants one.
 - **The same scaler, not a second one.** The scaling that was inside `Painter::image` moved
   to its own file, `gfx/painted.rs`, as `Scaled` (taps, the across pass and the down pass)
   and `blend_pixel`. `image` still uses it, so its pixels are unchanged; `prepare_image`
   uses the same sampling and folds `corner_cover` into alpha; `blit_rgba` reuses
   `blend_pixel` at 1:1. `gfx/shapes.rs` no longer holds the picture code (it was already
-  over a thousand lines; it is 829 now, `painted.rs` is 498 and `picture.rs` is 594).
+  over a thousand lines; it is 829 now, `painted.rs` is 511 and `picture.rs` is 619).
 - **A prepared draw matches `Painter::image`** at the same device size, within 2 levels a
   channel: the difference is the 8-bit rounding of the prepared buffer, and the test checks
   scales 1, 1.5 and 2, a rounded corner, half alpha and a cut-out. An infinite or NaN radius
@@ -1912,7 +1913,7 @@ and a later draw at the same size, scale and corner radius only blends them.
   `Painter::blit_rgba` and `prepare_image` are crate-private. No existing signature, public
   field or drawing changed.
 
-Tests, ten in `picture::tests`:
+Tests, eleven in `picture::tests`:
 
 - `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (three scales, radius,
   alpha and a cut-out, within 2 levels a channel).
@@ -1927,6 +1928,8 @@ Tests, ten in `picture::tests`:
 - `the_clip_and_the_offset_are_honoured` (the inked box is exactly the clip's intersection;
   the clipped draw and the whole draw together prepare once; the offset moves them by whole
   pixels without preparing again).
+- `a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (at scale 1.5 a placement one
+  device px narrower than the cached width leaves the pixel just past `dst` untouched).
 - `zero_nan_and_huge_sizes_neither_panic_nor_prepare` (zero, negative, NaN and infinite
   rectangles and a zero, NaN alpha draw nothing; a huge finite target is not prepared but
   draws its visible corner; huge, infinite and NaN radii all round fully and prepare once).
@@ -1945,14 +1948,17 @@ test fail. Making the key check always true (prepare on every draw) failed
 first commit did, failed `a_move_at_a_fractional_scale_does_not_prepare_again`. Removing the
 corner coverage from `prepare_image` failed
 `a_prepared_picture_draws_what_the_painter_draws_at_the_same_size` (by 253 levels). Removing
-the clip from `blit_rgba` failed `the_clip_and_the_offset_are_honoured`. Making `load` never
-call the slot failed `the_decoder_slot_reads_a_format_the_toolkit_refuses`; removing the
-`catch_unwind` failed `a_slot_that_panics_or_returns_a_broken_image_is_damaged`.
+the clip from `blit_rgba` failed `the_clip_and_the_offset_are_honoured`. Drawing the blit
+past the placed rectangle, as the first commit did, failed
+`a_picture_a_pixel_narrower_does_not_paint_past_its_rectangle` (the pixel outside `dst`
+became the picture's). Making `load` never call the slot failed
+`the_decoder_slot_reads_a_format_the_toolkit_refuses`; removing the `catch_unwind` failed
+`a_slot_that_panics_or_returns_a_broken_image_is_damaged`.
 
 Run on Windows: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --features
 mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace --features
 mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (exit 0;
-mdshared-ui 1130 passed, 33 ignored, doc-tests 5 passed and 1 ignored; the other crates all
+mdshared-ui 1131 passed, 33 ignored, doc-tests 5 passed and 1 ignored; the other crates all
 passed). Not run: release builds, the rest of the seventeen-command matrix, Linux and macOS
 (CI will). **Not seen in a real window**: no application or example draws a `Picture` yet, and
 no person has looked at it; the evidence is pixel tests against `Painter::image`.
