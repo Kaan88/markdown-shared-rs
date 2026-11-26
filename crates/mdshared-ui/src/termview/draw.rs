@@ -1,6 +1,7 @@
 //! Drawing a screen: each row on its own, clipped to its band, so that a row drawn alone is the
 //! row of a whole frame pixel for pixel.
 
+use super::backdrop::{self, BackgroundOpacity};
 use super::boxes::{Piece, coverage, is_box_char, pieces};
 use super::font::CellFont;
 use super::metrics::Metrics;
@@ -9,7 +10,7 @@ use super::view::View;
 use crate::anim::{Animator, AsId};
 use crate::gfx::{Painter, Rect, Rgb};
 use mdshared_term::select::END;
-use mdshared_term::{Attrs, Cell, CursorShape, Line, Screen, Selection};
+use mdshared_term::{Attrs, Cell, Color, CursorShape, Line, Screen, Selection};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -114,15 +115,60 @@ pub fn draw_screen(
     selection: Option<&Selection>,
     view: View,
 ) {
+    draw_screen_with_background(
+        p,
+        font,
+        scheme,
+        metrics,
+        area,
+        screen,
+        selection,
+        view,
+        BackgroundOpacity::new(1.0),
+    );
+}
+
+/// Draws the same grid as [`draw_screen`], with an optional translucent default background.
+/// The Windows host supplies a frost key only while its backdrop is active; without that key
+/// (including high contrast, loss of focus, Linux and macOS in `host`) this draws exactly like
+/// `draw_screen`. The terminal opacity is independent of the chrome's veil.
+///
+/// Glyph coverage, explicit backgrounds, inverse cells, selection and cursor ink are opaque.
+/// The renderer raises opacity as needed for 4.5:1 against any backdrop for text that meets
+/// that contrast with the original opaque background. Program colours that do not meet it
+/// stay unchanged on an opaque background. Opacity 1 gives the original pixels.
+///
+/// The translucent pixels are ready to present (premultiplied, not chrome-keyed). Draw this
+/// after other blended painting in the area, or cover it with opaque fills before drawing
+/// over it: ordinary painter blends assume an opaque destination.
+#[allow(clippy::too_many_arguments)] // drawing call: the grid, its look and its state
+pub fn draw_screen_with_background(
+    p: &mut Painter,
+    font: &mut CellFont,
+    scheme: &Scheme,
+    metrics: &Metrics,
+    area: Rect,
+    screen: &Screen,
+    selection: Option<&Selection>,
+    view: View,
+    opacity: BackgroundOpacity,
+) {
+    let background = Background::new(p, scheme, opacity);
     let (x0, y0, x1, y1) = p.dev_rect(area);
     let (_, ch) = metrics.cell_device();
     let below = y0 as i64 + screen.rows() as i64 * ch as i64;
     if below < y1 as i64 {
         let old = p.clip(area);
         p.fill_dev(x0, below as i32, x1, y1, scheme.background, 1.0);
+        if let Some(background) = background.filter(|b| b.opacity.padding) {
+            let clip = p.clip(area);
+            let rect = (clip.0, clip.1.max(below as i32), clip.2, clip.3);
+            backdrop::mark(p, rect, background.normal);
+            backdrop::finish(p, rect);
+        }
         p.restore(old);
     }
-    draw_rows(
+    paint_rows(
         p,
         font,
         scheme,
@@ -132,6 +178,7 @@ pub fn draw_screen(
         selection,
         view,
         std::slice::from_ref(&(0..screen.rows())),
+        background,
     );
 }
 
@@ -159,6 +206,55 @@ pub fn draw_rows(
     selection: Option<&Selection>,
     view: View,
     rows: &[Range<usize>],
+) {
+    draw_rows_with_background(
+        p,
+        font,
+        scheme,
+        metrics,
+        area,
+        screen,
+        selection,
+        view,
+        rows,
+        BackgroundOpacity::new(1.0),
+    );
+}
+
+/// [`draw_rows`] with the background treatment of [`draw_screen_with_background`]. It redraws
+/// the right padding in each band, not the padding below the grid. Redraw the whole area
+/// after changing the opacity or padding option.
+#[allow(clippy::too_many_arguments)] // drawing call: the grid, its look, its state and the rows
+pub fn draw_rows_with_background(
+    p: &mut Painter,
+    font: &mut CellFont,
+    scheme: &Scheme,
+    metrics: &Metrics,
+    area: Rect,
+    screen: &Screen,
+    selection: Option<&Selection>,
+    view: View,
+    rows: &[Range<usize>],
+    opacity: BackgroundOpacity,
+) {
+    let background = Background::new(p, scheme, opacity);
+    paint_rows(
+        p, font, scheme, metrics, area, screen, selection, view, rows, background,
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // shared row painting for both entry points
+fn paint_rows(
+    p: &mut Painter,
+    font: &mut CellFont,
+    scheme: &Scheme,
+    metrics: &Metrics,
+    area: Rect,
+    screen: &Screen,
+    selection: Option<&Selection>,
+    view: View,
+    rows: &[Range<usize>],
+    background: Option<Background>,
 ) {
     let (ax0, ay0, ax1, ay1) = p.dev_rect(area);
     if ax1 <= ax0 || ay1 <= ay0 {
@@ -188,6 +284,7 @@ pub fn draw_rows(
                 metrics,
                 cursor: cursor.filter(|c| c.row == r),
                 focused: view.is_focused(),
+                background,
             };
             row.draw(
                 p,
@@ -202,6 +299,54 @@ pub fn draw_rows(
         }
     }
     p.restore(outer);
+}
+
+#[derive(Clone, Copy)]
+struct Background {
+    opacity: BackgroundOpacity,
+    normal: u8,
+}
+
+impl Background {
+    fn new(p: &Painter, s: &Scheme, opacity: BackgroundOpacity) -> Option<Self> {
+        let opacity = opacity.active(p)?;
+        Some(Self {
+            opacity,
+            normal: opacity.for_ink(s.background, s.foreground),
+        })
+    }
+
+    fn alpha(self, scheme: &Scheme, cell: Cell, colors: CellColors, highlighted: bool) -> u8 {
+        if highlighted || cell.bg != Color::Default || cell.attrs.contains(Attrs::INVERSE) {
+            return 255;
+        }
+        match colors.glyph {
+            Some(ink)
+                if ink != scheme.foreground
+                    && (cell.ch != ' '
+                        || cell.attrs.contains(Attrs::UNDERLINE)
+                        || cell.attrs.contains(Attrs::STRIKE)) =>
+            {
+                self.opacity.for_ink(scheme.background, ink)
+            }
+            _ => self.normal,
+        }
+    }
+}
+
+fn paint_background_run(
+    p: &mut Painter,
+    rect: (i32, i32, i32, i32),
+    color: Rgb,
+    alpha: u8,
+    default: Rgb,
+) {
+    if color != default {
+        p.fill_dev(rect.0, rect.1, rect.2, rect.3, color, 1.0);
+    }
+    if alpha != 255 {
+        backdrop::mark(p, rect, alpha);
+    }
 }
 
 /// Logical px for a device rectangle of the painter (its offset taken off), which the painter
@@ -225,6 +370,7 @@ struct Row<'a> {
     cursor: Option<CursorAt>,
     /// The view has the focus: a block cursor is filled, every cursor is hollow otherwise.
     focused: bool,
+    background: Option<Background>,
 }
 
 impl Row<'_> {
@@ -246,7 +392,20 @@ impl Row<'_> {
         let first = ((clip.0 - self.ax0).max(0) / cw) as usize;
         let last = ((((clip.2 - self.ax0).max(0) + cw - 1) / cw) as usize).min(cols);
         p.fill_dev(clip.0, y0, clip.2, y1, scheme.background, 1.0);
+        if let Some(background) = self.background.filter(|b| b.opacity.padding) {
+            let right = self.ax0 as i64 + cols as i64 * cw as i64;
+            let padding = (
+                right.max(clip.0 as i64).min(clip.2 as i64) as i32,
+                clip.1,
+                clip.2,
+                clip.3,
+            );
+            backdrop::mark(p, padding, background.normal);
+        }
         if first >= last {
+            if self.background.is_some() {
+                backdrop::finish(p, clip);
+            }
             return;
         }
         let span = selection.and_then(|s| s.span_on(abs));
@@ -263,29 +422,32 @@ impl Row<'_> {
         };
 
         // Backgrounds, in runs of one colour.
-        let mut run: Option<(i32, Rgb)> = None;
+        let mut run: Option<(i32, Rgb, u8)> = None;
+        let rect = |x0: i32, x1: i32| (x0.max(clip.0), clip.1, x1.min(clip.2), clip.3);
         let mut col = start;
         while col < last {
             let (lead, cells) = character_at(line, col, cols);
-            let c = look(scheme, &cell(lead), lead, cells, span, focused_block);
+            let cl = cell(lead);
+            let c = look(scheme, &cl, lead, cells, span, focused_block);
+            let alpha = self.background.map_or(255, |b| {
+                let highlighted = focused_block == Some(lead)
+                    || (lead..lead + cells).any(|col| covers(span, col));
+                b.alpha(scheme, cl, c, highlighted)
+            });
             let x = self.ax0 + (lead * cw as usize) as i32;
             match run {
-                Some((_, color)) if color == c.back => {}
-                Some((sx, color)) => {
-                    if color != scheme.background {
-                        p.fill_dev(sx, y0, x, y1, color, 1.0);
-                    }
-                    run = Some((x, c.back));
+                Some((_, color, a)) if (color, a) == (c.back, alpha) => {}
+                Some((sx, color, a)) => {
+                    paint_background_run(p, rect(sx, x), color, a, scheme.background);
+                    run = Some((x, c.back, alpha));
                 }
-                None => run = Some((x, c.back)),
+                None => run = Some((x, c.back, alpha)),
             }
             col = lead + cells;
         }
-        if let Some((sx, color)) = run
-            && color != scheme.background
-        {
+        if let Some((sx, color, a)) = run {
             let end = self.ax0 + (col * cw as usize) as i32;
-            p.fill_dev(sx, y0, end, y1, color, 1.0);
+            paint_background_run(p, rect(sx, end), color, a, scheme.background);
         }
 
         // Characters and their lines.
@@ -301,7 +463,17 @@ impl Row<'_> {
             let x = self.ax0 + (lead * cw as usize) as i32;
             let w = cw * cells as i32;
             if is_box_char(cl.ch) {
-                draw_box(p, cl.ch, x, y0, cw, ch, self.metrics.stroke(), fg);
+                draw_box(
+                    p,
+                    cl.ch,
+                    x,
+                    y0,
+                    cw,
+                    ch,
+                    self.metrics.stroke(),
+                    fg,
+                    self.background.map(|_| clip),
+                );
             } else if cl.ch != ' ' {
                 let style = (
                     cl.attrs.contains(Attrs::BOLD),
@@ -315,6 +487,7 @@ impl Row<'_> {
                     self.metrics,
                     (x, w, y0 + self.metrics.baseline()),
                     fg,
+                    self.background.is_some(),
                 );
             }
             let t = self.metrics.stroke();
@@ -347,14 +520,44 @@ impl Row<'_> {
                 }
             }
         }
+        if self.background.is_some() {
+            backdrop::finish(p, clip);
+        }
     }
 }
 
 /// Draws a box-drawing or block character in the cell at `x, y` (device px), `cw` by `ch`.
 #[allow(clippy::too_many_arguments)] // drawing call: a place plus a style
-fn draw_box(p: &mut Painter, c: char, x: i32, y: i32, cw: i32, ch: i32, light: i32, fg: Rgb) {
+fn draw_box(
+    p: &mut Painter,
+    c: char,
+    x: i32,
+    y: i32,
+    cw: i32,
+    ch: i32,
+    light: i32,
+    fg: Rgb,
+    opaque_ink: Option<(i32, i32, i32, i32)>,
+) {
     let Some(shapes) = pieces(c, cw, ch, light) else {
         return;
+    };
+    let fill = |p: &mut Painter, x0, y0, x1, y1, a: f32| {
+        p.fill_dev(x0, y0, x1, y1, fg, a);
+        if let Some(clip) = opaque_ink
+            && a > 0.0
+            && a < 1.0
+        {
+            let rect = (
+                x0.max(clip.0),
+                y0.max(clip.1),
+                x1.min(clip.2),
+                y1.min(clip.3),
+            );
+            if rect.0 < rect.2 && rect.1 < rect.3 {
+                backdrop::mark(p, rect, 255);
+            }
+        }
     };
     for piece in &shapes {
         match *piece {
@@ -364,13 +567,13 @@ fn draw_box(p: &mut Painter, c: char, x: i32, y: i32, cw: i32, ch: i32, light: i
                 x1,
                 y1,
                 alpha,
-            } => p.fill_dev(x + x0, y + y0, x + x1, y + y1, fg, alpha),
+            } => fill(p, x + x0, y + y0, x + x1, y + y1, alpha),
             _ => {
                 for py in 0..ch {
                     for px in 0..cw {
                         let a = coverage(piece, px, py, cw, ch);
                         if a > 0.0 {
-                            p.fill_dev(x + px, y + py, x + px + 1, y + py + 1, fg, a);
+                            fill(p, x + px, y + py, x + px + 1, y + py + 1, a);
                         }
                     }
                 }

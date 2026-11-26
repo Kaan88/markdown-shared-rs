@@ -337,7 +337,7 @@ impl TextEngine {
         oy: f32,
         clip: (i32, i32, i32, i32),
     ) {
-        self.draw_runs(fb, layout, ox, oy, clip, None);
+        self.draw_runs(fb, layout, (ox, oy), clip, None, false);
     }
 
     /// [`draw_layout_clipped`](Self::draw_layout_clipped) with every glyph in the colour `rgb`
@@ -355,7 +355,24 @@ impl TextEngine {
         clip: (i32, i32, i32, i32),
         rgb: [u8; 3],
     ) {
-        self.draw_runs(fb, layout, ox, oy, clip, Some(rgb));
+        self.draw_runs(fb, layout, (ox, oy), clip, Some(rgb), false);
+    }
+
+    /// Draws tinted glyphs on a flat, straight-colour background as
+    /// [`Self::draw_layout_clipped_tinted`] does, and writes alpha 255 at every pixel covered by
+    /// a glyph mask, including its antialiased edges. Leaves alpha alone where there is no ink.
+    /// This lets a caller composite the finished background separately without thinning the ink.
+    #[allow(clippy::too_many_arguments)] // same coordinates and tint as the existing draw
+    pub fn draw_layout_clipped_tinted_opaque_ink(
+        &mut self,
+        fb: &mut Bitmap,
+        layout: &Layout<Brush>,
+        ox: f32,
+        oy: f32,
+        clip: (i32, i32, i32, i32),
+        rgb: [u8; 3],
+    ) {
+        self.draw_runs(fb, layout, (ox, oy), clip, Some(rgb), true);
     }
 
     /// The drawing of both: each run's brush, or `tint` in its place.
@@ -363,10 +380,10 @@ impl TextEngine {
         &mut self,
         fb: &mut Bitmap,
         layout: &Layout<Brush>,
-        ox: f32,
-        oy: f32,
+        (ox, oy): (f32, f32),
         clip: (i32, i32, i32, i32),
         tint: Option<[u8; 3]>,
+        opaque_ink: bool,
     ) {
         let clip = (
             clip.0.max(0),
@@ -417,7 +434,15 @@ impl TextEngine {
                     if let Some(entry) = self.map.get_mut(&key) {
                         entry.last_used = tick;
                         self.stats.hits += 1;
-                        blit(fb, clip, entry, floor_x as i32, y as i32, brush, &self.lut);
+                        blit(
+                            fb,
+                            clip,
+                            entry,
+                            (floor_x as i32, y as i32),
+                            brush,
+                            &self.lut,
+                            opaque_ink,
+                        );
                         continue;
                     }
                     self.stats.misses += 1;
@@ -430,7 +455,15 @@ impl TextEngine {
                     let Some(entry) = self.map.get(&key) else {
                         continue;
                     };
-                    blit(fb, clip, entry, floor_x as i32, y as i32, brush, &self.lut);
+                    blit(
+                        fb,
+                        clip,
+                        entry,
+                        (floor_x as i32, y as i32),
+                        brush,
+                        &self.lut,
+                        opaque_ink,
+                    );
                 }
             }
         }
@@ -442,10 +475,10 @@ fn blit(
     fb: &mut Bitmap,
     clip: (i32, i32, i32, i32),
     entry: &Entry,
-    gx: i32,
-    gy: i32,
+    (gx, gy): (i32, i32),
     brush: Brush,
     lut: &Lut,
+    opaque_ink: bool,
 ) {
     if entry.w == 0 || entry.h == 0 {
         return;
@@ -485,6 +518,9 @@ fn blit(
                 d[0] = ((s[2] as u32 * a + d[0] as u32 * ia + 127) / 255) as u8;
                 d[1] = ((s[1] as u32 * a + d[1] as u32 * ia + 127) / 255) as u8;
                 d[2] = ((s[0] as u32 * a + d[2] as u32 * ia + 127) / 255) as u8;
+                if opaque_ink {
+                    d[3] = 255;
+                }
             }
         } else {
             for (s, d) in src
@@ -504,6 +540,9 @@ fn blit(
                 d[0] = ((brush[2] as u32 * ab + d[0] as u32 * (255 - ab) + 127) / 255) as u8;
                 d[1] = ((brush[1] as u32 * ag + d[1] as u32 * (255 - ag) + 127) / 255) as u8;
                 d[2] = ((brush[0] as u32 * ar + d[2] as u32 * (255 - ar) + 127) / 255) as u8;
+                if opaque_ink {
+                    d[3] = 255;
+                }
             }
         }
     }
@@ -532,6 +571,38 @@ mod tests {
 
     const SAMPLE: &str = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen \
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
+
+    #[test]
+    fn nonzero_ink_masks_restore_alpha_even_when_the_rgb_does_not_change() {
+        let lut = Lut::new(1.0, 1.0);
+        for (color, data) in [
+            (false, vec![0, 0, 0, 0, 1, 0]),
+            (true, vec![0, 0, 0, 0, 37, 37, 37, 1]),
+        ] {
+            let entry = Entry {
+                left: 0,
+                top: 0,
+                w: 2,
+                h: 1,
+                color,
+                data: data.into_boxed_slice(),
+                last_used: 0,
+            };
+            let mut bmp = Bitmap::new(2, 1);
+            bmp.pixels
+                .copy_from_slice(&[37, 37, 37, 190, 37, 37, 37, 190]);
+            blit(
+                &mut bmp,
+                (0, 0, 2, 1),
+                &entry,
+                (0, 0),
+                [37, 37, 37, 255],
+                &lut,
+                true,
+            );
+            assert_eq!(bmp.pixels, [37, 37, 37, 190, 37, 37, 37, 255]);
+        }
+    }
 
     #[test]
     fn a_clipped_draw_is_the_unclipped_draw_cropped() {

@@ -81,6 +81,7 @@
 //! `termview-150.png`. The speed of a full 200 by 60 frame: `cargo test --release -p
 //! mdshared-ui --features term termview_speed -- --ignored --nocapture`.
 
+mod backdrop;
 mod boxes;
 mod draw;
 mod font;
@@ -89,11 +90,15 @@ mod scheme;
 mod view;
 
 #[cfg(test)]
+mod backdrop_tests;
+#[cfg(test)]
 mod tests;
 
+pub use backdrop::BackgroundOpacity;
 pub use boxes::is_box_char;
 pub use draw::{
-    cursor_blinks_on, draw_rows, draw_rows_animated, draw_screen, draw_screen_animated,
+    cursor_blinks_on, draw_rows, draw_rows_animated, draw_rows_with_background, draw_screen,
+    draw_screen_animated, draw_screen_with_background,
 };
 pub use font::{CellFont, MAX_SHAPED, MONO_FAMILY};
 pub use metrics::Metrics;
