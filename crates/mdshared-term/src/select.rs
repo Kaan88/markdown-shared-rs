@@ -750,9 +750,9 @@ mod tests {
         s.resize_reflow(6, 4);
         assert_eq!(sel.text(&s), "abc");
         assert_eq!(
-            s.scrollback_line(0).map(Line::text).as_deref(),
-            Some("abcdef"),
-            "the line the number points at holds the rest of the row now"
+            s.row_text(0),
+            "abcdef",
+            "the row the number points at holds the rest of the text now"
         );
         assert!(!sel.follow(&s));
         // A selection made after the reflow follows the screen like any other.

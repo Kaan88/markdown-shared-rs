@@ -54,8 +54,9 @@ pub(crate) struct Spot {
     pub pending: bool,
 }
 
-/// How many places a reflow carries: the cursor and the saved cursor.
-const PLACES: usize = 2;
+/// How many places a reflow carries: the cursor, the saved cursor and one the caller holds (a
+/// view's top line, say).
+const PLACES: usize = 3;
 
 /// Re-wraps `lines` at `cols` columns, carrying the places in `spots` (their lines are indices
 /// into `lines`) across with the text.
@@ -285,8 +286,10 @@ mod tests {
     }
 
     /// The places these tests carry: the cursor, and nothing else.
-    fn at(line: usize, col: usize, pending: bool) -> [Option<Spot>; 2] {
-        [Some(Spot { line, col, pending }), None]
+    fn at(line: usize, col: usize, pending: bool) -> [Option<Spot>; PLACES] {
+        let mut spots = [None; PLACES];
+        spots[0] = Some(Spot { line, col, pending });
+        spots
     }
 
     /// The wrapped flags of the produced rows, as `-` for a hard break and `>` for a wrap.
@@ -460,6 +463,6 @@ mod tests {
         // A place outside the lines comes back as nothing, and does not panic.
         let (out, places) = reflow(vec![line("ab", false)], at(99, 99, false), 5);
         assert_eq!(out.len(), 1);
-        assert_eq!(places, [None, None]);
+        assert_eq!(places, [None; PLACES]);
     }
 }

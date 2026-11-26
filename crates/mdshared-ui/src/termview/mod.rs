@@ -47,9 +47,15 @@
 //! // Once: the font and its cells, again when the size or the scale changes.
 //! let mut font = CellFont::new();
 //! let metrics = font.metrics(14.0, scale);
-//! // On a resize: as many cells as fit, for the screen and the pseudo-terminal.
+//! // On a resize: as many cells as fit, for the screen and the pseudo-terminal. While the
+//! // window is being dragged, `resize` is enough; when it settles, `resize_reflow_anchored`
+//! // joins and wraps the lines again and says where the line the view was showing went, so a
+//! // view scrolled back keeps showing it.
 //! let (cols, rows) = metrics.grid_size(area);
-//! screen.resize_reflow(cols, rows);
+//! let top = view.top_line(&screen);
+//! if let Some(now) = screen.resize_reflow_anchored(cols, rows, Some(top)) {
+//!     view = view.at_line(&screen, now);
+//! }
 //! // Each frame:
 //! let scheme = Scheme::from_palette(&pal);
 //! let view = View::new().scrolled(scroll).focused(window_focused);

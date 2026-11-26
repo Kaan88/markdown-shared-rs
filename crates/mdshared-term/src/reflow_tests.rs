@@ -106,9 +106,9 @@ fn narrowing_and_widening_again_gives_back_the_same_lines() {
 
     // The line is wrapped again rather than cut, and what did not fit the screen is history.
     s.resize_reflow(7, 4);
-    assert_eq!(grid(&s), " past t\nhe edge\nshort\n");
-    assert_eq!(s.scrollback_len(), 3);
-    assert_eq!(at(&s), (2, 5));
+    assert_eq!(grid(&s), "at goes\n past t\nhe edge\nshort");
+    assert_eq!(s.scrollback_len(), 2);
+    assert_eq!(at(&s), (3, 5));
     check(&s);
 
     // Wider again: the two rows join back into the one line they were, and the rows the
@@ -195,8 +195,8 @@ fn the_cursor_stays_on_the_same_character_of_the_same_line() {
     s.resize_reflow(7, 6);
     let c = s.cursor();
     assert_eq!(s.cell(c.row, c.col).ch, 'k', "on the same character");
-    assert_eq!((c.row, c.col), (0, 3), "three columns into the row below");
-    assert_eq!(grid(&s), "hijklmn\nopqrst\nxyz\n\n\n");
+    assert_eq!((c.row, c.col), (1, 3), "three columns into the row below");
+    assert_eq!(grid(&s), "abcdefg\nhijklmn\nopqrst\nxyz\n\n");
 
     // Back to the width it was: the letter is under the cursor again, where it was.
     s.resize_reflow(20, 6);
@@ -223,8 +223,8 @@ fn a_hard_break_stays_where_it_is() {
     assert_eq!(grid(&s), "abcdef\ngh\n");
     assert_eq!(logical(&s), ["abcdef", "gh"]);
     s.resize_reflow(3, 3);
-    assert_eq!(grid(&s), "def\ngh\n");
-    assert_eq!(s.scrollback_line(0).map(Line::text).as_deref(), Some("abc"));
+    assert_eq!(grid(&s), "abc\ndef\ngh");
+    assert_eq!(s.scrollback_len(), 0);
     assert_eq!(logical(&s), ["abcdef", "gh"]);
     check(&s);
 }
@@ -234,13 +234,13 @@ fn a_wide_character_at_the_edge_is_padded_off_and_never_cut() {
     let mut s = fed(6, 3, "abcd漢\r\nxyz");
     assert_eq!(grid(&s), "abcd漢\nxyz\n");
     s.resize_reflow(5, 3);
-    // It does not fit in the last column: that one stays empty and it goes in the row below,
-    // and the row of text above it is pushed into the scrollback by the new row it takes.
-    assert_eq!(grid(&s), "漢\nxyz\n");
+    // It does not fit in the last column: that one stays empty and it goes in the row below.
+    assert_eq!(grid(&s), "abcd\n漢\nxyz");
     assert_eq!(logical(&s), ["abcd漢", "xyz"]);
     assert_eq!(
-        s.scrollback_line(0).map(Line::text).as_deref(),
-        Some("abcd")
+        s.scrollback_len(),
+        0,
+        "the whole text still fits the screen"
     );
     check(&s);
     // Wider again: the pad is not a space of the text, so the character comes back up.
@@ -309,9 +309,9 @@ fn the_alternate_screen_is_cut_and_the_main_screen_behind_it_is_reflowed() {
     );
     assert_eq!(logical(&s), ["main line that is long", "second"]);
     assert_eq!(
-        s.scrollback_line(0).map(Line::text).as_deref(),
-        Some("main lin"),
-        "and the rest of the line is on the screen below it"
+        grid(&s),
+        "main lin\ne that i\ns long\nsecond",
+        "the line is joined onto the rows it grew, not cut"
     );
     check(&s);
 }
@@ -407,4 +407,66 @@ fn the_logical_content_survives_a_random_resize_round_trip() {
         );
         assert_eq!(before_cursor(&s), place, "round {round}: the cursor back");
     }
+}
+
+#[test]
+fn the_text_below_the_cursor_is_kept_and_the_overflow_goes_into_the_scrollback() {
+    // Six full lines on six rows, the cursor at the top: narrowing makes every line four rows
+    // long, and not one of them may be lost below the screen.
+    let mut s = Screen::new(20, 6, 1000);
+    let lines = [
+        "aaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccc",
+        "dddddddddddddddddddd",
+        "eeeeeeeeeeeeeeeeeeee",
+        "ffffffffffffffffffff",
+    ];
+    for line in lines {
+        s.feed(line.as_bytes());
+        s.feed(b"\r\n");
+    }
+    s.feed(b"\x1b[1;1H");
+    let before = logical(&s);
+    assert_eq!(before, lines);
+    s.resize_reflow(5, 6);
+    assert_eq!(logical(&s), before, "every line of text is still there");
+    assert_eq!(
+        s.line(s.rows() - 1).map(Line::text).as_deref(),
+        Some("fffff"),
+        "the bottom of the text is on the screen"
+    );
+    assert!(s.scrollback_len() > 0, "what did not fit is history");
+    check(&s);
+}
+
+#[test]
+fn an_anchor_line_is_reported_where_its_text_went() {
+    let mut s = Screen::new(20, 3, 100);
+    s.feed(b"one two\r\nsix ten\r\nnine\r\nfour");
+    s.feed(b"\x1b[2;1H");
+    let anchor = s.screen_start();
+    let was = s.line_at(anchor).expect("the screen's top line").text();
+    let now = s
+        .resize_reflow_anchored(6, 3, Some(anchor))
+        .expect("the line is still kept");
+    let there = s.line_at(now).expect("the line the anchor named");
+    assert!(
+        was.starts_with(&there.text()),
+        "the anchor's text: {was:?} at {now} is {:?}",
+        there.text()
+    );
+}
+
+#[test]
+fn an_anchor_line_the_ring_dropped_is_not_reported() {
+    let mut s = Screen::new(20, 3, 2);
+    s.feed(b"aaaa bbbb cccc\r\ndddd\r\neeee\r\nffff\r\ngggg\r\nhhhh");
+    assert!(s.first_line() > 0, "the ring has dropped something");
+    let gone = s.first_line() - 1;
+    assert_eq!(
+        s.resize_reflow_anchored(6, 3, Some(gone)),
+        None,
+        "a line the scrollback dropped has no place to point at"
+    );
 }

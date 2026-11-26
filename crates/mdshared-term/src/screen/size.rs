@@ -114,14 +114,32 @@ impl Screen {
     /// answers false after it and the caller drops the selection, as it does when a program
     /// rewrites the text.
     pub fn resize_reflow(&mut self, cols: usize, rows: usize) {
+        self.resize_reflow_anchored(cols, rows, None);
+    }
+
+    /// [`resize_reflow`](Self::resize_reflow), and it says where the content that was at
+    /// absolute line `anchor` is after it (`None` for one the reflow did not keep, or when no
+    /// anchor was given): what a caller that was scrolled back to a line needs to stay on it,
+    /// the numbers having moved with the text.
+    ///
+    /// A caller that resizes a window while it is being dragged should call this once, when the
+    /// drag ends, and [`resize`](Self::resize) while it is going on: each reflow joins and
+    /// wraps the whole scrollback again, and a scrollback that grows past its limit at every
+    /// intermediate width loses its oldest lines for good.
+    pub fn resize_reflow_anchored(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        anchor: Option<u64>,
+    ) -> Option<u64> {
         let (cols, rows) = (cols.clamp(1, MAX_SIDE), rows.clamp(1, MAX_SIDE));
         if (cols, rows) == (self.cols, self.rows) {
-            return;
+            return anchor;
         }
         // A new height alone leaves every line of text as it was.
         if cols == self.cols {
             self.resize(cols, rows);
-            return;
+            return anchor;
         }
         let alt = self.modes.alt_screen;
         if alt {
@@ -138,6 +156,12 @@ impl Screen {
         // the alternate screen is. Its cursor's column is the saved one, which is where the
         // program left it, unless it never saved one.
         let saved = self.saved[0].map(|s| (s.row, s.col, s.pending));
+        // An anchor is a line of the buffer on screen, which the alternate screen never is.
+        let anchor = if alt {
+            None
+        } else {
+            anchor.and_then(|line| usize::try_from(line.checked_sub(self.dropped)?).ok())
+        };
         let (grid, cursor) = if alt {
             let (col, pending) = self.saved[0].map_or((self.col, false), |s| (s.col, s.pending));
             let main = self.main.take().unwrap_or_default();
@@ -148,7 +172,7 @@ impl Screen {
                 (self.row, self.col, self.pending),
             )
         };
-        let out = self.reflow_buffer(grid, cursor, saved, cols, rows);
+        let out = self.reflow_buffer(grid, cursor, saved, anchor, cols, rows);
         if alt {
             self.main = Some(out.grid);
             self.main_row = out.row;
@@ -171,20 +195,24 @@ impl Screen {
             self.col = self.col.min(cols - 1);
             self.pending = false;
         }
-        self.dirty = vec![true; rows];
+        self.dirty.clear();
+        self.dirty.resize(rows, true);
         self.reflows = self.reflows.wrapping_add(1);
+        out.anchor.map(|line| self.dropped + line as u64)
     }
 
     /// Re-wraps one buffer, its scrollback first, at `cols` by `rows`: the grid that is shown,
     /// or the main screen while the alternate one is. `cursor` and `saved` are places in `grid`
-    /// (a row, a column and whether the place hangs past a full row), and the result gives the
-    /// grid that fits, where the cursor is on it and, when it was given, where the saved place
-    /// is. The lines that do not fit the grid go into the scrollback.
+    /// (a row, a column and whether the place hangs past a full row), and `anchor` is a line of
+    /// the buffer the caller wants to find again. The result gives the grid that fits, where the
+    /// cursor is on it, where the saved place is, and where the anchor went. The lines that do
+    /// not fit the grid go into the scrollback.
     fn reflow_buffer(
         &mut self,
         grid: Vec<Line>,
         cursor: (usize, usize, bool),
         saved: Option<(usize, usize, bool)>,
+        anchor: Option<usize>,
         cols: usize,
         rows: usize,
     ) -> Reflowed {
@@ -197,18 +225,36 @@ impl Screen {
             col,
             pending,
         };
-        let (mut lines, places) =
-            reflow::reflow(lines, [Some(spot(cursor)), saved.map(spot)], cols);
+        let anchor_spot = anchor.map(|line| reflow::Spot {
+            line: line.min(last),
+            col: 0,
+            pending: false,
+        });
+        let (mut lines, places) = reflow::reflow(
+            lines,
+            [Some(spot(cursor)), saved.map(spot), anchor_spot],
+            cols,
+        );
         let place = places[0].unwrap_or_default();
-        // The grid shows the end of the buffer, or the cursor's line at its top when the text
-        // below it is longer than the screen: then the lines past the bottom are lost, as the
-        // lines below the cursor are when rows go.
-        let start = place.line.min(lines.len().saturating_sub(rows));
+        // The content ends at its last line, or at the cursor's line when that is below it: the
+        // empty rows after that are not content and are dropped. The grid shows the bottom of
+        // the content, so the lines the new wrapping added above it go into the scrollback and
+        // none below it is lost. Only when the content below the cursor is taller than the
+        // screen does the cursor's line end up above the grid, and then its row is the top one
+        // while the text it is on is history: nothing is lost, and a caller that scrolls back
+        // can show it.
+        let mut end = place.line;
+        for (i, line) in lines.iter().enumerate().skip(place.line) {
+            if line.text_len > 0 {
+                end = i;
+            }
+        }
+        lines.truncate(end + 1);
+        let start = end.saturating_add(1).saturating_sub(rows);
         let mut grid = lines.split_off(start);
         for line in lines {
             self.push_scrollback(line);
         }
-        grid.truncate(rows);
         while grid.len() < rows {
             grid.push(Line::blank(cols, Cell::BLANK));
         }
@@ -223,6 +269,7 @@ impl Screen {
                     p.pending,
                 )
             }),
+            anchor: places[2].map(|p| p.line),
             grid,
         }
     }
@@ -252,4 +299,6 @@ struct Reflowed {
     col: usize,
     pending: bool,
     saved: Option<(usize, usize, bool)>,
+    /// The line the caller's anchor is on now, when it was given one.
+    anchor: Option<usize>,
 }

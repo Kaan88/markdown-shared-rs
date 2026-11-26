@@ -621,6 +621,38 @@ fn a_painter_offset_moves_the_grid_by_whole_pixels() {
 }
 
 #[test]
+fn a_scrolled_back_view_stays_on_its_text_through_a_reflow() {
+    let mut s = screen(
+        12,
+        3,
+        b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc\r\ndddddddddd\r\neeeeeeeeee",
+    );
+    let view = View::new().scrolled(1);
+    let top = view.top_line(&s);
+    assert_eq!(
+        s.line_at(top).map(|line| line.text()).as_deref(),
+        Some("bbbbbbbbbb")
+    );
+    // Narrowing wraps the history again and every line takes two rows: the content the view
+    // showed has another number now, and the view goes with the content.
+    let now = s
+        .resize_reflow_anchored(6, 3, Some(top))
+        .expect("the line is still kept");
+    let kept = view.at_line(&s, now);
+    assert_eq!(
+        s.line_at(kept.top_line(&s))
+            .map(|line| line.text())
+            .as_deref(),
+        Some("bbbbbb")
+    );
+    assert_eq!(kept.scroll(), s.screen_start().saturating_sub(now) as usize);
+    assert!(
+        kept.scroll() > view.scroll(),
+        "the rows above it are more now"
+    );
+}
+
+#[test]
 fn nonsense_rectangles_and_rows_draw_nothing_and_do_not_panic() {
     let pal = DARK;
     let s = screen(5, 2, b"hi");

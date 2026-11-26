@@ -85,6 +85,18 @@ impl View {
         screen.screen_start() - self.scroll_in(screen) as u64
     }
 
+    /// The view scrolled back to show `line` on its top row, `line` being an absolute line
+    /// number. This is how a caller keeps a scrolled-back view on the same text across a resize
+    /// that reflowed the screen: remember [`top_line`](Self::top_line) before it,
+    /// [`Screen::resize_reflow_anchored`] says where that line went, and this puts the view back
+    /// on it. A line past either end is brought to the nearest row there is.
+    pub fn at_line(self, screen: &Screen, line: u64) -> View {
+        View {
+            scroll: screen.screen_start().saturating_sub(line) as usize,
+            ..self
+        }
+    }
+
     /// The absolute line number shown in the view's row `row`.
     pub fn line_of_row(&self, screen: &Screen, row: usize) -> u64 {
         self.top_line(screen).saturating_add(row as u64)
