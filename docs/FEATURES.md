@@ -1839,6 +1839,15 @@ terminal runs with Acrylic, Mica and the backdrop off. Pixel regressions check t
 over black and white, the frost marker throughout a fade, and repeat repaint of an already
 translucent row. The release matrix was not rerun for the review fix.
 
+Left open from the re-review:
+- No test pins the subpixel path on opaque pixels while a backdrop is active. A glyph on an
+  explicit background, compared pixel for pixel with `draw_screen`, would cover it.
+- The repaint test is a regression guard: it also passes on the commit before the fix.
+- Overlays are documented only. `scroll::draw_scrollbar` (0.55 and 0.85 alpha) still lets the
+  desktop show through for an app that skips the gutter. Possible guards: a `debug_assert!` on
+  a destination alpha below 255 that is not the chrome value, or an opaque-backing option on
+  the scrollbar.
+
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 
 `platform::system_is_dark` used to ask the settings portal on the calling thread with a 500 ms
