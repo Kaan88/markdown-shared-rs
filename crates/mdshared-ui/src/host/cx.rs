@@ -8,6 +8,7 @@ use winit::window::Window;
 
 use super::Proxy;
 use super::frame::{Damage, Deadlines, Visibility};
+use super::timers::NamedTimers;
 use crate::anim::Animator;
 use crate::corners::Corners;
 use crate::cursor::Cursor;
@@ -42,6 +43,11 @@ pub(super) struct Shared {
     pub(super) exit: bool,
     /// A call asked for a redraw or said the accessibility tree changed.
     pub(super) touched: bool,
+    /// The application asked to be shown again ([`Cx::show_window`]); the loop draws first and
+    /// then shows.
+    pub(super) show: bool,
+    /// The window has been shown once already (the first frame's show).
+    pub(super) shown: bool,
     /// Where the resize band is off ([`Cx::set_no_resize`]).
     pub(super) no_resize: Vec<Rect>,
 }
@@ -51,6 +57,8 @@ pub(super) struct Shared {
 pub struct Cx<'a, M: 'static> {
     pub(super) window: &'a Window,
     pub(super) anim: &'a mut Animator,
+    /// The application's named timers ([`Cx::timer_at`]).
+    pub(super) timers: &'a mut NamedTimers,
     pub(super) proxy: &'a Proxy<M>,
     pub(super) st: &'a mut Shared,
     pub(super) now: Instant,
@@ -61,11 +69,13 @@ pub struct Cx<'a, M: 'static> {
 
 impl<M: 'static> Cx<'_, M> {
     /// Asks for `r` (logical px) to be drawn again. Rectangles asked for before the frame are
-    /// joined. One that is empty or not made of numbers asks for nothing. Outside
-    /// [`App::draw`](super::App::draw) it also has the accessibility tree asked for again; during
-    /// a draw (the next frame of an animation) it does not: say
-    /// [`accessibility_changed`](Self::accessibility_changed) when a frame moved what the tree
-    /// reports.
+    /// joined where they overlap; an application whose
+    /// [`damage_regions`](super::App::damage_regions) is true gets each piece as its own `draw`
+    /// call and present, while every other one frame draws the union. One that is empty or not
+    /// made of numbers asks for nothing. Outside [`App::draw`](super::App::draw) it also has the
+    /// accessibility tree asked for again; during a draw (the next frame of an animation) it
+    /// does not: say [`accessibility_changed`](Self::accessibility_changed) when a frame moved
+    /// what the tree reports.
     pub fn request_redraw(&mut self, r: Rect) {
         self.st.damage.add(r);
         if self.drawing.is_none() {
@@ -111,6 +121,69 @@ impl<M: 'static> Cx<'_, M> {
     /// tooltip's delay, a toast's end, a `--seconds` limit.
     pub fn wake_at(&mut self, at: Instant) {
         self.st.deadlines.wake_at(at);
+    }
+
+    /// Sets the timer called `name` to `at`, or moves it when one of that name is already
+    /// waiting. When it comes the application gets
+    /// [`App::timer_fired`](super::App::timer_fired) with its name, once: ask again for a
+    /// repeating timer. Named timers are folded into the same one wake-up as
+    /// [`wake_at`](Self::wake_at) and the animator's deadline, so several of them (a caret's
+    /// blink, an autosave, a toast's end) still cost one `WaitUntil`; the loop sleeps until the
+    /// earliest. An instant already past is due at the next turn of the loop, even when set
+    /// from [`App::timer_fired`](super::App::timer_fired): a timer set during a turn waits for
+    /// the next one, so re-arming at [`now`](Self::now) cannot spin the loop.
+    ///
+    /// A name is just a string the application chooses; setting it twice moves that one timer.
+    /// Timers keep running while the window is hidden ([`hide_window`](Self::hide_window)).
+    pub fn timer_at(&mut self, name: &str, at: Instant) {
+        self.timers.set(name, at);
+    }
+
+    /// Cancels the named timer `name`; true when one was waiting. A timer that has already
+    /// come is not cancelled (it is gone).
+    pub fn cancel_timer(&mut self, name: &str) -> bool {
+        self.timers.cancel(name)
+    }
+
+    /// Hides the window but keeps the loop alive (close to tray): timers and worker messages
+    /// still come, and the application still gets every call, but no frame is drawn or
+    /// presented until [`show_window`](Self::show_window). The window is not minimized and not
+    /// closed: its place, size and state stay as they were. This needs no tray icon of its
+    /// own; showing the window again is the application's (a tray icon, a second launch, a
+    /// global shortcut), which the host does not provide.
+    ///
+    /// **On Wayland this does nothing.** A Wayland window is a surface of its own and winit's
+    /// `set_visible` is a no-op there, so hiding it would only freeze it. The flag is not set
+    /// and the window keeps drawing; an application that offers close to tray must not rely on
+    /// it hiding there ([`hidden`](Self::hidden) stays false). Windows and macOS hide it.
+    pub fn hide_window(&mut self) {
+        if !super::run::can_hide(self.window) {
+            return;
+        }
+        if !self.st.vis.app_hidden() {
+            self.st.vis.set_app_hidden(true);
+            self.st.show = false;
+            self.window.set_visible(false);
+            // A window that is not on screen has no keyboard.
+            self.st.focused = false;
+        }
+    }
+
+    /// Shows a window hidden by [`hide_window`](Self::hide_window) again. The host draws and
+    /// presents it once while it is still hidden, then shows it, so the client area is never
+    /// seen undrawn; the whole window is drawn because it may have been resized or covered
+    /// while away. The keyboard is read again (a window hidden from launch has none). Nothing
+    /// when the window was not hidden by the application.
+    pub fn show_window(&mut self) {
+        if self.st.vis.app_hidden() {
+            self.st.show = true;
+            self.st.damage.all();
+        }
+    }
+
+    /// Whether the application hid the window with [`hide_window`](Self::hide_window).
+    pub fn hidden(&self) -> bool {
+        self.st.vis.app_hidden()
     }
 
     /// The time the host read for this call (a frame's time during a draw): what a model is
