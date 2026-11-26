@@ -12,6 +12,7 @@
 //! [`Screen::feed`] for the list, and the crate's documentation for what is left out.
 
 use crate::parse::{Params, Parser, Perform};
+use crate::reflow;
 use crate::width::char_width;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -121,6 +122,11 @@ impl Cell {
 pub struct Line {
     cells: Vec<Cell>,
     wrapped: bool,
+    /// The last cell is blank because a wide character did not fit in it and was moved to the
+    /// line below, not because a space was written there. A wrapped line's blank cells are
+    /// otherwise part of the text, which is why this is remembered: joining such a line into
+    /// another one drops this one cell and no other.
+    padded: bool,
 }
 
 impl Line {
@@ -128,7 +134,36 @@ impl Line {
         Line {
             cells: vec![fill; cols],
             wrapped: false,
+            padded: false,
         }
+    }
+
+    /// A line of the cells given, going on in the next one when `wrapped`. The caller keeps the
+    /// grid's habit: a wide character and its spacer cell travel together, and a line of the
+    /// grid is as wide as the screen.
+    pub(crate) fn from_cells(cells: Vec<Cell>, wrapped: bool) -> Line {
+        Line {
+            cells,
+            wrapped,
+            padded: false,
+        }
+    }
+
+    /// Whether the last cell is blank only because a wide character was moved down a line. Such
+    /// a cell is not a space of the text, and a caller joining the lines drops it.
+    pub(crate) fn is_padded(&self) -> bool {
+        self.padded
+    }
+
+    /// Says that the last cell is such a blank, or that it is not one any more.
+    pub(crate) fn set_padded(&mut self, padded: bool) {
+        self.padded = padded;
+    }
+
+    /// Takes the cells out and leaves the line empty: for a caller that joins this line into
+    /// another one and has no use for it afterwards. The `wrapped` flag stays.
+    pub(crate) fn take_cells(&mut self) -> Vec<Cell> {
+        std::mem::take(&mut self.cells)
     }
 
     /// The cells the line holds. A line of the grid holds one per column; a line of the
@@ -195,11 +230,13 @@ impl Line {
 
     fn resize(&mut self, cols: usize) {
         self.cells.resize(cols, Cell::BLANK);
-        // A wide character cut in two by the new edge goes altogether.
+        // A wide character cut in two by the new edge goes altogether, and the cell it leaves
+        // is a blank that is not a space of the text.
         if let Some(last) = self.cells.last_mut()
             && last.width == 2
         {
             *last = Cell::BLANK;
+            self.padded = true;
         }
     }
 }
@@ -324,7 +361,9 @@ const LINE_DRAWING: [char; 31] = [
 /// [`screen_start`](Self::screen_start), and [`line_at`](Self::line_at) reads any of them. A
 /// selection ([`crate::select`]) and a view scrolled back hold these numbers, so they stay on
 /// their text while output arrives. The numbers follow the text only when the whole screen
-/// scrolls; a program that scrolls a region of it, or redraws it, moves text under them.
+/// scrolls; a program that scrolls a region of it, or redraws it, moves text under them, and so
+/// does a [reflow of the width](Self::resize_reflow), which joins the wrapped lines and wraps
+/// them again and therefore renumbers every line of the buffer.
 #[derive(Clone, Debug)]
 pub struct Screen {
     cols: usize,
@@ -339,6 +378,10 @@ pub struct Screen {
     limit: usize,
     /// How many lines have left the scrollback's far end, ever.
     dropped: u64,
+    /// How many times the width was reflowed ([`Screen::resize_reflow`]). A selection holds the
+    /// number it was made under, so it can tell that its line numbers may point at other text
+    /// now, which comparing the text alone would miss whenever two pieces of text are alike.
+    reflows: u64,
     row: usize,
     col: usize,
     /// A character was written in the last column: the next one wraps first.
@@ -424,6 +467,7 @@ impl Screen {
             scrollback: VecDeque::new(),
             limit: scrollback,
             dropped: 0,
+            reflows: 0,
             row: 0,
             col: 0,
             pending: false,
@@ -565,6 +609,14 @@ impl Screen {
         }
     }
 
+    /// Whether the cursor stands after the last cell of a full row, where [the next character
+    /// wraps](Self::cursor) rather than being written over the last one. A terminal draws it
+    /// there as it does anywhere else, but a caller that tells the cursor's place apart from a
+    /// place on a character needs this: a resize keeps it as it keeps the cursor.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
     pub fn modes(&self) -> Modes {
         self.modes
     }
@@ -620,6 +672,10 @@ impl Screen {
     /// when rows come, they come empty at the bottom (nothing is pulled back out of the
     /// scrollback). The scroll region becomes the whole screen and every row is marked changed.
     /// The scrollback's lines keep the width they were written with.
+    ///
+    /// This is the call for a caller that wants a width change to cut, as a terminal did before
+    /// reflow existed; [`resize_reflow`](Self::resize_reflow) is the same change with the primary
+    /// screen and its scrollback joined and wrapped again.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let (cols, rows) = (cols.clamp(1, MAX_SIDE), rows.clamp(1, MAX_SIDE));
         if (cols, rows) == (self.cols, self.rows) {
@@ -648,17 +704,103 @@ impl Screen {
         for line in &mut self.grid {
             line.resize(cols);
         }
-        let old = self.tabs.len();
-        self.tabs.resize(cols, false);
-        for (c, stop) in self.tabs.iter_mut().enumerate().skip(old) {
-            *stop = c % 8 == 0;
-        }
+        self.fit_tabs(cols);
         (self.cols, self.rows) = (cols, rows);
         (self.top, self.bottom) = (0, rows - 1);
         self.row = self.row.min(rows - 1);
         self.col = self.col.min(cols - 1);
         self.pending = false;
         self.dirty = vec![true; rows];
+    }
+
+    /// Changes the screen's size and re-wraps it: when the width changes, the primary screen and
+    /// its scrollback are joined back into the lines of text they were (see [`Line::wrapped`])
+    /// and wrapped again at the new width, as xterm, VTE and kitty do, so that a line longer than
+    /// the screen is not cut and nothing is lost when the screen widens again.
+    ///
+    /// - A hard line break, one whose line is not marked as wrapped, stays where it is.
+    /// - The blank cells at the end of a line are not text and are dropped, so the padding of a
+    ///   row does not grow a space each time the width changes. The blank cells at the end of a
+    ///   line that goes on in the next one are text, though (a space written where the line
+    ///   broke off), and are kept; only the one cell a wide character was moved out of is
+    ///   dropped. A blank cell the program gave a colour is something on the screen and is kept.
+    /// - A character two cells wide is never cut: when it does not fit in the last column of the
+    ///   row, that column stays empty and the character goes in the row below.
+    /// - The cursor stays on the same character of the same line of text; a cursor past the end
+    ///   of that text keeps its place as far as the new width has columns for it, and a cursor
+    ///   that hangs past the right edge keeps its pending wrap.
+    /// - The grid stays at the end of the buffer, so the rows the new wrapping saved come back
+    ///   out of the scrollback and the rows it added go into it, up to the scrollback's limit
+    ///   (the oldest go when the new wrapping needs more lines than it keeps). The cursor's line
+    ///   stays on the screen: it keeps its row where the text above it wraps to the same height,
+    ///   and when more than a screenful of text ends up below it, it is put on the top row and
+    ///   the lines below the screen are lost, as the lines below the cursor are when rows go.
+    /// - The scroll region becomes the whole screen, the tab stops reach the new columns and
+    ///   every row is marked changed.
+    ///
+    /// The alternate screen is not reflowed: it is a picture the program drew cell by cell, and
+    /// it is cut and padded exactly as [`resize`](Self::resize) does, which is also what a change
+    /// of height alone gives. The two are the same call then, so a caller that wants no reflow at
+    /// all uses [`resize`](Self::resize).
+    ///
+    /// A selection cannot survive the re-wrap: its line numbers and columns point into a buffer
+    /// that was joined and wrapped again, so [`Selection::follow`](crate::select::Selection::follow)
+    /// answers false after it and the caller drops the selection, as it does when a program
+    /// rewrites the text.
+    pub fn resize_reflow(&mut self, cols: usize, rows: usize) {
+        let (cols, rows) = (cols.clamp(1, MAX_SIDE), rows.clamp(1, MAX_SIDE));
+        if (cols, rows) == (self.cols, self.rows) {
+            return;
+        }
+        // A picture drawn cell by cell is not a text to re-wrap, and a new height alone leaves
+        // every line of text as it was.
+        if self.modes.alt_screen || cols == self.cols {
+            self.resize(cols, rows);
+            return;
+        }
+        let cursor = self.scrollback.len() + self.row;
+        let grid = std::mem::take(&mut self.grid);
+        let mut lines: Vec<Line> = self.scrollback.drain(..).collect();
+        lines.extend(grid);
+        let (mut lines, place) = reflow::reflow(lines, cursor, self.col, self.pending, cols);
+        // The grid shows the end of the buffer, or the cursor's line at its top when the text
+        // below it is longer than the screen: then the lines past the bottom are lost, as the
+        // lines below the cursor are when rows go.
+        let start = place.line.min(lines.len().saturating_sub(rows));
+        let mut grid = lines.split_off(start);
+        for line in lines {
+            self.push_scrollback(line);
+        }
+        grid.truncate(rows);
+        while grid.len() < rows {
+            grid.push(Line::blank(cols, Cell::BLANK));
+        }
+        let row = place.line - start;
+        self.grid = grid;
+        self.fit_tabs(cols);
+        (self.cols, self.rows) = (cols, rows);
+        (self.top, self.bottom) = (0, rows - 1);
+        self.row = row.min(rows - 1);
+        self.col = place.col.min(cols - 1);
+        self.pending = place.pending && self.modes.autowrap;
+        self.dirty = vec![true; rows];
+        self.reflows = self.reflows.wrapping_add(1);
+    }
+
+    /// How many times the width of the screen was reflowed. A selection made under an older
+    /// count cannot know where its text went, and is dropped.
+    pub(crate) fn reflows(&self) -> u64 {
+        self.reflows
+    }
+
+    /// Brings the tab stops to `cols` columns: the ones that are there stay, the new ones are
+    /// every eighth column, as a terminal starts with them.
+    fn fit_tabs(&mut self, cols: usize) {
+        let old = self.tabs.len();
+        self.tabs.resize(cols, false);
+        for (c, stop) in self.tabs.iter_mut().enumerate().skip(old) {
+            *stop = c % 8 == 0;
+        }
     }
 
     // ---- writing ------------------------------------------------------------------------------
@@ -804,9 +946,11 @@ impl Screen {
         line.clean_edges(col, col, blank);
         line.cells[col..].rotate_right(n);
         line.cells[col..col + n].fill(blank);
-        // A wide character whose second cell was pushed off the edge goes with it.
+        // A wide character whose second cell was pushed off the edge goes with it, and the
+        // cell it leaves is a blank that is not a space of the text.
         if line.cells[cols - 1].width == 2 {
             line.cells[cols - 1] = blank;
+            line.set_padded(true);
         }
         self.dirty[row] = true;
     }
@@ -840,6 +984,7 @@ impl Screen {
             if self.modes.autowrap {
                 // It does not fit in the last column: that one stays empty and it goes below.
                 self.erase(self.row, self.col, self.cols);
+                self.grid[self.row].set_padded(true);
                 self.wrap();
             } else {
                 self.col = self.cols - 2;
@@ -866,6 +1011,10 @@ impl Screen {
                 width: 0,
                 ..cell
             };
+        }
+        if col + w >= cols {
+            // The last cell holds a character again, so it is not a pad any more.
+            line.set_padded(false);
         }
         self.dirty[row] = true;
         if col + w >= cols {

@@ -149,7 +149,8 @@ impl Metrics {
     }
 
     /// How many whole columns and rows fit `area`: the size to give
-    /// [`Screen::resize`](mdshared_term::Screen::resize) and the pseudo-terminal when the window
+    /// [`Screen::resize_reflow`](mdshared_term::Screen::resize_reflow) (or `resize`, which
+    /// cuts its lines instead of wrapping them again) and the pseudo-terminal when the window
     /// changes. Zero when not even one cell fits (a `Screen` makes that one); zero for a
     /// rectangle with a side that is NaN or infinite.
     pub fn grid_size(&self, area: Rect) -> (usize, usize) {

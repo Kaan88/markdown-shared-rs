@@ -12,7 +12,10 @@
 //! arrives still covers the same characters when they are in the scrollback. They do not follow
 //! text when a program rewrites cells in place, so after each [`Screen::feed`] the caller asks
 //! [`Selection::follow`]: it says whether the cells still hold the text the selection was made
-//! on, and the caller drops the selection when they do not, as terminals do. A selection keeps
+//! on, and the caller drops the selection when they do not, as terminals do. A reflow of the
+//! width ([`Screen::resize_reflow`]) joins the wrapped lines and wraps them again, which moves
+//! every line and column: the numbers a selection holds cannot follow that, so it is dropped as
+//! well, and the caller takes no part in it beyond asking. A selection keeps
 //! the text it holds as a 64-bit fingerprint rather than as characters, so it stays small and
 //! copyable; a rewrite that leaves the text exactly as it was is not noticed, and neither is
 //! one whose text happens to fingerprint the same way (which no real output does).
@@ -66,6 +69,10 @@ pub struct Selection {
     /// what it last saw under itself, which [`Selection::is_intact`] compares with what is
     /// there now.
     held: u64,
+    /// The screen's count of width reflows when the selection was made or last moved. A reflow
+    /// joins and wraps the lines again, so the numbers this selection holds may point at other
+    /// text even when that text happens to read the same.
+    reflows: u64,
 }
 
 /// A 64-bit fingerprint of a string (FNV-1a), so that a selection can tell whether the cells
@@ -145,6 +152,7 @@ impl Selection {
             anchor: extent,
             head: extent,
             held: 0,
+            reflows: screen.reflows(),
         };
         sel.held = fingerprint(&sel.text(screen));
         sel
@@ -155,6 +163,7 @@ impl Selection {
     pub fn extend(&mut self, screen: &Screen, to: Point) {
         self.head = unit_at(screen, to, self.unit);
         self.held = fingerprint(&self.text(screen));
+        self.reflows = screen.reflows();
     }
 
     pub fn kind(&self) -> SelectionKind {
@@ -253,9 +262,12 @@ impl Selection {
     /// Whether the cells the selection covers still hold the text they held when it was made,
     /// extended or clipped. A screen that scrolled leaves the text where the line numbers point,
     /// so it stays intact; a program that rewrote or erased those cells makes it false, and the
-    /// caller drops the selection. An empty selection is intact: it has no text to lose.
+    /// caller drops the selection. A reflow of the width
+    /// ([`Screen::resize_reflow`]) makes it false too, because the lines were joined and wrapped
+    /// again and the numbers it holds may point at other text even when that text reads the same.
+    /// An empty selection is intact: it has no text to lose.
     pub fn is_intact(&self, screen: &Screen) -> bool {
-        self.held == fingerprint(&self.text(screen))
+        self.reflows == screen.reflows() && self.held == fingerprint(&self.text(screen))
     }
 
     /// Follows the screen after output: whether the selection still covers the text it was made
@@ -264,7 +276,9 @@ impl Selection {
     /// the text it holds is then not all there any more (the top of it is gone), so it is dropped
     /// whole, even when lines at the bottom survive; [`clip`](Self::clip) is the call that keeps
     /// that surviving part instead. A selection that reaches past the last line of the screen is
-    /// clamped to it and kept, which a resize does. A press that was not dragged is empty, and
+    /// clamped to it and kept, which a resize does. A reflow of the width is not a resize of that
+    /// kind: it answers false, because the lines were joined and wrapped again and the numbers
+    /// the selection holds may point at other text. A press that was not dragged is empty, and
     /// `follow` answers false for it because there is no text to keep: the caller holds the press
     /// itself until the drag.
     pub fn follow(&mut self, screen: &Screen) -> bool {
@@ -717,5 +731,34 @@ mod tests {
         let two = Selection::start(&s, Point::new(1, 2), SelectionKind::Stream, 2);
         assert_eq!(two.range(), (Point::new(1, 0), Point::new(1, 3)));
         assert_eq!(two.text(&s), "mnop");
+    }
+
+    #[test]
+    fn a_reflow_of_the_width_drops_a_selection_and_a_change_of_height_does_not() {
+        let mut s = Screen::new(12, 4, 100);
+        s.feed(b"abcdefghijkl\r\nnop");
+        let mut sel = drag(&s, (0, 0), (0, 2), SelectionKind::Stream);
+        assert_eq!(sel.text(&s), "abc");
+        // A change of height leaves every line where it was, so the selection stays on it.
+        let mut same = sel;
+        s.resize(12, 5);
+        assert!(same.follow(&s));
+        s.resize(12, 4);
+        // The width is reflowed. Here the cells the selection covers still read "abc", so its
+        // fingerprint is what it was: it is dropped all the same, because a caller cannot tell
+        // which of the line numbers it holds moved, and here the line under it is another one.
+        s.resize_reflow(6, 4);
+        assert_eq!(sel.text(&s), "abc");
+        assert_eq!(
+            s.scrollback_line(0).map(Line::text).as_deref(),
+            Some("abcdef"),
+            "the line the number points at holds the rest of the row now"
+        );
+        assert!(!sel.follow(&s));
+        // A selection made after the reflow follows the screen like any other.
+        let mut after = drag(&s, (0, 0), (0, 2), SelectionKind::Stream);
+        s.feed(b"\r\nx");
+        assert!(after.follow(&s));
+        assert_eq!(after.text(&s), "abc");
     }
 }

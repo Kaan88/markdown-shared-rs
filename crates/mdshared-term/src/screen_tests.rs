@@ -6,7 +6,7 @@
 use crate::screen::*;
 
 /// The screen's rows as text, one a line, trailing spaces gone.
-fn grid(s: &Screen) -> String {
+pub(crate) fn grid(s: &Screen) -> String {
     (0..s.rows())
         .map(|r| s.row_text(r))
         .collect::<Vec<_>>()
@@ -14,19 +14,19 @@ fn grid(s: &Screen) -> String {
 }
 
 /// A screen of this size with a scrollback of 100, fed `bytes`.
-fn fed(cols: usize, rows: usize, bytes: &str) -> Screen {
+pub(crate) fn fed(cols: usize, rows: usize, bytes: &str) -> Screen {
     let mut s = Screen::new(cols, rows, 100);
     s.feed(bytes.as_bytes());
     s
 }
 
-fn at(s: &Screen) -> (usize, usize) {
+pub(crate) fn at(s: &Screen) -> (usize, usize) {
     (s.cursor().row, s.cursor().col)
 }
 
 /// What every grid must hold whatever was fed: the cursor inside it, every line as wide as the
 /// screen, and every wide character whole.
-fn check(s: &Screen) {
+pub(crate) fn check(s: &Screen) {
     let (row, col) = at(s);
     assert!(row < s.rows() && col < s.cols(), "cursor at {row},{col}");
     for r in 0..s.rows() {

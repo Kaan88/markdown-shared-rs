@@ -171,14 +171,15 @@ No window system. All of it is usable from a test with a temporary folder.
 ## Terminal (`mdshared-term`)
 
 No dependencies, no window, no process: bytes in, a grid out, events to bytes. Its crate doc
-lists what a full terminal has that this does not yet (reflow, combining marks, OSC 8 and 52,
-the kitty keyboard protocol, images).
+lists what a full terminal has that this does not yet (combining marks, OSC 8 and 52, the kitty
+keyboard protocol, images). The width of the screen can now be reflowed: the wrapped lines are
+joined and wrapped again, as xterm, VTE and kitty do.
 
 | Module | For | Start at |
 |---|---|---|
-| `screen` | The grid a program's output is written into: cells with colours and attributes, cursor, scrollback, alternate screen, scroll regions, modes, dirty rows, replies | `Screen::new(cols, rows, scrollback)`, `feed(bytes)`, `resize`, `cell`, `line`, `row_text`, `cursor`, `modes`, `take_dirty`, `take_reply`, `take_title`, `scrollback_line` |
+| `screen` | The grid a program's output is written into: cells with colours and attributes, cursor, scrollback, alternate screen, scroll regions, modes, dirty rows, replies; a resize that cuts and pads the lines, and one that joins the soft-wrapped lines and wraps them again at the new width (the primary screen and its scrollback, keeping the cursor on its character, the grid at the end of the buffer and the scrollback's limit; the alternate screen is cut as before) | `Screen::new(cols, rows, scrollback)`, `feed(bytes)`, `resize_reflow` (`resize` is the same change without the re-wrap), `cell`, `line`, `row_text`, `cursor`, `pending`, `modes`, `take_dirty`, `take_reply`, `take_title`, `scrollback_line` |
 | `parse` | The VT byte-stream parser, apart from what the sequences mean | `Parser::feed(bytes, &mut impl Perform)`, `Params` |
-| `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block; a word and a line run across a soft wrap (a row whose text went on in the next) and stop at a hard break; the selection holds the text it was made on, so it follows the screen after output (`follow`, `is_intact`) and is dropped when the program rewrote or erased it, or when its first line left the ring | `Selection::start(&screen, point, kind, clicks)`, `extend`, `span_on`, `contains`, `range`, `text`, `clip`, `is_intact`, `follow` |
+| `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block; a word and a line run across a soft wrap (a row whose text went on in the next) and stop at a hard break; the selection holds the text it was made on, so it follows the screen after output (`follow`, `is_intact`) and is dropped when the program rewrote or erased it, when its first line left the ring, or when the width was reflowed | `Selection::start(&screen, point, kind, clicks)`, `extend`, `span_on`, `contains`, `range`, `text`, `clip`, `is_intact`, `follow` |
 | `input` | Keys, pastes, mouse events and focus changes as the bytes a program expects | `encode_key(Key, Mods, &modes)`, `encode_paste`, `encode_mouse`, `encode_focus` |
 | `width` | How many cells a character takes | `char_width`, `str_width` |
 

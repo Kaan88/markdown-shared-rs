@@ -121,7 +121,7 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 |---|---|---|---|---|---|---|
 | T1 | **Drawing a grid of cells.** Monospace glyphs placed on a fixed cell grid from the text engine's glyph cache, wide cells, colours and attributes from `mdshared_term::Cell`, box-drawing characters drawn as lines so they join, the cursor, the selection, and only the damaged rows redrawn | L | medium | none | `mdshared_text::TextEngine`, `gfx::Face::Mono`, `mdshared_term::Screen::take_dirty`, `anim::Animator::blink` for the cursor | done: `termview` in `mdshared-ui`, feature `term` (`feat/terminal-pty-grid`; write-up in `docs/FEATURES.md`). Seen as a specimen sheet only; first used by an application outside this repository (claude-switch) |
 | T2 | **A pseudo-terminal.** ConPTY on Windows, `openpty`/`forkpty` on Unix: start a shell, read and write on threads, resize, exit status | L | high | none (`windows-sys`, `libc`, both there) but `unsafe`, so its own crate `mdshared-pty` | `job` (thread and wake), `mdshared_term::Screen::feed`/`take_reply` | done: crate `mdshared-pty` (`feat/terminal-pty-grid`; write-up in `docs/FEATURES.md`). Windows runs in the tests; the Unix side is type-checked only (T8) |
-| T3 | **Reflow on resize.** Re-wrap lines when the width changes, using the `wrapped` flag lines already carry | M | medium | none | `mdshared_term::screen` | open |
+| T3 | **Reflow on resize.** Re-wrap lines when the width changes, using the `wrapped` flag lines already carry | M | medium | none | `mdshared_term::screen` | done: `Screen::resize_reflow` in `mdshared_term::screen` (`feat/t3-reflow`; write-up in `docs/FEATURES.md`); the alternate screen is still cut as before |
 | T4 | **Combining marks, grapheme clusters, Unicode widths.** Cells that hold a cluster, not a `char`; widths from the Unicode data | M | medium | none (the table is generated into the source) | `mdshared_term::width`, `screen::Cell` | open |
 | T5 | **The rest of xterm that people meet.** OSC 8 hyperlinks, OSC 52 clipboard, colour queries (OSC 4/10/11), synchronized output (2026), underline styles and colours, the kitty keyboard protocol | M each | low | none | `mdshared_term::parse`, `screen`, `input` | open |
 | T6 | **A selection that follows rewrites, and words across wrapped rows.** | S | low | none | `mdshared_term::select` | done: `select` keeps its text (`follow`, `is_intact`) and words and lines cross a soft wrap (write-up in `docs/FEATURES.md`) |
@@ -279,4 +279,4 @@ A5 = L2, A9 = F6, A11 = W2, A12 = L1, A13 = L7 + L8, A14 = L9, A15 = W1, A18 = W
 A20 = W5, A21 = W6 + W7, A22 = W8, A23 = W9; M1 = M3 (seek bar), M2 = M4 (knob, fader),
 M3 = M2, M4 = M5 (cover art), M5 = M1 (media session); F3 = L6, F4 = F3, F5 = F5, F6 = F4,
 F7 = L5, F8 = F7 (deferred); T1 = T1, T3 = T2, T6 = row damage, part of T1, T7 = T7; the
-`mdshared-term` gaps = T3 + T4 + T6.
+`mdshared-term` gaps = T4 + T6.

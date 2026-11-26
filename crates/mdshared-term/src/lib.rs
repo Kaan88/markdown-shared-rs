@@ -37,7 +37,6 @@
 //! The solid core of a VT220-style terminal as xterm does it is here ([`Screen::feed`] lists
 //! it). These are known to be missing, in rough order of how soon a user meets them:
 //!
-//! - **Reflow on resize.** [`Screen::resize`] cuts and pads lines; it does not re-wrap them.
 //! - **Combining marks and grapheme clusters.** A character of no width (an accent that
 //!   combines, a variation selector, a zero-width joiner) is dropped, so decomposed text loses
 //!   its accents and an emoji sequence shows as its separate emoji. Widths come from a small
@@ -66,6 +65,10 @@ pub mod screen;
 pub mod select;
 pub mod width;
 
+mod reflow;
+
+#[cfg(test)]
+mod reflow_tests;
 #[cfg(test)]
 mod screen_tests;
 

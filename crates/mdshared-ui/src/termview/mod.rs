@@ -49,7 +49,7 @@
 //! let metrics = font.metrics(14.0, scale);
 //! // On a resize: as many cells as fit, for the screen and the pseudo-terminal.
 //! let (cols, rows) = metrics.grid_size(area);
-//! screen.resize(cols, rows);
+//! screen.resize_reflow(cols, rows);
 //! // Each frame:
 //! let scheme = Scheme::from_palette(&pal);
 //! let view = View::new().scrolled(scroll).focused(window_focused);
