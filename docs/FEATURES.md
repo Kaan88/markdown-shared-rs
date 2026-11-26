@@ -1841,12 +1841,11 @@ Decisions:
   a number gives one arch, as wide as the band (a half wave, not a whole one); a wavelength far
   below a pixel is cut at a thousand half waves, since nothing on a display would show the
   rest. A band with no width or height is refused before a path is built. Only the half waves
-  the clip can show are put in the path, and the two the cut falls in the middle of are
-  shortened by the quadratic's own reparametrization, so a band far wider than the window costs
-  a mask only as wide as the window while the curve inside the clip is the one the whole band
-  would give there. At the cut, the stroke's end and the shortened half wave's join make a few
-  pixels differ from the unclipped drawing by a few levels (the test allows 8 there), and the
-  text above is exact.
+  the clip can show are put in the path, widened by the stroke's thickness at each end and
+  taken as whole half waves: every join inside the clip is then the one the whole band draws,
+  the path's ends and their round caps are cut by the clip itself, and a band far wider than
+  the window costs a mask about as wide as the window, while the wave inside the clip is the
+  unclipped drawing pixel for pixel.
 - **Where `runs` gets a byte range.** Parley places glyph runs, split at style changes, but a
   glyph run carries no byte range of its own: `Run::text_range` is the part of the shaped run on
   that line, which a style change does not split. Parley groups by shaped cluster (atom), not by
@@ -1857,7 +1856,11 @@ Decisions:
   glyphs. A right-to-left run's atoms are then turned round, because parley places that run's
   glyph runs in visual order, and neighbouring atoms of one style are grouped. An atom with no
   glyph of its own (a soft hyphen) makes no glyph run: its bytes join the group before it, or
-  wait for the one after it, so no byte is lost. The k-th group is then the k-th glyph run.
+  wait for the one after it. A run of nothing but such atoms has no entry of its own and leaves
+  its bytes to the last run of the line before it that has glyphs (a line with no glyph run at
+  all keeps none of them); every byte of a run that has glyphs is in exactly one range — a
+  branch no font here reaches, which is why it has no test of its own. The k-th group is then
+  the k-th glyph run.
   Walking *visual* clusters instead fails two ways: a ligature's continuation comes before the
   cluster that starts it, so `لا` with the alef in another brush gave `2..4` and lost `0..2`, and
   `بلا` with the alef alone blue gave `4..6` for a box covering the whole word. Both are in the
@@ -1906,9 +1909,8 @@ against the tree before this change; each assertion was also shown failing under
   band, or a NaN of either or of a place, draw nothing. A straight line instead of a wave fails
   it ("no crest").
 - `the_painter_clip_cuts_the_layout_and_the_wave`: outside the clip the bitmap is the page
-  before the draw; inside it the text is the unclipped drawing pixel for pixel and the wave is
-  the same to within 8 levels in the pixels a half wave from the cut, where the stroke's end
-  sits; the text ink is on both sides of the clip's edge, the clipped one keeps its share and
+  before the draw; inside it every pixel is the unclipped drawing's, text and wave alike;
+  the text ink is on both sides of the clip's edge, the clipped one keeps its share and
   some of the text was cut off. A `rich_text` that draws nothing fails it.
 - `a_line_placed_by_its_alignment_is_drawn_and_the_rect_covers_it`: `OK` broken at 300 and
   aligned to the end sits at about 270, and a clip over only 150 to 320 keeps all of it; the
@@ -1939,7 +1941,7 @@ against the tree before this change; each assertion was also shown failing under
 Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
 --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
 --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
-test binary passes; the `mdshared-ui` library alone ran 1131 tests with 34 ignored and 4
+test binary passes; the `mdshared-ui` library alone ran 1132 tests with 34 ignored and 4
 filtered, and the doctests passed); and the sheet
 `cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
 `target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
@@ -1971,6 +1973,16 @@ the Latin `fi` cases are skipped with a note when no font forms them (as is the 
 when no Arabic font is there). From the non-blocking list: the answered rectangle now comes
 from the glyph runs, so a justified line's added spacing is in it (with a test); the drawing
 doc says what the engine really skips (lines above or below the clip, not beside it); the wave
-is built only over the half waves the clip can show, its cut half waves shortened rather than
-restarted, so a band far wider than the window costs a mask only as wide as the window; and
-this section's sentences about the Arabic fallback say what the test now does.
+is built only over the half waves the clip can show, widened by the stroke at each end and taken
+whole, so a band far wider than the window costs a mask about as wide as the window while the
+pixels inside the clip are the unclipped drawing's; and this section's sentences about the
+Arabic fallback say what the test now does.
+
+A last pass made three small fixes. A run of nothing but atoms without glyphs used to keep its
+bytes in the grouping's waiting range and drop them; they now join the last run of the line
+before it that has glyphs (a branch no font here reaches, so it has no test of its own, and the
+doc says "every byte of a run that has glyphs"). An empty layout now answers
+`Rect(x, y, 0, layout.height() / scale)` rather than no height, so a caret or a field's
+background has its place (with a test). And the wave is now cut a stroke's thickness beyond the
+clip on each side and taken as whole half waves rather than shortened inside it, so the pixels
+inside the clip are exactly the unclipped drawing's and the clip test demands equality again.

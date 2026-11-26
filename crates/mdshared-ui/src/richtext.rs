@@ -56,8 +56,10 @@ struct Atom {
 /// with the rest of its range. Two things do not begin one, because parley shapes them as one
 /// piece: the second half of a ligature, whatever style it asks for (a brush change does not
 /// split shaping, so `fi` may stay one glyph with the `i` in another colour), and a cluster with
-/// no glyph of its own (a soft hyphen), whose bytes join the run next to it. The work is linear
-/// in the layout's length.
+/// no glyph of its own (a soft hyphen), whose bytes join the run next to it. A run of nothing
+/// but such clusters has no entry of its own: its bytes join the last run of the line before it
+/// that has glyphs, and a line with no glyph run at all keeps none of its bytes. The work is
+/// linear in the layout's length.
 pub fn runs(layout: &Layout<Brush>) -> Vec<RunBox> {
     let mut out = Vec::new();
     for line in layout.lines() {
@@ -121,6 +123,18 @@ pub fn runs(layout: &Layout<Brush>) -> Vec<RunBox> {
                         style = Some(atom.style);
                         groups.push(range);
                     }
+                }
+            }
+            if let Some(left) = waiting {
+                // A run of nothing but atoms without glyphs has no glyph run of its own: its
+                // bytes belong to the last run of the line before it that has one.
+                if let Some(last) = ranges
+                    .iter_mut()
+                    .rev()
+                    .find_map(|(_, groups)| groups.last_mut())
+                {
+                    last.start = last.start.min(left.start);
+                    last.end = last.end.max(left.end);
                 }
             }
             ranges.push((run.index(), groups));

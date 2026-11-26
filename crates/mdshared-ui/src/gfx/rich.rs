@@ -24,11 +24,12 @@ use parley::{Layout, PositionedLayoutItem};
 /// negative gives one arch, as wide as the band; a band with no width or height gives an empty
 /// path.
 ///
-/// Only the part of the wave between `show.0` and `show.1` (logical px, cut to the band) is put
-/// in the path, and the half waves that the cut falls inside are shortened exactly, by the
-/// quadratic's own reparametrization, so the drawn curve is the one the whole band would give
-/// there. That keeps a mask as wide as the window rather than as wide as a band that may run far
-/// past it, and a caller that repaints one region sees the wave the whole frame has.
+/// Only the half waves between `show.0` and `show.1` (logical px), widened by the stroke's
+/// thickness at each end, are put in the path, and as whole half waves: every join inside the
+/// clip is then the one the whole band would draw, and the path's two ends, with their round
+/// caps, fall outside the clip, which cuts them. The mask is about as wide as the visible part
+/// of the band rather than as wide as a band that may run far past it, and a caller that
+/// repaints one region sees the wave the whole frame has there.
 fn squiggle(band: Rect, thickness: f32, wavelength: f32, show: (f32, f32)) -> Path {
     if !(band.w.is_finite() && band.w > 0.0 && band.h.is_finite() && band.h > 0.0) {
         return Path::new();
@@ -44,7 +45,10 @@ fn squiggle(band: Rect, thickness: f32, wavelength: f32, show: (f32, f32)) -> Pa
     // in a wide band, and nothing on a screen would show the difference.
     let turns = (band.w / half).round().clamp(1.0, 1000.0);
     let step = band.w / turns;
-    let (xs, xe) = (show.0.max(band.x), show.1.min(band.right()));
+    let (xs, xe) = (
+        (show.0 - thickness).max(band.x),
+        (show.1 + thickness).min(band.right()),
+    );
     let visible = xs.is_finite() && xe.is_finite() && xe > xs;
     if !visible {
         return Path::new();
@@ -52,15 +56,12 @@ fn squiggle(band: Rect, thickness: f32, wavelength: f32, show: (f32, f32)) -> Pa
     let last = turns as usize - 1;
     let band_x = |x: f32| (((x - band.x) / step).floor().clamp(0.0, last as f32)) as usize;
     let (first, end) = (band_x(xs), band_x(xe));
-    let mut path = Path::new();
-    let mut started = false;
+    // Whole half waves, from the one the visible part starts in to the one it ends in: every
+    // join inside the clip is then the one the whole band would draw, and the path's two ends
+    // (with their round caps, half a stroke wide) fall outside it, on the widened span.
+    let mut path = Path::new().move_to(band.x + step * first as f32, mid);
     for i in first..=end {
         let xa = band.x + step * i as f32;
-        let xb = xa + step;
-        let (a, b) = (xs.max(xa), xe.min(xb));
-        if b <= a {
-            continue;
-        }
         // A quadratic from the middle line up (or down) and back: its top is exactly `amp`
         // above (or below) the middle line, since the control point is twice as far out.
         let peak = if i % 2 == 0 {
@@ -68,28 +69,7 @@ fn squiggle(band: Rect, thickness: f32, wavelength: f32, show: (f32, f32)) -> Pa
         } else {
             mid + 2.0 * amp
         };
-        let (p0, c, p2) = ((xa, mid), (xa + step / 2.0, peak), (xb, mid));
-        let at = |t: f32| {
-            let u = 1.0 - t;
-            (
-                u * u * p0.0 + 2.0 * t * u * c.0 + t * t * p2.0,
-                u * u * p0.1 + 2.0 * t * u * c.1 + t * t * p2.1,
-            )
-        };
-        let (t0, t1) = ((a - xa) / step, (b - xa) / step);
-        let (s, e) = (at(t0), at(t1));
-        // The piece of the quadratic between two parameters is a quadratic with these ends and
-        // this control point.
-        let d = (t1 - t0) * (t1 - t0);
-        let control = (
-            (s.0 + e.0 - d * (p0.0 - 2.0 * c.0 + p2.0)) / 2.0,
-            (s.1 + e.1 - d * (p0.1 - 2.0 * c.1 + p2.1)) / 2.0,
-        );
-        if !started {
-            path = path.move_to(s.0, s.1);
-            started = true;
-        }
-        path = path.quad_to(control.0, control.1, e.0, e.1);
+        path = path.quad_to(xa + step / 2.0, peak, xa + step, mid);
     }
     path
 }
@@ -112,8 +92,9 @@ impl Painter<'_> {
     /// justification's added spacing are all in the runs' places and widths, so a centred,
     /// end-aligned, justified or right-to-left line is covered where it is drawn. The rectangle
     /// is the runs' advance box, not their ink: a raised or lowered run, a rounded glyph or a
-    /// swash may reach past it. A place that is not a number draws nothing and answers no size;
-    /// a layout with no glyph run draws nothing and answers no size.
+    /// swash may reach past it. A place that is not a number draws nothing and answers no size.
+    /// A layout with no glyph run (empty text) draws nothing and answers a rectangle no wider
+    /// than nothing but as tall as the layout, so a caret or a field's background has its place.
     pub fn rich_text(&mut self, layout: &Layout<Brush>, x: f32, y: f32) -> Rect {
         if !x.is_finite() || !y.is_finite() {
             return Rect::new(x, y, 0.0, 0.0);
@@ -128,14 +109,17 @@ impl Painter<'_> {
                 right = right.max(glyph_run.offset() + glyph_run.advance());
             }
         }
+        // No glyph run at all (no text, or text of nothing but spaces that were not laid out):
+        // the height is still the layout's, so a caret or a field's background has its place.
+        let height = layout.height() / self.scale;
         if left > right {
-            return Rect::new(x, y, 0.0, 0.0);
+            return Rect::new(x, y, 0.0, height);
         }
         let size = Rect::new(
             x + left / self.scale,
             y,
             (right - left) / self.scale,
-            layout.height() / self.scale,
+            height,
         );
         let dx = (x * self.scale).round() + self.origin.0 as f32;
         let dy = (y * self.scale).round() + self.origin.1 as f32;
@@ -586,18 +570,9 @@ mod tests {
                 let in_clip = x < 70 && y < 30;
                 let got = at(&cut, x, y);
                 if in_clip {
-                    let want = at(&whole, x, y);
-                    // The text is the engine's own drawing, cut exactly. The wave is a stroked
-                    // path cut where the clip cuts it, and the stroke's end and the join of the
-                    // shortened half wave sit there, so the pixels within a half wave of the cut
-                    // may differ by a few levels; elsewhere the same curve is drawn.
-                    let near_cut = y >= 26 && x + 6 >= 70;
-                    let allowed = if near_cut { 8 } else { 0 };
-                    let worst = (0..3)
-                        .map(|i| (got[i] as i32 - want[i] as i32).abs())
-                        .max()
-                        .unwrap_or(0);
-                    assert!(worst <= allowed, "{x},{y}: {got:?} of {want:?}");
+                    // The wave is built a thickness past the clip's edges, so its ends and their
+                    // caps are cut by the clip itself and what is inside is the unclipped curve.
+                    assert_eq!(got, at(&whole, x, y), "{x},{y}");
                     inside += (got != WHITE) as usize;
                 } else {
                     assert_eq!(got, WHITE, "{x},{y} is outside the clip");
@@ -695,6 +670,20 @@ mod tests {
             "{rect:?} of {end}"
         );
         assert!(ink(&bmp, WHITE).0 > 0);
+    }
+
+    #[test]
+    fn an_empty_layout_answers_a_caret_s_height_and_no_width() {
+        let layout = layout("", 18.0, BLACK_BRUSH, |_| ());
+        let (bmp, rect) = scale_page(40, 40, 1.0, |p| p.rich_text(&layout, 6.0, 5.0));
+        assert_eq!((rect.x, rect.y, rect.w), (6.0, 5.0, 0.0), "{rect:?}");
+        assert!(
+            (rect.h - layout.height()).abs() < 0.01,
+            "{rect:?} of the layout's {}",
+            layout.height()
+        );
+        assert!(rect.h > 0.0, "an empty layout has no height at all");
+        assert_eq!(ink(&bmp, WHITE).0, 0, "nothing was drawn");
     }
 
     #[test]
