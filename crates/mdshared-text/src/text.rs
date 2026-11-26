@@ -1,7 +1,8 @@
 //! CPU text: parley shapes and lays out, swash rasterizes, this module blends. Ported from the
 //! Phase 0 text spike (`spikes/text`), which the user accepted after the subpixel fix. The glyph
 //! cache is byte-capped, and text uses subpixel masks in the order [`Subpixel`] names (RGB by
-//! default), or greyscale coverage with `Subpixel::None`.
+//! default), or greyscale coverage with `Subpixel::None`. Only the height of an outline is
+//! grid-fitted; its horizontal geometry and parley's layout are left alone.
 
 use crate::bitmap::Bitmap;
 use parley::{FontData, Layout, PositionedLayoutItem};
@@ -11,6 +12,9 @@ use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Format, Vector};
 use swash::{CacheKey, FontRef};
+
+mod vertical;
+use vertical::Vertical;
 
 pub type Brush = [u8; 4];
 
@@ -181,6 +185,7 @@ impl CacheStats {
 
 pub struct TextEngine {
     scaler: ScaleContext,
+    vertical: Vertical,
     fonts: HashMap<(u64, u32), (FontData, u32, CacheKey)>,
     map: GlyphMap,
     tick: u64,
@@ -196,6 +201,7 @@ impl TextEngine {
     pub fn new(cap: usize) -> Self {
         TextEngine {
             scaler: ScaleContext::new(),
+            vertical: Vertical::default(),
             fonts: HashMap::new(),
             map: GlyphMap::default(),
             tick: 0,
@@ -227,7 +233,7 @@ impl TextEngine {
         &mut self,
         key: Key,
         font: &FontData,
-        coords: impl Iterator<Item = i16>,
+        coords: impl Iterator<Item = i16> + Clone,
         size: f32,
     ) -> Entry {
         let cache_key = (font.data.id(), font.index);
@@ -240,21 +246,40 @@ impl TextEngine {
             offset: *offset,
             key: *font_key,
         };
-        let mut scaler = self
+        let mut unhinted = self
             .scaler
             .builder(font_ref)
             .size(size)
             .hint(false)
-            .normalized_coords(coords)
+            .normalized_coords(coords.clone())
             .build();
-        let image = Render::new(&[
+        let format = self.subpixel.format();
+        let offset = Vector::new(key.sub as f32 / 4.0, 0.0);
+        // Keep colour sources as they were. Only the monochrome fallback uses fitted outlines.
+        let color = Render::new(&[
             Source::ColorOutline(0),
             Source::ColorBitmap(StrikeWith::BestFit),
-            Source::Outline,
         ])
-        .format(self.subpixel.format())
-        .offset(Vector::new(key.sub as f32 / 4.0, 0.0))
-        .render(&mut scaler, key.glyph);
+        .format(format)
+        .offset(offset)
+        .render(&mut unhinted, key.glyph);
+        let image = if color.is_some() {
+            color
+        } else if unhinted.scale_outline_into(key.glyph, &mut self.vertical.linear) {
+            let mut hinted = self
+                .scaler
+                .builder(font_ref)
+                .size(size)
+                .hint(true)
+                .normalized_coords(coords)
+                .build();
+            if hinted.scale_outline_into(key.glyph, &mut self.vertical.hinted) {
+                self.vertical.fit();
+            }
+            Some(self.vertical.render(format, offset))
+        } else {
+            None
+        };
         let tick = self.tick;
         let Some(image) = image else {
             return Entry {
@@ -532,6 +557,111 @@ mod tests {
 
     const SAMPLE: &str = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen \
         liquor jugs! 0123456789 (sphinx of black quartz, judge my vow) — Ünïcödé façade, 日本語. ";
+
+    #[test]
+    fn rasterizing_at_fractional_x_leaves_layout_advances_and_positions_bit_identical() {
+        let bits = |layout: &Layout<Brush>| {
+            let mut bits = vec![layout.width().to_bits(), layout.height().to_bits()];
+            for line in layout.lines() {
+                bits.extend([
+                    line.metrics().advance.to_bits(),
+                    line.metrics().baseline.to_bits(),
+                ]);
+                for item in line.items() {
+                    if let PositionedLayoutItem::GlyphRun(run) = item {
+                        bits.push(run.advance().to_bits());
+                        for glyph in run.positioned_glyphs() {
+                            bits.extend([
+                                glyph.id,
+                                glyph.advance.to_bits(),
+                                glyph.x.to_bits(),
+                                glyph.y.to_bits(),
+                            ]);
+                        }
+                    }
+                }
+            }
+            bits
+        };
+        let mut engine = TextEngine::new(4 << 20);
+        let mut fb = Bitmap::new(320, 120);
+        for size in [12.0, 13.0, 14.0, 16.25] {
+            let make = || paragraph(SAMPLE, size, 290.0, [40, 40, 40, 255]);
+            let layout = make();
+            let before = bits(&layout);
+            assert!(before.len() > 100);
+            for x in [4.0, 4.25, 4.5, 4.75] {
+                engine.draw_layout(&mut fb, &layout, x, 2.0);
+            }
+            assert_eq!(bits(&layout), before);
+            assert_eq!(bits(&make()), before);
+        }
+        assert!(engine.stats.misses > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn small_segoe_ui_cap_and_crossbar_snap_without_moving_x() {
+        let Some(root) = std::env::var_os("WINDIR") else {
+            eprintln!("skipped: WINDIR is unavailable");
+            return;
+        };
+        let path = std::path::Path::new(&root).join("Fonts/segoeui.ttf");
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("skipped: Segoe UI is unavailable");
+            return;
+        };
+        let font = FontData::new(bytes.into(), 0);
+        let reference = FontRef::from_index(font.data.as_ref(), 0).unwrap();
+        let glyph = reference.charmap().map('H');
+        assert_ne!(glyph, 0);
+        let size = 13.0;
+        let mut ctx = ScaleContext::new();
+        let mut unhinted = ctx.builder(reference).size(size).build();
+        let outline = unhinted.scale_outline(glyph).unwrap();
+        let offset = Vector::new(0.25, 0.0);
+        let legacy = Render::new(&[Source::Outline])
+            .format(Format::Alpha)
+            .offset(offset)
+            .render(&mut unhinted, glyph)
+            .unwrap();
+        let mut engine = TextEngine::new(4 << 20);
+        engine.set_subpixel(Subpixel::None);
+        let mask = engine.raster(
+            Key {
+                font: font.data.id(),
+                index: 0,
+                glyph,
+                size: (size * 64.0) as u32,
+                sub: 1,
+                coords: 0,
+            },
+            &font,
+            std::iter::empty(),
+            size,
+        );
+        assert_eq!(
+            (mask.left, mask.w),
+            (legacy.placement.left, legacy.placement.width)
+        );
+        assert_ne!(
+            mask.data
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| p[0])
+                .collect::<Vec<_>>(),
+            legacy.data,
+            "the fitted mask must differ from the original"
+        );
+        let fitted = &engine.vertical.linear;
+        assert_eq!(fitted.verbs(), outline.verbs());
+        for (a, b) in fitted.points().iter().zip(outline.points()) {
+            assert_eq!(a.x.to_bits(), b.x.to_bits());
+            assert_eq!(a.y.fract(), 0.0, "a horizontal edge of H is between rows");
+        }
+        assert_ne!(fitted.bounds().max.y, outline.bounds().max.y);
+    }
 
     #[test]
     fn a_clipped_draw_is_the_unclipped_draw_cropped() {

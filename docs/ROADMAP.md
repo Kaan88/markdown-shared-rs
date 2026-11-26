@@ -129,6 +129,18 @@ coordinates, the nearest monitor, `WM_DPICHANGED`, never restore minimised) are 
 | T7 | **Colour schemes and IME at the cursor.** The 16 colours and the default pair as a scheme (with the palette's light and dark), and the IME composition window placed at the terminal's cursor with the preedit drawn in the cells | M | medium | none | T1, `textfield::Preedit`, winit `set_ime_cursor_area` | open |
 | T8 | **Run the Unix pseudo-terminal.** `mdshared-pty` on Linux and macOS was compiled and linted from Windows and never run: start a shell, type, resize (`SIGWINCH`), exit status and signal, a background child holding the terminal open, `SIGHUP` on drop | S | medium | none | `mdshared-pty` | open |
 
+## Text sharpness
+
+These are candidates for later review, not part of vertical-only hinting.
+
+| Id | What | Size | Risk | Deps | Builds on | Status |
+|---|---|---|---|---|---|---|
+| TS2 | **Round the final device font size at fractional scales.** For example, 13 px at 125% is 16.25 device px; compare using 16 px instead. | S | medium | owner decides | `gfx`, `mdshared_text::text` | open |
+| TS3 | **Whole-pixel glyph positions.** Try them for small UI text (under about 14 px at 100%) and use them throughout the terminal grid. Keep quarter-pixel positioning for body text. | M | medium | owner decides | `gfx`, `termview`, `mdshared_text::text` | open |
+| TS4 | **Small light text on dark backgrounds.** Compare stem darkening with a separate gamma for this case. | M | medium | owner decides | `mdshared_text::text` masks and blend tables | open |
+| TS5 | **Follow system ClearType settings.** Respect on/off, contrast and stripe order rather than assuming RGB. The Windows UI already reads on/off and stripe order when `Gfx` is created; review contrast and coverage across text entry points. | M | medium | owner decides | `platform::subpixel_order`, `mdshared_text::text` | open |
+| TS6 | **DirectWrite rasterization on Windows.** Match the native Windows look. This is the largest change, and the rendered look would differ by platform. | XL | high | owner decides | `mdshared_text::text`, `platform` | open |
+
 ## Purge (fast track, 2026-11-25)
 
 Purge (`Kaan88/purge`), an uninstaller, ports its WinUI 3 UI to `mdshared-ui` once this toolkit meets

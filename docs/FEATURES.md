@@ -4,6 +4,32 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Vertical-only text hinting (`mdshared_text::text`)
+
+On a monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
+skrifa to preserve linear metrics, but that is not a guarantee of bit-identical X coordinates:
+the hinted draw can use different scaling precision. Skrifa can return a rounded TrueType
+advance from that draw; swash uses only the outline and discards the returned metrics. The
+rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
+commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
+rather than risking a bad point match. The existing quarter-pixel X phases, subpixel offsets,
+colour glyph sources, and blending are unchanged. Parley still supplies all positions and
+advances; no API or dependency was added.
+
+On Windows, the 13 px Segoe UI `H` test verifies that the cap and crossbar sit on whole rows,
+its X coordinates match the unhinted outline bit for bit, and the actual glyph mask changes.
+That test failed with the vertical fit bypassed. The layout test compares line and glyph
+advances and positions bit for bit before and after rasterizing at all four X phases, including
+a fractional device font size. The UI sheet's 18 measured widths per scale are byte-identical
+before and after. PNGs at 100% and 150% for both themes (12, 13 and 14 px UI labels and the
+`termview` grid) are under `E:/mds-target/vhint/shots/{before,after}/`.
+
+Windows verification: formatting, workspace Clippy and tests with `host,a11y` (the tests
+excluded `explorer_tests`), and `term` Clippy and `termview` tests passed. No existing pixel
+test expectation needed updating. The full release CI matrix was not run.
+The sheets have not been judged by a person or checked in a running application. Linux and
+macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
+
 ## Vue and Svelte highlighting (`mdshared-highlight`)
 
 `.vue` and `.svelte` files, and the fence names `vue` and `svelte`, are highlighted by a line
