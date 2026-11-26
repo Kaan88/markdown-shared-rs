@@ -1907,7 +1907,7 @@ Added: `scrollarea::{ScrollArea, Scrolled, draw_bars, draw_bars_animated, LINE}`
 Page Up / Page Down, Home and End, with Tab moving the focus and the area revealing it when it
 moves. No existing signature, field or drawing changed.
 
-Tests (in `scrollarea.rs`, 19 and the ignored sheet). Model: content shorter than the view,
+Tests (in `scrollarea_tests.rs` since the split below, 19 and the ignored sheet). Model: content shorter than the view,
 exact fit and a pixel more (no scroll, no bars), a content that shrinks pulling the offset in,
 a wheel notch away from the user scrolling up and Shift turning it across, the page keys and
 Home/End, reveal above, below and taller than the view, `reveal_focus` only for the focused
@@ -1958,11 +1958,98 @@ Known limits for later:
   not revealed. Call `reveal` directly when the area reopens, or keep offering the controls
   while it is hidden (which costs nothing).
 
+The file was split when it passed the house limit: the test module (617 of its 1011 lines) moved
+to `scrollarea_tests.rs` beside it, in the `submenu_tests.rs` pattern, leaving the model and the
+two drawing functions in `scrollarea.rs` (397 lines). No test was edited: the body of the module
+moved out of its `mod tests` wrapper unchanged but for one level of indentation, and
+`cargo test -p mdshared-ui --lib scrollarea -- --list` gives the same 20 names before and after. Run on Windows 11: `cargo fmt --all --check`; the workspace clippy with
+`host` and `a11y`; and the workspace tests with `--skip explorer_tests`, 1139 passed and 34
+ignored in `mdshared-ui`. Not run on Linux or macOS.
+
 Left for later: momentum and rubber-banding at the ends; dragging a thumb and the bar's hover
 fade (`scroll::draw_scrollbar_animated` is ready for it, `draw_bars_animated` takes `active`
 from the caller); a scroll area that also reports how much is left to a screen reader (roadmap
 K12); and an application or Barbican screen using it, which is what would show it to a person
 first.
+
+## Escape closes the submenu, not the menu (`submenu::Cascade`, 2026-11-26, `fix/cascade-cancel-wait`, asked by mdview)
+
+A cascade whose submenu is open, with the pointer moved onto another row of the main menu (or
+onto its padding) less than `DELAY` ago, has a close waiting. `Cascade::key` made that waiting
+change first, before acting on the key, so Escape then found only the root open and returned
+`Outcome::Close`: the application closed the whole menu, where before `Cascade` its Escape
+closed only the submenu. Left lost the menu too, because the waiting close ran first and Left
+then fell through to `Outcome::Ignored`, which a menu bar takes as "move to the menu beside".
+
+Two additions, both opt-in; a caller that uses neither behaves exactly as before:
+
+- `Cascade::cancel_wait(&mut self) -> bool` drops the waiting pointer change without making
+  it: nothing opens or closes, and `deadline()` is `None`. It puts the menus back on the open
+  path: the pointer had lit the row it moved onto, though that row's submenu never opened, so
+  the row that opened each open submenu is lit again, and the keys go to the innermost open
+  menu. What is drawn changes when the pointer had lit another row, nothing else. Called before
+  forwarding Escape or Left, those keys then close only the innermost submenu. It returns true
+  when a wait was dropped, as `pointer` and `tick` return whether they changed anything, and
+  false when nothing was waiting, in which case nothing is touched at all.
+- `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` do exactly that for
+  Escape and Left (it calls the same `cancel_wait`), and has Left close the innermost open
+  submenu even when the keys are in the menu before it (where it is `Ignored` otherwise), so
+  Left means "back one level" before "the menu beside"; when either key closes a submenu, the
+  rows that opened the menus still open stay lit. Every other key still makes a waiting change
+  first.
+
+Known limit, with the switch on: where the keys land after Left depends on whether a wait was
+dropped. If one was, they go to the innermost open menu, where `cancel_wait` puts them; if not,
+they stay where the pointer put them, in the root. The same picture can therefore react
+differently to the Down that follows. The next pointer move resets this.
+
+Tests, in `submenu_tests.rs`:
+
+- `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`: from a cascade
+  with nothing waiting, `cancel_wait()` is false, the keys stay in the root and no lit row
+  moves; Down then acts in the root, not in the submenu.
+- `cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu` and
+  `cancel_wait_drops_a_waiting_close_from_the_padding_too`: submenu open, a close waiting from
+  a pointer onto another main-menu row (resp. onto the padding above the first row);
+  `cancel_wait()` lights the row that opened the submenu again and gives the keys back to the
+  submenu, then Escape closes the submenu only, the root stays open, and a second Escape is
+  `Close`.
+- `cancel_wait_then_left_closes_only_the_submenu_with_the_switch_off`: a context menu, the
+  switch off; after `cancel_wait()` Left is `Changed` (the keys are back in the submenu), the
+  submenu closes, the root lights Open recent, and with nothing open Left is `Ignored` again.
+- `cancel_wait_lights_the_open_path_of_a_deep_cascade`: at depth 3, `cancel_wait()` lights Open
+  recent and More (the rows that opened the open menus) and gives the keys to the innermost
+  menu; Escape closes only More's submenu and the path stays lit.
+- `with_the_switch_escape_drops_the_wait_by_itself` and
+  `with_the_switch_left_drops_the_wait_and_closes_only_the_submenu`: the switch alone, no
+  `cancel_wait` call.
+- `the_switch_closes_one_level_at_depth_three_and_leaves_the_open_path_lit`: with the switch,
+  Open recent then More open and the pointer on Print in the root; Left closes More's submenu
+  only, and Open recent and More stay lit.
+- `assert_path_lit` (a helper, not a test) checks the rule in each open menu: the lit row is the
+  row that opened the next one.
+- `without_the_wait_cancelled_the_pointer_change_runs_first_as_before`: the old behaviour kept
+  as a guard: Escape returns `Close` and takes the menu, Left returns `Ignored` after the
+  waiting close has run, and Down still makes the waiting change first with the switch off and
+  on.
+
+Fail-before evidence: in the first commit, with `key` restored to its old body (both methods
+kept, so the tests compile), the two switch tests failed, Left giving `Ignored` where `Changed`
+was expected and Escape giving `Close`; with `cancel_wait` made a no-op, the three tests that
+call it failed on `deadline()`. For the review's commit, with the production hunks reverted (the
+old `cancel_wait` body, the switch dropping the wait without `cancel_wait`, and neither closing
+arm re-lighting the path), seven tests failed and the guard passed; the first was `the lit row
+of menu 0 opened the next: left: Some(3), right: Some(1)` — Print lit while Open recent's
+submenu is still open, the defect the review found. With the early return removed from
+`cancel_wait`, `cancel_wait_with_nothing_waiting_returns_false_and_leaves_the_keys_alone`
+failed: it returned true and moved the keys into the submenu.
+
+Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
+test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests` (exit 0; mdshared-ui 1129 passed, 33 ignored; doctests pass). Not run: the
+release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
+feature clippy/test lines, Linux and macOS. Not seen by a person in a window.
 
 ## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
 
