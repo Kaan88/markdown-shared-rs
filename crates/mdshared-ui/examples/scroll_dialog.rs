@@ -37,6 +37,8 @@ struct Demo {
     close: Rect,
     pointer: Option<(f32, f32)>,
     hover: Option<usize>,
+    /// The row last brought into view, so the reveal is asked for only when the focus moves.
+    revealed: Option<usize>,
     pressed: bool,
     until: Option<Instant>,
     seconds: Option<u64>,
@@ -229,16 +231,21 @@ impl App for Demo {
         let rects = self.area.layout_column(body, &flex, &items);
         self.body = body;
         self.rows = rects.clone();
-        // The focused row is brought into view before anything is drawn.
-        if let Some(i) = self.focus.focused()
-            && let Some(r) = rects.get(i)
-        {
-            self.area.reveal_focus(
-                &self.focus,
-                i,
-                (f64::from(r.x), f64::from(r.y)),
-                (f64::from(r.w), f64::from(r.h)),
-            );
+        // The focused row is brought into view when the focus moves to it, not every frame:
+        // the wheel and the page keys may then scroll inside it.
+        let focused = self.focus.focused();
+        if focused != self.revealed {
+            self.revealed = focused;
+            if let Some(i) = focused
+                && let Some(r) = rects.get(i)
+            {
+                self.area.reveal_focus(
+                    &self.focus,
+                    i,
+                    (f64::from(r.x), f64::from(r.y)),
+                    (f64::from(r.w), f64::from(r.h)),
+                );
+            }
         }
 
         let saved = self.area.scrolled(p, body);
@@ -297,6 +304,7 @@ fn main() {
         close: Rect::new(0.0, 0.0, 0.0, 0.0),
         pointer: None,
         hover: None,
+        revealed: None,
         pressed: false,
         until: None,
         seconds,

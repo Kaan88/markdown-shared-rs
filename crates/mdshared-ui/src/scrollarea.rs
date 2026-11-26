@@ -17,12 +17,14 @@
 //! The offsets, the content's size and the view's size are kept in content pixels (logical
 //! pixels in practice); every question and event answers in that one unit. The model draws
 //! nothing and reads no clock, so a test moves it with numbers alone. Wheel deltas come in the
-//! application's own unit, as [`host::Event::Wheel`](crate::host::Event::Wheel) gives them, and
-//! are added as they are.
+//! application's own unit, as [`host::Event::Wheel`](crate::host::Event::Wheel) gives them: a
+//! notch away from the user (a positive `down`) scrolls up, so [`ScrollArea::wheel`] subtracts
+//! both axes.
 //!
 //! The focus is passed in ([`ScrollArea::reveal_focus`]) rather than held: the id type is the
-//! application's, as in [`Focus`]. `reveal` and its sibling move the offset at once. An
-//! application that wants the offset to glide keeps a
+//! application's, as in [`Focus`]. `reveal` moves the offset at once, and `reveal_focus` only
+//! when the focus has come to another control, so a wheel or a key is not undone on the next
+//! frame. An application that wants the offset to glide keeps a
 //! [`SmoothScroll`](crate::scroll::SmoothScroll) for each axis as [`viewport`] describes and
 //! gives [`ScrollArea::set_offset`] what it draws each frame.
 //!
@@ -32,6 +34,9 @@
 //! wheel's own scaling (the caller turns notches into pixels), momentum, rubber-banding at the
 //! ends, zoom, a thumb that is dragged (the application asks [`scroll::offset_for_thumb`] and
 //! calls [`ScrollArea::set_offset`]), and accessibility of the content's place (roadmap K12).
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::anim::{Animator, AsId};
 use crate::focus::Focus;
@@ -54,10 +59,14 @@ pub const LINE: f64 = 24.0;
 ///
 /// The offsets are always kept inside what the sizes allow, so a content that shrinks pulls
 /// the view back in the moment it is told, and every answer is about the content as it is now.
-/// A size or an offset that is not a number is taken as no movement; one that is negative is 0.
+/// A size that is not finite is 0, a negative one is 0, and a component of an offset or a wheel
+/// that is not a number leaves that axis where it is.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ScrollArea {
     viewport: Viewport,
+    /// The hash of the focus id [`reveal_focus`](ScrollArea::reveal_focus) last brought into
+    /// view; `None` before the first. Kept so that giving the same focus again moves nothing.
+    revealed: Option<u64>,
 }
 
 /// A number that is not negative, and 0 when it is not finite.
@@ -75,6 +84,7 @@ impl ScrollArea {
                 view: (0.0, 0.0),
                 offset: (0.0, 0.0),
             },
+            revealed: None,
         }
     }
 
@@ -134,28 +144,36 @@ impl ScrollArea {
 
     /// Puts the offset where `offset` says, kept inside the limits (also what an application
     /// gives after its [`SmoothScroll`](crate::scroll::SmoothScroll) glided). Returns whether the
-    /// offset changed.
+    /// offset changed. A component that is not a number keeps that axis where it is.
     pub fn set_offset(&mut self, offset: (f64, f64)) -> bool {
-        self.viewport.scroll_to(offset)
+        self.scroll_to(offset)
     }
 
     /// Moves the offset by `delta`, kept inside the limits. Returns whether it moved; a wheel
-    /// that does not move the area is one for something else.
+    /// that does not move the area is one for something else. A component that is not a number
+    /// moves that axis not at all.
     pub fn scroll_by(&mut self, delta: (f64, f64)) -> bool {
-        self.viewport.scroll_by(delta)
+        let step = |v: f64| if v.is_nan() { 0.0 } else { v };
+        self.viewport.scroll_by((step(delta.0), step(delta.1)))
     }
 
-    /// Moves the offset to `offset`, kept inside the limits. Returns whether it moved.
+    /// Moves the offset to `offset`, kept inside the limits. Returns whether it moved. A
+    /// component that is not a number keeps that axis where it is.
     pub fn scroll_to(&mut self, offset: (f64, f64)) -> bool {
-        self.viewport.scroll_to(offset)
+        let (x, y) = self.viewport.at();
+        let keep = |v: f64, old: f64| if v.is_nan() { old } else { v };
+        self.viewport
+            .scroll_to((keep(offset.0, x), keep(offset.1, y)))
     }
 
     /// Takes a wheel's movement, `(across, down)` in the caller's unit, and scrolls by it: a
-    /// wheel that only turns with Shift held scrolls across, as [`wheel_delta`] says. Returns
-    /// whether the area moved.
+    /// notch away from the user is positive in [`host::Event::Wheel`](crate::host::Event::Wheel)
+    /// and scrolls up, so both axes are subtracted. A wheel that only turns with Shift held
+    /// scrolls across, as [`wheel_delta`] says (a notch away from the user then scrolls left).
+    /// Returns whether the area moved.
     pub fn wheel(&mut self, across: f64, down: f64, shift: bool) -> bool {
         let (dx, dy) = wheel_delta(across, down, shift);
-        self.scroll_by((dx, dy))
+        self.scroll_by((-dx, -dy))
     }
 
     /// Takes a key that no control wanted and scrolls by it. Returns whether the area moved, so
@@ -202,25 +220,33 @@ impl ScrollArea {
         to != before
     }
 
-    /// Reveals the control with `id` when `focus` holds it there: the same as
-    /// [`reveal`](Self::reveal) for that control's rectangle, and nothing when the focus is
-    /// elsewhere. Returns whether the offset changed.
+    /// Reveals the control with `id` when `focus` holds it there, the first time the focus comes
+    /// to it: once that id has been revealed, giving it again while `focus` still holds it moves
+    /// nothing, so the wheel and the keys can scroll inside a control taller than the view
+    /// instead of being pinned back on the next frame. Another id reveals again. Returns whether
+    /// the offset changed.
     ///
-    /// The application calls it once per control it laid out, or only for the control the frame
-    /// says is focused; either way `at` and `extent` are in content pixels, as
-    /// [`layout_column`](Self::layout_column) and [`Flex::layout`] give them.
-    pub fn reveal_focus<K: Copy + Eq>(
+    /// `at` and `extent` are in content pixels, as [`layout_column`](Self::layout_column) and
+    /// [`Flex::layout`] give them. The id is remembered as its hash, because [`ScrollArea`]
+    /// holds no `K`; so `K` must be `Hash` as well as `Copy + Eq`.
+    pub fn reveal_focus<K: Copy + Eq + Hash>(
         &mut self,
         focus: &Focus<K>,
         id: K,
         at: (f64, f64),
         extent: (f64, f64),
     ) -> bool {
-        if focus.is_focused(id) {
-            self.reveal(at, extent)
-        } else {
-            false
+        if !focus.is_focused(id) {
+            return false;
         }
+        let mut h = DefaultHasher::new();
+        id.hash(&mut h);
+        let key = h.finish();
+        if self.revealed == Some(key) {
+            return false;
+        }
+        self.revealed = Some(key);
+        self.reveal(at, extent)
     }
 
     /// The rectangles of `items` laid out as a column as long as they want, and the area sized
@@ -234,8 +260,12 @@ impl ScrollArea {
     /// pulled in when the column got shorter.
     pub fn layout_column(&mut self, area: Rect, flex: &Flex, items: &[Item]) -> Vec<Rect> {
         let height = flex.natural(items);
-        self.set_view((f64::from(area.w), f64::from(area.h)));
-        self.set_content((f64::from(area.w), f64::from(height)));
+        // Both sizes are set before the offset is pulled in: a view that grew and a content
+        // that grew in the same frame must not clamp the offset against the old content.
+        let before = self.viewport.at();
+        self.viewport.view = (size(f64::from(area.w)), size(f64::from(area.h)));
+        self.viewport.content = (size(f64::from(area.w)), size(f64::from(height)));
+        self.pull_in(before);
         flex.layout(Rect::new(0.0, 0.0, area.w, height), items)
     }
 
@@ -291,8 +321,10 @@ impl ScrollArea {
 }
 
 /// What [`ScrollArea::scrolled`] changed in the painter, to be given back to [`restore`](Self::restore):
-/// the clip and the origin as they were.
+/// the clip and the origin as they were. `#[must_use]`: a painter left clipped and moved would
+/// draw the rest of the frame into the wrong place.
 #[derive(Clone, Copy, Debug)]
+#[must_use = "give it back to Scrolled::restore, or the painter stays clipped and moved"]
 pub struct Scrolled {
     clip: (i32, i32, i32, i32),
     origin: (i32, i32),
@@ -411,25 +443,31 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_moves_by_its_delta_and_shift_turns_it_across() {
+    fn a_wheel_notch_away_from_the_user_scrolls_up_and_shift_turns_it_across() {
         let mut a = area();
-        assert!(a.wheel(0.0, 120.0, false));
-        assert_eq!(a.offset(), (0.0, 120.0));
-        // Zoomed out, a wheel notch with Shift held scrolls across.
+        a.set_offset((100.0, 200.0));
+        // `host::Event::Wheel` gives a notch away from the user as positive: it scrolls up.
+        assert!(a.wheel(0.0, 40.0, false));
+        assert_eq!(a.offset(), (100.0, 160.0));
+        // Towards the user is negative, and scrolls down.
+        assert!(a.wheel(0.0, -120.0, false));
+        assert_eq!(a.offset(), (100.0, 280.0));
+        // Shift turns a vertical wheel across: away from the user scrolls left.
         assert!(a.wheel(0.0, 30.0, true));
-        assert_eq!(a.offset(), (30.0, 120.0));
-        // A trackpad's two-way movement is taken as it is.
+        assert_eq!(a.offset(), (70.0, 280.0));
+        // A trackpad's two-way movement is taken as it is, both axes subtracted.
         assert!(a.wheel(10.0, 20.0, true));
-        assert_eq!(a.offset(), (40.0, 140.0));
-        // At the end it does not move, so the caller may give the wheel to a parent.
-        a.set_offset((600.0, 1800.0));
+        assert_eq!(a.offset(), (60.0, 260.0));
+        // At the top it does not move, so the caller may give the wheel to a parent.
+        a.set_offset((0.0, 0.0));
         assert!(!a.wheel(0.0, 40.0, false));
         assert!(!a.wheel(40.0, 0.0, false));
-        // The top behaves the same way upwards, and a part that is not a number moves nothing.
-        a.set_offset((0.0, 0.0));
+        // The far end behaves the same way downwards, and a part that is not a number moves
+        // nothing.
+        a.set_offset((600.0, 1800.0));
         assert!(!a.wheel(0.0, -40.0, false));
-        assert!(!a.wheel(f64::NAN, f64::INFINITY, false));
-        assert_eq!(a.offset(), (0.0, 0.0));
+        assert!(!a.wheel(f64::NAN, f64::NAN, false));
+        assert_eq!(a.offset(), (600.0, 1800.0));
     }
 
     #[test]
@@ -536,6 +574,35 @@ mod tests {
     }
 
     #[test]
+    fn reveal_focus_brings_a_control_in_once_and_does_not_pin_it_after_a_scroll() {
+        let mut a = area();
+        let mut focus: Focus<u32> = Focus::new();
+        focus.begin_frame();
+        for id in [1, 2] {
+            focus.add(id);
+        }
+        focus.end_frame();
+        focus.focus(2);
+        // The first reveal moves it in; a control taller than the view shows its start.
+        assert!(a.reveal_focus(&focus, 2, (0.0, 900.0), (50.0, 260.0)));
+        assert_eq!(a.offset(), (0.0, 900.0));
+        // Page Down scrolls inside it; the next frame's reveal for the same focus moves nothing.
+        assert!(a.key(KeyName::PageDown, Mods::default()));
+        assert_eq!(a.offset(), (0.0, 1076.0));
+        assert!(!a.reveal_focus(&focus, 2, (0.0, 900.0), (50.0, 260.0)));
+        assert_eq!(a.offset(), (0.0, 1076.0));
+        // Even to the end of the content, where the control's start is far above the view.
+        assert!(a.wheel(0.0, -1000.0, false));
+        assert_eq!(a.offset(), (0.0, 1800.0));
+        assert!(!a.reveal_focus(&focus, 2, (0.0, 900.0), (50.0, 260.0)));
+        assert_eq!(a.offset(), (0.0, 1800.0));
+        // Another control takes the focus: it is revealed in its turn.
+        focus.focus(1);
+        assert!(a.reveal_focus(&focus, 1, (0.0, 100.0), (50.0, 20.0)));
+        assert_eq!(a.offset(), (0.0, 100.0));
+    }
+
+    #[test]
     fn layout_column_makes_the_content_as_long_as_the_items_want_and_keeps_them_still() {
         let mut a = ScrollArea::new();
         let flex = Flex::column().gap(10.0);
@@ -567,6 +634,22 @@ mod tests {
         assert_eq!(a.content(), (300.0, 140.0));
         assert_eq!(rects[0].h, 80.0);
         assert_eq!(rects[1].y, 80.0);
+    }
+
+    #[test]
+    fn layout_column_keeps_the_offset_when_the_view_and_the_content_grow_together() {
+        let mut a = ScrollArea::new();
+        a.set_view((200.0, 200.0));
+        a.set_content((200.0, 600.0));
+        a.set_offset((0.0, 400.0));
+        // A view of 300 and a content of 900 in one frame: clamping against the old content
+        // first would pull 400 down to 300 and lose it.
+        let flex = Flex::column();
+        let items: Vec<Item> = (0..9).map(|_| Item::fixed(100.0)).collect();
+        a.layout_column(Rect::new(0.0, 0.0, 300.0, 300.0), &flex, &items);
+        assert_eq!(a.content(), (300.0, 900.0));
+        assert_eq!(a.view(), (300.0, 300.0));
+        assert_eq!(a.offset(), (0.0, 400.0));
     }
 
     #[test]
@@ -605,6 +688,24 @@ mod tests {
         assert_eq!(a.offset(), (0.0, 0.0));
     }
 
+    #[test]
+    fn a_component_that_is_not_a_number_keeps_its_axis_where_it_is() {
+        let mut a = area();
+        a.set_offset((100.0, 200.0));
+        // An offset with a NaN part moves the other axis and leaves this one where it was.
+        assert!(a.set_offset((f64::NAN, 300.0)));
+        assert_eq!(a.offset(), (100.0, 300.0));
+        assert!(a.scroll_to((f64::NAN, 250.0)));
+        assert_eq!(a.offset(), (100.0, 250.0));
+        assert!(a.scroll_by((f64::NAN, -50.0)));
+        assert_eq!(a.offset(), (100.0, 200.0));
+        // Nothing but NaN parts: nothing moves, and the answer says so.
+        assert!(!a.scroll_by((f64::NAN, f64::NAN)));
+        assert_eq!(a.offset(), (100.0, 200.0));
+        assert!(!a.set_offset((f64::NAN, f64::NAN)));
+        assert_eq!(a.offset(), (100.0, 200.0));
+    }
+
     // ---- drawing ---------------------------------------------------------------------------
 
     const PAGE: Rect = Rect::new(0.0, 0.0, 160.0, 120.0);
@@ -633,14 +734,19 @@ mod tests {
         a.set_content((200.0, 400.0));
         a.set_offset((0.0, 50.0));
         let ink = [200, 30, 40];
+        let mark = [20, 220, 90];
         let drawn = shot(&LIGHT, |p| {
             let saved = a.scrolled(p, VIEW_RECT);
             p.fill(Rect::new(0.0, 0.0, 200.0, 400.0), ink);
+            // A mark whose place says whether the content was moved as well as clipped.
+            p.fill(Rect::new(10.0, 60.0, 10.0, 10.0), mark);
             saved.restore(p);
         });
         // Inside the area the body shows, wherever the offset put it.
         assert_eq!(at(&drawn, 80.0, 60.0), ink);
         assert_eq!(at(&drawn, 31.0, 99.0), ink);
+        // The translation: content (10, 60) is at screen (40, 30) at offset (0, 50).
+        assert_eq!(at(&drawn, 45.0, 35.0), mark);
         // Outside it nothing was touched: the page keeps its pixels all round the area.
         for (x, y) in [(10.0, 10.0), (29.0, 60.0), (131.0, 60.0), (80.0, 19.0)] {
             assert_eq!(at(&drawn, x, y), LIGHT.page, "({x}, {y})");
@@ -651,6 +757,30 @@ mod tests {
             p.fill(Rect::new(0.0, 0.0, 200.0, 400.0), ink);
         });
         assert_eq!(at(&unclipped, 80.0, 10.0), ink);
+    }
+
+    #[test]
+    fn after_restore_drawing_outside_the_area_is_unclipped_and_in_place() {
+        let mut a = ScrollArea::new();
+        a.set_view((VIEW_RECT.w as f64, VIEW_RECT.h as f64));
+        a.set_content((200.0, 400.0));
+        a.set_offset((0.0, 50.0));
+        let ink = [10, 200, 30];
+        let inside = [200, 30, 40];
+        let drawn = shot(&LIGHT, |p| {
+            let saved = a.scrolled(p, VIEW_RECT);
+            p.fill(Rect::new(0.0, 60.0, 10.0, 10.0), inside);
+            saved.restore(p);
+            // The page's own top left, outside the area, and a corner beyond its right edge:
+            // both land where asked, unclipped and unmoved.
+            p.fill(Rect::new(0.0, 0.0, 10.0, 10.0), ink);
+            p.fill(Rect::new(150.0, 110.0, 10.0, 10.0), ink);
+        });
+        assert_eq!(at(&drawn, 5.0, 5.0), ink);
+        assert_eq!(at(&drawn, 155.0, 115.0), ink);
+        // The body drawn before the restore was clipped and moved as it should be.
+        assert_eq!(at(&drawn, 35.0, 35.0), inside);
+        assert_eq!(at(&drawn, 29.0, 20.0), LIGHT.page);
     }
 
     #[test]
@@ -692,16 +822,22 @@ mod tests {
             at(&across_only, VIEW_RECT.right() - 6.0, VIEW_RECT.y + 5.0),
             LIGHT.page
         );
-        // Both: each bar stops short of the corner.
-        let both = bars((400.0, 400.0), (0.0, 0.0));
+        // Both, scrolled to the far end with the bars active: each stops short of the corner.
         let mut b = ScrollArea::new();
         b.set_view((VIEW_RECT.w as f64, VIEW_RECT.h as f64));
         b.set_content((400.0, 400.0));
+        b.set_offset((300.0, 320.0));
         let (down, across) = b.bars(VIEW_RECT);
         let (_, dthumb) = down.unwrap();
         let (_, hthumb) = across.unwrap();
+        let both = shot(&LIGHT, |p| draw_bars(p, &LIGHT, VIEW_RECT, &b, true));
         assert_ne!(at(&both, dthumb.cx(), dthumb.cy()), LIGHT.page);
         assert_ne!(at(&both, hthumb.cx(), hthumb.cy()), LIGHT.page);
+        // The corner the two bars leave to each other shows the page, not either track.
+        assert_eq!(
+            at(&both, VIEW_RECT.right() - 6.0, VIEW_RECT.bottom() - 6.0),
+            LIGHT.page
+        );
     }
 
     #[test]
