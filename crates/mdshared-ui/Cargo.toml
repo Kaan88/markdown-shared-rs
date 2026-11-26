@@ -18,6 +18,9 @@ trash = { version = "=5.4.0", default-features = false, features = ["coinit_apar
 # feature. Pure Rust with no system library, so the tree builds on every system; only the adapter
 # that serves it (accesskit_winit, below) is Windows-only.
 accesskit = { version = "=0.25.2", optional = true }
+# A terminal's grid drawn with the painter (`termview`, roadmap T1), only with the `term` feature.
+# Our own crate, with no dependencies of its own.
+mdshared-term = { path = "../mdshared-term", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
@@ -127,6 +130,9 @@ a11y = ["dep:accesskit", "dep:accesskit_winit"]
 # is not built, and softbuffer is not a dependency. With `a11y` too, the host serves the
 # application's AccessKit tree to UI Automation.
 host = ["dep:softbuffer"]
+# A terminal's screen drawn into a rectangle: `termview` (roadmap T1), over `mdshared-term`'s
+# `Screen`. Off: the module is not built, and mdshared-term is not a dependency.
+term = ["dep:mdshared-term"]
 
 [[example]]
 name = "purge_shape"
