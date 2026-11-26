@@ -30,6 +30,16 @@
 //! [`Outcome::Close`]. Left in the root and Right on a row without a submenu are
 //! [`Outcome::Ignored`], so an application with a menu bar moves to the menu beside.
 //!
+//! A key acts on what is open now: a change the pointer asked for that still waits is made
+//! before the key ([`Cascade::key`]), so the key acts on what is lit. An application whose
+//! Escape closes only the submenu wants the opposite for Escape and Left, because a waiting
+//! close would otherwise run first and take the menu the key meant to land on. It calls
+//! [`Cascade::cancel_wait`] before forwarding the key, which drops the wait, lights the row
+//! that opened each open submenu again (the pointer had lit another) and gives the keys to the
+//! innermost open menu; or it turns on [`Cascade::keys_cancel_wait`], where `key` does that
+//! itself for those two keys, and Left closes the innermost open submenu even when the keys are
+//! in the menu before it.
+//!
 //! The geometry, as plain functions of rectangles: [`around`] places a menu by a rectangle or
 //! a point (below and to the right, flipped above or to the left where it would not fit) and
 //! [`beside`] places a submenu by its row (to the right, flipped to the left, slid up to stay
@@ -363,6 +373,7 @@ pub struct Cascade<T> {
     delay: Duration,
     access: bool,
     access_visible: bool,
+    keys_cancel_wait: bool,
     look: Look,
 }
 
@@ -383,6 +394,7 @@ impl<T: Clone> Cascade<T> {
             delay: DELAY,
             access: false,
             access_visible: true,
+            keys_cancel_wait: false,
             look: Look::ROUNDED,
         };
         cascade.menus.push(cascade.root());
@@ -425,6 +437,18 @@ impl<T: Clone> Cascade<T> {
     pub fn with_look(mut self, look: Look) -> Self {
         self.look = look.sane();
         self.reset();
+        self
+    }
+
+    /// Whether Escape and Left act on what is open now instead of on what the pointer last
+    /// asked for; off by default. On, [`key`](Self::key) does for those two keys what
+    /// [`cancel_wait`](Self::cancel_wait) does, and Left closes the innermost open submenu even
+    /// when the keys are in the menu before it, where it is [`Outcome::Ignored`] otherwise;
+    /// either key leaves the rows that opened the menus still open lit. With the switch off, a
+    /// close the pointer asked for less than [`DELAY`] ago runs first, and Escape then finds
+    /// the root alone open and is [`Outcome::Close`], which takes the whole menu.
+    pub fn keys_cancel_wait(mut self, on: bool) -> Self {
+        self.keys_cancel_wait = on;
         self
     }
 
@@ -491,6 +515,35 @@ impl<T: Clone> Cascade<T> {
     /// wakes then. `None` when nothing waits.
     pub fn deadline(&self) -> Option<Instant> {
         self.pending.map(|p| p.due)
+    }
+
+    /// Drops a change the pointer asked for that still waits, without making it: nothing is
+    /// opened or closed, and [`deadline`](Self::deadline) is `None` afterwards. Returns true
+    /// when something was waiting and is dropped, false when nothing was waiting, in which
+    /// case nothing at all is touched.
+    ///
+    /// The menus go back onto their open path: the pointer had lit the row it moved onto,
+    /// though that row's submenu never opened, so the row that opened each open submenu is lit
+    /// again, and the keys go to the innermost open menu. What is drawn changes when the
+    /// pointer had lit another row; nothing else does.
+    ///
+    /// The application calls it before a key that must act on what is open now: a submenu is
+    /// open and a close of it waits because the pointer moved onto another row of its menu, or
+    /// onto that menu's padding, less than [`DELAY`] ago. Without it [`key`](Self::key) makes
+    /// the close first: Escape then finds only the root open and is [`Outcome::Close`], which
+    /// takes the whole menu, and Left with the keys in the root is [`Outcome::Ignored`], which
+    /// a menu bar takes as "move to the menu beside". After it, both close the innermost
+    /// submenu only.
+    ///
+    /// [`keys_cancel_wait`](Self::keys_cancel_wait) has `key` do this itself for those two keys.
+    pub fn cancel_wait(&mut self) -> bool {
+        if self.pending.take().is_none() {
+            return false;
+        }
+        let last = self.menus.len() - 1;
+        self.hold_path(last);
+        self.focus = last;
+        true
     }
 
     /// Whether `x`, `y` is in any open menu (as last placed).
@@ -728,9 +781,14 @@ impl<T: Clone> Cascade<T> {
     /// Escape with none open is [`Outcome::Close`]; a letter is an access key
     /// ([`access_keys`](Self::access_keys)), which chooses its item or opens its submenu.
     /// Anything else is [`Outcome::Ignored`]. A key waits for nothing: a change the pointer
-    /// asked for and that still waits is made first, so the key acts on what is lit.
+    /// asked for and that still waits is made first, so the key acts on what is lit, except
+    /// that under [`keys_cancel_wait`](Self::keys_cancel_wait) Escape and Left drop it instead
+    /// ([`cancel_wait`](Self::cancel_wait)), which puts the lit rows back on the open path.
     pub fn key(&mut self, key: &KeyName) -> Outcome<T> {
-        if let Some(p) = self.pending.take() {
+        let closing = matches!(key, KeyName::Escape | KeyName::Left);
+        if self.keys_cancel_wait && closing {
+            self.cancel_wait();
+        } else if let Some(p) = self.pending.take() {
             self.apply(p);
         }
         let k = self.focus.min(self.menus.len() - 1);
@@ -758,12 +816,20 @@ impl<T: Clone> Cascade<T> {
                         .map_or(Outcome::Nothing, Outcome::Chosen)
                 }),
             },
+            KeyName::Left if self.keys_cancel_wait && self.menus.len() > 1 => {
+                self.close_after(self.menus.len() - 2);
+                self.hold_path(self.menus.len() - 1);
+                Outcome::Changed
+            }
             KeyName::Left if k > 0 => {
                 self.close_after(k - 1);
                 Outcome::Changed
             }
             KeyName::Escape if self.menus.len() > 1 => {
                 self.close_after(self.menus.len() - 2);
+                if self.keys_cancel_wait {
+                    self.hold_path(self.menus.len() - 1);
+                }
                 Outcome::Changed
             }
             KeyName::Escape => Outcome::Close,
