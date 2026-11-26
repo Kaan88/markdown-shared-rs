@@ -10,6 +10,32 @@ events and the hits; a model answers questions and takes events, a `draw_*` func
 changes nothing; a function that ends in `_animated` or `_presence` is the same drawing with
 motion ([ANIMATION.md](ANIMATION.md)).
 
+## I want to ...
+
+- **Show a Markdown page:** [mdview-preview](#what-exists-outside-these-crates) today; moving to `mdshared-md-preview` ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+- **Show a terminal:** [`termview`](#widgets-mdshared-ui) (feature `term`) draws the [`mdshared-term`](#terminal-mdshared-term) screen.
+- **Run a shell in a pseudo-terminal (PTY):** [`mdshared-pty`](#pseudo-terminal-mdshared-pty).
+- **Draw rich or styled text:** [`richtext` and `Painter::rich_text`](#painting-mdshared-ui-mdshared-text).
+- **Edit text in a field:** [`textfield`](#widgets-mdshared-ui); a multi-line editor is not yet shared ([ROADMAP K9](ROADMAP.md#barbican-fast-track-2026-11-25)).
+- **Pick a colour:** [`colour_picker`](#widgets-mdshared-ui).
+- **Show a settings form:** [`settings::Form` or `settings::pages::Form`](#widgets-mdshared-ui).
+- **Open a menu, submenu or context menu:** [`menu` and `submenu`](#widgets-mdshared-ui).
+- **Show a file list or directory listing:** [`dirlist`](#application-plumbing-mdshared-app-mdshared-fetch) with [`rows`](#list-and-layout-models-mdshared-ui).
+- **Watch a folder for changes:** [`dirwatch`](#application-plumbing-mdshared-app-mdshared-fetch).
+- **Handle file drops:** use winit's file events; toolkit drag-and-drop is not yet built ([ROADMAP L7/L8](ROADMAP.md#lists-menus-and-input)).
+- **Use the clipboard:** [`platform`](#platform-mdshared-ui) for text and HTML; files and images are not yet supported ([ROADMAP L9](ROADMAP.md#lists-menus-and-input)).
+- **Draw images or pictures:** [`mdshared_text::image`, `Painter::image` and `picture`](#painting-mdshared-ui-mdshared-text).
+- **Make thumbnails:** [`thumbs`](#widgets-mdshared-ui) for pictures; shell icons and thumbnails are not yet provided ([ROADMAP F5](ROADMAP.md#files)).
+- **Animate a control or transition between pages:** [`anim::Animator` and `PageTransition`](#animation-mdshared-uianim).
+- **Make a scroll area:** [`scrollarea`, `viewport` and `scroll`](#widgets-mdshared-ui).
+- **Lay out controls:** [`layout`](#list-and-layout-models-mdshared-ui) for flexible rows and columns.
+- **Draw buttons and controls:** [`overlay::draw_dialog_button`, `link`, `check`, `toggle`, `dropdown` and `slider`](#widgets-mdshared-ui); the broader set is not yet on this branch ([ROADMAP K4](ROADMAP.md#barbican-fast-track-2026-11-25)).
+- **Put an icon in the tray:** [`tray`](#widgets-mdshared-ui) (Windows and Linux).
+- **Send a system notification:** [`notify`](#widgets-mdshared-ui) (feature `notify`, Windows and Linux).
+- **Expose accessibility:** [`a11y`](#accessibility-mdshared-ui-feature-a11y) (feature `a11y`; Windows adapter today).
+- **Host a window:** [`host`](#platform-mdshared-ui) (feature `host`, one window).
+- **Give a window frosted chrome:** [`frost`](#platform-mdshared-ui) (the host supports it on Windows).
+
 ## Painting (`mdshared-ui`, `mdshared-text`)
 
 | Module | For | Start at |
@@ -30,7 +56,8 @@ motion ([ANIMATION.md](ANIMATION.md)).
 
 | Module | For | Start at |
 |---|---|---|
-| `mdshared_text::text` | Parley layouts drawn with subpixel masks and a byte-capped glyph cache. Monochrome outlines fit vertically to pixel rows without changing their horizontal coordinates or the layout | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
+| `mdshared_text::text` | Laying out and rasterizing text for a document page: parley layouts drawn with subpixel masks, a byte-capped glyph cache. Monochrome outlines fit vertically to pixel rows without changing their horizontal coordinates or the layout | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
+| `mdshared_text::text` (premultiplied glyphs) | Tinted text over premultiplied pixels, with grayscale coverage where the destination is translucent and the usual text drawing elsewhere | `TextEngine::draw_layout_clipped_tinted_premultiplied`, `bitmap::blend_premultiplied` |
 | `mdshared_text::fonts` | One font enumeration per thread, fallback families, colour emoji runs | `shared_fonts`, `add_fallbacks`, `push_emoji_runs` |
 | `mdshared_highlight` | Highlighting a whole code block by language name | `tokens`, `Token` |
 | `mdshared_highlight::incremental` | Highlighting line by line for an editor, with checkpoints and limits | `LineHighlighter`, `Language::for_path` / `by_token`, `Limits`, `Span` |
@@ -78,7 +105,8 @@ the row says the widget holds state.
 | `scroll` | The overlay scrollbar, upright and on its side, and an offset that glides (kept as `f64`) | `scrollbar(area, content, view, offset)`, `offset_for_thumb`, `draw_scrollbar`, `draw_scrollbar_animated`; `hscrollbar`, `offset_for_hthumb`, `draw_hscrollbar`, `draw_hscrollbar_animated`; `scrollbars` (both, clear of the corner); `SmoothScroll` (`scroll_by`, `jump_to`, `offset` / `offset_f64`, `current` for hit tests during a glide) |
 | `viewport` | A view that scrolls both ways (a wide table, a terminal, a large picture): content and view sizes and both offsets as `f64`, clamped; the offset that reveals a rectangle; points between the content and the screen; both scrollbars (provisional) | `Viewport::new(content, view)`, `max`, `clamp`, `at`, `scroll_to`, `scroll_by`, `scrolls`, `visible`, `reveal(at, extent)`, `to_area`, `to_content`, `bars(area)`; `wheel_delta(across, down, shift)` |
 | `scrollarea` | A scroll area, one model tying a `Viewport` to both bars, the clip, the wheel, the keys and the focus reveal: content and view sizes, offsets always kept inside them, a column laid out as long as its items want (the dialog whose body scrolls), the painter cut and moved to content pixels, and a control brought into view above, below or taller than the view | `ScrollArea::new()`, `set_view` / `set_content` / `set_offset`, `scroll_by` / `scroll_to`, `wheel(across, down, shift)`, `key(KeyName, Mods)`, `reveal(at, extent)`, `reveal_focus(&focus, id, at, extent)` (once, when the focus comes to it), `layout_column(area, &Flex, &[Item])`, `scrolled(p, area) -> Scrolled` (`restore(p)`), `bars`, `content_rect`, `to_area` / `to_content`, `viewport`, `content` / `view` / `offset` / `max` / `scrolls` / `visible`; `draw_bars`, `draw_bars_animated`; `LINE` |
-| `termview` (feature `term`) | A terminal's grid drawn with the painter: a `mdshared_term::Screen` in a rectangle, one character a cell on a whole-device-pixel grid; colours and attributes from each `Cell`, wide characters over two cells, U+2500 to U+259F drawn as shapes that join, block, bar, underline or hollow cursor, the selection, a scrollback offset, and only the changed rows redrawn | `CellFont` (`metrics`), `Metrics` (`grid_size`, `cell_at`, `cell_clamped`, `cell_rect`, `row_rect`), `Scheme` (`from_palette`, `cell_colors`), `View` (`scrolled`, `focused`, `point_at`, `cursor_row`, `damage`), `draw_screen`, `draw_rows`, `draw_screen_animated`, `draw_rows_animated`, `cursor_blinks_on`, `is_box_char`; also `mdshared_text::TextEngine::draw_layout_clipped_tinted` |
+| `termview` (feature `term`) | A terminal's grid drawn with the painter: a `mdshared_term::Screen` in a rectangle, one character a cell on a whole-device-pixel grid; colours and attributes from each `Cell`, wide characters over two cells, U+2500 to U+259F drawn as shapes that join, block, bar, underline or hollow cursor with an application default for shape and blink, the selection, a scrollback offset, and only the changed rows redrawn | `CellFont` (`metrics`), `Metrics` (`grid_size`, `cell_at`, `cell_clamped`, `cell_rect`, `row_rect`), `Scheme` (`from_palette`, `cell_colors`), `View` (`scrolled`, `focused`, `cursor_preference`, `point_at`, `cursor_row`, `damage`), `draw_screen`, `draw_rows`, `draw_screen_animated`, `draw_rows_animated`, `cursor_blinks_on`, `is_box_char`; also `mdshared_text::TextEngine::draw_layout_clipped_tinted` |
+| `termview` (translucent background, opt-in) | Lets Windows Mica or Acrylic show through the default terminal background with an independent opacity, optional right and bottom padding, and a text contrast floor. Opaque when the host's backdrop is inactive, including Linux, macOS and high contrast | `BackgroundOpacity::new(opacity).with_padding(on)`, `draw_screen_with_background`, `draw_rows_with_background`; `examples/term_backdrop.rs` |
 | `textfield` | A single-line text field: text, caret, selection, IME preedit. Holds state. Its caret blinks at the system's rate on an `Animator` the caller owns, waking the window only while focused with no selection (the blink provisional) | `TextField`, `EditKey`, `FieldColors`, `Preedit`; `TextField::blink_caret(anim, id, blink, focused) -> bool`, `draw_blinking(p, anim, id, blink, area, …)` |
 | `seltext` | Read-only selectable text: a wrapped paragraph with a selection by drag, double click or Shift, carets only on cluster edges, Ctrl+C as an action for the caller's clipboard and a context menu; hit testing from the same parley layout that draws, wrapped and monospace (provisional) | `SelectableText::new()`, `with_wrap`, `set_wrap`, `seltext::lines`, `set_text`, `set_lines`, `press(lines, x, y, mods, clicks)`, `drag`, `release`, `key(KeyName, Mods) -> Option<Action>`, `select_all`, `clear_selection`, `selected_text`, `selection`, `caret`, `caret_line`, `context_menu_items`; `Action::{Copy, SelectAll}`; `draw(p, pal, area, face, size, &model, focused)` |
 | `palette` | The command palette: a text field over a ranked list. Holds state | `Palette`, `Entry::new(id, label).hint().icon().group()`, `Outcome`, `draw_presence` and `presence_bounds` (its entrance) |
@@ -180,7 +208,7 @@ the kitty keyboard protocol, images).
 
 | Module | For | Start at |
 |---|---|---|
-| `screen` | The grid a program's output is written into: cells with colours and attributes, cursor, scrollback, alternate screen, scroll regions, modes, dirty rows, replies | `Screen::new(cols, rows, scrollback)`, `feed(bytes)`, `resize`, `cell`, `line`, `row_text`, `cursor`, `modes`, `take_dirty`, `take_reply`, `take_title`, `scrollback_line` |
+| `screen` | The grid a program's output is written into: cells with colours and attributes, cursor (including whether the program chose its style), scrollback, alternate screen, scroll regions, modes, dirty rows, replies | `Screen::new(cols, rows, scrollback)`, `feed(bytes)`, `resize`, `cell`, `line`, `row_text`, `cursor`, `cursor_style_is_explicit`, `modes`, `take_dirty`, `take_reply`, `take_title`, `scrollback_line` |
 | `parse` | The VT byte-stream parser, apart from what the sequences mean | `Parser::feed(bytes, &mut impl Perform)`, `Params` |
 | `select` | Selecting cells across scrollback and screen, by cell, word or line, as a stream or a block; a word and a line run across a soft wrap (a row whose text went on in the next) and stop at a hard break; the selection holds the text it was made on, so it follows the screen after output (`follow`, `is_intact`) and is dropped when the program rewrote or erased it, or when its first line left the ring | `Selection::start(&screen, point, kind, clicks)`, `extend`, `span_on`, `contains`, `range`, `text`, `clip`, `is_intact`, `follow` |
 | `input` | Keys, pastes, mouse events and focus changes as the bytes a program expects | `encode_key(Key, Mods, &modes)`, `encode_paste`, `encode_mouse`, `encode_focus` |
@@ -215,3 +243,84 @@ match anim.end_frame() {
     None => event_loop.set_control_flow(ControlFlow::Wait),
 }
 ```
+
+## What exists outside these crates
+
+These libraries live in sibling repositories, not in this workspace. For a Cargo dependency,
+use the package name with `git =` the repository URL and `rev =` its full commit below. Paths
+are relative to that repository; Cargo finds the package in its checkout. **Toolkit pin** is
+the revision the library actually uses, including transitive dependencies. “None” means the
+library does not pull in the toolkit, even if its app does.
+
+### Markdown viewer
+
+[markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) ·
+`https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`.
+All five are moving into this toolkit ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
+
+| Crate | Path | For | Toolkit pin |
+|---|---|---|---|
+| `mdview-preview` | `crates/preview` | Markdown page pixels for another window; enable `server` to embed it | `48eb3ce` with `server`; none without it |
+| `mdview-render` | `crates/render` | Headless page layout, raster drawing, images, hit testing and HTML export | `48eb3ce` |
+| `mdview-core` | `crates/core` | Markdown parser, document model, search and selection; also contains viewer session glue | `48eb3ce` |
+| `mdview-engine` | `crates/engine` | SVG, TeX and Mermaid rasterizers; build and ship the `mdview-engine` binary for these in previews | None |
+| `mdview-engine-proto` | `crates/engine-proto` | Request and reply frames shared by the renderer and helper process | None |
+
+```toml
+mdview-preview = { git = "https://github.com/Kaan88/markdown-viewer-rs", rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99", features = ["server"] }
+```
+
+**Known revision pair:** mdview `01f67b2` uses toolkit
+[`48eb3ce`](https://github.com/Kaan88/markdown-shared-rs/commit/48eb3cefb17f5025f3ac418f7a01b31b7a914779).
+Pin your app's toolkit dependencies to the same URL and full revision when sharing types.
+`preview/server` pulls in `render` and `core`: `render` pins `mdshared-text` and
+`mdshared-highlight`, and `core` pins `mdshared-app`. Without `server`, preview is just the
+wire format for `mdview --preview-server` and has no toolkit pin.
+
+Cargo treats different Git revisions as separate crates. If your app also uses `mdshared-text`
+and `mdshared-highlight` from newer toolkit `main`, Cargo builds two copies of each. Their
+types do not mix: `mdview_render::Bitmap` is the older `mdshared_text::Bitmap`, so it cannot
+be passed to a newer toolkit's `Painter::blit`. `mdshared-ui` brings in `mdshared-text` even if
+your app does not name it directly. Separate revisions can coexist if you exchange bytes or
+other revision-independent values instead of those types.
+
+For example, [Claude Switch](https://github.com/Kaan88/claude-switch) at `fd1d3ad` uses mdview
+`01f67b2` with its own toolkit pin at `d1cca33`. Its lockfile has both copies of `mdshared-text`;
+it gives `Painter::image` RGBA bytes rather than handing it the renderer's `Bitmap`.
+
+[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `9898d24` uses mdview `e2b3e31` for
+its preview (toolkit pin `49de4ec`). The editor itself pins `48eb3ce`; its lockfile has two
+copies each of `mdshared-text` and `mdshared-highlight`. Its preview applies wire updates to
+the editor's own bitmap before blitting.
+
+### Other sibling libraries
+
+| Repository (`git`) | Repository `rev` |
+|---|---|
+| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `9898d24d85ed06b46b7a91f5dd1b194224af25b1` |
+| [mdmix](https://github.com/Kaan88/mdmix) (Rust port on `f/g0-proto`, not `main`) | `adb10855c95a5f2b39c10da05f214827da6f5a29` |
+| [purge](https://github.com/Kaan88/purge) | `7022fde4771ab6762a3f7111fae6e94c83aff0df` |
+| [claude-switch](https://github.com/Kaan88/claude-switch) | `fd1d3ad86119dd866b64d25691f2accb161ef947` |
+| [mdhub](https://github.com/Kaan88/mdhub) | `f0e0c93d3360eaf5f72cc33b1b0aaf099c59576e` |
+
+| Repository | Crate | Path | For | Toolkit pin |
+|---|---|---|---|---|
+| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `48eb3ce` (`mdshared-app`) |
+| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `48eb3ce` (`mdshared-highlight`) |
+| mdedit | `mdedit-outline` | `crates/mdedit-outline` | Find headings, functions and types for an outline | None |
+| mdmix | `g6-proto` | `rust/g6-proto` | Sound BlasterX G6 packet builders and status parsers, without I/O | None |
+| mdmix | `g6-device` | `rust/g6-device` | G6 device access over HID | None |
+| mdmix | `g6-osaudio` | `rust/g6-osaudio` | Read G6 mixer state and output levels on Windows | None |
+| purge | `purge-model` | `crates/purge-model` | Shared engine data types and JSON schemas | None |
+| purge | `purge-rpc` | `crates/purge-rpc` | Engine JSON-RPC framing and message types | None |
+| purge | `purge-client` | `crates/purge-client` | Windows clients for the Purge engine and broker | None |
+| purge | `purge-ui-model` | `crates/purge-ui-model` | Purge-specific view state and requests, without I/O | None |
+| claude-switch | `claude-switch-core` | `crates/core` | Discover Claude Code sessions and accounts without a window | None |
+| mdhub | `hub-core` | `crates/hub-core` | Hub app catalogue, install detection and updates | `b4b2182` (`mdshared-app` and `mdshared-fetch`) |
+
+The app pins are separate: mdmix's `g6-gui` pins `6017fcd` at the Rust port revision above,
+Purge's UI pins `f45a71c`, and Claude Switch's UI pins `d1cca33`. None of those pins is inherited
+by the libraries in the table. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust
+library or toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins
+`95bbf87`, but `ui-rs` builds a static library for the foobar2000 C++ shim, not a Rust library
+for another toolkit app.

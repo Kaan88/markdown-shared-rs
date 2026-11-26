@@ -1850,6 +1850,67 @@ reviewing session, not by the owner), the speed test (`termview_speed`, release)
 `cargo check -p mdshared-ui` without the feature. Not run on Linux or macOS. In a window it
 has been seen only through the application that uses it.
 
+## A translucent terminal background (`mdshared_ui::termview`, feature `term`, roadmap CS1)
+
+Enable Mica or Acrylic with `Cx::set_backdrop`, then use `draw_screen_with_background` or
+`draw_rows_with_background` with `BackgroundOpacity::new(0.65).with_padding(true)`. Padding
+is opaque by default. Redraw the whole area when changing the opacity or padding option;
+otherwise the rows call still works with damage bands. To blink the cursor, use
+`cursor_blinks_on` to decide what to pass to `View::cursor_shown`. The old draw calls and
+opacity `1.0` give the same opaque pixels as before.
+
+On Windows the host asks DWM for per-pixel alpha through the blur-behind setup, and for Mica
+or Acrylic through the system backdrop attribute. It copies damaged BGRA pixels into
+softbuffer's Win32 DIB, keys out alpha-254 chrome, and softbuffer copies the DIB to the window
+with `BitBlt`. The terminal does not use that chrome key colour or its veil. Each affected row
+replaces its background with premultiplied pixels. Over translucent pixels, glyphs use
+grayscale coverage instead of subpixel colour masks. Partial coverage of glyphs, colour emoji,
+box edges and shades blends both colour and alpha, leaving the uncovered fraction for DWM to
+composite. Fully covered ink, explicit backgrounds, inverse cells, selection and a filled block
+cursor stay opaque. The row's finish and the animation blends avoid producing alpha 254 from
+premultiplied pixels, so the chrome key does not key them out. There is no separate surface,
+mask buffer, or change to the present path.
+
+The floor keeps the nominal ink at least 4.5:1 against the default background in the 8-bit
+composite if it already had that contrast when opaque. Black and white bound the possible
+composited background in each channel, so checking the near bound in luminance covers
+intermediate desktop colours too. Ink that starts below 4.5:1 (for example dim ANSI colours)
+keeps its original opaque background instead of being recoloured. This can make individual
+`ls --color` cells look like solid rectangles; that is expected and avoids making those
+colours harder to read. This is a floor for the foreground colour, not a contrast claim for
+every antialiased sample or colour-emoji palette.
+
+The stock host uses the opaque path when the backdrop is off, unavailable or refused, when
+the window loses focus, under high contrast, and on Linux and macOS. If an application owns
+its own loop, only give the painter a frost key while its present path supports premultiplied
+alpha and a backdrop is active. These pixels are ready to present: do not pass the terminal
+area through the chrome's `Cx::frost`. Ordinary scrollbars (including animated and horizontal
+variants) and `Painter::text` for IME or search labels are not safe directly over these pixels.
+Reserve an opaque gutter or fill an opaque backing under the full overlay bounds, including
+its antialiased edges. Repaint the terminal when removing the overlay.
+
+Verified on Windows: requested debug lint and test commands, the release lint and test
+matrix (the workspace runs skipped `explorer_tests`), the two-second host example,
+fail-before checks with the new paths disabled, and `terminal_backdrop_sheet` (simulated
+desktops, light and dark, at 1 and 1.5). The two-second `term_backdrop` runs logged the
+backdrop active while focused for Acrylic and Mica, and inactive with `--off` and on focus
+loss. No compositor screenshot or human visual approval; high contrast was not toggled
+live. Linux and macOS were not run.
+
+The review fix was checked with the Windows debug commands, the specimen, and two-second
+terminal runs with Acrylic, Mica and the backdrop off. Pixel regressions check the edges
+over black and white, the frost marker throughout a fade, and repeat repaint of an already
+translucent row. The release matrix was not rerun for the review fix.
+
+Left open from the re-review:
+- No test pins the subpixel path on opaque pixels while a backdrop is active. A glyph on an
+  explicit background, compared pixel for pixel with `draw_screen`, would cover it.
+- The repaint test is a regression guard: it also passes on the commit before the fix.
+- Overlays are documented only. `scroll::draw_scrollbar` (0.55 and 0.85 alpha) still lets the
+  desktop show through for an app that skips the gutter. Possible guards: a `debug_assert!` on
+  a destination alpha below 255 that is not the chrome value, or an opaque-backing option on
+  the scrollbar.
+
 ## `system_is_dark` off the UI thread on Linux (2026-11-26, roadmap X9)
 
 `platform::system_is_dark` used to ask the settings portal on the calling thread with a 500 ms
@@ -2324,6 +2385,34 @@ message). Not run on Linux or macOS, so `can_hide`'s Wayland branch is compiled 
 was not run. **Not seen by a person**: the window itself, the blink and the scroll, and the
 close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
 makes close-to-tray usable is out of scope and is the application's to add.
+
+## A cursor style the application chooses (`mdshared_ui::termview`, roadmap CS2)
+
+`View::cursor_preference(shape, blinking)` sets the application's default cursor style without
+writing anything to the grid. Pass `mdshared_term::CursorShape::Block`, `Bar` or `Underline` and
+whether the cursor should blink. A view without a preference draws exactly as before.
+An explicit program style takes precedence for shape and blink; `CSI 0 SP q` (also with the
+parameter omitted) restores the application preference. `Screen::cursor_style_is_explicit()`
+distinguishes those cases even when the program explicitly chooses the built-in blinking
+block. The built-in values returned by `Screen::cursor()` are unchanged.
+
+DECTCEM still hides the cursor; an unfocused cursor is still a steady outline. The cursor uses
+the existing wide-character bounds, including when positioned on the second cell. The animated
+draws use the same interval and motion policy as before; a steady preference asks for no blink
+frame. After a preference change, an application painting only dirty rows can redraw the row
+returned by `View::cursor_row`.
+
+Run on Windows with `CARGO_TARGET_DIR=E:/mds-target/cs2` and two build jobs: formatting,
+workspace Clippy with `host,a11y`, and `mdshared-ui` Clippy with `term` passed. Workspace
+tests with `host,a11y` passed (1,880 including doctests, 38 ignored, four Explorer tests
+skipped); the `termview` suite passed (50 passed, two ignored). All eight new pixel tests
+failed when the preference was disabled, and targeted regressions also failed for block
+fill, program precedence, reset, visibility and wide coverage. The screen state test
+failed when zero did not clear the explicit flag. The extra release CI matrix was not run
+locally. Not run on Linux or macOS; not seen by a person in a live terminal.
+
+When `feat/t3-reflow` is merged with this branch, its `screen/dispatch.rs` must carry the line that sets
+`cursor_style_is_explicit`, or the preference silently beats every program.
 
 ## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
 

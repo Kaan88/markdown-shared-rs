@@ -6,7 +6,7 @@ use super::*;
 use crate::anim::{Animator, Clock, ManualClock, Policy};
 use crate::gfx::{Gfx, Painter, Rect, Rgb};
 use crate::theme::{DARK, LIGHT, Palette};
-use mdshared_term::{Point, Screen, Selection, SelectionKind};
+use mdshared_term::{CursorShape, Point, Screen, Selection, SelectionKind};
 use mdshared_text::Bitmap;
 use std::time::Duration;
 
@@ -291,6 +291,165 @@ fn the_cursor_takes_the_shape_the_program_asked_for_and_is_hollow_without_the_fo
         );
         assert_eq!(px(&f.bmp, 4, 9), scheme.background);
     }
+}
+
+#[test]
+fn a_cursor_preference_draws_a_bar_at_the_left_edge() {
+    let s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 0, 9), scheme.cursor);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+}
+
+#[test]
+fn a_cursor_preference_can_switch_from_a_bar_to_a_filled_block() {
+    let s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+    let view = view.cursor_preference(CursorShape::Block, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.cursor);
+    assert_eq!(px(&f.bmp, 8, 0), scheme.cursor);
+    assert_eq!(px(&f.bmp, 9, 0), scheme.background);
+}
+
+#[test]
+fn a_cursor_preference_draws_an_underline_at_the_bottom_edge() {
+    let s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Underline, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 17), scheme.cursor);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+}
+
+#[test]
+fn a_programs_explicit_default_looking_block_wins_over_the_cursor_preference() {
+    let mut s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+    // The old cursor fields are identical for a fresh screen and an explicit blinking block.
+    s.feed(b"\x1b[1 q");
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.cursor);
+}
+
+#[test]
+fn out_of_range_cursor_styles_leave_the_apps_preferred_bar_visible() {
+    let mut s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    for invalid in [b"\x1b[7 q".as_slice(), b"\x1b[12 q"] {
+        s.feed(invalid);
+        f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+        assert_eq!(px(&f.bmp, 0, 9), scheme.cursor);
+        assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+    }
+}
+
+#[test]
+fn a_program_reset_gives_the_cursor_preference_back() {
+    let mut s = screen(2, 1, b"\x1b[2 q");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Underline, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.cursor);
+    s.feed(b"\x1b[0 q");
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 4, 17), scheme.cursor);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+}
+
+#[test]
+fn a_hidden_cursor_stays_hidden_with_a_cursor_preference() {
+    let mut s = screen(2, 1, b"\x1b[?25l");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Bar, false);
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert!((0..18).all(|y| (0..18).all(|x| px(&f.bmp, x, y) == scheme.background)));
+    s.feed(b"\x1b[?25h");
+    f.full(&DARK, 1.0, area(2, 1), &s, None, view);
+    assert_eq!(px(&f.bmp, 0, 9), scheme.cursor);
+    assert_eq!(px(&f.bmp, 4, 9), scheme.background);
+}
+
+#[test]
+fn a_preferred_underline_on_the_second_half_of_a_wide_character_covers_both_cells() {
+    // Conceal the glyph so the test is independent of the installed fonts.
+    let s = screen(3, 1, "\x1b[8m日\x1b[1;2H".as_bytes());
+    assert_eq!(s.cursor().col, 1);
+    assert!(s.cell(0, 1).is_spacer());
+    let mut f = Frame::new(27, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let view = View::new().cursor_preference(CursorShape::Underline, false);
+    f.full(&DARK, 1.0, area(3, 1), &s, None, view);
+    assert!((0..18).all(|x| px(&f.bmp, x, 17) == scheme.cursor));
+    assert_eq!(px(&f.bmp, 18, 17), scheme.background);
+    assert!((0..18).all(|x| px(&f.bmp, x, 9) == scheme.background));
+}
+
+#[test]
+fn a_steady_cursor_preference_has_no_off_phase_until_the_program_asks_for_blink() {
+    let mut s = screen(2, 1, b"");
+    let mut f = Frame::new(18, 18);
+    let scheme = Scheme::from_palette(&DARK);
+    let steady = View::new().cursor_preference(CursorShape::Block, false);
+    let blinking = View::new().cursor_preference(CursorShape::Block, true);
+    let half = Duration::from_millis(500);
+    let clock = ManualClock::new();
+    let mut anim = Animator::new();
+    let mut frame = |s: &Screen, view, now| {
+        anim.begin_frame(now);
+        let mut p = Painter::new(&mut f.bmp, &mut f.gfx, 1.0);
+        draw_screen_animated(
+            &mut p,
+            &mut f.font,
+            &scheme,
+            &metrics(1.0),
+            area(2, 1),
+            s,
+            None,
+            view,
+            &mut anim,
+            "cursor",
+            Some(half),
+        );
+        (px(&f.bmp, 4, 9), anim.end_frame())
+    };
+    // Give the animation an active off phase before switching to the steady preference.
+    assert_eq!(
+        frame(&s, blinking, clock.now()),
+        (scheme.cursor, Some(clock.now() + half))
+    );
+    clock.advance(half);
+    assert_eq!(frame(&s, blinking, clock.now()).0, scheme.background);
+    assert_eq!(frame(&s, steady, clock.now()), (scheme.cursor, None));
+
+    s.feed(b"\x1b[1 q");
+    assert_eq!(
+        frame(&s, steady, clock.now()),
+        (scheme.cursor, Some(clock.now() + half))
+    );
+    clock.advance(half);
+    assert_eq!(frame(&s, steady, clock.now()).0, scheme.background);
+
+    s.feed(b"\x1b[2 q");
+    assert_eq!(frame(&s, blinking, clock.now()), (scheme.cursor, None));
+    s.feed(b"\x1b[0 q");
+    assert_eq!(frame(&s, steady, clock.now()), (scheme.cursor, None));
 }
 
 #[test]

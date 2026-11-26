@@ -36,6 +36,17 @@ fn mix(old: u8, new: u8, a: u32) -> u8 {
     ((old as u32 * (256 - a) + new as u32 * a + 128) >> 8) as u8
 }
 
+/// Preserve intentional chrome marks on the legacy plain path, but never create a new mark
+/// from two premultiplied inputs.
+fn mix_alpha(old: u8, new: u8, a: u32) -> u8 {
+    let alpha = mix(old, new, a);
+    if old == crate::frost::MARK || new == crate::frost::MARK {
+        alpha
+    } else {
+        crate::frost::avoid_mark(alpha)
+    }
+}
+
 /// A fraction as parts of 256.
 fn parts(t: f32) -> u32 {
     if t.is_nan() {
@@ -131,9 +142,16 @@ impl Snapshot {
             if a == 0 {
                 dst.copy_from_slice(old);
             } else {
-                // Alpha is 255 on both sides and stays so through the same formula.
-                for (d, &s) in dst.iter_mut().zip(old) {
-                    *d = mix(s, *d, a);
+                for (d, s) in dst
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(old.as_chunks::<4>().0)
+                {
+                    for i in 0..3 {
+                        d[i] = mix(s[i], d[i], a);
+                    }
+                    d[3] = mix_alpha(s[3], d[3], a);
                 }
             }
         }
@@ -184,13 +202,13 @@ impl Snapshot {
                     for i in 0..3 {
                         d[i] = mix(s[i], d[i], a);
                     }
-                    d[3] = if was { mark } else { mix(s[3], d[3], a) };
+                    d[3] = if was { mark } else { mix_alpha(s[3], d[3], a) };
                     continue;
                 }
                 let (os, ns) = (shown(&s[..]), shown(&d[..]));
                 let out: [u32; 4] = std::array::from_fn(|i| mixed(os[i], ns[i]));
                 // 254 would be taken for chrome and keyed again; one step more is opaque enough.
-                let alpha = if out[0] == mark as u32 { 255 } else { out[0] };
+                let alpha = u32::from(crate::frost::avoid_mark(out[0] as u8));
                 d[0] = out[3].min(alpha) as u8;
                 d[1] = out[2].min(alpha) as u8;
                 d[2] = out[1].min(alpha) as u8;
@@ -262,9 +280,10 @@ impl Snapshot {
                     let s = from.rem_euclid(w) as usize * 4;
                     [ahead[s], ahead[s + 1], ahead[s + 2], ahead[s + 3]]
                 };
-                for i in 0..4 {
+                for i in 0..3 {
                     dst[d + i] = mix(old[d + i], px[i], a);
                 }
+                dst[d + 3] = mix_alpha(old[d + 3], px[3], a);
             }
         }
     }
@@ -273,6 +292,36 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fading_premultiplied_pixels_never_turns_them_into_chrome() {
+        let key = crate::frost::Key::new([220; 3], 0);
+        let mut bmp = Bitmap::new(2, 1);
+        bmp.pixels
+            .copy_from_slice(&[21, 21, 21, 179, 21, 21, 21, 179]);
+        let under = Snapshot::take(&bmp, 0, 0, 2, 1);
+        for method in ["keyed", "plain", "slide"] {
+            for step in 0..=256 {
+                bmp.clear([220; 3]);
+                let t = step as f32 / 256.0;
+                match method {
+                    "keyed" => under.crossfade_keyed(&mut bmp, t, Some(&key)),
+                    "plain" => under.crossfade(&mut bmp, t),
+                    _ => under.slide_fade(&mut bmp, 1, 0, t),
+                }
+                let alpha = (179.0 + 76.0 * t).round() as u8;
+                assert_eq!(
+                    bmp.pixels[3],
+                    if alpha == 254 { 255 } else { alpha },
+                    "{method}, step {step}"
+                );
+                let mut pixel = [u32::from_le_bytes(bmp.pixels[..4].try_into().unwrap())];
+                let original = pixel[0];
+                crate::frost::key_out(&key, &mut pixel, 1, (0, 0, 1, 1));
+                assert_eq!(pixel[0], original, "{method}, step {step}");
+            }
+        }
+    }
 
     /// A popup fading in over frosted chrome shows as the compositor will draw it: its alpha
     /// rises with `t`, where a plain crossfade turned it opaque at halfway. Where neither side is chrome the keyed fade is the plain one, byte for byte.
