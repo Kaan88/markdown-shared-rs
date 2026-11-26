@@ -9,7 +9,7 @@ pub mod html;
 pub mod limits;
 pub mod links;
 pub mod model;
-mod parse;
+pub mod parse;
 pub mod rich;
 pub mod select;
 pub mod slug;

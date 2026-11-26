@@ -2671,8 +2671,12 @@ The already-locked `memchr`, `regex-syntax`, `serde_json` (test-only), `parley`,
 `zune-jpeg` are reused. No new CI system package is needed; Linux already installs Fontconfig.
 
 The copied suites include parser specs/fuzzing, fixed Windows pixel goldens, raster jobs
-and preview server tests. Fixtures live in `fixtures/md`: 21 top-level Markdown fixtures,
-eight images, eight goldens and two spec files. Windows debug format, workspace Clippy
+and preview server tests. The parser, preview server, HTML export, raster store and two
+integration suites are split into modules, all under 1,000 lines. The three oversized
+data exceptions are the generated `mdshared-md-core/src/emoji_table.rs` and the unchanged
+parser fixtures `fixtures/md/spec/spec.json` and `fixtures/md/spec/spec.txt`.
+Fixtures live in `fixtures/md`: 21 top-level Markdown fixtures, eight images, eight goldens
+and two spec files. Windows debug format, workspace Clippy
 (`host,a11y`), and workspace tests (`host,a11y`, excluding the four `explorer_tests`) passed.
 The moved suites and new wire tests, including the separate `server` run, account for
 388 passing tests, zero failures and five upstream ignored tests. Windows release
