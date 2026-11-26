@@ -646,6 +646,64 @@ mod tests {
         assert!(s.is_empty() && s.anchor().is_none());
     }
 
+    #[test]
+    fn a_file_listings_remap_keeps_the_selection_on_its_entries() {
+        use mdshared_app::dirlist::{Change, Column, Entry, Kind, Listing, Sort};
+        use std::path::PathBuf;
+
+        let entry = |name: &str, size: u64| Entry {
+            path: PathBuf::from("/listing").join(name),
+            name: name.to_string(),
+            kind: Kind::File,
+            size,
+            modified: None,
+            created: None,
+            hidden: false,
+        };
+        let mut listing = Listing::new();
+        listing.set_entries(vec![
+            entry("a.txt", 3),
+            entry("b.txt", 1),
+            entry("c.txt", 2),
+        ]);
+        let mut s = Selection::new();
+        s.click(1, PLAIN);
+        assert_eq!(listing.entry(1).unwrap().name, "b.txt");
+
+        // By size the entry is the first row, and the selection follows it there.
+        let remap = listing.set_sort(Sort {
+            column: Column::Size,
+            descending: false,
+        });
+        s.remap(remap.mapping());
+        assert_eq!(rows_of(&s), vec![0]);
+        assert_eq!(listing.entry(s.cursor().unwrap()).unwrap().name, "b.txt");
+
+        // Back to the names, where it is the second row again.
+        let remap = listing.set_sort(Sort {
+            column: Column::Name,
+            descending: false,
+        });
+        s.remap(remap.mapping());
+        assert_eq!(s.cursor(), Some(1));
+
+        // A rename keeps the selection on the entry under its new name, last by name.
+        let remap = listing.apply(Change::Renamed {
+            from: PathBuf::from("/listing/b.txt"),
+            to: entry("z.txt", 1),
+        });
+        s.remap(remap.mapping());
+        let cursor = s.cursor().expect("the renamed entry is still selected");
+        assert_eq!(listing.entry(cursor).unwrap().name, "z.txt");
+        assert_eq!(cursor, 2);
+        assert_eq!(rows_of(&s), vec![2]);
+
+        // Removing the selected entry drops the selection.
+        let remap = listing.apply(Change::Removed(PathBuf::from("/listing/z.txt")));
+        s.remap(remap.mapping());
+        assert!(s.is_empty() && s.cursor().is_none());
+    }
+
     const NAMES: [&str; 8] = [
         "Alpha", "apple", "Beta", "sand", "Sea", "second", "Şeker", "zeta",
     ];

@@ -2322,3 +2322,546 @@ message). Not run on Linux or macOS, so `can_hide`'s Wayland branch is compiled 
 was not run. **Not seen by a person**: the window itself, the blink and the scroll, and the
 close-to-tray show/hide path (only the pure hidden-window state was tested). The tray icon that
 makes close-to-tray usable is out of scope and is the application's to add.
+
+## Rich text through the painter (`richtext`, `Painter::rich_text`, `Painter::wavy_underline`, 2026-11-26, `feat/k7-rich-text`, roadmap K7, Barbican BT1)
+
+An application that shapes its own text with parley can now hand that layout to the painter
+and get it drawn with a brush per run: a colour, a family, a size, a weight and the fourth byte
+of the brush (raised, lowered, marked) as the layout says them. The painter draws the layout's
+glyph runs through its own `TextEngine::draw_layout_clipped`, so the glyph cache, the subpixel
+masks and the antialiasing are the ones every other text draw uses, and nothing is shaped or
+rasterized twice. A spelling squiggle is one path, drawn under a run of the caller's choosing.
+
+API added, all of it additive:
+
+- `gfx::Brush` is public (it was a private alias in `gfx.rs`): red, green, blue and a fourth
+  byte that is 255 on the baseline or `mdshared_text::text::{RAISED, LOWERED, MARKED}`. It is
+  the same type as `mdshared_text::text::Brush`. `RAISED` and `LOWERED` move the run;
+  `MARKED` (a `<mark>`) only splits the run, so that a caller can find its box and draw a
+  highlight behind it. Nothing here draws that highlight.
+- `Painter::rich_text(&layout, x, y) -> Rect` draws the whole layout at a point in logical px,
+  at the painter's scale, offset and clip, and answers the rectangle the lines occupy in
+  logical px, so a caller can put a background, a caret or a squiggle against it without
+  measuring again.
+- `Painter::wavy_underline(band, thickness, wavelength, c, alpha)` draws a squiggle across the
+  whole width of `band` and fills its height.
+- New module `richtext`: `runs(&layout) -> Vec<RunBox>` gives every glyph run's byte range, the
+  box it was placed in and its line's baseline, in the layout's own units; `RunBox` (`#[non_exhaustive]`,
+  so a field can be added later); and `parley` and `Brush` re-exported, so an application names
+  one version of parley (the one this crate draws with) and needs no dependency of its own on
+  it.
+
+Decisions:
+
+- **The layout is in device units.** Parley is shaped at a size, so a caller shapes at
+  `size * scale`, as `Painter::paragraph` already does internally, and passes the place in
+  logical px. The returned rectangle is the union of the glyph runs' advance boxes (the same
+  rectangles `runs` gives), measured in logical px: the leftmost run's inline start (its
+  alignment offset) to the rightmost run's end. A centred or end-aligned line, a right-to-left
+  one and a justified one's added spacing are all in those places and widths, so the rectangle
+  covers them where they are drawn; it is the runs' advance box, not their ink, so a raised or
+  lowered run may reach past it. Earlier it was the layout's width from `x` (which left out
+  alignment and justification), then each line's `advance` (which leaves out justification);
+  the review found both, and the blocks' own widths are used now.
+- **The band is the squiggle's clip.** A round stroke end reaches half its thickness past the
+  path's end, so a squiggle that must not paint outside its band (the test's requirement, and a
+  spelling checker's) is drawn with the band intersected into the painter's clip for the one
+  call, and the clip is restored after it. Nothing else about the caller's clip changes. A
+  thickness more than the band's height is held to the band's height: the stroke would be cut
+  back to the band anyway, and the rasterizer would otherwise be asked for a mask far taller
+  than the band.
+- **The wave is one path of quadratics.** A whole number of equal half waves across the band
+  starts and ends it on the middle line whatever the width; each half wave is one quadratic
+  whose control point is twice the amplitude out, which puts its top exactly half the band's
+  height less half the stroke from the middle line. So the stroke fills the band edge to edge
+  and no later mark is needed to close a gap: the pixels of every column of the band are inked,
+  which is what "continuous under a run" means here. A wavelength that is zero, negative or not
+  a number gives one arch, as wide as the band (a half wave, not a whole one); a wavelength far
+  below a pixel is cut at a thousand half waves, since nothing on a display would show the
+  rest. A band with no width or height is refused before a path is built. Only the half waves
+  the clip can show are put in the path, widened by the stroke's thickness at each end and
+  taken as whole half waves: every join inside the clip is then the one the whole band draws,
+  the path's ends and their round caps are cut by the clip itself, and a band far wider than
+  the window costs a mask about as wide as the window, while the wave inside the clip is the
+  unclipped drawing pixel for pixel.
+- **Where `runs` gets a byte range.** Parley places glyph runs, split at style changes, but a
+  glyph run carries no byte range of its own: `Run::text_range` is the part of the shaped run on
+  that line, which a style change does not split. Parley groups by shaped cluster (atom), not by
+  grapheme, and a brush change is not a shaping change, so a ligature's second letter can carry
+  another style while belonging to the first letter's glyph. So the run's clusters are walked in
+  **logical** order and gathered into atoms: a cluster that is not a continuation opens one, and
+  continuations extend it; an atom takes the style of its first cluster and notes whether it has
+  glyphs. A right-to-left run's atoms are then turned round, because parley places that run's
+  glyph runs in visual order, and neighbouring atoms of one style are grouped. An atom with no
+  glyph of its own (a soft hyphen) makes no glyph run: its bytes join the group before it, or
+  wait for the one after it. A run of nothing but such atoms has no entry of its own and leaves
+  its bytes to the last run of the line before it that has glyphs (a line with no glyph run at
+  all keeps none of them); every byte of a run that has glyphs is in exactly one range — a
+  branch no font here reaches, which is why it has no test of its own. The k-th group is then
+  the k-th glyph run.
+  Walking *visual* clusters instead fails two ways: a ligature's continuation comes before the
+  cluster that starts it, so `لا` with the alef in another brush gave `2..4` and lost `0..2`, and
+  `بلا` with the alef alone blue gave `4..6` for a box covering the whole word. Both are in the
+  tests, which fail with that grouping.
+- **Mixed families need no code.** Each run's font, size and normalized coordinates come from
+  the layout, as `TextEngine` already reads them, so a run in the mono family is drawn with it;
+  the test checks that the pixels are the engine's own and that parley shaped the two runs in
+  two different fonts, and says so and passes where the machine has no family of another width
+  to show that with.
+- **For the owner: `parley` is part of the public API now.** `richtext` re-exports it, and
+  `Painter::rich_text` takes a `parley::Layout<Brush>`; a caller cannot draw a rich layout
+  without naming the type, so parley's version is in this crate's signature either way. A
+  later parley bump is therefore a change to a public path and type, and under "add, do not
+  change" it is a stop-and-ask, not a routine dependency bump. If the owner would rather not
+  re-export it, dropping the `pub use` costs nothing else; the signature stays as it is.
+
+Tests (`cargo test -p mdshared-ui --lib rich`), each of which is new and does not compile
+against the tree before this change; each assertion was also shown failing under a mutation:
+
+- `gfx::rich::tests::two_runs_are_drawn_in_their_own_colours`: two runs of one text in red and
+  blue; the strongest pixel inside each run's box is nearer that run's colour than the other's
+  and within 60 of it, and the whole drawing is the `TextEngine`'s own draw of the same layout
+  at the same place, pixel for pixel. Drawing every run in the first run's colour fails it with
+  "run 1 is [200, 30, 30], not near [20, 60, 220]".
+- `a_run_of_another_family_is_drawn_as_that_family_shaped_it`: the mono family on the second
+  half; `runs` reports two ranges, parley resolved two different fonts, and the pixels are the
+  engine's.
+- `a_ligature_across_a_brush_change_keeps_its_bytes_in_one_run`: two sets of cases. The Arabic
+  lam-alef is tried on every machine, in Cambria, Times and DejaVu/Noto Naskh Arabic, because
+  its ligature is not optional wherever Arabic is shaped; the Latin `find` with the `fi` halves
+  in two brushes is tried in Calibri, Georgia and DejaVu. The first family of each set that
+  shapes the ligature is used and its ranges asserted (`0..4` for the lam-alef, `0..2` and
+  `2..4` for `find`). If no Arabic font forms the lam-alef, or no font forms `fi`, the test
+  prints a note and goes on without that set, so it does not depend on the machine. With the
+  style-only grouping the Arabic case gives `[2..4]` and `find` gives `[0..1, 1..4]` — both seen
+  on this machine.
+- `richtext::tests::a_ligature_in_a_right_to_left_line_keeps_its_bytes` and
+  `a_brush_on_a_continuation_in_a_right_to_left_word_keeps_the_word_whole`: `لا` with the alef
+  in another brush is one run covering the whole text, and `بلا` with only the alef blue keeps
+  the ligature's bytes (`2..6`) in one run; both skip with a note where no Arabic font ligates.
+  With the visual-cluster grouping they fail with `2..4` and `4..6`.
+- `a_wavy_underline_is_continuous_across_its_band_and_stays_inside_it`: every device column of
+  the band has ink in it, nothing outside the band is touched, the crest and the trough reach
+  the band's first and last row, the two halves of one wavelength are on opposite sides of the
+  middle line, a band thinner than the stroke is a straight line filling it, a stroke a million
+  px thick on a four-px band inks exactly the band, and zero or negative thickness, alpha or
+  band, or a NaN of either or of a place, draw nothing. A straight line instead of a wave fails
+  it ("no crest").
+- `the_painter_clip_cuts_the_layout_and_the_wave`: outside the clip the bitmap is the page
+  before the draw; inside it every pixel is the unclipped drawing's, text and wave alike;
+  the text ink is on both sides of the clip's edge, the clipped one keeps its share and
+  some of the text was cut off. A `rich_text` that draws nothing fails it.
+- `a_line_placed_by_its_alignment_is_drawn_and_the_rect_covers_it`: `OK` broken at 300 and
+  aligned to the end sits at about 270, and a clip over only 150 to 320 keeps all of it; the
+  pixels inside the clip are the unclipped ones and nothing is drawn left of 150. The answered
+  rectangle is the line's own place, the same with and without the clip. It fails with the
+  earlier box taken from the layout's width ("the aligned line was not drawn inside the clip").
+- `a_justified_line_answers_the_width_its_words_were_spread_over`: a paragraph broken at 200 and
+  justified; the answered rectangle reaches past the widest line's `advance`, by the
+  justification's own spacing, and agrees with the runs. It fails with a rectangle measured from
+  the lines' `advance`.
+- `the_offset_moves_the_text_and_the_squiggle_by_whole_pixels`: with `Painter::offset(7, 9)` the
+  text and the wave are the un-offset drawing moved by seven across and nine down, whole
+  device pixels, and the answered rectangle does not move.
+- `the_scale_places_the_layout_and_keeps_the_wave_in_its_band`: at scale 1, 1.5 and 2, the
+  answered rectangle is the layout's size divided by the scale, the pixels are the engine's at
+  the device place the scale names, and the wave's ink box is exactly the band in device px
+  (120 by 10 at scale 2).
+- `richtext::tests::each_run_gives_its_text_and_the_box_it_was_placed_in`,
+  `a_colour_that_changes_back_makes_the_middle_word_a_run_of_its_own`,
+  `a_right_to_left_line_keeps_each_range_with_its_own_box`,
+  `a_right_to_left_line_split_between_two_fonts_reports_each_part`, and
+  `a_wrapped_layout_reports_its_runs_line_by_line` share one helper (`checked`) that asserts
+  what holds whatever fonts the machine has, since a fallback may split a line into more runs
+  by itself: the ranges tile the text in reading order, every brush boundary is a run boundary,
+  and the boxes of one line touch in visual order; the widths of the boxes add up to the same
+  line drawn in one colour, which is what "each range's box is where its text was drawn" means
+  here. The RTL test finds its boxes by the byte they start at and checks that the three-letter
+  range is the wide one and sits left of the one-letter range; the split test asks for the space
+  in the mono family so that a font fallback's own split (the shape a Mac gives of its own
+  accord) is exercised on every machine, and notes and passes where the machine has no mono
+  family to split with. All of them fail when `runs` reports the shaped run's own range (`0..11` three times, `0..10` for both halves); the RTL test also fails when the
+  atoms are not turned round for a right-to-left run (the boxes no longer touch and the narrow
+  range gets the wide box).
+
+Run on Windows 11: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets
+--features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`; `cargo test --workspace
+--features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip explorer_tests` (every
+test binary passes; the `mdshared-ui` library alone ran 1138 tests with 34 ignored and 4
+filtered, and the doctests passed); and the sheet
+`cargo test -p mdshared-ui --lib rich_text_sheet -- --ignored`, which writes
+`target/specimen/richtext.png` and `richtext-150.png` (light and dark, each with a mixed line,
+a marked word squiggled under, and raised and lowered runs). The agent that wrote it looked at
+both sheets; the owner has not. Not run on Linux or macOS. Not seen in a window: no application
+uses it yet.
+
+Reviewed; its ten findings are fixed in the second commit of the branch. The two blocking ones
+first: the skip that lost an end-aligned line is gone, and the returned rectangle now comes from
+the lines' own offsets; and `runs` keeps a ligature's bytes together, which the style-only
+grouping split (`find` gave `0..1` and `1..4`). Then: the squiggle's thickness is held to its
+band, the "one wave" wording became "one arch", the scale figure is 120 by 10, `Run::text_range`
+is described as the part of a run on its line, the wrapped test also checks that runs begin and
+end where the style does, the clip test asserts that some text was cut off, negative band,
+thickness and alpha joined the nonsense inputs, `MARKED` is written down as a split that draws
+no highlight, `RunBox` is `#[non_exhaustive]`, a `Painter::offset` test was added, and the
+parley re-export is recorded above as an owner decision.
+
+The re-review found two more blockers, fixed in the third commit of the branch. First, `runs`
+grouped clusters in visual order, which is right to left for an RTL run, so a ligature's
+continuation came before the cluster that starts it: `لا` with the alef in another brush lost
+`0..2`, and `بلا` with only the alef blue answered a box as wide as the alef. The grouping now
+walks the clusters in logical order into atoms, turns them round for a right-to-left run and
+folds an atom with no glyph into the group next to it, which is what parley's own glyph runs
+are; the two cases are tests, and both failed with the old grouping (`2..4`, `4..6`). Second,
+the ligature test made the Arabic case depend on the Latin fonts it tried first and failed the
+whole test on a machine without either; the Arabic lam-alef is now tried on every machine and
+the Latin `fi` cases are skipped with a note when no font forms them (as is the Arabic case
+when no Arabic font is there). From the non-blocking list: the answered rectangle now comes
+from the glyph runs, so a justified line's added spacing is in it (with a test); the drawing
+doc says what the engine really skips (lines above or below the clip, not beside it); the wave
+is built only over the half waves the clip can show, widened by the stroke at each end and taken
+whole, so a band far wider than the window costs a mask about as wide as the window while the
+pixels inside the clip are the unclipped drawing's; and this section's sentences about the
+Arabic fallback say what the test now does.
+
+A last pass made three small fixes. A run of nothing but atoms without glyphs used to keep its
+bytes in the grouping's waiting range and drop them; they now join the last run of the line
+before it that has glyphs (a branch no font here reaches, so it has no test of its own, and the
+doc says "every byte of a run that has glyphs"). An empty layout now answers
+`Rect(x, y, 0, layout.height() / scale)` rather than no height, so a caret or a field's
+background has its place (with a test). And the wave is now cut a stroke's thickness beyond the
+clip on each side and taken as whole half waves rather than shortened inside it, so the pixels
+inside the clip are exactly the unclipped drawing's and the clip test demands equality again.
+
+PR #38 then failed on both macOS runners: `a_right_to_left_line_keeps_each_range_with_its_own_box`
+expected two runs, and a Mac's font fallback splits `א אאא` into three (the space comes from
+another font), so the count and the exact ranges were a statement about the machine, not about
+`runs`. Every test that counted runs was rewritten to assert what holds on any font: the ranges
+tile the text, every brush boundary is a run boundary, the boxes of a line touch in visual
+order, and their widths add up to the same line drawn in one colour; boxes are found by the byte
+they start at, never by index. A new test pins the split shape on purpose — the space asked for
+in the mono family — so the three-run case is exercised on Windows and Linux too. The awkward
+half of this was that a single-atom run cannot show a range paired with the wrong box, which is
+what the RTL test is for; the split test therefore checks the split shape while the pairing test
+keeps its two runs (still three on a Mac, where the properties hold). Both still fail when the
+atoms are not turned round (the boxes stop touching and the narrow range gets the wide box).
+
+## A folder's entries as a file manager's list (`mdshared_app::dirlist`, 2026-11-26, `feat/f1-dir-listing`, roadmap F1)
+
+The model behind a files list: what a folder holds, sorted, filtered and kept in step with the
+disk without reading it all again, plus a remap that keeps the selection on its entries.
+
+**Where it lives, and why.** It reads files and runs a worker, and it draws nothing, so it is in
+`mdshared-app` ([NEW-MODULE.md](NEW-MODULE.md)). That places it below `mdshared-ui`, which is why
+it has its own `Column` and `Sort` rather than borrowing `table::Sort`: `mdshared-app` cannot
+depend on the toolkit. The application maps a header hit to `Listing::toggle_sort(Column::...)`,
+and a click on a column already sorted the same way turns the direction round, as `Table` does.
+
+**Reading, off the window thread.** `read(dir, cancel)` lists the entries in the folder's own
+order and asks `cancel` before each one; an entry it cannot read (deleted between being listed
+and being asked for, a name the system will not open) is skipped, and the read goes on.
+`read_checked` is the same read with the folder's own error kept, so the application can tell a
+folder it may not open from an empty one; `read` keeps its old shape and answers nothing for one
+that cannot be opened. `FolderRead::start(dir, wake)` runs the read on a `job::Job` — one long
+read per folder is what a job is for, while the pool is for many short pieces — and `take` or
+`take_checked` hands the folder and its entries over once, after the wake. Cancelling, by
+`FolderRead::cancel` or by dropping the handle, delivers nothing: the take drops what a
+cancelled read had read instead of handing it over half read. A cancel is seen between entries
+and cannot interrupt a system call, so a dead network path keeps its worker thread where it is;
+the window is never in that call.
+
+**Links are never followed.** `read` uses the scan's own `DirEntry::file_type` and
+`DirEntry::metadata` (on Windows both come from the folder scan, so neither costs another
+read), and `Entry::at` uses `symlink_metadata`. A symbolic link or a Windows junction is
+`Kind::Other` whatever it points at, so a link to a dead share, a link to another folder or a
+link to itself cannot stall the read of the folder or send it anywhere else. A junction cannot
+be told from a symbolic link without asking what it points at — the scan and the link's own
+metadata both call it a link — and that question is the follow this refuses, so no link is ever
+a `Kind::Folder`; it is listed, with the link's own hidden flag and times, which is what makes a
+hidden junction such as `C:\Documents and Settings` come out hidden. An application that opens a
+link to a folder therefore follows it itself, off the thread that draws, as it would follow any
+slow path. The junction test sets the attribute on the link itself and checks that it is listed,
+hidden and Other.
+
+**What an entry holds.** Name, kind, size, modified and created times, and the hidden flag: the
+`FILE_ATTRIBUTE_HIDDEN` attribute on Windows, a leading dot elsewhere. The times are
+`Option<SystemTime>` because a file system may not have a birth time. A folder's size is what
+the system reports for it, usually zero — its contents are never added up.
+
+**Paths are compared exactly**, as the platform spelled them: no case folding and no tidying of
+separators. Two names that differ only in case are two entries where the file system tells them
+apart; on Windows they cannot both exist, and the disk test says so and skips, while a model
+test with two such paths runs everywhere. That puts one rule on the watcher: it must report
+paths in the folder's own spelling — no `\\?\` prefix and no 8.3 short name, which can name
+the same entry another way on Windows, and on macOS `/private/var` and `/var` are two paths —
+because `apply` matches exactly and a path spelled otherwise is one the list does not hold.
+Folder membership is `Path::parent` against the folder, so a change for a path outside the
+folder is ignored: a rename out of it is a removal, a rename into it a creation, and the folder
+itself is not one of its entries.
+
+**Sorting.** Folders come first whatever the column and the direction; names use
+`fmt::natural_cmp`, so `"file2"` comes before `"file10"`; times sort with "unknown" before any
+time. Ties are broken by the name in natural order and then by the path's bytes, so the order is
+total: an applied change and a fresh read agree under every column and both directions. Each
+entry's lower-case name is made once when it comes in, and is the key for both the name column
+and the filter, so no pass lower-cases a name again.
+
+**Changes without a re-read.** `Change::{Created, Removed, Renamed { from, to }, Modified}` is
+what a watcher (F2) will report; `apply` finds the entry through a hash index of its path (no
+path is copied into the index), removes it from the sorted rows by binary search, changes it and
+inserts it again by binary search — no sort runs for a change. A `Modified` for a path the list
+does not hold inserts it, because a save the watcher reports as a change may be a file it never
+reported being created. A `Renamed` carries the entry read at its new path (`Entry::at`).
+
+**The selection.** Every call that changes the rows returns a `Remap`: for each old row, its new
+row or `None`, handed over as `selection.remap(remap.mapping())`. A change describes itself with
+a handful of row edits (one removed, one inserted) and a few rows named by hand, so a change on
+a list of a million entries builds no per-row table; a new sort or filter has no such
+description and keeps one answer per old row. A rename needs the hand-named row: the old path is
+gone, so `apply` maps the old row of `from` to the new row of `to`, and the selection stays on
+the entry under its new name. A replaced entry does the same for its own row.
+
+Tests, `dirlist_tests.rs` (20) and one in `mdshared-ui`'s `select`:
+
+- reading a temporary folder gives the right entries, kinds, size and row lookups;
+- the system's way of hiding a file is read (attribute on Windows via `attrib +h`, a dot
+  elsewhere), and a hidden junction on Windows is listed and hidden (skipped with a note where
+  `mklink /J` is not available);
+- a link to a folder, a dead link and a link to itself are all listed as `Kind::Other` and the
+  folder is still read to its end (skipped with a note where the machine will not make links),
+  and a junction is Other as well;
+- every column sorts with the folders first, the name sort is natural, the direction turns, the
+  name then the path settle every tie, and a click turns a column round;
+- the filter and the hidden switch narrow the list, together, and their remap says what went;
+- create, remove, rename, modify (and a change of kind on disk) applied one by one give the same
+  list as a full re-read under every column and both directions, with equal sizes in play;
+- a rename onto a name already listed replaces it, and the row follows;
+- a change outside the folder is ignored, and a rename across the folder's edge is a removal or
+  a creation by its direction;
+- a cancelled read reads nothing, a cancel part way stops the read at that entry, and a
+  cancelled worker hands nothing over even when its thread finished;
+- a folder read on a worker hands its entries over once, and a folder that cannot be opened is
+  an error through `take_checked`;
+- an entry that cannot be read is skipped without a panic (the skip step is checked directly on
+  Unix, where the disk is asked again, and through an injected step elsewhere), and a missing
+  folder or path gives nothing;
+- two paths that differ only in case are two entries, and a change moves one of them (the disk
+  test of the same is skipped where the file system folds case);
+- a remap answers `None` for a row past the list's old end, and for the end of `usize`;
+- a filter narrows and widens without losing the sorted order, and a hundred filter changes on
+  100,000 entries stay inside the test's four-second bound because none of them sorts (a re-sort
+  each time would not);
+- 1,000 changes on 100,000 entries finish well inside the test's two-second bound: 17 ms of
+  applies in a debug build on Windows 11;
+- in `mdshared-ui`, a selection follows its entry through a re-sort, a rename and a removal.
+
+Each test was seen failing under a mutation of the implementation, one at a time: links followed
+with `fs::metadata` (failing both the link test and the junction test), no folder check, the
+name and path tiebreak removed (failing both the sort test and the applied-equals-re-read test),
+the hand-named rows ignored (failing both the replace test and the rename-onto test), keys
+case-folded, the cancel flag ignored by the read, a cancelled worker handing its entries over,
+`read_checked` swallowing the folder's error, an unreadable entry not skipped (and an injected
+step that skips nothing, which fails the order-independent test), the remap's guard for a row
+past the end removed, a re-sort put back into every filter change (which the filter test's
+bound then fails), and a full re-sort added to every change (which the 100,000-entry apply test
+then fails). The files were restored afterwards. The earlier round's mutations (kind always
+`File`, hidden always false, plain `cmp`, filter and switch ignored, and so on) still fail their
+tests.
+
+Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, and `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests`. On Linux the crate is type-checked only: `cargo clippy --target
+x86_64-unknown-linux-gnu -p mdshared-app --all-targets -- -D warnings` passes, and nothing was
+run there — the Unix hidden flag, the link creation and the skip of a vanished entry in
+`read_entry` were compiled, not run. Nothing here was seen by a person or used by an application:
+it is a model with no drawing.
+
+Known behaviours and limits for later:
+
+- A filter change drops the selection of every row it hides, and clearing the filter does not
+  bring that selection back: `Selection::remap` is told those rows are gone, so the application
+  would have to remember them itself if a filtered selection must survive.
+- Freeing a large result happens on the thread that replaces it: dropping a folder's
+  `Vec<Entry>` (in `set_entries`, or when a cancelled or stale read is dropped) releases its
+  paths and names on the window's thread. A folder of a million entries should be handed to a
+  worker to drop if that pause is ever measured to matter.
+- A new sort is O(n log n) and its remap one answer per old row. A filter keystroke or a
+  show-hidden switch is O(n) and sorts nothing: every entry is kept in the sort's order, and
+  the rows shown are chosen out of it, so a keystroke only walks the entries; the remap stays
+  exact, one answer per old row. `set_entries` rebuilds the index, the lower-case keys and the
+  order, O(n) and O(n log n) for the sort. A change is O(log n) plus the rows' own move, which
+  is `Vec::insert`/`remove` and so up to O(n) bytes copied, in both the order and the rows, and
+  the `Remap` it returns is lazy. `row_of` is a hash lookup and a binary search. The index keeps
+  one hash per entry and no copied path; the lower-case name of every entry is kept beside it,
+  and the sorted order is one `usize` per entry, so a folder costs about its names again in
+  memory.
+- F2 (`dirwatch`, below) now supplies the changes, and an application's list view is what would
+  show this to a person first.
+
+## A watcher that says what changed (`mdshared_app::dirwatch`)
+
+`watch::FileWatcher` says only "something in this folder". A file manager needs one change per
+entry, so `dirwatch` watches one folder (not its subfolders) and reports `dirlist::Change`
+values that `Listing::apply` takes directly, a `Signal::Rescan` after an overflow, or a
+`Signal::Lost` when the folder itself is gone. It is built on the `notify` crate the workspace
+already names; no dependency was added.
+
+**The model, and the edge.** `Coalescer` has no clock and no disk. Raw events arrive through
+`push(RawChange, Instant)` and leave through `flush(now)` as `Verdict`s that name paths;
+`deadline()` says when the open burst may be reported (the last event plus the debounce, and at
+most `MAX_WAIT` after its first event), and a flush before it gives nothing. The rules are the
+ones the roadmap asked for:
+
+- create then modifies is one `Created`;
+- create then remove is nothing (the list never saw it);
+- remove then create (or remove then modify) is one `Modified`;
+- a rename chain `a` to `b` to `c` is one `Renamed { from: a, to: c }`;
+- a burst of modifies is one `Modified`;
+- a rescan or a lost watch clears what was pending and reports only itself.
+
+A report is ordered for application, not by path: whatever takes a name away (a rename's old
+name, or a removal) comes before whatever puts an entry under that name (a creation, a
+modification, or a rename's new name). A backup on save (`f` to `f~`, then a new `f`) is
+therefore the rename followed by the creation; log rotation moves the oldest file first; a
+rename onto an existing name removes that name where the platform reports no removal. When the
+verdicts form a cycle — two renames that swap their names through a temporary one — only the
+renames in the cycle are broken into a removal and a modification, and the disk decides whether
+each name is there; an unrelated rename stays a rename, so the selection can follow it. The
+order is the same for the same events: among the verdicts that can go next, the first one seen
+goes. The puts are indexed by path once and the next verdict comes from a heap, so a report of
+twenty thousand verdicts is ordered in about `n log n` (a test flushes 20,000 removals and
+renames and holds the report to a few seconds in a debug build).
+
+Rename pairing keeps each path's state in a map and the old names still waiting for a new one in
+a queue, oldest first. Windows reports the two names as separate events; inotify on Linux also
+reports a pair carrying both names, which is remembered as the same move and ignored the second
+time, including when the chain passes through a name (a repeated `Both(b, c)` after `a` to `b`
+to `c` is the same chain). An old name still waiting when the quiet period ends is a `Removed`,
+and a new name with no old one waiting is a `Created`: the unpaired fallback, a removal plus a
+creation. A name a rename landed on, and a created name that then moved on, are removed as well
+as the entry moved: a removal of an unlisted name does nothing, and leaving it out would leave
+a stale entry. macOS reports a rename as one path with no side; that path is read as a
+modification, and the disk says whether it is still there. A rename out of the folder is a
+removal and one into it a creation; an event about any other path is dropped.
+
+**The watcher.** `DirWatcher::new(folder, wake)` starts the OS watcher and one thread, which is
+the only user of the coalescer. `notify`'s callback translates each event and queues it under a
+mutex, the thread waits on a condition variable until an event or the deadline arrives (never a
+poll, so an idle folder costs nothing), reads each pending path's details there with `Entry::at`
+(the disk is never touched on the drawing thread), and queues `Signal`s. Waking is
+`FileWatcher`'s: one `wake` call, then none until `woken()`. `take()` drains the reports and
+`woken()` is called before it. `with_debounce` takes a quiet period of the caller's choice; the
+report is never held longer than `MAX_WAIT` (one second) after its first event, so a file
+written without pause cannot starve the rest.
+
+The root the OS watcher is given is worked out once, at start: `std::path::absolute` on Windows
+and Linux, `canonicalize` on macOS. Every event path is compared against that root as it is and
+rewritten as the caller's folder joined with the event's own file name, so the list's exact
+matching works where the platform spells paths another way (macOS FSEvents reports
+`/private/var/...` for a folder given as `/var/...`), and the callback touches no disk at all:
+a hung mount cannot make it, or the drop that waits for the callback, wait. A path whose parent
+is not the root is dropped. An entry's name is the platform's own; on Windows it can come back
+in 8.3 short form, which is a different path to the list.
+
+Dropping the watcher does not wait for its thread: the thread may be inside a read on a share
+that never answers, and the drop runs on the thread that draws. The drop tells the thread to
+stop; the thread checks between two reads and before reporting, so it ends after the read it is
+in without touching the disk again or waking the application. A `Created` whose path cannot be
+read when the report is made is dropped (it went again), a `Modified` or a rename whose path is
+gone becomes a `Removed`.
+
+The watched folder itself being deleted or renamed is a lost watch: Linux reports it on the
+folder's own path (`DELETE_SELF`, `MOVE_SELF`). The callback only says the folder may be gone;
+the worker confirms it before the application hears anything — the folder is not there, or it
+is not the same folder on Unix (`symlink_metadata`'s device and inode) — and reports
+`Signal::Lost`. A folder that is still the same one means the events were confused, and a full
+read (`Rescan`) is the safe answer. notify's Windows backend does not report that error at all —
+it silently stops its watch — and it does not report a queue overflow either (an empty buffer
+gives nothing), so on Windows a deleted folder or lost events are noticed only by a full read;
+this is a limit of notify 8.2.1, documented rather than worked around. The stop a drop sets is
+checked with the queue's lock held before a report is delivered, so a drop cannot land between
+the check and the wake.
+
+**Public API.** `DirWatcher` (`new`, `with_debounce`, `folder`, `take`, `woken`), `Signal`
+(`Changed(Change)`, `Rescan`, `Lost`), `Coalescer` (`new`, `with_max_wait`, `push`, `flush`,
+`deadline`, `is_idle`), `RawChange`, `Verdict`, `DEBOUNCE` and `MAX_WAIT`. Everything is
+additive: no existing signature, field or variant changed, and `Signal` is new, so its variants
+are new before any application sees them.
+
+Tests: `dirwatch_tests.rs` (53), `dirwatch_model_tests.rs` (10) and
+`dirwatch_watcher_tests.rs` (8). The pure tests cover every coalescing rule, the debounce and
+the longest wait, a burst that cancels out leaving no stale wait, order and deduplication,
+unpaired renames, a name created where another was renamed away, two renames onto one name, a
+cycle beside an unrelated rename, the folder itself, paths outside the folder, lost and rescan,
+the `notify` translation of every event kind (rescan, create, remove, modify, the two rename
+halves, a pair, macOS' single path, access, an error, the folder itself), the path rewriting
+(the root the watcher was given versus the folder the caller named, macOS' canonical root, a
+path outside), the verdict to `Change` reading, the wake contract, and 20,000 removals and
+renames in one report. The model tests are the cases a review asked for: backup on save, log
+rotation, a swap through a temporary name, a rename onto an existing name then removed, a name
+created and renamed onto an existing one then removed, a name moved in onto an existing one
+then removed, an inotify rename onto an existing name that moves again, a chain that leaves the
+folder, and a random model: 2,000 seeds per style with the operations of create, remove,
+modify, rename, swap, backup, chain, move in and move out on a made-up disk; each run advances
+a clock so reports are split by the quiet period and the longest wait; Windows reports the
+removal of an overwritten name, inotify reports its pairs, and macOS reports every touched path
+as a modification; every verdict is resolved through the disk, applied to a `Listing`, and the
+list must equal the disk in names and generations after every report and at the end. Three
+further tests hold the thread down: one abandons the watcher while the reader is blocked and
+times the drop, one stops the watcher after the first read of a report and requires the second
+path not to be read, and three check that a folder-loss report is confirmed (still there → a
+rescan, gone → lost, made again under the same name on Unix → lost). The real-disk test on
+Windows (create, two renames and a remove, a bounded poll, compare with a fresh read) remains,
+and passed 10 of 10 runs before this round.
+
+Fail-before evidence, each test seen failing under a change, one at a time, with the file
+restored afterwards. Before the ordering fix, the model's first seed, backup, rotation and swap
+failed; before the displaced-name fix, the rename-onto-then-removed and chain tests failed; the
+inotify chain test requires the chain's verdict shape. Under mutations of this round: no
+dependency ordering failed the backup, rotation, swap, random and created-beside-rename tests;
+no cycle split failed the swap and the random test; no removal for a landed-on name failed the
+rename-onto-then-removed, chain and random tests; no removal for a renamed-away created name
+failed the created-at-the-new-name and random tests; no rename pair remembered failed the
+inotify chain and random tests; macOS' pair read as removal plus creation failed its adapter
+test; a path not rewritten as the folder failed the canonicalised-folder test; no stop check
+between reads failed the two-reads test; a drop that waits failed the drop test; reporting after
+the stop failed the drop test's wake assertion; an ignored error failed the rescan test; an
+ignored folder event failed the lost test; and an ignored longest wait failed the wait test.
+This round: the two hole-2 tests and the random model failed before the fix that keeps a landing
+name's removal; a chain leaving the folder failed before the first name's removal was reported;
+the burst-that-cancels test failed before the wait was reset; the random model also found a
+rename chain whose last hop left the folder and lost the first name; the 20,000-verdict test
+took 27 s with the quadratic edge loop and is held to a few seconds; splitting every rename
+with a cycle failed the cycle-only test; per-event canonicalisation failed the path-rewriting
+tests; always-lost and never-lost failed the two folder-loss tests.
+
+Run on Windows 11, debug profile: `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings`, `cargo test
+--workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
+explorer_tests`, and `cargo clippy --target x86_64-unknown-linux-gnu -p mdshared-app
+--all-targets -- -D warnings`. On Linux and macOS nothing was run: the inotify pairing (the
+`Both` event and its cookie), the FSEvents single-path rename, the folder's own
+`DELETE_SELF`/`MOVE_SELF`, and the Unix side of the thread are compiled, not run. Nothing here
+was seen by a person or used by an application yet.
+
+Known behaviours and limits for later:
+
+- A rename that happens entirely outside the folder, or into it from outside, is seen by one
+  side only and reported as a creation or a removal, as the platform allows.
+- On macOS a rename cannot be paired: FSEvents reports both the old and the new path as a
+  modification, so the list converges (the old entry is removed, the new one inserted or
+  changed), but the two are not tied together, so a selection does not follow the entry through
+  a rename.
+- On Windows notify 8.2.1 reports neither a queue overflow nor a watch error; the watcher can
+  only report what notify hands it. A folder deleted there is noticed by the next full read,
+  not by a signal.
+- A name inside the folder may come back in 8.3 short form on Windows, which the list, matching
+  paths exactly, does not know.
+- A file's contents change is reported for every save, coalesced within the quiet period and
+  the longest wait; a caller that only re-reads changed entries is expected.
+- The watcher reads each changed path's details on its own thread; a dead network path can hold
+  that thread for as long as the system takes to answer, but it never holds the window, and the
+  drop does not wait for it.
+- No subfolders are watched. An entry's change of kind (a file becoming a folder) is read as a
+  change of its details, which `Listing::apply` replaces in place.
