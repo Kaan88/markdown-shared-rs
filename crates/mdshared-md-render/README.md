@@ -53,10 +53,10 @@ and `MDV_ENGINE` environment variable. Ship the matching `mdview-engine`
 shared installation. If you need to override an inherited `MDV_ENGINE`, call
 `set_engine_path` with the bundled path. The renderer looks in this order:
 
-1. The path passed to `mdshared_md_render::set_engine_path`.
-2. The `MDV_ENGINE` environment variable.
+1. The absolute path passed to `mdshared_md_render::set_engine_path`.
+2. The absolute path in the `MDV_ENGINE` environment variable.
 3. A sibling of the running executable.
-4. A development fallback: walking up from the executable directory, it checks for a binary
+4. In debug builds and unit tests only: walking up from the executable directory, it checks for a binary
    directly in each directory and in its `target/release`, at most six directories in all.
 
 An explicit path that does not exist does not fall back. `cargo test --workspace` builds
