@@ -1868,39 +1868,58 @@ then fell through to `Outcome::Ignored`, which a menu bar takes as "move to the 
 
 Two additions, both opt-in; a caller that uses neither behaves exactly as before:
 
-- `Cascade::cancel_wait(&mut self)` drops a waiting pointer change without making it:
-  `deadline()` is `None` afterwards, nothing opens or closes, no lit row moves, and nothing
-  drawn changes. The host calls it before forwarding Escape or Left.
-- `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` itself drop the wait for
-  Escape and Left, and has Left close the innermost open submenu even when the keys are in the
-  menu before it (where it is `Ignored` otherwise), so Left means "back one level" before "the
-  menu beside". Every other key still makes a waiting change first.
+- `Cascade::cancel_wait(&mut self)` drops the waiting pointer change without making it:
+  nothing opens or closes, and `deadline()` is `None`. It puts the menus back on the open path:
+  the pointer had lit the row it moved onto, though that row's submenu never opened, so the row
+  that opened each open submenu is lit again, and the keys go to the innermost open menu. What
+  is drawn changes when the pointer had lit another row, nothing else. Called before forwarding
+  Escape or Left, those keys then close only the innermost submenu.
+- `Cascade::keys_cancel_wait(on)`, a builder off by default, has `key` do exactly that for
+  Escape and Left (it calls the same `cancel_wait`), and has Left close the innermost open
+  submenu even when the keys are in the menu before it (where it is `Ignored` otherwise), so
+  Left means "back one level" before "the menu beside"; when either key closes a submenu, the
+  rows that opened the menus still open stay lit. Every other key still makes a waiting change
+  first.
 
 Tests, in `submenu_tests.rs`:
 
 - `cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu` and
   `cancel_wait_drops_a_waiting_close_from_the_padding_too`: submenu open, a close waiting from
   a pointer onto another main-menu row (resp. onto the padding above the first row);
-  `cancel_wait()` then Escape closes the submenu only, the root stays open with the pointer's
-  row lit, and a second Escape is `Close`.
-- `with_the_switch_left_closes_only_the_submenu_after_a_cancelled_wait`: the same with Left and
-  the switch on; with nothing open, Left is `Ignored` again.
-- `with_the_switch_escape_and_left_drop_the_wait_by_themselves`: the switch alone, no
+  `cancel_wait()` lights the row that opened the submenu again and gives the keys back to the
+  submenu, then Escape closes the submenu only, the root stays open, and a second Escape is
+  `Close`.
+- `cancel_wait_then_left_closes_only_the_submenu_with_the_switch_off`: a context menu, the
+  switch off; after `cancel_wait()` Left is `Changed` (the keys are back in the submenu), the
+  submenu closes, the root lights Open recent, and with nothing open Left is `Ignored` again.
+- `cancel_wait_lights_the_open_path_of_a_deep_cascade`: at depth 3, `cancel_wait()` lights Open
+  recent and More (the rows that opened the open menus) and gives the keys to the innermost
+  menu; Escape closes only More's submenu and the path stays lit.
+- `with_the_switch_escape_drops_the_wait_by_itself` and
+  `with_the_switch_left_drops_the_wait_and_closes_only_the_submenu`: the switch alone, no
   `cancel_wait` call.
+- `the_switch_closes_one_level_at_depth_three_and_leaves_the_open_path_lit`: with the switch,
+  Open recent then More open and the pointer on Print in the root; Left closes More's submenu
+  only, and Open recent and More stay lit.
+- `assert_path_lit` (a helper, not a test) checks the rule in each open menu: the lit row is the
+  row that opened the next one.
 - `without_the_wait_cancelled_the_pointer_change_runs_first_as_before`: the old behaviour kept
   as a guard: Escape returns `Close` and takes the menu, Left returns `Ignored` after the
   waiting close has run, and Down still makes the waiting change first with the switch off and
   on.
 
-Fail-before evidence: with `key` restored to its old body (the two new methods kept, so the
-tests compile), the two switch tests failed, Left giving `Ignored` where `Changed` was
-expected and Escape giving `Close`. With `cancel_wait` made a no-op, the three tests that call
-it failed on `deadline()` still being set and on the depth after Escape. The regression guard
-passes on both old and new code, as it must.
+Fail-before evidence: in the first commit, with `key` restored to its old body (both methods
+kept, so the tests compile), the two switch tests failed, Left giving `Ignored` where `Changed`
+was expected and Escape giving `Close`; with `cancel_wait` made a no-op, the three tests that
+call it failed on `deadline()`. For the review's commit, with the production hunks reverted (the
+old `cancel_wait` body, the switch dropping the wait without `cancel_wait`, and neither closing
+arm re-lighting the path), seven tests failed and the guard passed; the first was `the lit row
+of menu 0 opened the next: left: Some(3), right: Some(1)` — Print lit while Open recent's
+submenu is still open, the defect the review found.
 
 Run on Windows, debug: `cargo fmt --all --check` (exit 0); `cargo clippy --workspace
 --all-targets --features mdshared-ui/host,mdshared-ui/a11y -- -D warnings` (exit 0); `cargo
 test --workspace --features mdshared-ui/host,mdshared-ui/a11y --no-fail-fast -- --skip
-explorer_tests` (exit 0; mdshared-ui 1125 passed, 33 ignored; doctests pass). Not run: the
+explorer_tests` (exit 0; mdshared-ui 1128 passed, 33 ignored; doctests pass). Not run: the
 release commands, the `recycle`, `media-session`, `notify`, `host`, `host,a11y` and `term`
 feature clippy/test lines, Linux and macOS. Not seen by a person in a window.

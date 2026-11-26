@@ -677,6 +677,33 @@ fn recent_open_keys(t0: Instant) -> Cascade<u8> {
     c
 }
 
+/// The cascade with Open recent and, beside it, More's submenu open; placed. In `switch`
+/// (`keys_cancel_wait`).
+fn more_open(switch: bool) -> Cascade<u8> {
+    let mut c = Cascade::at(tree(), 100.0, 100.0).keys_cancel_wait(switch);
+    place(&mut c, AREA);
+    let (x, y) = on(&c, 0, 1);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    let (x, y) = on(&c, 1, 2);
+    assert_eq!(c.click(x, y), Outcome::Changed);
+    place(&mut c, AREA);
+    assert_eq!(c.depth(), 3);
+    c
+}
+
+/// The rule a cascade keeps: in every menu that opened a submenu still open, the lit row is
+/// the row that opened it.
+fn assert_path_lit(c: &Cascade<u8>) {
+    for j in 0..c.path().len() {
+        assert_eq!(
+            hover(c, j),
+            Some(c.path()[j]),
+            "the lit row of menu {j} opened the next"
+        );
+    }
+}
+
 #[test]
 fn cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu() {
     let clock = ManualClock::new();
@@ -689,20 +716,21 @@ fn cancel_wait_drops_a_waiting_close_so_escape_closes_only_the_submenu() {
     c.cancel_wait();
     assert_eq!(c.deadline(), None);
     assert_eq!(
-        (c.depth(), hover(&c, 0)),
-        (2, Some(3)),
-        "nothing was applied: the lit row is the pointer's, the submenu is open"
+        (c.depth(), hover(&c, 0), c.focus()),
+        (2, Some(1), 1),
+        "nothing was applied: the row that opened the submenu is lit again"
     );
+    assert_path_lit(&c);
     assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
     assert_eq!(
         (c.depth(), c.path(), hover(&c, 0)),
-        (1, &[][..], Some(3)),
+        (1, &[][..], Some(1)),
         "only the submenu closed; the root stays open"
     );
     assert_eq!(c.key(&KeyName::Escape), Outcome::Close);
-    // Nothing waiting, nothing to drop.
+    // Nothing waiting, nothing to drop: the keys stay where they are.
     c.cancel_wait();
-    assert_eq!(c.deadline(), None);
+    assert_eq!((c.deadline(), c.focus()), (None, 0));
 }
 
 #[test]
@@ -720,45 +748,102 @@ fn cancel_wait_drops_a_waiting_close_from_the_padding_too() {
     assert_eq!((c.focus(), c.deadline()), (0, Some(t0 + ms(50) + DELAY)));
     c.cancel_wait();
     assert_eq!(c.deadline(), None);
-    assert_eq!(c.depth(), 2, "nothing was applied");
+    assert_eq!((c.depth(), c.focus()), (2, 1), "nothing was applied");
+    assert_path_lit(&c);
     assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
     assert_eq!((c.depth(), c.path()), (1, &[][..]));
 }
 
 #[test]
-fn with_the_switch_left_closes_only_the_submenu_after_a_cancelled_wait() {
+fn cancel_wait_then_left_closes_only_the_submenu_with_the_switch_off() {
     let clock = ManualClock::new();
     let t0 = clock.now();
-    let mut c = recent_open_keys(t0);
+    // A context menu: the application is not using the switch.
+    let mut c = recent_open(t0);
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
-    assert!(c.deadline().is_some());
+    assert_eq!(hover(&c, 0), Some(3), "the pointer lit Print");
     c.cancel_wait();
-    assert_eq!(c.deadline(), None, "cancel_wait dropped it");
+    assert_path_lit(&c);
+    assert_eq!(hover(&c, 0), Some(1), "Open recent is lit again");
+    assert_eq!(c.focus(), 1, "the keys are back in the submenu");
+    // With the keys in the submenu, Left closes it and nothing else, as it always did.
     assert_eq!(c.key(&KeyName::Left), Outcome::Changed);
-    assert_eq!(
-        (c.depth(), c.focus()),
-        (1, 0),
-        "the root stays open and keeps the keys"
-    );
-    // With nothing open, Left is the menu bar's again.
+    assert_eq!((c.depth(), c.path(), hover(&c, 0)), (1, &[][..], Some(1)));
     assert_eq!(c.key(&KeyName::Left), Outcome::Ignored);
 }
 
 #[test]
-fn with_the_switch_escape_and_left_drop_the_wait_by_themselves() {
+fn cancel_wait_lights_the_open_path_of_a_deep_cascade() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = more_open(false);
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert_eq!(hover(&c, 0), Some(3));
+    c.cancel_wait();
+    assert_path_lit(&c);
+    assert_eq!((hover(&c, 0), hover(&c, 1)), (Some(1), Some(2)));
+    assert_eq!(c.focus(), 2, "the keys are back in the innermost menu");
+    // Escape then closes More's submenu only, and the rows still opening one stay lit.
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
+    assert_eq!((c.depth(), c.path()), (2, &[1][..]));
+    assert_eq!((hover(&c, 0), hover(&c, 1)), (Some(1), Some(2)));
+    assert_path_lit(&c);
+}
+
+#[test]
+fn with_the_switch_escape_drops_the_wait_by_itself() {
     let clock = ManualClock::new();
     let t0 = clock.now();
     let mut c = recent_open_keys(t0);
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
     assert_eq!(c.key(&KeyName::Escape), Outcome::Changed);
-    assert_eq!((c.depth(), hover(&c, 0)), (1, Some(3)));
+    assert_eq!(
+        (c.depth(), hover(&c, 0)),
+        (1, Some(1)),
+        "the submenu closed and the root lights the row that opened it, not Print"
+    );
+    assert_eq!(c.key(&KeyName::Escape), Outcome::Close);
+}
+
+#[test]
+fn with_the_switch_left_drops_the_wait_and_closes_only_the_submenu() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
     let mut c = recent_open_keys(t0);
     let (x, y) = on(&c, 0, 3);
     c.pointer(x, y, t0 + ms(50));
     assert_eq!(c.key(&KeyName::Left), Outcome::Changed);
     assert_eq!((c.depth(), c.focus()), (1, 0));
+    assert_eq!(hover(&c, 0), Some(1));
+    // With nothing open, Left is the menu bar's again.
+    assert_eq!(c.key(&KeyName::Left), Outcome::Ignored);
+}
+
+#[test]
+fn the_switch_closes_one_level_at_depth_three_and_leaves_the_open_path_lit() {
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let mut c = more_open(true);
+    // Onto Print in the root within the delay: a close of everything waits.
+    let (x, y) = on(&c, 0, 3);
+    c.pointer(x, y, t0 + ms(50));
+    assert!(c.deadline().is_some());
+    assert_eq!(hover(&c, 0), Some(3));
+    assert_eq!(c.key(&KeyName::Left), Outcome::Changed);
+    assert_eq!(
+        (c.depth(), c.path()),
+        (2, &[1][..]),
+        "only More's submenu closed"
+    );
+    assert_eq!(
+        (hover(&c, 0), hover(&c, 1)),
+        (Some(1), Some(2)),
+        "Open recent and More stay lit"
+    );
+    assert_path_lit(&c);
 }
 
 #[test]
