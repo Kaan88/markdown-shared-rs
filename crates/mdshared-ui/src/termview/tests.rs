@@ -836,9 +836,9 @@ fn nonsense_rectangles_and_rows_draw_nothing_and_do_not_panic() {
 }
 
 /// The sheet: a screen with colours, attributes, box drawing, wide characters, the cursor's
-/// shapes and a selection, light and dark, at scale 1 and 1.5. `cargo test -p mdshared-ui
-/// --features term termview_sheet -- --ignored`, then open target/specimen/termview.png and
-/// termview-150.png.
+/// shapes and a selection, light and dark, at 100%, 125%, and 150%. `cargo test -p mdshared-ui
+/// --features term termview_sheet -- --ignored`, then open the PNGs under `target/specimen`
+/// (or set `TEXT_SHARPNESS_SHOTS` to write them elsewhere).
 #[test]
 #[ignore]
 fn termview_sheet() {
@@ -862,7 +862,11 @@ fn termview_sheet() {
         "two lines, then the cursor shapes below.\r\n",
         "block [ ]  bar [ ]  underline [ ]  hollow [ ]",
     );
-    for (scale, file) in [(1.0, "termview.png"), (1.5, "termview-150.png")] {
+    for (scale, file) in [
+        (1.0, "termview.png"),
+        (1.25, "termview-125.png"),
+        (1.5, "termview-150.png"),
+    ] {
         let mut font = CellFont::new();
         let m = font.metrics(14.0, scale);
         let (cols, rows) = (100usize, 13usize);
@@ -916,7 +920,11 @@ fn termview_sheet() {
                 );
             }
         }
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen");
+        let out = std::env::var_os("TEXT_SHARPNESS_SHOTS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/specimen")
+            });
         std::fs::create_dir_all(&out).unwrap();
         bmp.write_png(&out.join(file)).unwrap();
     }

@@ -56,7 +56,7 @@ motion ([ANIMATION.md](ANIMATION.md)).
 
 | Module | For | Start at |
 |---|---|---|
-| `mdshared_text::text` | Laying out and rasterizing text for a document page: parley layouts drawn with subpixel masks, a byte-capped glyph cache | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
+| `mdshared_text::text` | Laying out and rasterizing text for a document page: parley layouts drawn with subpixel masks, a byte-capped glyph cache. Monochrome outlines fit vertically to pixel rows without changing their horizontal coordinates or the layout | `TextEngine::new`, `draw_layout`, `draw_layout_clipped`, `set_subpixel`; `Subpixel`, `Brush` |
 | `mdshared_text::text` (premultiplied glyphs) | Tinted text over premultiplied pixels, with grayscale coverage where the destination is translucent and the usual text drawing elsewhere | `TextEngine::draw_layout_clipped_tinted_premultiplied`, `bitmap::blend_premultiplied` |
 | `mdshared_text::fonts` | One font enumeration per thread, fallback families, colour emoji runs | `shared_fonts`, `add_fallbacks`, `push_emoji_runs` |
 | `mdshared_highlight` | Highlighting a whole code block by language name | `tokens`, `Token` |

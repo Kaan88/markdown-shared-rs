@@ -4,6 +4,69 @@ One section per feature that was added to the shared crates after both applicati
 them. Each says what it is, how the applications use it, and what was not verified. The summary
 for a release is in [next/shared-more.md](next/shared-more.md).
 
+## Vertical-only text hinting (`mdshared_text::text`)
+
+On an eligible monochrome glyph cache miss, swash scales the outline twice. Its smooth LCD hinter asks
+skrifa to preserve linear metrics, but that is not a guarantee of bit-identical X coordinates:
+the hinted draw can use different scaling precision. Skrifa can return a rounded TrueType
+advance from that draw; swash uses only the outline and discards the returned metrics. The
+rasterizer keeps the unhinted path and copies in just the hinted Y coordinates. If the path
+commands disagree or an X coordinate differs by more than 1/16 px, the glyph stays unhinted
+rather than risking a bad point match. The existing quarter-pixel X phases, subpixel offsets,
+colour glyph sources, and blending are unchanged. Parley still supplies all positions and
+advances; no API or dependency was added.
+
+At fractional device sizes, the fitter first checks bit 3 of the font's OpenType
+`head.flags`. If it is set (or cannot be read), the fitter skips hinting: skrifa's
+TrueType hinter can otherwise supply Y coordinates from a rounded size. Both installed
+Segoe UI (`segoeui.ttf`, `0x001B`) and Segoe UI Variable (`SegUIVar.ttf`, `0x000B`) set
+this bit. The glyph cache keys the exact size so a nearby whole and fractional size
+cannot reuse each other's masks.
+
+What that means with the default UI font: hinting happens only at whole device sizes. At 100%,
+12 to 14 px text is hinted. At 125% and 150%, 13 px (16.25 and 19.5 device px) and 14 px at
+125% (17.5) are never hinted and draw as before this change; 12 px at 125% and 150% (15 and
+18) and 14 px at 150% (21) are hinted. Rounding the device size (ROADMAP TS2) is the way to
+get hinting at those scales.
+
+On Windows, the 13 px Segoe UI `H` test verifies that the cap and crossbar sit on whole rows,
+its X coordinates match the unhinted outline bit for bit, and the actual glyph mask changes.
+That test failed with the vertical fit bypassed. The fractional-size raster tests compare
+every glyph of a word and its superscript, at four X phases, against swash's unhinted
+masks and placements. They failed before the fix at 16.25 and 19.5 device px. A cache test
+also failed before the fix when 16 and 16 + 1/128 px reused a mask. The former layout test
+was removed: drawing borrows an immutable layout and comparing it with itself or a fresh
+layout supplied no independent baseline. The UI sheet's 18 measured widths per scale
+are byte-identical across the unhinted, pre-fix and fixed renders.
+
+The review PNGs at 100%, 125%, and 150% show 12, 13 and 14 px UI labels and the `termview`
+grid in both themes. See `E:/mds-target/vhint/shots/review/{unhinted,before,after}/`.
+The review fix changed 143 pixels on the 125% UI sheet; the other five sheets did not
+change from the pre-fix render.
+
+**Left open for review:**
+
+- The cap-and-crossbar test covers one glyph in the static `segoeui.ttf` and only runs on
+  Windows; the UI asks for Segoe UI Variable Text first. All the hinting tests, including the
+  cache-key test that needs no Segoe UI, are `cfg(windows)`, so Linux and macOS CI check none
+  of this.
+- Outline-matching fallback happens glyph by glyph and is not counted.
+- A cold eligible miss scales the outline twice and runs the hinter. Swash caches eight
+  hinting instances per outline format; a busy page can make it rebuild them. Cold-cache cost
+  has not been measured.
+- The exact-size cache key also drops the old 1/64 px bucketing for unhinted glyphs, so sizes
+  that differ only by float noise no longer share masks (fewer hits, not wrong pixels). Keying
+  on "hinted or not" plus the old bucket would keep the old hit rate.
+- `fract() == 0.0` is exact: a computed 16.000002 counts as fractional and stays unhinted.
+  Treating sizes within 1/128 px of a whole number as whole would be safe.
+
+Windows verification: formatting, workspace Clippy and tests with `host,a11y` (the tests
+excluded `explorer_tests`), `term` Clippy and `termview` tests, and the UI ignored tests
+without a specimen directory override passed. No existing pixel test expectation needed
+updating. The full release CI matrix was not run.
+The sheets have not been judged by a person or checked in a running application. Linux and
+macOS were not run. The remaining ideas are in [ROADMAP.md](ROADMAP.md#text-sharpness).
+
 ## Vue and Svelte highlighting (`mdshared-highlight`)
 
 `.vue` and `.svelte` files, and the fence names `vue` and `svelte`, are highlighted by a line
