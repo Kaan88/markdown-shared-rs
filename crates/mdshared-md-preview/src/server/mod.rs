@@ -500,7 +500,10 @@ impl Server {
             .view_frame_sized(doc, &self.options, self.top, size);
         let (width, rows) = (frame.bitmap.width, frame.bitmap.height);
         let row = width as usize * 4;
-        let band = if self.whole { None } else { frame.band };
+        let band = if self.whole { None } else { frame.band }.map(|(first, count)| {
+            let first = first.min(rows);
+            (first, count.min(rows - first))
+        });
         let pixels = match band {
             None => frame.bitmap.pixels.clone(),
             Some((_, 0)) if frame.shift == 0 => {

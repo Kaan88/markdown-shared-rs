@@ -18,6 +18,32 @@ pub(super) const GUESS_IMAGE: (f32, f32) = (400.0, 240.0);
 pub(super) const GUESS_MATH: f32 = 44.0;
 pub(super) const GUESS_DIAGRAM: f32 = 300.0;
 
+/// A store id in the per-pass set. Tests count attempts at hashing and comparison, not time.
+#[derive(Clone, Copy, Eq)]
+#[cfg_attr(not(test), derive(PartialEq, Hash))]
+pub(super) struct ImageUse(u32);
+
+#[cfg(test)]
+thread_local! {
+    static USE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl PartialEq for ImageUse {
+    fn eq(&self, other: &Self) -> bool {
+        USE_PROBES.set(USE_PROBES.get() + 1);
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+impl std::hash::Hash for ImageUse {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        USE_PROBES.set(USE_PROBES.get() + 1);
+        self.0.hash(state);
+    }
+}
+
 fn is_remote(src: &str) -> bool {
     ["http://", "https://"].iter().any(|scheme| {
         src.get(..scheme.len())
@@ -79,7 +105,7 @@ impl<'a, 'b> Pager<'a, 'b> {
     /// local image, formula or diagram this pass was not allowed to load. (An undecided remote
     /// image is a final state for layout: its arrival re-measures the blocks that use it.)
     pub(super) fn note(&mut self, id: u32, found: &Found, local: bool) {
-        if id != u32::MAX && !self.used.contains(&id) {
+        if id != u32::MAX && self.used_ids.insert(ImageUse(id)) {
             self.used.push(id);
         }
         if local && matches!(found, Found::Unknown) {
@@ -371,5 +397,50 @@ impl<'a, 'b> Pager<'a, 'b> {
             });
         }
         self.y = y0 + height + self.px(16.0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn distinct_inline_atoms_take_linear_image_membership_work() {
+    use super::store::QUEUE_PROBES;
+    use super::{DocumentRenderer, Options};
+    use std::fmt::Write;
+
+    for n in [1024, 4096] {
+        let mut source = String::new();
+        for id in 0..n {
+            write!(source, "![a](https://example.invalid/{id}) ").unwrap();
+        }
+        source.push_str("![again](https://example.invalid/0)");
+        let doc = mdshared_md_core::parse(&source);
+        assert_eq!(doc.blocks.len(), 1);
+        let mut renderer = DocumentRenderer::new();
+        let mut pager = Pager::new(
+            &doc,
+            &Options::light(),
+            &mut renderer.fonts,
+            &mut renderer.layouts,
+            false,
+            &mut renderer.store,
+            &renderer.details,
+            None,
+        );
+        USE_PROBES.set(0);
+        QUEUE_PROBES.set(0);
+        pager.inline_of(0);
+        let probes = USE_PROBES.get();
+        assert_eq!(pager.used.len(), n);
+        assert!((n..=8 * n).contains(&probes), "{probes} probes for {n} ids");
+        let probes = QUEUE_PROBES.get();
+        assert!(
+            (n..=8 * n).contains(&probes),
+            "{probes} queue probes for {n} URLs"
+        );
+        let queued = pager.store.take_remote();
+        assert_eq!(queued.len(), n);
+        for (id, url) in queued.iter().enumerate() {
+            assert_eq!(url, &format!("https://example.invalid/{id}"));
+        }
     }
 }

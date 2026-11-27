@@ -220,11 +220,9 @@ impl ImageStore {
                 Some(bytes) if anim::candidate(&bytes) => self.start(id, bytes),
                 _ => self.still(id),
             },
-            ImageKey::Remote(url) => {
+            ImageKey::Remote(_) => {
                 self.still(id);
-                if !self.remote_new.contains(&url) {
-                    self.remote_new.push(url);
-                }
+                self.queue_remote(id);
             }
             _ => self.still(id),
         }

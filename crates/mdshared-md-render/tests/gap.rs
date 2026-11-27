@@ -46,6 +46,28 @@ fn shown() -> (DocumentRenderer, mdshared_md_core::Document) {
 }
 
 #[test]
+fn scroll_bands_stay_inside_an_odd_height_frame_on_a_tall_page() {
+    let (mut r, doc) = shown();
+    r.set_gap(
+        &doc,
+        Some(Gap {
+            first_line: 3,
+            last_line: 3,
+            height: 20_000_000.0,
+        }),
+    );
+    let top = (1 << 24) as f32;
+    let size = (7, 31);
+    r.view_frame_sized(&doc, &options(), 0.0, size);
+    assert_eq!(r.view_frame_sized(&doc, &options(), top, size).top, top);
+    for (y, expected) in [(top + 4.0, None), (top, Some((0, 4)))] {
+        let frame = r.view_frame_sized(&doc, &options(), y, size);
+        assert_eq!(frame.band, expected);
+        assert_eq!(frame.bitmap.pixels.len(), 7 * 31 * 4);
+    }
+}
+
+#[test]
 fn the_covered_blocks_become_one_room_and_the_page_below_moves_by_the_difference() {
     let (mut r, doc) = shown();
     let before = spans(&mut r, &doc);

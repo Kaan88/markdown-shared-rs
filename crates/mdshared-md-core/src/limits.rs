@@ -73,6 +73,10 @@ pub const FIND_WORK_PER_BYTE: usize = 64;
 /// keeps every walk of the open-element stack short whatever the input.
 pub const MAX_HTML_DEPTH: usize = 512;
 
+/// Markdown wrappers beyond this depth keep their text but add no span. This bounds the
+/// inline tree that the clipboard writer walks, independently of surrounding HTML.
+pub const MAX_MD_SPAN_DEPTH: usize = 128;
+
 /// Largest pixel width or height taken from an HTML attribute, the same as the SVG height limit.
 pub const MAX_HTML_LENGTH_PX: u32 = MAX_SVG_HEIGHT;
 /// GitHub clamps `<img>` width and height to this, keeping their ratio. Table attributes are not
