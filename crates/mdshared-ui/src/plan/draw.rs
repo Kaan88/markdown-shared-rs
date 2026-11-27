@@ -981,6 +981,9 @@ fn clipped(r: Rect, to: Rect) -> Rect {
 }
 
 /// A text field in a framed box over a row or the group button.
+// The old click-only field route, kept as it was until this widget moves to `FieldInput`
+// (roadmap L15); its callers see no change.
+#[allow(deprecated)]
 fn draw_field(
     p: &mut Painter,
     pal: &Palette,

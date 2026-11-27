@@ -813,6 +813,9 @@ impl Palette {
 
     /// The pointer moved. Over a row it moves the selection there, so the highlight follows the
     /// pointer but not a scroll under it. Returns true when something needs redrawing.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
         match self.drag {
             Drag::Bar(grab) => {
@@ -861,6 +864,9 @@ impl Palette {
     /// outside the card closes the palette; in the box it places the caret (a double click selects
     /// a word); on the scrollbar it grabs or jumps; on a row it selects it, and the release over
     /// the same row chooses it.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
         self.drag = Drag::None;
         self.pressed_row = None;

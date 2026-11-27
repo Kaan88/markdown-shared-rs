@@ -1600,6 +1600,9 @@ impl Form {
     // ---- pointer -----------------------------------------------------------------------------
 
     /// The pointer moved. Returns true when something needs redrawing.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
         if let Some((_, menu)) = &mut self.menu {
             return menu.pointer(x, y);
@@ -1621,6 +1624,9 @@ impl Form {
     /// A mouse button went down; `clicks` is 1, or 2 for a double click. Controls act when the
     /// button comes up over the same control; a text box places its caret at once; a press
     /// outside the card closes the dialog (with a dropdown open, only the dropdown).
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
         self.cancel_text_pointer();
         self.drag = None;

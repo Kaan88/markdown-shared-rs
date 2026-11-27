@@ -1271,6 +1271,9 @@ impl Form {
     /// The pointer moved. Returns true when something needs redrawing (hover, a drag). A
     /// slider row's thumb in hand follows the pointer, but its change is reported only by
     /// [`release`](Self::release); [`pointer`](Self::pointer) reports it as it happens.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
         if let Some(moved) = self.colour_move(x, y) {
             return moved;
@@ -1327,6 +1330,9 @@ impl Form {
     /// caret at once; the scrollbar is grabbed; a slider row takes hold of its thumb and a press
     /// on its track moves the value there at once ([`Outcome::Changed`]); a press outside the
     /// card closes the dialog (and, with a dropdown open, only the dropdown).
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
         self.cancel_text_pointer();
         self.drag = Drag::None;

@@ -148,10 +148,12 @@ additive; nothing that existed changes.
   tested without a window.
 
 `FieldOutcome` is `non_exhaustive`. `Focus` means "give this field the keyboard": the focus
-between fields stays the application's. The docs of `TextField::press`, `drag`,
-`select_word_at` and `Pointer` now point at `FieldInput`. They are not deprecated, because
-a deprecation warns in every application built with `-D warnings` (roadmap L20, owner
-decides).
+between fields stays the application's. `TextField::press`, `drag` and `select_word_at`
+are deprecated (the owner's decision, roadmap L20): an application that moves its pin past
+this and builds with `-D warnings` moves its fields to `FieldInput` (or `Pointer`), or allows
+the warning where it means to keep the old behaviour. The toolkit's own callers (the palette,
+the plan screen, the settings forms' old `press` route and colour row; roadmap L15) allow it
+and behave as before. `Pointer`'s doc points at `FieldInput`.
 
 **Left for later** (roadmap rows):
 
