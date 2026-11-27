@@ -73,6 +73,9 @@ owner and requires a 0700 directory with no group/other access to the files. mac
 checks the extended ACL on the handles and refuses allow entries even with mode 0600.
 Windows rejects reparse points and requires the user SID and a protected owner-only ACL.
 The endpoint lives in `instance-v2` beside the settings, regardless of launch environment.
+A settings folder on a filesystem that keeps no owner, mode or ACL (FAT or exFAT, some network
+shares) cannot hold a private endpoint: `listen` returns `None` there and every launch opens
+its own window, where builds before authentication handed over.
 On Linux the record and lock names carry a hash of `/etc/machine-id`, falling back to
 `/var/lib/dbus/machine-id` and then the kernel hostname. They also carry the network namespace
 inode when readable, so separate loopback namespaces do not contend. On macOS they use

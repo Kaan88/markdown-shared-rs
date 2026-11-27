@@ -2,6 +2,11 @@ use super::*;
 use crate::update::sha256_hex;
 use std::cell::RefCell;
 
+// The Linux installation's hold on its files, through the public entry points and the swap.
+#[cfg(target_os = "linux")]
+#[path = "updater_linux_tests.rs"]
+mod linux;
+
 // Generic swap tests use manufactured targets even on Linux. There, exercise the same
 // staging and swap with a fixture verifier; the public entry points also have guard tests.
 #[cfg(target_os = "linux")]
@@ -655,32 +660,6 @@ fn the_installation_is_checked_after_fetch_before_swap_and_before_cleanup() {
     assert_eq!(read(&staged), "keep staged");
     assert_eq!(read(&old), "keep old");
     fs::remove_dir_all(files.app.parent().unwrap()).unwrap();
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn a_plain_linux_binary_neither_installs_nor_cleans_up_an_unverified_target() {
-    let files = files("unverified", false);
-    let manifest = manifest_for("linux-x86_64", "9.0.0", b"app 2", None);
-    let offer = offer_for(
-        &APP,
-        manifest.as_bytes(),
-        &APP.current_version(),
-        Platform::LinuxX64,
-    )
-    .unwrap()
-    .unwrap();
-    let old = selfupdate::retired(&files.app);
-    let staged = selfupdate::staged(&files.app);
-    std::fs::write(&old, "keep old").unwrap();
-    std::fs::write(&staged, "keep staged").unwrap();
-    let never_fetch = |_: &str, _: usize, _: Duration| panic!("unverified install fetched");
-    assert!(super::install(&offer, &files, &never_fetch).is_err());
-    super::clean_up(&files);
-    assert_eq!(read(&files.app), "app 1");
-    assert_eq!(read(&old), "keep old");
-    assert_eq!(read(&staged), "keep staged");
-    std::fs::remove_dir_all(files.app.parent().unwrap()).unwrap();
 }
 
 #[cfg(target_os = "linux")]

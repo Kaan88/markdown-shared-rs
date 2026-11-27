@@ -4,6 +4,23 @@
 //! keeps the FUSE daemon alive. We cannot use a wrapper's pipes to identify the child's mount.
 //! For extract-and-run the runtime stays as the direct parent, even after closing its image fd.
 //! Inaccessible proc files are not proof of anything.
+//!
+//! Three things are asked, and all must hold. This process is the image's application: the
+//! file it executes is the one the AppDir's `AppRun` leads to, so a second program packed in
+//! the same image (an engine, a sister application) never updates the image as if it were its
+//! own. The image is in use: a live runtime process executes it (the FUSE daemon whose
+//! keepalive pipe this process holds, or the waiting parent of an extract-and-run). And, for
+//! a mounted image, the mount is that image: the kernel shows no link from a FUSE mount to
+//! the process that serves it, so the pipe alone would let the daemon of image B vouch while
+//! the AppDir is image A's. The link used instead is the filesystem itself: the size and the
+//! inode count that `statvfs` reports for the AppDir must be those in the squashfs superblock
+//! inside the file ([`Geometry`]). Two images agree in both only when they hold the same
+//! filesystem, to the block and the inode.
+//!
+//! What this is for: an inherited or mixed-up environment must never make the updater
+//! replace a file that is not the image this process runs from. It is no defence against
+//! another program of the same account, which can write a matching file, or replace the
+//! image, without asking; nothing in this process can be.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -29,7 +46,107 @@ pub(crate) fn current() -> Option<PathBuf> {
     if !appdir.metadata().ok()?.is_dir() {
         return None;
     }
-    find(proc, &value, &dir, exe.as_raw_fd(), appdir.as_raw_fd())
+    find(
+        proc,
+        &value,
+        &dir,
+        exe.as_raw_fd(),
+        appdir.as_raw_fd(),
+        Geometry::mounted(&appdir),
+    )
+}
+
+/// How large a squashfs is, as both its superblock and `statvfs` on its mount say it: the
+/// number of blocks its bytes take, and the number of inodes. This is what ties a mounted
+/// AppDir to the image file it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Geometry {
+    blocks: u64,
+    inodes: u64,
+}
+
+impl Geometry {
+    /// What the filesystem `dir` is on reports. `None` when it cannot be asked.
+    // The two counts are 64 bits wide on some targets and narrower on others.
+    #[allow(clippy::unnecessary_cast)]
+    fn mounted(dir: &File) -> Option<Self> {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the descriptor is open and `stat` is writable storage for one statvfs.
+        if unsafe { libc::fstatvfs(dir.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: fstatvfs returned 0, so it filled the structure.
+        let stat = unsafe { stat.assume_init() };
+        Some(Self {
+            blocks: stat.f_blocks as u64,
+            inodes: stat.f_files as u64,
+        })
+    }
+
+    /// What the squashfs inside the Type 2 image `image` says. The filesystem begins where the
+    /// runtime's ELF ends: after its section header table or after its last section, whichever
+    /// is later, as the runtime itself finds it; the end of the table is tried as well.
+    /// `None` for anything but a 64-bit little-endian ELF followed by a squashfs 4 superblock.
+    fn of_image(image: &File) -> Option<Self> {
+        let mut elf = [0; 64];
+        image.read_exact_at(&mut elf, 0).ok()?;
+        // EI_CLASS 2 is 64-bit and EI_DATA 1 is little-endian.
+        if !elf.starts_with(b"\x7fELF") || elf[4] != 2 || elf[5] != 1 {
+            return None;
+        }
+        let table = le(&elf, 0x28, 8)?;
+        let (entry, count) = (le(&elf, 0x3a, 2)?, le(&elf, 0x3c, 2)?);
+        let table_end = table.checked_add(entry * count)?;
+        let last_section_end = (|| {
+            let mut header = [0; 64];
+            let at = table.checked_add(entry * count.checked_sub(1)?)?;
+            image.read_exact_at(&mut header, at).ok()?;
+            le(&header, 0x18, 8)?.checked_add(le(&header, 0x20, 8)?)
+        })();
+        let ends = [
+            last_section_end.map(|end| end.max(table_end)),
+            Some(table_end),
+        ];
+        ends.into_iter().flatten().find_map(|at| {
+            let mut block = [0; 48];
+            image.read_exact_at(&mut block, at).ok()?;
+            Self::of_superblock(&block)
+        })
+    }
+
+    /// The first 48 bytes of a squashfs 4 superblock: the magic, the inode count at 4, the block
+    /// size at 12 with its logarithm at 22, the major version at 28, the bytes used at 40.
+    fn of_superblock(block: &[u8; 48]) -> Option<Self> {
+        let log = le(block, 22, 2)?;
+        let used = le(block, 40, 8)?;
+        if !block.starts_with(b"hsqs")
+            || le(block, 28, 2)? != 4
+            || !(12..=20).contains(&log)
+            || le(block, 12, 4)? != 1 << log
+            || used == 0
+        {
+            return None;
+        }
+        Some(Self {
+            blocks: ((used - 1) >> log) + 1,
+            inodes: le(block, 4, 4)?,
+        })
+    }
+
+    /// Whether a mount reporting `self` is the filesystem inside an image that says `image`.
+    /// A mount may count a last, partly used block or not.
+    fn is_mount_of(self, image: Self) -> bool {
+        self.inodes == image.inodes
+            && (self.blocks == image.blocks || self.blocks.checked_add(1) == Some(image.blocks))
+    }
+}
+
+/// The little-endian number of `len` bytes at `at`.
+fn le(bytes: &[u8], at: usize, len: usize) -> Option<u64> {
+    let field = bytes.get(at..)?.get(..len)?;
+    let mut number = [0; 8];
+    number.get_mut(..len)?.copy_from_slice(field);
+    Some(u64::from_le_bytes(number))
 }
 
 fn path_handle(path: &Path) -> Option<File> {
@@ -50,11 +167,25 @@ fn mount_id(info: &Path) -> Option<u64> {
         .ok()
 }
 
-fn find(proc: &Path, value: &OsStr, dir: &Path, exe_fd: i32, dir_fd: i32) -> Option<PathBuf> {
+fn find(
+    proc: &Path,
+    value: &OsStr,
+    dir: &Path,
+    exe_fd: i32,
+    dir_fd: i32,
+    mounted: Option<Geometry>,
+) -> Option<PathBuf> {
     let exe = fs::read_link(proc.join("self/exe")).ok()?;
     let exe_id = mount_id(&proc.join(format!("self/fdinfo/{exe_fd}")))?;
     let dir_id = mount_id(&proc.join(format!("self/fdinfo/{dir_fd}")))?;
     if exe.strip_prefix(dir).ok()?.as_os_str().is_empty() || exe_id != dir_id {
+        return None;
+    }
+    // Only the application the image starts updates it: `AppRun`, followed to its end, is the
+    // file this process executes. An image whose `AppRun` is a script or a launcher of its own
+    // is not updated in place.
+    let running = fs::metadata(proc.join("self/exe")).ok()?;
+    if !fs::metadata(dir.join("AppRun")).is_ok_and(|entry| same_file(&entry, &running)) {
         return None;
     }
     let mounts = fs::read(proc.join("self/mountinfo")).ok()?;
@@ -76,7 +207,11 @@ fn find(proc: &Path, value: &OsStr, dir: &Path, exe_fd: i32, dir_fd: i32) -> Opt
     }
 
     let verified = if mount.fuse_at(dir) {
-        mounted_runtime(proc, dir, dir_id, &image)
+        // The daemon shows that the image is in use; the geometry, that this mount is it.
+        mounted
+            .zip(Geometry::of_image(&opened))
+            .is_some_and(|(mount, image)| mount.is_mount_of(image))
+            && mounted_runtime(proc, dir, dir_id, &image)
     } else if dir.starts_with(&mount.point) && extraction_dir(dir) {
         extract_runtime(proc, &image)
     } else {

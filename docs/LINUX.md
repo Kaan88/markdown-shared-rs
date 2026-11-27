@@ -13,7 +13,7 @@ Plasma on Wayland, cargo 1.99, except where sway (headless, in a container) is n
 |---|---|---|
 | Downloads (`mdshared-fetch`) | The system libcurl, loaded at run time with `dlopen` (`libcurl.so.4`, then `libcurl.so`; the `libloading` crate). No link-time dependency: without libcurl every download fails as before (`Error::Unsupported`, seen by callers as `State::Failed`). Same contract as WinHTTP: no redirects followed, no cookies/netrc/auth/`Accept-Encoding`, http and https only, TLS verification on, size cap from `Content-Length` and while reading, overall deadline. | The network tests (local TCP server) run on unix; `live_https_badge` (`--ignored`) fetched an https badge. |
 | File dialogs (`platform`) | Both apps use these for Open files, Open folder and Save as. `pick_files_async`, `pick_folder_async`, `pick_save_async`: the blocking dialog on a helper thread; one at a time (a second request calls `done` at once with the empty result and returns false). The blocking `pick_files`/`pick_folder` stay for Windows. | Unit test of the one-at-a-time rule; `examples/dialog.rs` run: a portal request was open on the bus while it waited. The apps' dialog flows were not run by hand (not re-checked). |
-| Self-update (`mdshared-app`) | `updater::installed_files` checks the executable's kernel mount ID from `/proc/self/fdinfo` against `/proc/self/mountinfo` and `$APPDIR`. For a mounted image it uses the application's inherited AppDir handle and keepalive pipe to identify the FUSE runtime and its open backing file. For extract-and-run the kernel pins the direct parent's executable, so the parent need not keep a separate file descriptor open. A mount source label or filename prefix proves nothing. | Filesystem staging and recheck tests ran on Windows; Linux proc fixtures were type-checked only. No real AppImage was mounted or updated. |
+| Self-update (`mdshared-app`) | `updater::installed_files` checks the executable's kernel mount ID from `/proc/self/fdinfo` against `/proc/self/mountinfo` and `$APPDIR`, and that the AppDir's `AppRun` leads to the file this process executes. For a mounted image it uses the application's inherited AppDir handle and keepalive pipe to find the live FUSE runtime and its open backing file, and it requires the block and inode counts `statvfs` reports for the AppDir to be those of the squashfs superblock inside that file. For extract-and-run the kernel pins the direct parent's executable, so the parent need not keep a separate file descriptor open. A mount source label or filename prefix proves nothing. The swap moves only the file that was verified and the file the updater wrote, and a launch's clean-up takes the installation's lock. | Filesystem staging and recheck tests ran on Windows. The proc fixtures, the superblock reader, the held-file swap and the lock tests are Linux-only: type-checked from Windows, run by CI on Linux. No real AppImage was mounted or updated, so whether a real Type 2 runtime passes these checks is not yet known. |
 | Window identity (`window::identify`) | Wayland app id and X11 `WM_CLASS` from the app name; the X11 window icon from PNG bytes. | Used by both apps. Compiles; the identity as the desktop shows it (taskbar name and icon) was not re-checked. |
 | Desktop entry (`desktop_entry::ensure`) | From an AppImage: writes `applications/<name>.desktop` and the 256 px icon under `$XDG_DATA_HOME` (or `~/.local/share`) when missing or when the recorded `X-AppImage-Path` differs; never touches an entry without the marker; sets no defaults. | Unit tests with a temp data directory; mdedit run with `$APPIMAGE` set and `XDG_DATA_HOME` on a scratch folder wrote the entry and the icon. |
 | Fonts (`mdshared-text`) | `add_fallbacks` (applied by `shared_fonts()`): Windows names first, then Noto/Twemoji/JoyPixels/Symbola, Noto Symbols/Math, DejaVu Sans, and the CJK families, behind the system's fallback for Han, Common, Inherited and Latin. `EMOJI_FAMILIES` for family strings, and `emoji_presentation_runs` / `push_emoji_runs` so that emoji with U+FE0F, keycaps, skin tones and ZWJ sequences draw in colour (see below; both apps call it, the chrome text too; empty on Windows). | `examples/fontprobe.rs` rendered to PNG and looked at. |
@@ -75,6 +75,27 @@ different inode cannot. If a wrapper closes the AppDir handle or keepalive pipe 
 the application, mounted self-update is unavailable. An ancestor can hold pipes for other
 AppImages, so its descriptors are not used as a fallback. Unsupported runtime layouts and
 restricted `/proc` also leave self-update unavailable.
+
+Only the application the image starts updates it: the AppDir's `AppRun`, followed to its end,
+must be the file the process executes (the applications' images link `AppRun` to
+`usr/bin/<name>`, which links to the executable). A second program packed in the same image, an
+engine or a sister application, updates nothing. So does an image whose `AppRun` is a script
+or a launcher of its own; an application built that way needs another rule before it can
+update in place.
+
+The kernel shows no link from a FUSE mount to the process that serves it, so the keepalive
+pipe alone would let the live daemon of another image vouch for `$APPIMAGE` while the AppDir
+is a different image's. The mount is therefore tied to the file by the filesystem itself: the
+squashfs superblock is read from the image (it begins where the runtime's ELF ends, found as
+the runtime finds it), and its inode count and its size in blocks must be what `statvfs`
+reports for the AppDir. A 64-bit little-endian runtime with a squashfs 4 filesystem is
+understood; anything else, or a mount that reports other numbers, leaves mounted self-update
+unavailable. Two images agree in both numbers only when they hold the same filesystem, to
+the block and the inode. This guards against an inherited or mixed-up environment; another
+program of the same account can replace the image without asking, and no check here is a
+defence against that. Extract-and-run needs no such tie: only the image's own waiting
+runtime is the direct parent of its `AppRun`.
+
 The folder must be writable. The updater checks identity again after download, immediately
 before swapping, and before cleaning up. It never truncates an existing `.new`; if identity is
 lost after staging, it leaves the staged file alone instead of trying to clean up beside an
@@ -84,8 +105,26 @@ An interrupted install can replace its leftover `.new` beside the verified image
 a singly linked regular file owned by the current account. The updater opens the new stage
 exclusively at mode 0600, then changes it to 0755 after writing. `.new` and `.old` sit beside
 the image, with no separate engine.
-Linux was type-checked; the updater, runtime and lock tests were not run on Linux.
-No live AppImage was run or updated, and no NFS mount was tested.
+
+The swap holds its files by what they are (device and inode), not only by name. What the
+image's name denotes is noted before the installation is verified, and the staged file stays
+open from its creation. After `<image>` is renamed to `.old` the file moved must be the one
+noted, and after `.new` is renamed to `<image>` the file in place must be the one the updater
+wrote; otherwise the renames are taken back and the update fails. A failed installation
+removes its `.new` only while that name is still its own file. A rename or a removal still
+takes a name, so a file given the name in the instant between the check and the call is moved
+in the other's place; the check after the rename finds that out and puts it back.
+The clean-up at a later launch takes the same `.lck` lock: while an installation holds it,
+nothing is removed. It removes `.old` and `.new` only when each is a singly linked regular
+file owned by the current account, never a folder or a link, and makes no lock file when
+there is nothing to remove. It cannot know which inode an earlier process retired, so for
+`.old` the rule is the file's kind and owner, not its identity.
+
+These tests are Linux-only: type-checked from Windows and run by CI on Linux, not on a
+desktop. No live AppImage was run or updated, and no NFS mount was tested. In particular the
+runtime's descriptors and the numbers `statvfs` reports were written from the Type 2 runtime's
+and squashfuse's sources, not observed: if a real launch differs, the checks fail closed and
+the update bar does not appear.
 
 ## Window shadow (`mdshared_ui::shadow`)
 

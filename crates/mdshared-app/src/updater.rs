@@ -421,7 +421,8 @@ fn create_staged_appimage(path: &std::path::Path) -> std::io::Result<std::fs::Fi
 
 /// Downloads every file beside its target, checks each against its hash, and swaps them in. On
 /// failure nothing is replaced. On Linux, the AppImage's identity must still be verifiable
-/// before it stages, swaps or removes files beside the installation.
+/// before it stages, swaps or removes files beside the installation, and the swap moves only
+/// the file that was verified and the file this call wrote (see `appimage::swap`).
 pub fn install(offer: &Offer, files: &Files, fetch: Fetch) -> Result<(), String> {
     install_checked(offer, files, fetch, still_installed)
 }
@@ -432,18 +433,20 @@ fn install_checked(
     fetch: Fetch,
     verify: impl Fn(&Files) -> bool,
 ) -> Result<(), String> {
+    // What each target is now, noted before the verification that says it is the installation.
+    #[cfg(target_os = "linux")]
+    let pinned = &mut Pinned::of(&files.targets());
+    #[cfg(not(target_os = "linux"))]
+    let pinned = &mut Pinned;
     require_installation(verify(files))?;
     #[cfg(target_os = "linux")]
     let _update_lock = crate::appimage::lock_update(&files.app)
         .map_err(|e| format!("cannot lock the installed AppImage for updating: {e}"))?;
-    let mut staged = Vec::new();
-    let result = stage_and_swap(offer, files, fetch, &verify, &mut staged);
+    let result = stage_and_swap(offer, files, fetch, &verify, pinned);
     if result.is_err() {
         #[cfg(target_os = "linux")]
-        if !staged.is_empty() && verify(files) {
-            for path in staged {
-                _ = std::fs::remove_file(&path);
-            }
+        if pinned.any() && verify(files) {
+            pinned.discard();
         }
         #[cfg(not(target_os = "linux"))]
         for target in files.targets() {
@@ -459,12 +462,21 @@ fn require_installation(verified: bool) -> Result<(), String> {
         .ok_or_else(|| "the running AppImage no longer identifies this installation".into())
 }
 
+// The files a Linux installation holds on to from staging to the swap.
+#[cfg(target_os = "linux")]
+use crate::appimage::swap::Pinned;
+
+/// Nothing is held elsewhere: the swap there is [`selfupdate::swap_in`], by name.
+#[cfg(not(target_os = "linux"))]
+struct Pinned;
+
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn stage_and_swap(
     offer: &Offer,
     files: &Files,
     fetch: Fetch,
     verify: &impl Fn(&Files) -> bool,
-    _written: &mut Vec<PathBuf>,
+    pinned: &mut Pinned,
 ) -> Result<(), String> {
     let mut pairs = vec![(&offer.app, &files.app)];
     match (&offer.engine, &files.engine) {
@@ -498,7 +510,7 @@ fn stage_and_swap(
             use std::io::ErrorKind::AlreadyExists;
             use std::io::Write;
             use std::os::unix::fs::PermissionsExt;
-            let mut f = match create_staged_appimage(&staged) {
+            let f = match create_staged_appimage(&staged) {
                 Err(e) if e.kind() == AlreadyExists => {
                     // The name is derived from the verified target and sits beside it.
                     crate::appimage::remove_stale_stage(&staged).map_err(|e| e.to_string())?;
@@ -507,7 +519,8 @@ fn stage_and_swap(
                 result => result,
             }
             .map_err(|e| e.to_string())?;
-            _written.push(staged.clone());
+            // Held open until the swap, which installs this file and no other of its name.
+            let f = pinned.hold(target, f);
             f.write_all(&bytes)
                 .and_then(|()| f.set_permissions(std::fs::Permissions::from_mode(0o755)))
                 .and_then(|()| f.sync_all())
@@ -524,7 +537,11 @@ fn stage_and_swap(
         }
     }
     require_installation(verify(files))?;
-    selfupdate::swap_in(&files.targets()).map_err(|e| e.to_string())
+    #[cfg(target_os = "linux")]
+    let swapped = pinned.swap();
+    #[cfg(not(target_os = "linux"))]
+    let swapped = selfupdate::swap_in(&files.targets());
+    swapped.map_err(|e| e.to_string())
 }
 
 /// `--install-update`: looks for a newer version, installs it as the bar's Update button would,
@@ -574,7 +591,8 @@ pub fn install_and_restart(app: &App, fetch: Fetch) -> i32 {
     0
 }
 
-/// Removes what an earlier update left beside the executables.
+/// Removes what an earlier update left beside the executables. On Linux this waits for no
+/// installation: while one holds the update lock, nothing is removed until a later call.
 pub fn clean_up(files: &Files) {
     clean_up_checked(files, still_installed);
 }
@@ -583,12 +601,10 @@ fn clean_up_checked(files: &Files, verify: impl Fn(&Files) -> bool) {
     if !verify(files) {
         return;
     }
-    // AppImage leftovers are files, never directories to be removed recursively.
+    // AppImage leftovers are this account's plain files, never directories to be removed
+    // recursively, and they are not touched while an installation holds the update lock.
     #[cfg(target_os = "linux")]
-    for target in files.targets() {
-        _ = std::fs::remove_file(selfupdate::retired(&target));
-        _ = std::fs::remove_file(selfupdate::staged(&target));
-    }
+    crate::appimage::swap::remove_leftovers(&files.app, &files.targets());
     #[cfg(not(target_os = "linux"))]
     selfupdate::clean_up(&files.targets());
 }

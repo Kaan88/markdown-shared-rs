@@ -4,8 +4,11 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+// Which file is the running image, and the updater's swap beside it.
 #[cfg(target_os = "linux")]
 pub(crate) mod runtime;
+#[cfg(target_os = "linux")]
+pub(crate) mod swap;
 
 /// The canonical path `value` (the content of `$APPIMAGE`) names, when it is set, names an
 /// existing regular file. This is a location hint, not proof of the running image's identity.

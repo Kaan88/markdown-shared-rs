@@ -4,7 +4,42 @@ use std::os::unix::fs::symlink;
 const EXE_SLOT: i32 = 1000;
 const DIR_SLOT: i32 = 1001;
 const RUNTIME: &str = "4321";
-const TYPE2: &[u8] = b"\x7fELF\x02\x01\x01\0AI\x02 test runtime";
+/// A Type 2 image in miniature: a 64-bit little-endian ELF header with the AppImage mark, one
+/// empty section header after it, and then the start of a squashfs 4 superblock that says the
+/// filesystem has `inodes` inodes in `blocks` blocks of 128 KiB.
+const fn type2(inodes: u8, blocks: u8) -> [u8; 176] {
+    let mut image = [0; 176];
+    let head = *b"\x7fELF\x02\x01\x01\0AI\x02";
+    let mut i = 0;
+    while i < head.len() {
+        image[i] = head[i];
+        i += 1;
+    }
+    // The section header table follows the ELF header: one entry of 64 bytes.
+    image[0x28] = 64;
+    image[0x3a] = 64;
+    image[0x3c] = 1;
+    let magic = *b"hsqs";
+    i = 0;
+    while i < magic.len() {
+        image[128 + i] = magic[i];
+        i += 1;
+    }
+    image[128 + 4] = inodes;
+    // Block size 0x2_0000 and its logarithm, the major version, and the bytes used.
+    image[128 + 14] = 2;
+    image[128 + 22] = 17;
+    image[128 + 28] = 4;
+    image[128 + 42] = 2 * blocks;
+    image
+}
+
+const TYPE2: &[u8] = &type2(7, 3);
+/// What a mount of [`TYPE2`] reports.
+const MOUNTED: Geometry = Geometry {
+    blocks: 3,
+    inodes: 7,
+};
 
 fn mount_path(path: &Path) -> Vec<u8> {
     let mut escaped = Vec::new();
@@ -76,6 +111,8 @@ impl Fixture {
         fs::create_dir(&dir).unwrap();
         let exe = dir.join("mdtest");
         fs::write(&exe, b"application").unwrap();
+        // The image starts this application.
+        symlink("mdtest", dir.join("AppRun")).unwrap();
         // The file has no app-name prefix (nor does it need one). The fixture exposes the
         // actual runtime exe and its backing descriptor; mountinfo does not supply a path.
         let image = root.join("My copy.AppImage");
@@ -136,7 +173,12 @@ impl Fixture {
     }
 
     fn verify(&self, value: &OsStr) -> Option<PathBuf> {
-        find(&self.proc, value, &self.dir, EXE_SLOT, DIR_SLOT)
+        self.verify_mounted(value, Some(MOUNTED))
+    }
+
+    /// [`Fixture::verify`] when the AppDir's filesystem reports `mounted`.
+    fn verify_mounted(&self, value: &OsStr, mounted: Option<Geometry>) -> Option<PathBuf> {
+        find(&self.proc, value, &self.dir, EXE_SLOT, DIR_SLOT, mounted)
     }
 }
 
@@ -297,4 +339,118 @@ fn an_inherited_or_unrelated_appimage_is_never_an_update_target() {
     symlink(&other, launch.proc.join("self/exe")).unwrap();
     assert_eq!(launch.verify(launch.image.as_os_str()), None);
     assert_eq!(fs::read(other).unwrap(), TYPE2);
+}
+
+#[test]
+fn another_images_live_daemon_and_pipe_cannot_stand_in_for_the_mounted_image() {
+    let launch = Fixture::new("mount-a", true);
+    let other = Fixture::new("mount-b", true);
+    // Image B holds another filesystem. Its daemon runs, and this application has inherited
+    // the read end of B's keepalive pipe beside its own: every question about B's runtime is
+    // answered as it would be for a launch of B.
+    let image_b = type2(9, 5);
+    fs::write(&other.image, image_b).unwrap();
+    fs::rename(other.proc.join(RUNTIME), launch.proc.join("6543")).unwrap();
+    symlink(
+        format!("/proc/self/fd/{}", other._pipe.0.as_raw_fd()),
+        launch.proc.join("self/fd/7"),
+    )
+    .unwrap();
+    Fixture::fdinfo(&launch.proc, "self", 7, 1, "00");
+    // The AppDir is image A's, so `$APPIMAGE` naming B is refused, and A is still found.
+    assert_eq!(launch.verify(other.image.as_os_str()), None);
+    assert_eq!(
+        launch.verify(launch.image.as_os_str()),
+        Some(launch.image.clone())
+    );
+    // What refuses B is the mount: an AppDir reporting B's filesystem would be B's.
+    let mounted_b = Geometry {
+        blocks: 5,
+        inodes: 9,
+    };
+    assert_eq!(
+        launch.verify_mounted(other.image.as_os_str(), Some(mounted_b)),
+        Some(other.image.clone())
+    );
+    assert_eq!(
+        launch.verify_mounted(launch.image.as_os_str(), Some(mounted_b)),
+        None
+    );
+    // A mount that cannot be asked proves nothing.
+    assert_eq!(launch.verify_mounted(launch.image.as_os_str(), None), None);
+}
+
+#[test]
+fn only_the_application_apprun_starts_updates_the_image() {
+    for mounted in [true, false] {
+        let launch = Fixture::new(if mounted { "apprun-m" } else { "apprun-x" }, mounted);
+        let image = launch.image.as_os_str();
+        assert_eq!(launch.verify(image), Some(launch.image.clone()));
+        // A second program packed in the same image, on the same mount.
+        let engine = launch.dir.join("mdtest-engine");
+        fs::write(&engine, b"engine").unwrap();
+        let exe = launch.proc.join("self/exe");
+        fs::remove_file(&exe).unwrap();
+        symlink(&engine, &exe).unwrap();
+        assert_eq!(launch.verify(image), None);
+        // An AppRun that is a file of its own (a script) starts nothing we can name.
+        fs::remove_file(&exe).unwrap();
+        symlink(launch.dir.join("mdtest"), &exe).unwrap();
+        assert_eq!(launch.verify(image), Some(launch.image.clone()));
+        let apprun = launch.dir.join("AppRun");
+        fs::remove_file(&apprun).unwrap();
+        fs::write(&apprun, b"#!/bin/sh\nexec mdtest\n").unwrap();
+        assert_eq!(launch.verify(image), None);
+        fs::remove_file(&apprun).unwrap();
+        assert_eq!(launch.verify(image), None, "no AppRun at all");
+    }
+}
+
+#[test]
+fn the_geometry_of_an_image_is_read_from_its_superblock_or_not_at_all() {
+    let root = std::env::temp_dir().join(format!("mdshared-geometry-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let file = root.join("image");
+    let geometry = |bytes: &[u8]| {
+        fs::write(&file, bytes).unwrap();
+        Geometry::of_image(&File::open(&file).unwrap())
+    };
+    let good = type2(7, 3);
+    assert_eq!(geometry(&good), Some(MOUNTED));
+    // A last section that ends after the table moves the filesystem there, as in the runtime.
+    let mut padded = good[..128].to_vec();
+    padded[64 + 0x18] = 128;
+    padded[64 + 0x20] = 16;
+    padded.extend([0; 16]);
+    padded.extend(&good[128..]);
+    assert_eq!(geometry(&padded), Some(MOUNTED));
+
+    let changed = |at: usize, to: u8| {
+        let mut bytes = good;
+        bytes[at] = to;
+        bytes
+    };
+    for bad in [
+        changed(4, 1),         // a 32-bit ELF
+        changed(5, 2),         // big-endian
+        changed(128, b'x'),    // no squashfs where the ELF ends
+        changed(128 + 28, 3),  // squashfs 3
+        changed(128 + 22, 16), // a block size that is not two to its logarithm
+        changed(128 + 22, 99),
+        changed(128 + 42, 0), // nothing used
+        changed(0x3c, 9),     // a section table that runs past the file
+    ] {
+        assert_eq!(geometry(&bad), None);
+    }
+    for short in [0, 10, 64, 128, 175] {
+        assert_eq!(geometry(&good[..short]), None);
+    }
+    // A mount may count the last, partly used block or not; nothing else is the same mount.
+    let image = MOUNTED;
+    let mount = |blocks, inodes| Geometry { blocks, inodes };
+    assert!(mount(3, 7).is_mount_of(image) && mount(2, 7).is_mount_of(image));
+    assert!(!mount(4, 7).is_mount_of(image) && !mount(1, 7).is_mount_of(image));
+    assert!(!mount(3, 8).is_mount_of(image) && !mount(0, 0).is_mount_of(image));
+    assert!(!mount(u64::MAX, 7).is_mount_of(image));
+    fs::remove_dir_all(root).unwrap();
 }
