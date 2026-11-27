@@ -241,11 +241,19 @@ pub fn types_text(mods: Mods) -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static STATIC_LABEL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A shortcut as the platform prints it: unchanged off macOS; on macOS in the Mac's symbols, in
 /// its order (Control, Option, Shift, Command, then the key): "Ctrl+Shift+F" is "⇧⌘F". `s` may
 /// hold several shortcuts ("Ctrl+W, Ctrl+F4", "Ctrl+K Ctrl+0"); a part that is not a shortcut
-/// (a path, a heading level) is kept as it is. The result lives for the program, as menu hints do.
+/// (a path, a heading level) is kept as it is. The result lives for the program; use
+/// [`label_owned`] for hints made from changing data.
 pub fn label(s: &str) -> &'static str {
+    #[cfg(test)]
+    STATIC_LABEL_CALLS.set(STATIC_LABEL_CALLS.get() + 1);
     use std::collections::HashMap;
     use std::sync::Mutex;
     static CACHE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
@@ -255,12 +263,18 @@ pub fn label(s: &str) -> &'static str {
         return done;
     }
     let made: &'static str = Box::leak(label_for(s, MAC).into_boxed_str());
-    // A hint that is not a shortcut can be anything (a file's path in the palette): only a
-    // bounded number are kept, the rest are made again.
+    // Bound the lookup table. Even an uncached result must live for the program.
     if map.len() < 512 {
         map.insert(s.to_string(), made);
     }
     made
+}
+
+/// Prints a shortcut as [`label`] does, but the caller owns the result and can drop it.
+/// Off macOS an input `String` is returned as it is; no platform keeps it in the label cache.
+pub fn label_owned(s: impl Into<String>) -> String {
+    let s = s.into();
+    if MAC { label_for(&s, true) } else { s }
 }
 
 /// [`label`] for a given platform, without the cache.
@@ -373,6 +387,17 @@ pub fn key_name(key: &Key) -> Option<KeyName> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_menu_and_palette_hints_do_not_request_static_labels() {
+        let before = STATIC_LABEL_CALLS.get();
+        for hint in ["Ctrl+Shift+F", "files/one.md"] {
+            let expected = label_for(hint, MAC);
+            assert_eq!(crate::menu::Item::new(1, "").hint(hint).hint, expected);
+            assert_eq!(crate::palette::Entry::new(1, "").hint(hint).hint, expected);
+        }
+        assert_eq!(STATIC_LABEL_CALLS.get(), before);
+    }
 
     const NONE: Mods = Mods {
         ctrl: false,

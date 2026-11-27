@@ -306,11 +306,13 @@ pub fn draw_meter(
     if peak > 0.0 {
         let line = if vertical {
             let h = r.h.min(2.0);
-            let y = (r.bottom() - r.h * peak - h / 2.0).clamp(r.y, r.bottom() - h);
+            let y = (r.bottom() - r.h * peak - h / 2.0)
+                .min(r.bottom() - h)
+                .max(r.y);
             Rect::new(r.x, y, r.w, h)
         } else {
             let w = r.w.min(2.0);
-            let x = (r.x + r.w * peak - w / 2.0).clamp(r.x, r.right() - w);
+            let x = (r.x + r.w * peak - w / 2.0).min(r.right() - w).max(r.x);
             Rect::new(x, r.y, w, r.h)
         };
         p.fill(line, zone_colour(pal, meter.peak_db(now)));
@@ -398,6 +400,32 @@ mod tests {
 
     fn track(pal: &Palette) -> Rgb {
         mix(pal.line, pal.text, 0.18)
+    }
+
+    #[test]
+    fn a_subpixel_meter_draws_its_peak_across_the_whole_short_axis() {
+        let now = Instant::now();
+        let mut m = LevelMeter::new();
+        m.update(now, 0.1);
+        for (r, vertical) in [
+            (Rect::new(0.1, 0.0, 0.3, 1.0), false),
+            (Rect::new(0.0, 0.1, 1.0, 0.3), true),
+        ] {
+            let mut bmp = Bitmap::new(10, 10);
+            let mut gfx = Gfx::new();
+            let mut p = Painter::new(&mut bmp, &mut gfx, 10.0);
+            draw_meter(&mut p, &LIGHT, r, &m, now, vertical);
+            let at_axis = |n| {
+                if vertical {
+                    at(&bmp, 5, n)
+                } else {
+                    at(&bmp, n, 5)
+                }
+            };
+            assert_eq!(at_axis(1), LIGHT.accent);
+            assert_eq!(at_axis(3), LIGHT.accent);
+            assert_ne!(at_axis(4), LIGHT.accent);
+        }
     }
 
     #[test]

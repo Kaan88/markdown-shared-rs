@@ -550,10 +550,9 @@ impl Form {
             })
             .collect();
         self.rows = rows;
-        if matches!(self.drag, Drag::Slider(..) | Drag::Number(_)) {
-            // The thumb in hand may now be another row's, or no row's.
-            self.drag = Drag::None;
-        }
+        // The row under a held pointer may now be a different row, or gone.
+        self.drag = Drag::None;
+        self.pressed = None;
         self.close_colour();
         self.stops = vec![Vec::new(); self.rows.len()];
         self.stops_text = vec![String::new(); self.rows.len()];
@@ -1012,9 +1011,12 @@ impl Form {
             return Outcome::None;
         };
         let n = options.len() as i32;
+        if n == 0 {
+            return Outcome::None;
+        }
         let next = *value as i32 + d;
         let next = if wrap {
-            next.rem_euclid(n.max(1))
+            next.rem_euclid(n)
         } else {
             next.clamp(0, n - 1)
         };
@@ -2104,6 +2106,28 @@ mod tests {
 
     fn changed(id: u32, value: Value) -> Outcome {
         Outcome::Changed { id, value }
+    }
+
+    #[test]
+    fn arrows_leave_an_empty_choice_alone() {
+        let mut t = T::new(vec![Row::choice(1, "Device", &[], 0)], 800.0, 600.0);
+        t.f.focus_row(1);
+        for key in [KeyName::Left, KeyName::Right] {
+            assert_eq!(t.key(key), Outcome::None);
+            assert_eq!(t.f.value(1), Some(Value::Choice(0)));
+        }
+    }
+
+    #[test]
+    fn replacing_rows_cancels_the_held_text_drag_and_press() {
+        let mut t = T::new(rows(), 800.0, 600.0);
+        let r = t.f.control_rect(t.row(NAME));
+        assert_eq!(t.f.press(r.cx(), r.cy(), NONE, 1), Outcome::Redraw);
+        assert!(matches!(t.f.drag, Drag::Text(_)));
+        t.f.set_rows(vec![]);
+        t.f.pointer_move(r.cx(), r.cy());
+        assert!(t.f.pressed.is_none());
+        assert_eq!(t.f.release(r.cx(), r.cy()), Outcome::None);
     }
 
     #[test]

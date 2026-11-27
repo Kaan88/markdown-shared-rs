@@ -333,8 +333,69 @@ impl DiskCache {
     }
 }
 
+/// The source pixels covered by one output pixel along an axis, with their shares of its area.
+/// These are the weights of `Image::scaled`, generated as needed rather than stored.
+fn taps(pixel: u32, step: f64, limit: u32) -> impl Iterator<Item = (usize, f32)> + Clone {
+    let lo = f64::from(pixel) * step;
+    let hi = f64::from(pixel + 1) * step;
+    (lo.floor() as u32..(hi.ceil() as u32).min(limit)).map(move |i| {
+        let share = (hi.min(f64::from(i + 1)) - lo.max(f64::from(i))) / step;
+        (i as usize, share as f32)
+    })
+}
+
+/// Shrinks an already decoded picture to a nonzero thumbnail bucket, or returns it as is
+/// when it fits. Keeps just two four-channel sums on the stack: finish each horizontal
+/// average before weighting it vertically, in the same order and precision as `Image::scaled`.
+fn shrink(source: Image, side: u32) -> Option<Image> {
+    let longest = source.width.max(source.height);
+    if longest <= side {
+        return Some(source);
+    }
+    let k = f64::from(side) / f64::from(longest);
+    let size = |n| ((f64::from(n) * k).round() as u32).clamp(1, side);
+    let (w, h) = (size(source.width), size(source.height));
+    let dx = f64::from(source.width) / f64::from(w);
+    let dy = f64::from(source.height) / f64::from(h);
+    let pixels = source.rgba.as_chunks::<4>().0;
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        let rows = taps(y, dy, source.height);
+        for x in 0..w {
+            let cols = taps(x, dx, source.width);
+            let mut sum = [0.0; 4];
+            for (sy, wy) in rows.clone() {
+                let row = &pixels[sy * source.width as usize..];
+                let mut across = [0.0; 4];
+                for (sx, wx) in cols.clone() {
+                    let [r, g, b, a] = row[sx];
+                    let a = f32::from(a) / 255.0;
+                    let pre = [f32::from(r) * a, f32::from(g) * a, f32::from(b) * a, a];
+                    for (v, c) in across.iter_mut().zip(pre) {
+                        *v += c * wx;
+                    }
+                }
+                for (v, c) in sum.iter_mut().zip(across) {
+                    *v += c * wy;
+                }
+            }
+            let [r, g, b, a] = sum;
+            let straight = |v: f32| if a > 0.0 { (v / a).round() as u8 } else { 0 };
+            out.extend([
+                straight(r),
+                straight(g),
+                straight(b),
+                (a * 255.0).round() as u8,
+            ]);
+        }
+    }
+    Image::new(w, h, out)
+}
+
 /// Makes one thumbnail, as a worker does: the disk cache first, then the file. This is the
 /// work [`Thumbnails`] queues, public so a caller with its own threads can use it.
+/// The source is decoded under the usual [`Limits::DEFAULT`]. After decoding, shrinking
+/// allocates only the final thumbnail's RGBA bytes (at most 4 MiB at the largest bucket).
 pub fn make(
     path: &Path,
     side: u32,
@@ -355,9 +416,7 @@ pub fn make(
     let bytes = std::fs::read(path).map_err(|e| Failure::Unreadable(e.kind()))?;
     let full = image::decode(&bytes, Limits::DEFAULT).map_err(Failure::Picture)?;
     drop(bytes);
-    let thumb = full
-        .scaled_to_fit(key.side, key.side)
-        .ok_or(Failure::Picture(image::Error::Damaged))?;
+    let thumb = shrink(full, key.side).ok_or(Failure::Picture(image::Error::Damaged))?;
     if let Some(d) = disk {
         // A cache that cannot be written is a cache that does not help; the thumbnail stands.
         _ = d.store(&key, &thumb);
