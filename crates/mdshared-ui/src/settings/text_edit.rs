@@ -186,8 +186,8 @@ macro_rules! text_edit_methods {
 
         /// Applies a menu action to the focused text field, unless a form popup is open.
         /// Reports `Changed` only for a new text value, or `Redraw` if just the selection may
-        /// have changed. Copy has no visible effect. Secret fields refuse Cut, Copy and Paste
-        /// even if called directly.
+        /// have changed. Copy has no visible effect. Secret fields accept Paste and refuse
+        /// Cut and Copy even if called directly.
         pub fn apply_context_action(&mut self, action: ContextAction) -> Outcome {
             self.cancel_text_pointer();
             if self.popup_open() {

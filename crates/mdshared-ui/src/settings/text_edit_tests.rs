@@ -79,7 +79,8 @@ fn a_drag_selects_text_and_draws_the_same_pixels_as_keyboard_selection() {
 }
 
 #[test]
-fn a_paged_secret_row_can_be_selected_but_its_menu_cannot_export_or_paste() {
+fn a_paged_secret_row_can_be_selected_and_pasted_into_but_its_menu_cannot_export() {
+    let _clipboard = crate::textfield::paste_fixture("new token");
     let mut form = pages::Form::new(
         "Settings",
         vec![pages::Page::new(
@@ -101,12 +102,21 @@ fn a_paged_secret_row_can_be_selected_but_its_menu_cannot_export_or_paste() {
     assert_eq!(form.focus_id(), Some(1));
     assert_eq!(form.apply_context_action(SelectAll), Outcome::Redraw);
     let menu = form.context_menu(None).unwrap();
-    for action in [Cut, Copy, Paste] {
+    for action in [Cut, Copy] {
         assert!(!enabled(&menu, action));
         assert_eq!(form.apply_context_action(action), Outcome::None);
     }
     assert!(enabled(&menu, SelectAll));
     assert_eq!(form.value(1), Some(Value::Text("secret".into())));
+    assert!(enabled(&menu, Paste));
+    assert_eq!(
+        form.apply_context_action(Paste),
+        Outcome::Changed {
+            id: 1,
+            value: Value::Text("new token".into()),
+        }
+    );
+    assert_eq!(form.value(1), Some(Value::Text("new token".into())));
     let ctrl = form.control_rect(2);
     assert_eq!(form.pointer_cursor_at(ctrl.cx(), ctrl.cy()), None);
     assert!(form.context_menu(Some((ctrl.cx(), ctrl.cy()))).is_none());
