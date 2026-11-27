@@ -18,6 +18,34 @@ fn headings_paragraphs_and_emphasis() {
 }
 
 #[test]
+fn backslashes_in_destinations_and_markup_in_alt_stay_literal() {
+    assert_eq!(
+        md(r#"<a href="\\server\share\plan.md">Plan</a>"#),
+        "[Plan](%5C%5Cserver%5Cshare%5Cplan.md)"
+    );
+    assert_eq!(
+        md(r#"<img src="img\" alt="&lt;em&gt;*A*&lt;/em&gt;">"#),
+        r"![\<em>\*A\*\</em>](img%5C)"
+    );
+}
+
+#[test]
+fn image_alt_inside_code_keeps_its_previous_escapes() {
+    assert_eq!(
+        md(r#"<code><img src="img" alt="&lt;em&gt;*A*&lt;/em&gt; \ &amp;amp;"></code>"#),
+        r"`![<em>*A*</em> \\ \&amp;](img)`"
+    );
+}
+
+#[test]
+fn image_source_inside_code_keeps_its_backslashes() {
+    assert_eq!(
+        md(r#"<code><img src="dir\pic name.png" alt="Pic"></code>"#),
+        r"`![Pic](dir\pic%20name.png)`"
+    );
+}
+
+#[test]
 fn links_and_images() {
     assert_eq!(
         md(r#"<p>See <a href="https://example.com/a b">the page</a>.</p>"#),
