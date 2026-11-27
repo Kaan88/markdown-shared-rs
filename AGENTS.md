@@ -130,8 +130,9 @@ is linked or run that way; say so when you report it.
   and hand-edited settings lines without panicking, and the tests feed them these.
 - **`unsafe` only at the system's edge.** It lives in the modules that call the OS: `platform`
   (and `platform/recycle`), `snap`, `handover`, `corners`, `place`, `menu_bar`, `open_documents`,
-  `desktop_entry`, `blur/wl`, `shadow/wl`, `mdshared-app/crash`, `mdshared-app/single_mutex`, `mdshared-fetch/winhttp` and
-  `curl`. Every block has a `// SAFETY:` line. A model, a widget or a parser has none.
+  `desktop_entry`, `blur/wl`, `shadow/wl`, `mdshared-app/crash`, `mdshared-app/single_mutex`,
+  `mdshared-app/single/private_unix` and `private_windows`, `mdshared-app/appimage` (and
+  `appimage/runtime`), `mdshared-fetch/winhttp` and `curl`. Every block has a `// SAFETY:` line. A model, a widget or a parser has none.
 - Logical pixels in every public API; the painter multiplies by the scale and snaps to device
   pixels. Functions that take device pixels say so in their name or doc (`fill_dev`, `blit`).
 

@@ -1726,6 +1726,7 @@ dependencies = [
 name = "mdshared-app"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "notify",
  "windows-sys 0.59.0",
 ]
