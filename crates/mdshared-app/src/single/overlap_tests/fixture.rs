@@ -12,9 +12,15 @@ pub(super) fn scratch(name: &str) -> PathBuf {
     }
     #[cfg(windows)]
     record::create_legacy_fixture_dir(&path).unwrap();
-    #[cfg(not(windows))]
-    fs::create_dir(&path).unwrap();
+    #[cfg(unix)]
+    create_private(&path);
     path
+}
+
+#[cfg(unix)]
+fn create_private(path: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path).unwrap();
 }
 
 pub(super) fn retire<T>(path: PathBuf, rx: Receiver<T>) {
@@ -61,6 +67,63 @@ fn a_loopback_fixture_clears_stale_state_and_releases_its_directory() {
     assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap().doc, request.doc);
     retire(path.clone(), rx);
     assert!(!path.exists());
+}
+
+#[test]
+fn dropping_a_guarded_receiver_allows_immediate_relisten_without_sending() {
+    let path = scratch("guarded-relisten");
+    let settings = path.join("settings.ini");
+    let first = listen_waking_guarded(APP, &settings, || {}).unwrap();
+    assert!(listen_guarded(APP, &settings).is_none());
+    drop(first);
+    let second = listen_guarded(APP, &settings).expect("drop released the lock");
+    let file = path.join("note.md");
+    fs::write(&file, b"note").unwrap();
+    assert!(forward(APP, &settings, std::slice::from_ref(&file)));
+    assert_eq!(second.recv_timeout(READ_DEADLINE).unwrap(), file);
+    drop(second);
+    remove(path);
+}
+
+#[test]
+fn dropping_a_guarded_receiver_releases_the_gate_before_deferred_publication() {
+    let path = scratch("guarded-deferred-relisten");
+    let settings = path.join("settings.ini");
+    let legacy = legacy_start(&path);
+    #[cfg(unix)]
+    legacy.1.try_lock().unwrap();
+    assert!(legacy_predecessor(&settings));
+    let first = listen_requests_waking_guarded(APP, &settings, || {}).unwrap();
+    assert!(!port_file(&settings).exists());
+    drop(first);
+    let second = listen_unresolved_requests_waking_guarded(APP, &settings, || {})
+        .expect("drop released the gate");
+    drop(legacy);
+    let request = Request::document("replacement", "");
+    assert_eq!(deliver_request(APP, &settings, &request), Delivery::Taken);
+    assert_eq!(second.recv_timeout(READ_DEADLINE).unwrap().doc, request.doc);
+    drop(second);
+    remove(path);
+}
+
+#[test]
+fn discovery_opens_the_gate_and_lifetime_lock_read_only() {
+    let path = scratch("discovery-read-only");
+    let settings = path.join("settings.ini");
+    let dir = directory(&settings, true).unwrap();
+    let (held, _) = hold_lock(&dir, |_| unreachable!())
+        .unwrap()
+        .publish(&dir, 12345)
+        .unwrap();
+    for mut lock in [
+        record::gate(&dir, false).unwrap(),
+        record::lock(&dir, false).unwrap(),
+    ] {
+        assert!(lock.write_all(b"cannot write a discovery handle").is_err());
+    }
+    assert!(matches!(discovery(&settings), Discovery::Ready(record) if record.port == 12345));
+    drop((held, dir));
+    remove(path);
 }
 
 #[test]
@@ -294,8 +357,15 @@ fn a_readable_windows_legacy_lock_needs_a_live_port_and_never_defers() {
 }
 
 #[cfg(unix)]
+const LEGACY_UMASK_CHILD: &str = "MDSHARED_TEST_LEGACY_UMASK_CHILD";
+
+#[cfg(unix)]
 #[test]
 fn a_group_writable_legacy_record_is_probed_only_in_owner_only_settings() {
+    let root = scratch("legacy-umask");
+    create_private(&root.join("ordinary"));
+    create_private(&root.join("group-writable"));
+    fs::write(root.join("group-writable/note.md"), b"note").unwrap();
     let output = std::process::Command::new("/bin/sh")
         .args(["-c", "umask 0002; exec \"$@\"", "sh"])
         .arg(std::env::current_exe().unwrap())
@@ -304,8 +374,11 @@ fn a_group_writable_legacy_record_is_probed_only_in_owner_only_settings() {
             "--exact",
             "single::overlap_tests::fixture::probe_a_legacy_record_created_under_umask_0002",
         ])
+        .env(LEGACY_UMASK_CHILD, "1")
+        .env("MDSHARED_TEST_LEGACY_UMASK_ROOT", &root)
         .output()
         .unwrap();
+    remove(root);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed"),
@@ -318,7 +391,18 @@ fn a_group_writable_legacy_record_is_probed_only_in_owner_only_settings() {
 #[ignore = "helper run with umask 0002 by the legacy permissions test"]
 fn probe_a_legacy_record_created_under_umask_0002() {
     use std::os::unix::fs::PermissionsExt;
-    let ordinary = scratch("ordinary-legacy-under-umask");
+    if std::env::var_os(LEGACY_UMASK_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("MDSHARED_TEST_LEGACY_UMASK_ROOT").unwrap());
+    let ordinary = root.join("ordinary");
+    let path = root.join("group-writable");
+    for dir in [&ordinary, &path] {
+        assert_eq!(
+            fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
     let listener = legacy_start(&ordinary);
     for name in ["instance.port", "instance.lock"] {
         assert_eq!(
@@ -331,9 +415,6 @@ fn probe_a_legacy_record_created_under_umask_0002() {
         );
     }
     drop(listener);
-    remove(ordinary);
-
-    let path = scratch("legacy-group-writable");
     let settings = path.join("settings.ini");
     let (listener, lock) = legacy_start_with_umask(&path);
     let mode = fs::metadata(path.join("instance.port"))
@@ -342,7 +423,6 @@ fn probe_a_legacy_record_created_under_umask_0002() {
         .mode();
     assert_eq!(mode & 0o777, 0o664);
     let file = path.join("note.md");
-    fs::write(&file, b"note").unwrap();
     let request = Request {
         text: Some("not for the legacy socket".into()),
         ..Request::new(file)
@@ -361,5 +441,4 @@ fn probe_a_legacy_record_created_under_umask_0002() {
     probe.set_read_timeout(Some(CONNECT)).unwrap();
     assert_eq!(probe.read(&mut [0; 1]).unwrap(), 0, "no payload");
     drop((listener, lock));
-    remove(path);
 }

@@ -76,8 +76,9 @@ The endpoint lives in `instance-v2` beside the settings, regardless of launch en
 On Linux the record and lock names carry a hash of `/etc/machine-id`, falling back to
 `/var/lib/dbus/machine-id` and then the kernel hostname. They also carry the network namespace
 inode when readable, so separate loopback namespaces do not contend. On macOS they use
-`kern.bootsessionuuid`, falling back to the hostname only if the sysctl is missing.
-Windows filenames are unchanged.
+the host UUID, with a 100 ms lookup timeout; a failed lookup uses the hostname for that
+lookup only. Windows uses MachineGuid, falling back to `COMPUTERNAME`. Discovery opens
+both locks read-only; publication opens them read/write.
 Neither end sends the key. The sender
 opens with a random 32-byte challenge `C`; the listener returns its own random 32-byte `S`
 and `HMAC-SHA256(key, 'S' || C || S)`. Only after checking that proof does the sender
@@ -181,6 +182,9 @@ mdview
    queue drops only that message. A send that discovers the public channel is closed releases
    the instance lock before closing the request socket and stopping the listener.
    If the sender disconnects after queueing, the window still receives the request.
+   The `*_guarded` listener functions return a receiver that releases its registration when
+   dropped, even if no more requests arrive. The original receiver-returning functions
+   retain their behavior.
    `single::forward` sends large file selections as batches on one authenticated connection.
    The complete selection must fit in 1 MiB, with at most 256 paths per batch. The receiver
    buffers just the path bytes until the final marker, discards incomplete or invalid

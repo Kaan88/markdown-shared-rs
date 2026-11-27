@@ -9,14 +9,22 @@ use std::fs::{File, TryLockError};
 use std::time::{Duration, Instant};
 
 pub(super) struct Registration {
-    lifetime: File,
-    _gate: File,
+    _lifetime: File,
+    gate: Option<File>,
 }
 
 impl Registration {
-    pub(super) fn publish(self, dir: &Directory, port: u16) -> Option<(File, Record)> {
+    pub(super) fn publish_held(&mut self, dir: &Directory, port: u16) -> Option<Record> {
+        self.gate.as_ref()?;
         let record = Record::publish(dir, port)?;
-        Some((self.lifetime, record))
+        drop(self.gate.take());
+        Some(record)
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish(mut self, dir: &Directory, port: u16) -> Option<(File, Record)> {
+        let record = self.publish_held(dir, port)?;
+        Some((self._lifetime, record))
     }
 }
 
@@ -43,8 +51,8 @@ pub(super) fn hold_lock(dir: &Directory, mut pause: impl FnMut(Duration)) -> Opt
         match lifetime.try_lock() {
             Ok(()) => {
                 return Some(Registration {
-                    lifetime,
-                    _gate: gate,
+                    _lifetime: lifetime,
+                    gate: Some(gate),
                 });
             }
             Err(TryLockError::WouldBlock) => {

@@ -78,8 +78,12 @@ fn win_offer(app: &App, manifest: &str, current: &Version) -> Result<Option<Offe
 
 fn files(name: &str, engine: bool) -> Files {
     let dir = std::env::temp_dir().join(format!("mdshared-updater-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&dir)
+        .unwrap();
+    #[cfg(not(unix))]
+    std::fs::create_dir(&dir).unwrap();
     let files = Files {
         app: dir.join("app.exe"),
         engine: engine.then(|| dir.join("engine.exe")),
@@ -787,6 +791,7 @@ fn an_appimage_install_locks_a_private_writable_sibling_not_the_image() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_staged_appimage_is_private_and_exclusive_before_the_first_write() {
+    let files = files("private-stage-open", false);
     // A child owns its umask; setting it here would also affect unrelated parallel tests.
     let output = std::process::Command::new("/bin/sh")
         .args(["-c", "umask 000; exec \"$@\"", "sh"])
@@ -796,14 +801,15 @@ fn the_staged_appimage_is_private_and_exclusive_before_the_first_write() {
             "--exact",
             "updater::tests::probe_the_staged_appimage_open",
         ])
+        .env("MDSHARED_TEST_STAGE_CHILD", selfupdate::staged(&files.app))
         .output()
         .unwrap();
+    std::fs::remove_dir_all(files.app.parent().unwrap()).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}"
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
 #[cfg(target_os = "linux")]
@@ -811,8 +817,14 @@ fn the_staged_appimage_is_private_and_exclusive_before_the_first_write() {
 #[ignore = "helper run under a permissive umask by the staged AppImage open test"]
 fn probe_the_staged_appimage_open() {
     use std::os::unix::fs::PermissionsExt;
-    let files = files("private-stage-open", false);
-    let staged = selfupdate::staged(&files.app);
+    let Some(staged) = std::env::var_os("MDSHARED_TEST_STAGE_CHILD").map(PathBuf::from) else {
+        return;
+    };
+    let mode = std::fs::metadata(staged.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
     let f = create_staged_appimage(&staged).unwrap();
     assert_eq!(f.metadata().unwrap().permissions().mode() & 0o777, 0o600);
     assert_eq!(f.metadata().unwrap().len(), 0);
@@ -820,8 +832,6 @@ fn probe_the_staged_appimage_open() {
         create_staged_appimage(&staged).unwrap_err().kind(),
         std::io::ErrorKind::AlreadyExists
     );
-    drop(f);
-    std::fs::remove_dir_all(files.app.parent().unwrap()).unwrap();
 }
 
 #[cfg(unix)]

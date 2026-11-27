@@ -14,6 +14,9 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Storage::FileSystem::*;
+use windows_sys::Win32::System::Registry::{
+    HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub(super) fn random() -> Option<[u8; 32]> {
@@ -28,6 +31,50 @@ pub(super) fn random() -> Option<[u8; 32]> {
         )
     } >= 0)
         .then_some(buf)
+}
+
+fn machine_guid() -> Option<String> {
+    let key: Vec<u16> = "SOFTWARE\\Microsoft\\Cryptography"
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let value: Vec<u16> = "MachineGuid".encode_utf16().chain([0]).collect();
+    let mut text = [0u16; 64]; // MachineGuid is a 36-character UUID.
+    let mut size = size_of_val(&text) as u32;
+    // SAFETY: the registry names are NUL-terminated; text is a live buffer of size bytes.
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
+            null_mut(),
+            text.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if result != ERROR_SUCCESS {
+        return None;
+    }
+    let end = text.iter().position(|&ch| ch == 0)?;
+    String::from_utf16(&text[..end]).ok()
+}
+
+fn machine_scope(guid: Option<String>, name: impl FnOnce() -> Option<String>) -> Option<String> {
+    let canonical = |s: String| s.trim().to_ascii_lowercase();
+    let guid = guid.map(canonical).filter(|s| !s.is_empty());
+    let (kind, id) = match guid {
+        Some(guid) => ("machine-guid", guid),
+        None => ("computername", canonical(name()?)),
+    };
+    (!id.is_empty()).then(|| crate::update::sha256_hex(format!("{kind}:{id}").as_bytes()))
+}
+
+pub(super) fn host_id() -> Option<&'static str> {
+    static ID: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        machine_scope(machine_guid(), || std::env::var("COMPUTERNAME").ok())
+    });
+    ID.as_deref()
 }
 
 struct Descriptor {
@@ -472,6 +519,22 @@ impl<'a> Security<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_guid_takes_precedence_over_the_computer_name() {
+        let name = || Some("shared-name".into());
+        let a = machine_scope(Some("ABC".into()), name);
+        assert_ne!(a, machine_scope(Some("DEF".into()), name));
+        assert_eq!(
+            a,
+            machine_scope(Some("abc".into()), || panic!("GUID was available"))
+        );
+        assert_eq!(
+            machine_scope(Some(" ".into()), name),
+            machine_scope(None, name)
+        );
+        assert_ne!(a, machine_scope(None, name));
+    }
 
     const USER: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 19, 0, 0, 0];
     const USERS: &[u8] = &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0];

@@ -41,33 +41,15 @@ fn system_id() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn boot_session_id() -> io::Result<Option<String>> {
-    let mut bytes = [0u8; 64];
-    let mut len = bytes.len();
-    // SAFETY: the read-only query writes at most len bytes into the live buffer.
-    let result = unsafe {
-        libc::sysctlbyname(
-            c"kern.bootsessionuuid".as_ptr(),
-            bytes.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
+fn system_id() -> Option<String> {
+    let mut id = [0u8; 16];
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
     };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    let uuid = bytes
-        .get(..len)
-        .and_then(|bytes| bytes.strip_suffix(b"\0"))
-        .filter(|uuid| !uuid.is_empty())
-        .ok_or(io::ErrorKind::InvalidData)?;
-    Ok(Some(crate::update::sha256_hex(&[b"boot:", uuid].concat())))
+    // SAFETY: gethostuuid writes a 16-byte UUID; the timeout lives through the call.
+    (unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) } == 0 && id != [0; 16])
+        .then(|| crate::update::sha256_hex(&[b"uuid:", id.as_slice()].concat()))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -103,23 +85,23 @@ pub(super) fn host_id() -> Option<&'static str> {
 #[cfg(target_os = "macos")]
 fn cached_macos_id(
     cache: &std::sync::OnceLock<String>,
-    boot: impl FnOnce() -> io::Result<Option<String>>,
+    machine: impl FnOnce() -> Option<String>,
     hostname: impl FnOnce() -> Option<String>,
-) -> Option<&str> {
+) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     if let Some(id) = cache.get() {
-        return Some(id);
+        return Some(Cow::Borrowed(id));
     }
-    let id = match boot().ok()? {
-        Some(id) => id,
-        None => hostname()?,
-    };
-    Some(cache.get_or_init(|| id))
+    if let Some(id) = machine() {
+        return Some(Cow::Borrowed(cache.get_or_init(|| id)));
+    }
+    hostname().map(Cow::Owned)
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn host_id() -> Option<&'static str> {
+pub(super) fn host_id() -> Option<std::borrow::Cow<'static, str>> {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    cached_macos_id(&ID, boot_session_id, hostname_id)
+    cached_macos_id(&ID, system_id, hostname_id)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -137,30 +119,26 @@ fn the_loopback_namespace_is_part_of_the_host_scope_when_readable() {
 
 #[cfg(all(test, target_os = "macos"))]
 #[test]
-fn a_transient_boot_session_error_does_not_use_or_cache_the_hostname() {
+fn a_host_uuid_failure_uses_the_hostname_for_one_call_only() {
+    use std::borrow::Cow;
     let cache = std::sync::OnceLock::new();
-    let no_fallback = || panic!("the sysctl was not missing");
     assert_eq!(
-        cached_macos_id(
-            &cache,
-            || Err(io::ErrorKind::Interrupted.into()),
-            no_fallback
-        ),
-        None
+        cached_macos_id(&cache, || None, || Some("host-1".into())),
+        Some(Cow::Owned("host-1".into()))
+    );
+    assert_eq!(
+        cached_macos_id(&cache, || None, || Some("host-2".into())),
+        Some(Cow::Owned("host-2".into()))
     );
     assert!(cache.get().is_none());
+    let no_fallback = || panic!("the UUID is available");
     assert_eq!(
-        cached_macos_id(&cache, || Ok(Some("boot".into())), no_fallback),
-        Some("boot")
+        cached_macos_id(&cache, || Some("uuid".into()), no_fallback),
+        Some(Cow::Borrowed("uuid"))
     );
     assert_eq!(
-        cached_macos_id(&cache, || panic!("use the cached boot id"), no_fallback),
-        Some("boot")
-    );
-    let missing = std::sync::OnceLock::new();
-    assert_eq!(
-        cached_macos_id(&missing, || Ok(None), || Some("host".into())),
-        Some("host")
+        cached_macos_id(&cache, || panic!("use cached UUID"), no_fallback),
+        Some(Cow::Borrowed("uuid"))
     );
 }
 

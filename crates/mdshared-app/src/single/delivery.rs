@@ -2,9 +2,10 @@
 //! whether it needs a filesystem check or not. A full queue refuses one message; a disconnected
 //! receiver releases registration before the client sees the failure.
 
+use super::record::{Directory, Record};
+use super::registration::Registration;
 use super::{CONNECT, Timed, connect};
 use crate::sister::Request;
-use std::fs::File;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::{Sender, TrySendError, sync_channel};
@@ -12,7 +13,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 const QUEUE: usize = 16;
-type Lifetime = Mutex<Option<File>>;
+type Lifetime = Mutex<Option<Registration>>;
 
 #[derive(Clone)]
 pub(super) struct Stop {
@@ -21,8 +22,8 @@ pub(super) struct Stop {
 }
 
 impl Stop {
-    pub(super) fn new(port: u16, lock: File) -> (Self, Arc<Lifetime>) {
-        let lifetime = Arc::new(Mutex::new(Some(lock)));
+    pub(super) fn new(port: u16, registration: Registration) -> (Self, Arc<Lifetime>) {
+        let lifetime = Arc::new(Mutex::new(Some(registration)));
         (
             Self {
                 lifetime: Arc::downgrade(&lifetime),
@@ -38,7 +39,16 @@ impl Stop {
             .is_none_or(|lock| lock.lock().unwrap().is_none())
     }
 
-    fn request(&self) {
+    pub(super) fn publish(&self, dir: &Directory) -> Option<Record> {
+        self.lifetime
+            .upgrade()?
+            .lock()
+            .unwrap()
+            .as_mut()?
+            .publish_held(dir, self.port)
+    }
+
+    pub(super) fn request(&self) {
         let Some(lifetime) = self.lifetime.upgrade() else {
             return;
         };
@@ -95,6 +105,9 @@ impl Pending {
         if writer.left().is_err() {
             return true;
         }
+        if stop.requested() {
+            return false;
+        }
         if !accepted
             .into_iter()
             .all(|request| sender.send(request).is_ok())
@@ -143,8 +156,9 @@ fn a_full_path_queue_refuses_one_message_without_stopping_the_listener() {
     let port = listener.local_addr().unwrap().port();
     let dir = std::env::temp_dir().join(format!("mdshared-path-queue-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let file = File::create_new(dir.join("lifetime")).unwrap();
-    let (stop, lifetime) = Stop::new(port, file);
+    let endpoint = Directory::open(&dir.join("private"), true).unwrap();
+    let registration = super::registration::hold_lock(&endpoint, |_| unreachable!()).unwrap();
+    let (stop, lifetime) = Stop::new(port, registration);
     let (tx, rx) = channel();
     let (entered, checking) = channel();
     let (release, gate) = channel::<()>();
@@ -192,6 +206,6 @@ fn a_full_path_queue_refuses_one_message_without_stopping_the_listener() {
         rx.recv_timeout(test_deadline).unwrap().path,
         std::path::Path::new("next")
     );
-    drop(lifetime);
+    drop((lifetime, endpoint));
     std::fs::remove_dir_all(dir).unwrap();
 }

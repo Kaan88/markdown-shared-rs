@@ -90,8 +90,9 @@ fn legacy_predecessor(settings: &Path) -> bool {
         && record::legacy_locked(&settings_dir(settings).join("instance.lock"))
 }
 
-fn wait_for_legacy(settings: &Path, end: Instant) {
-    while legacy_predecessor(settings) && retry(end, &mut std::thread::sleep) {}
+fn wait_for_legacy(settings: &Path, stop: &Stop, end: Instant) {
+    while !stop.requested() && legacy_predecessor(settings) && retry(end, &mut std::thread::sleep) {
+    }
 }
 
 /// Hands `paths` to a running instance. Large selections are sent in bounded batches,
@@ -264,6 +265,44 @@ pub fn listen(app: &str, settings: &Path) -> Option<Receiver<PathBuf>> {
     listen_waking(app, settings, || {})
 }
 
+/// A hand-over receiver that owns its registration. Dropping it releases the registration
+/// immediately, even if no more launches arrive or publication is still deferred.
+/// It borrows as an ordinary [`Receiver`], so receive and drain operations work as before.
+pub struct Listener<T> {
+    receiver: Receiver<T>,
+    registration: ListenerGuard,
+}
+
+struct ListenerGuard(Option<Stop>);
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.request();
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Listener<T> {
+    type Target = Receiver<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl<T> Listener<T> {
+    fn unmanaged(mut self) -> Receiver<T> {
+        self.registration.0.take();
+        self.receiver
+    }
+}
+
+/// [`listen`] with a receiver that releases the registration on drop.
+pub fn listen_guarded(app: &str, settings: &Path) -> Option<Listener<PathBuf>> {
+    listen_waking_guarded(app, settings, || {})
+}
+
 /// `listen`, calling `wake` from the delivery worker after each launch's paths are queued, so the
 /// shell can drain them at once instead of on a timer. What a launch asked beyond opening its
 /// files is dropped: see [`listen_requests_waking`].
@@ -272,15 +311,34 @@ pub fn listen_waking(
     settings: &Path,
     wake: impl Fn() + Send + 'static,
 ) -> Option<Receiver<PathBuf>> {
-    listen_files(app, settings, wake, Path::is_file)
+    listen_waking_guarded(app, settings, wake).map(Listener::unmanaged)
 }
 
+/// [`listen_waking`] with a receiver that releases the registration on drop.
+pub fn listen_waking_guarded(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+) -> Option<Listener<PathBuf>> {
+    listen_files_guarded(app, settings, wake, Path::is_file)
+}
+
+#[cfg(test)]
 fn listen_files(
     app: &str,
     settings: &Path,
     wake: impl Fn() + Send + 'static,
     is_file: impl Fn(&Path) -> bool + Send + 'static,
 ) -> Option<Receiver<PathBuf>> {
+    listen_files_guarded(app, settings, wake, is_file).map(Listener::unmanaged)
+}
+
+fn listen_files_guarded(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+    is_file: impl Fn(&Path) -> bool + Send + 'static,
+) -> Option<Listener<PathBuf>> {
     listen_filtered(app, settings, wake, move |request| {
         (!request.closed && is_file(&request.path)).then_some(request.path)
     })
@@ -291,14 +349,17 @@ fn listen_filtered<T: Send + 'static>(
     settings: &Path,
     wake: impl Fn() + Send + 'static,
     filter: impl Fn(Request) -> Option<T> + Send + 'static,
-) -> Option<Receiver<T>> {
+) -> Option<Listener<T>> {
     let (sender, receiver) = channel();
-    serve(
+    let stop = serve(
         app,
         settings,
         delivery::filtered(sender, wake, filter).ok()?,
     )?;
-    Some(receiver)
+    Some(Listener {
+        receiver,
+        registration: ListenerGuard(Some(stop)),
+    })
 }
 
 /// [`listen_waking`] handing over whole requests: the file and what the launch asked for it. A
@@ -311,17 +372,36 @@ pub fn listen_requests_waking(
     settings: &Path,
     wake: impl Fn() + Send + 'static,
 ) -> Option<Receiver<Request>> {
-    listen_checked_requests(app, settings, wake, |path| {
+    listen_requests_waking_guarded(app, settings, wake).map(Listener::unmanaged)
+}
+
+/// [`listen_requests_waking`] with a receiver that releases the registration on drop.
+pub fn listen_requests_waking_guarded(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+) -> Option<Listener<Request>> {
+    listen_checked_requests_guarded(app, settings, wake, |path| {
         path.metadata().is_ok_and(|m| m.is_file() || m.is_dir())
     })
 }
 
+#[cfg(test)]
 fn listen_checked_requests(
     app: &str,
     settings: &Path,
     wake: impl Fn() + Send + 'static,
     exists: impl Fn(&Path) -> bool + Send + 'static,
 ) -> Option<Receiver<Request>> {
+    listen_checked_requests_guarded(app, settings, wake, exists).map(Listener::unmanaged)
+}
+
+fn listen_checked_requests_guarded(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+    exists: impl Fn(&Path) -> bool + Send + 'static,
+) -> Option<Listener<Request>> {
     listen_filtered(app, settings, wake, move |request| {
         (request.doc.is_some() || request.closed || request.unplace || exists(&request.path))
             .then_some(request)
@@ -335,6 +415,15 @@ pub fn listen_unresolved_requests_waking(
     settings: &Path,
     wake: impl Fn() + Send + 'static,
 ) -> Option<Receiver<Request>> {
+    listen_unresolved_requests_waking_guarded(app, settings, wake).map(Listener::unmanaged)
+}
+
+/// [`listen_unresolved_requests_waking`] with registration released on receiver drop.
+pub fn listen_unresolved_requests_waking_guarded(
+    app: &str,
+    settings: &Path,
+    wake: impl Fn() + Send + 'static,
+) -> Option<Listener<Request>> {
     listen_filtered(app, settings, wake, Some)
 }
 
@@ -366,29 +455,32 @@ fn serve(
     app: &str,
     settings: &Path,
     dispatch: impl Fn(Pending, &Stop) -> bool + Send + 'static,
-) -> Option<()> {
+) -> Option<Stop> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
     let port = listener.local_addr().ok()?.port();
     let dir = directory(settings, true)?;
     let registration = hold_lock(&dir, std::thread::sleep)?;
+    let (stop, lifetime) = Stop::new(port, registration);
+    let running = stop.clone();
     let app = app.to_string();
-    let run = move |record, (lock, _dir): (File, Directory)| {
-        let (stop, _lifetime) = Stop::new(port, lock);
-        receive(listener, &app, record, &stop, dispatch);
+    let run = move |record, _dir: Directory| {
+        let _lifetime = lifetime;
+        receive(listener, &app, record, &running, dispatch);
     };
     let start = if legacy_predecessor(settings) {
         let settings = settings.to_owned();
+        let pending = stop.clone();
         std::thread::Builder::new().spawn(move || {
-            wait_for_legacy(&settings, Instant::now() + LEGACY_DEFER);
-            if let Some((lock, record)) = registration.publish(&dir, port) {
-                run(record, (lock, dir));
+            wait_for_legacy(&settings, &pending, Instant::now() + LEGACY_DEFER);
+            if let Some(record) = pending.publish(&dir) {
+                run(record, dir);
             }
         })
     } else {
-        let (lock, record) = registration.publish(&dir, port)?;
-        std::thread::Builder::new().spawn(move || run(record, (lock, dir)))
+        let record = stop.publish(&dir)?;
+        std::thread::Builder::new().spawn(move || run(record, dir))
     };
-    start.ok().map(|_| ())
+    start.ok().map(|_| stop)
 }
 
 fn accept_next<T>(
