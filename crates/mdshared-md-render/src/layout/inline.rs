@@ -6,7 +6,13 @@ use super::pager::Pager;
 use super::store::Found;
 use crate::theme::Color;
 use mdshared_md_core::model::{BlockKind, ImageAlign, SpanKind};
+use std::cmp::Reverse;
 use std::ops::Range;
+
+#[cfg(test)]
+thread_local! {
+    static STYLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Style {
@@ -189,25 +195,13 @@ impl Inline {
     /// The document offset for an inline byte offset, or `None` for text the renderer invented
     /// (a list marker, a language label, an alert title) that is not part of the document.
     pub(super) fn doc_at(&self, at: usize) -> Option<u32> {
-        let mut last = None;
-        for (range, origin, fixed) in &self.origins {
-            if at < range.start {
-                continue;
-            }
-            if at < range.end {
-                return Some(if *fixed {
-                    *origin
-                } else {
-                    origin + (at - range.start) as u32
-                });
-            }
-            last = Some(if *fixed {
-                *origin
-            } else {
-                origin + range.len() as u32
-            });
-        }
-        last
+        let n = self.origins.partition_point(|(r, _, _)| r.start <= at);
+        let (range, origin, fixed) = self.origins[..n].last()?;
+        Some(if *fixed {
+            *origin
+        } else {
+            origin + (at.min(range.end) - range.start) as u32
+        })
     }
 
     /// The inline byte offset for a document offset, the inverse of [`doc_at`](Self::doc_at). An
@@ -232,9 +226,10 @@ impl Inline {
     }
 
     pub(super) fn style_at(&self, at: usize) -> Style {
+        let i = self.runs.partition_point(|(range, _)| range.end <= at);
         self.runs
-            .iter()
-            .find(|(range, _)| range.start <= at && at < range.end)
+            .get(i)
+            .filter(|(range, _)| range.start <= at)
             .map_or(Style::default(), |(_, style)| *style)
     }
 }
@@ -284,18 +279,26 @@ impl<'a, 'b> Pager<'a, 'b> {
         // A note's base is the text between the previous note (or the start of its `<ruby>`) and
         // the note. A note with no base to sit over is ordinary small text.
         let mut bases: Vec<(usize, usize, usize)> = Vec::new();
+        let order = |&(start, end): &(usize, usize)| (start, Reverse(end));
+        rubies.sort_unstable_by_key(order);
+        notes.sort_unstable_by_key(order);
+        let mut ends: Vec<_> = notes.iter().map(|&(_, stop)| stop).collect();
+        ends.sort_unstable();
+        let mut rubies = rubies.into_iter().peekable();
+        let mut enclosing = Vec::new();
         for &(start, stop) in &notes {
-            let ruby = rubies
-                .iter()
-                .filter(|&&(from, to)| from <= start && stop <= to)
-                .min_by_key(|&&(from, to)| to - from);
-            let from = ruby.map(|&(from, _)| {
-                notes
-                    .iter()
-                    .map(|&(_, previous)| previous)
-                    .filter(|&previous| previous <= start && previous > from)
-                    .max()
-                    .unwrap_or(from)
+            while let Some(ruby) = rubies.next_if(|r| order(r) <= order(&(start, stop))) {
+                while enclosing.last().is_some_and(|&(_, end)| end <= ruby.0) {
+                    enclosing.pop();
+                }
+                enclosing.push(ruby);
+            }
+            while enclosing.last().is_some_and(|&(_, end)| end < stop) {
+                enclosing.pop();
+            }
+            let from = enclosing.last().map(|&(from, _)| {
+                let n = ends.partition_point(|&end| end <= start);
+                from.max(ends[..n].last().copied().unwrap_or(0))
             });
             match from {
                 Some(from) if from < start => {
@@ -305,10 +308,17 @@ impl<'a, 'b> Pager<'a, 'b> {
                 _ => spans.push((start, stop, SpanKind::Small)),
             }
         }
-        let hidden: Vec<(usize, usize)> = bases
-            .iter()
-            .map(|&(_, start, stop)| (start, stop))
-            .collect();
+        math_ranges.extend(bases.iter().map(|&(_, start, stop)| (start, stop)));
+        math_ranges.sort_unstable();
+        let mut hidden = math_ranges.into_iter().peekable();
+        let mut hidden_end = 0;
+        // Preserve the order of atoms sharing a byte. Visit wrappers outermost first;
+        // each active entry saves the combined style, so closing it costs one pop.
+        atoms.sort_by_key(|&(start, _, _)| start);
+        let mut atoms = atoms.into_iter().peekable();
+        spans.sort_by_key(|&(start, stop, _)| (start, Reverse(stop)));
+        let mut spans = spans.into_iter().peekable();
+        let mut active = Vec::new();
         cuts.sort_unstable();
         cuts.dedup();
         // The inline text length at each cut, to turn a note's document range into a byte range.
@@ -317,10 +327,8 @@ impl<'a, 'b> Pager<'a, 'b> {
         for i in 0..cuts.len() {
             let at = cuts[i];
             at_inline.push((at, out.text.len()));
-            for (position, end, kind) in &atoms {
-                if *position == at {
-                    self.push_atom(&mut out, *kind, *position as u32, *end as u32);
-                }
+            while let Some((position, end, kind)) = atoms.next_if(|a| a.0 == at) {
+                self.push_atom(&mut out, kind, position as u32, end as u32);
             }
             if i + 1 == cuts.len() {
                 continue;
@@ -329,14 +337,24 @@ impl<'a, 'b> Pager<'a, 'b> {
             if to <= at {
                 continue;
             }
-            if math_ranges
-                .iter()
-                .chain(&hidden)
-                .any(|(start, end)| at >= *start && at < *end)
-            {
+            while active.last().is_some_and(|&(end, _)| end <= at) {
+                active.pop();
+            }
+            let mut style = active.last().map_or(Style::default(), |&(_, style)| style);
+            while let Some((_, end, kind)) = spans.next_if(|s| {
+                #[cfg(test)]
+                STYLE_VISITS.set(STYLE_VISITS.get() + 1);
+                s.0 == at
+            }) {
+                self.apply_style(&mut style, kind);
+                active.push((end, style));
+            }
+            while let Some((_, end)) = hidden.next_if(|h| h.0 == at) {
+                hidden_end = hidden_end.max(end);
+            }
+            if at < hidden_end {
                 continue;
             }
-            let mut style = self.style_at(&spans, at);
             style.bold |= term;
             style.caption = caption;
             out.push_doc(&src[at - base..to - base], style, at as u32);
@@ -344,8 +362,7 @@ impl<'a, 'b> Pager<'a, 'b> {
         for (from, start, stop) in bases {
             let inline_at = |doc: usize| {
                 at_inline
-                    .iter()
-                    .find(|&&(at, _)| at >= doc)
+                    .get(at_inline.partition_point(|&(at, _)| at < doc))
                     .map_or(out.text.len(), |&(_, inline)| inline)
             };
             let range = inline_at(from)..inline_at(start);
@@ -379,37 +396,30 @@ impl<'a, 'b> Pager<'a, 'b> {
         }
     }
 
-    pub(super) fn style_at(&self, spans: &[(usize, usize, SpanKind)], at: usize) -> Style {
-        let mut style = Style::default();
-        for (start, stop, kind) in spans {
-            if *start > at || at >= *stop {
-                continue;
+    fn apply_style(&self, style: &mut Style, kind: SpanKind) {
+        match kind {
+            SpanKind::Emphasis => style.italic = true,
+            SpanKind::Strong => style.bold = true,
+            SpanKind::Strike => style.strike = true,
+            SpanKind::Underline => style.underline = true,
+            SpanKind::Code => style.code = true,
+            SpanKind::Kbd => style.kbd = true,
+            SpanKind::Sub => style.sub = true,
+            SpanKind::Sup => style.sup = true,
+            SpanKind::Mark => style.mark = true,
+            SpanKind::Small => style.small = true,
+            SpanKind::Abbr(_) => style.abbr = true,
+            SpanKind::Link(index) => {
+                style.link = true;
+                style.broken = self
+                    .doc
+                    .links
+                    .get(index as usize)
+                    .is_some_and(|l| l.missing);
             }
-            match kind {
-                SpanKind::Emphasis => style.italic = true,
-                SpanKind::Strong => style.bold = true,
-                SpanKind::Strike => style.strike = true,
-                SpanKind::Underline => style.underline = true,
-                SpanKind::Code => style.code = true,
-                SpanKind::Kbd => style.kbd = true,
-                SpanKind::Sub => style.sub = true,
-                SpanKind::Sup => style.sup = true,
-                SpanKind::Mark => style.mark = true,
-                SpanKind::Small => style.small = true,
-                SpanKind::Abbr(_) => style.abbr = true,
-                SpanKind::Link(index) => {
-                    style.link = true;
-                    style.broken = self
-                        .doc
-                        .links
-                        .get(*index as usize)
-                        .is_some_and(|l| l.missing);
-                }
-                SpanKind::Math { display: false, .. } => style.math = true,
-                _ => {}
-            }
+            SpanKind::Math { display: false, .. } => style.math = true,
+            _ => {}
         }
-        style
     }
 
     pub(super) fn push_atom(&mut self, out: &mut Inline, kind: SpanKind, at: u32, end: u32) {
@@ -603,6 +613,41 @@ impl<'a, 'b> Pager<'a, 'b> {
         }
         for child in self.doc.children(b) {
             self.collect_leaves(child, out);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn inline_conversion_checks_a_linear_number_of_span_boundaries() {
+    use super::{DocumentRenderer, Options};
+    for n in [512, 1024] {
+        let doc = mdshared_md_core::parse(&"*a **b** c* ".repeat(n));
+        let mut renderer = DocumentRenderer::new();
+        let options = Options::light();
+        let mut pager = Pager::new(
+            &doc,
+            &options,
+            &mut renderer.fonts,
+            &mut renderer.layouts,
+            false,
+            &mut renderer.store,
+            &renderer.details,
+            None,
+        );
+        STYLE_VISITS.set(0);
+        let inline = pager.inline_of(0);
+        let visits = STYLE_VISITS.get();
+        assert!(
+            (2 * n..=6 * n).contains(&visits),
+            "{visits} checks for {n} groups"
+        );
+        for i in 0..n {
+            let at = i * 6;
+            assert!(inline.style_at(at).italic);
+            assert!(inline.style_at(at + 2).bold);
+            assert!(!inline.style_at(at + 4).bold);
+            assert!(!inline.style_at(at + 5).italic);
         }
     }
 }

@@ -5,6 +5,7 @@
 use super::floats::{Float, band};
 use super::hit::{FloatBox, LineGeom, SourceBox, TaskBox};
 use super::inline::{ImageBox, Inline, RubyNote, Style};
+use super::media::ImageUse;
 use super::paint::Paint;
 use super::store::{Found, ImageStore};
 use super::{BlockBox, Code, Gap, Options, Source, SourceKind};
@@ -16,7 +17,7 @@ use parley::{
     InlineBox, InlineBoxKind, Layout, LayoutContext, LineHeight, OverflowWrap,
     PositionedLayoutItem, StyleProperty, TextWrapMode, VerticalAlign,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -74,6 +75,8 @@ pub(super) struct Pager<'a, 'b> {
     pub(super) provisional: bool,
     /// Store ids the pass looked up, so an arrival can find the blocks that use it.
     pub(super) used: Vec<u32>,
+    /// Membership in `used`, without scanning the ids in document order.
+    pub(super) used_ids: HashSet<ImageUse>,
     /// Document ranges of formulas and diagrams the engine could not draw, whose source the page
     /// shows instead. Find needs them: it skips source that a picture stands for.
     pub(super) undrawn: Vec<(u32, u32)>,
@@ -150,6 +153,7 @@ impl<'a, 'b> Pager<'a, 'b> {
             allow: true,
             provisional: false,
             used: Vec::new(),
+            used_ids: HashSet::new(),
             undrawn: Vec::new(),
             wrap: None,
             floats: Vec::new(),

@@ -121,10 +121,22 @@ there is nothing to remove. It cannot know which inode an earlier process retire
 `.old` the rule is the file's kind and owner, not its identity.
 
 These tests are Linux-only: type-checked from Windows and run by CI on Linux, not on a
-desktop. No live AppImage was run or updated, and no NFS mount was tested. In particular the
-runtime's descriptors and the numbers `statvfs` reports were written from the Type 2 runtime's
-and squashfuse's sources, not observed: if a real launch differs, the checks fail closed and
-the update bar does not appear.
+desktop. One real run was made on 2026-11-27 (Debian 13 x86_64 VM; an image built with
+appimagetool continuous build 370, Type 2 runtime, squashfs 4, laid out like mdview's `AppRun`,
+`usr/bin`, `../lib`):
+
+- A mounted launch was accepted for self-update, and the squashfs geometry matched `fstatvfs`
+  exactly (3 blocks, 10 inodes on both sides). `--appimage-extract-and-run` was accepted, and so
+  was a renamed copy.
+- The inner binary run directly with `APPIMAGE` set (also with `APPDIR` set, and inside a live
+  `--appimage-mount`) was refused.
+- A full local install, mounted and extract-and-run: the new image was swapped in, `.old` kept
+  and `.lck` (0 bytes, 0600) left. The next launch removed `.old` and kept `.lck`. A stale `.new`
+  of the account was removed and a `.old` symlink left alone.
+- The single-instance hand-over between two processes of the same image was delivered.
+
+Not covered: the real mdview and mdedit images (built in an Ubuntu 20.04 container), an update
+downloaded from a published release, NFS, and a launch from a desktop entry.
 
 ## Window shadow (`mdshared_ui::shadow`)
 

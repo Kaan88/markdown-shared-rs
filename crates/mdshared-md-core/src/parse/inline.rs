@@ -201,6 +201,13 @@ impl<'a> Builder<'a> {
         if self.open_alert.is_some() {
             self.alert_content = true;
         }
+        if origin == Origin::Md && self.md_span_depth >= crate::limits::MAX_MD_SPAN_DEPTH {
+            self.push_open(Open {
+                node: Node::Nothing,
+                origin,
+            });
+            return NONE;
+        }
         let at = self.doc.text.len() as u32;
         let idx = self.doc.spans.len() as u32;
         self.doc.spans.push(Span {
