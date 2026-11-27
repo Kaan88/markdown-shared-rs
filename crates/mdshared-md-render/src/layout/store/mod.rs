@@ -23,7 +23,7 @@ use crate::engine;
 use crate::image::{self, DecodedImage};
 use mdshared_md_core::limits::{ANIMATION_BYTES, MAX_ANIMATION_KEPT_BYTES, MAX_ANIMATION_PIXELS};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -56,6 +56,31 @@ pub(super) enum ImageKey {
         scale: u32,
         dark: bool,
     },
+}
+
+#[derive(Clone, Copy, Eq)]
+#[cfg_attr(not(test), derive(PartialEq, Hash))]
+struct QueuedUrl(u32);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static QUEUE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl PartialEq for QueuedUrl {
+    fn eq(&self, other: &Self) -> bool {
+        QUEUE_PROBES.set(QUEUE_PROBES.get() + 1);
+        self.0 == other.0
+    }
+}
+
+#[cfg(test)]
+impl std::hash::Hash for QueuedUrl {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        QUEUE_PROBES.set(QUEUE_PROBES.get() + 1);
+        self.0.hash(state);
+    }
 }
 
 /// Where an entry stands.
@@ -192,7 +217,8 @@ pub(super) struct ImageStore {
     clock: u64,
     stats: ImageStats,
     /// Remote URLs looked up while nobody had decided about them, oldest first, without repeats.
-    remote_new: Vec<String>,
+    remote_new: Vec<QueuedUrl>,
+    remote_queued: HashSet<QueuedUrl>,
     play: Playback,
 }
 
@@ -207,6 +233,7 @@ impl ImageStore {
             clock: 1,
             stats: ImageStats::default(),
             remote_new: Vec::new(),
+            remote_queued: HashSet::new(),
             play: Playback {
                 enabled: false,
                 waker: None,
@@ -340,12 +367,9 @@ impl ImageStore {
             if let Some(anim) = entry.anim.take() {
                 self.release(id, anim);
             }
-            let entry = &mut self.entries[id as usize];
             // A remote image cannot be loaded again here: it goes back to the shell's queue.
-            if let ImageKey::Remote(url) = &entry.key
-                && !self.remote_new.contains(url)
-            {
-                self.remote_new.push(url.clone());
+            if matches!(self.entries[id as usize].key, ImageKey::Remote(_)) {
+                self.queue_remote(id);
             }
         }
     }
@@ -430,10 +454,17 @@ impl ImageStore {
     pub(super) fn remote(&mut self, url: &str, ask: bool) -> (u32, Found) {
         let id = self.intern(ImageKey::Remote(url.to_string()));
         let found = self.found(id);
-        if ask && matches!(found, Found::Unknown) && !self.remote_new.iter().any(|u| u == url) {
-            self.remote_new.push(url.to_string());
+        if ask && matches!(found, Found::Unknown) {
+            self.queue_remote(id);
         }
         (id, found)
+    }
+
+    fn queue_remote(&mut self, id: u32) {
+        let queued = QueuedUrl(id);
+        if self.remote_queued.insert(queued) {
+            self.remote_new.push(queued);
+        }
     }
 
     pub(super) fn math(
@@ -478,7 +509,9 @@ impl ImageStore {
     /// whether anything changed.
     pub(super) fn set_remote(&mut self, url: &str, slot: Slot, density: f32) -> (u32, bool) {
         let id = self.intern(ImageKey::Remote(url.to_string()));
-        self.remote_new.retain(|u| u != url);
+        if self.remote_queued.remove(&QueuedUrl(id)) {
+            self.remote_new.retain(|queued| queued.0 != id);
+        }
         let same = matches!(
             (&self.entries[id as usize].slot, &slot),
             (Slot::Failed, Slot::Failed)
@@ -503,6 +536,16 @@ impl ImageStore {
     /// Remote URLs met since the last call that nobody has decided about.
     pub(super) fn take_remote(&mut self) -> Vec<String> {
         std::mem::take(&mut self.remote_new)
+            .into_iter()
+            .filter_map(|queued| {
+                // A small batch should not clear every bucket left over from a large one.
+                self.remote_queued.remove(&queued);
+                match &self.entries[queued.0 as usize].key {
+                    ImageKey::Remote(url) => Some(url.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 }
 
@@ -585,3 +628,6 @@ fn load_key(key: &ImageKey, stats: &mut ImageStats) -> (Option<DecodedImage>, f3
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

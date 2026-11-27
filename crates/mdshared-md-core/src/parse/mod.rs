@@ -209,6 +209,10 @@ struct Builder<'a> {
     counted: u32,
     doc: Document,
     stack: Vec<Open>,
+    md_span_depth: usize,
+    // At each truncation, the prefix of anchors already present must land no later
+    // than the new end. Apply those limits in one backward pass at the end.
+    anchor_cuts: Vec<(usize, u32)>,
     cur_block: u32,
     cur_span: u32,
     inline_open: bool,
@@ -316,6 +320,8 @@ impl<'a> Builder<'a> {
                 ..Document::default()
             },
             stack: Vec::with_capacity(32),
+            md_span_depth: 0,
+            anchor_cuts: Vec::new(),
             cur_block: NONE,
             cur_span: NONE,
             inline_open: false,
@@ -832,10 +838,13 @@ impl<'a> Builder<'a> {
             self.close(open);
         }
         let mut doc = self.doc;
-        let last = doc.blocks.len().saturating_sub(1) as u32;
-        doc.anchors
-            .iter_mut()
-            .for_each(|a| a.block = a.block.min(last));
+        let mut last = doc.blocks.len().saturating_sub(1) as u32;
+        for (i, anchor) in doc.anchors.iter_mut().enumerate().rev() {
+            while let Some((_, limit)) = self.anchor_cuts.pop_if(|cut| cut.0 > i) {
+                last = last.min(limit);
+            }
+            anchor.block = anchor.block.min(last);
+        }
         if doc.blocks.is_empty() {
             doc.anchors.clear();
         }
@@ -854,5 +863,61 @@ impl<'a> Builder<'a> {
             .zip(self.task_events)
             .and_then(|(source, events)| source.resolve(self.src, &doc, events));
         Parsed { doc, tasks }
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_block_drops_leave_one_deferred_anchor_cut() {
+        let mut wiki = |_: &str, _: bool| WikiAs::Text;
+        let mut b = Builder::new("", false, false, Front::default(), None, &mut wiki);
+        for _ in 0..512 {
+            let id = b.open_block(BlockKind::Paragraph { align: Align::None }, Origin::Auto);
+            b.doc.anchors.push(Anchor {
+                name: StrRef::default(),
+                block: id + 1,
+            });
+            b.pop_open();
+            b.finish_block(id);
+            assert_eq!(b.anchor_cuts.as_slice(), &[(b.doc.anchors.len(), id)]);
+        }
+        // No anchor has been rewritten, not even the earliest. When block indices
+        // are reused below, the deferred cut still applies only to the old anchors.
+        assert!(b.doc.anchors.iter().all(|a| a.block == 1));
+        for _ in 0..2 {
+            let id = b.open_block(BlockKind::Plain, Origin::Md);
+            b.pop_open();
+            b.finish_block(id);
+        }
+        b.doc.anchors.push(Anchor {
+            name: StrRef::default(),
+            block: 1,
+        });
+        let doc = b.into_document().doc;
+        assert!(doc.anchors[..512].iter().all(|a| a.block == 0));
+        assert_eq!(doc.anchors[512].block, 1);
+    }
+
+    #[test]
+    fn markdown_span_depth_is_bounded_and_closers_stay_balanced() {
+        let depth = crate::limits::MAX_MD_SPAN_DEPTH;
+        let doc = parse(&format!(
+            "{}x{} *after*",
+            "*a _b ".repeat(depth),
+            " c_ d*".repeat(depth)
+        ));
+        let x = doc.text.find('x').unwrap() as u32;
+        let wrappers = doc
+            .spans
+            .iter()
+            .filter(|s| s.start <= x && x < s.end)
+            .count();
+        assert_eq!(wrappers, depth);
+        let html = crate::rich::selection_html(&doc, 0, doc.text.len() as u32).unwrap();
+        assert_eq!(html.matches("<em>").count(), depth + 1);
+        assert!(html.ends_with(" <em>after</em></p>"));
     }
 }
