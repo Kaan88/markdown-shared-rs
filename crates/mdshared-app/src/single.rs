@@ -37,20 +37,20 @@ fn settings_dir(settings: &Path) -> &Path {
 }
 
 fn private_dir(settings: &Path) -> PathBuf {
-    settings_dir(settings).join("instance-v2")
+    record::endpoint_path(settings_dir(settings))
 }
 
 fn directory(settings: &Path, create: bool) -> Option<Directory> {
     if create {
         fs::create_dir_all(settings_dir(settings)).ok()?;
     }
-    Directory::open(&private_dir(settings), create)
+    record::open_endpoint(settings_dir(settings), create)
 }
 
 /// Where the authenticated listener records its port, in a directory separate from the
-/// legacy decimal port file. On Linux the filename is scoped to the hostname.
+/// legacy decimal port file. Linux and macOS prefer private, host-local storage.
 pub fn port_file(settings: &Path) -> PathBuf {
-    private_dir(settings).join(record::local_name(record::PORT).as_ref())
+    private_dir(settings).join(record::PORT)
 }
 
 fn connect(port: u16, timeout: Duration) -> io::Result<TcpStream> {
@@ -89,16 +89,10 @@ fn wait_for_legacy(settings: &Path, end: Instant) {
     while legacy_predecessor(settings) && retry(end, &mut std::thread::sleep) {}
 }
 
-/// Hands `paths` to an already running instance. True when one answered, so the caller can exit.
+/// Hands `paths` to a running instance in bounded batches. True when all batches were
+/// acknowledged. If a later batch fails, earlier acknowledged batches are not sent again.
 pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
-    let mut message = format!("{app}\n");
-    for path in paths {
-        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
-        message.push_str(&absolute.display().to_string());
-        message.push('\n');
-    }
-    message.push('\n');
-    send(settings, message.as_bytes())
+    wire::send_paths(app, paths, |message| send(settings, message))
 }
 
 /// [`forward`] for a file with a place to show: see [`Request::encode`] for the payload.

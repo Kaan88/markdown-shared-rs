@@ -9,12 +9,13 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::PathBuf;
 
 const NOFOLLOW_NONBLOCK: c_int = libc::O_NOFOLLOW | libc::O_NONBLOCK;
 
-/// The Linux kernel hostname, as bytes rather than an environment override.
 #[cfg(target_os = "linux")]
-pub(super) fn hostname() -> Option<Vec<u8>> {
+fn hostname() -> Option<Vec<u8>> {
     let mut name = [0u8; 65]; // Linux reserves up to 64 bytes plus the terminator.
     // SAFETY: the buffer is writable and its exact length is passed to gethostname.
     if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
@@ -22,6 +23,176 @@ pub(super) fn hostname() -> Option<Vec<u8>> {
     }
     let name = name.split(|&b| b == 0).next()?;
     (!name.is_empty()).then(|| name.to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_host_id(
+    machine: Option<&[u8]>,
+    hostname: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<String> {
+    let machine = machine.map(<[u8]>::trim_ascii).filter(|id| {
+        id.len() == 32 && id.iter().all(u8::is_ascii_hexdigit) && id.iter().any(|&b| b != b'0')
+    });
+    let key = match machine {
+        Some(id) => [b"machine:", id].concat(),
+        None => [b"hostname:", hostname()?.as_slice()].concat(),
+    };
+    Some(crate::update::sha256_hex(&key))
+}
+
+#[cfg(target_os = "linux")]
+fn host_id() -> Option<&'static str> {
+    use std::sync::LazyLock;
+    static ID: LazyLock<Option<String>> =
+        LazyLock::new(|| linux_host_id(std::fs::read("/etc/machine-id").ok().as_deref(), hostname));
+    ID.as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_temp() -> Option<PathBuf> {
+    // SAFETY: A null buffer and zero length ask confstr for the required size.
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0; size];
+    // SAFETY: buf is writable for size bytes and confstr cannot write beyond that size.
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written == 0 || written > size {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&buf[..written - 1])))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn private_runtime(path: PathBuf) -> Option<(PathBuf, Directory)> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let path: PathBuf = path.components().collect();
+    let dir = Directory::open(&path, false)?;
+    Some((path, dir))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn a_private_runtime_root_separates_hosts_and_coalesces_settings_aliases() {
+    use crate::single::registration::{Discovery, discover, hold_lock};
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let path = std::env::temp_dir().join(format!("mdshared-runtime-roots-{}", std::process::id()));
+    fs::create_dir(&path).unwrap();
+    let settings = path.join("settings");
+    let alias = path.join("alias");
+    fs::create_dir(&settings).unwrap();
+    symlink(&settings, &alias).unwrap();
+    let root_a = path.join("runtime-a");
+    let root_b = path.join("runtime-b");
+    drop(Directory::open(&root_a, true).unwrap());
+    drop(Directory::open(&root_b, true).unwrap());
+    let test_location = |settings: &Path, root| {
+        location(settings, private_runtime(root), || {
+            panic!("use the private runtime")
+        })
+        .unwrap()
+    };
+    let (first, root) = test_location(&settings, root_a.clone());
+    let a = root
+        .unwrap()
+        .subdir(first.file_name().unwrap(), true)
+        .unwrap();
+    let (same, _) = test_location(&alias, root_a.clone());
+    let (second, root) = test_location(&settings, root_b);
+    let b = root
+        .unwrap()
+        .subdir(second.file_name().unwrap(), true)
+        .unwrap();
+    assert_eq!(first, same);
+    assert_ne!(first, second);
+    let (lock, _) = hold_lock(&a, |_| panic!("no contention"))
+        .unwrap()
+        .publish(&a, 12345)
+        .unwrap();
+    assert!(matches!(discover(&a), Discovery::Ready(record) if record.port == 12345));
+    assert!(matches!(discover(&b), Discovery::Absent));
+    assert!(hold_lock(&a, |_| panic!("already listening")).is_none());
+    assert!(hold_lock(&b, |_| panic!("different host storage")).is_some());
+    drop((lock, a, b));
+
+    fs::set_permissions(&root_a, fs::Permissions::from_mode(0o755)).unwrap();
+    let (fallback, root) =
+        location(&settings, private_runtime(root_a), || Some("stable-id")).unwrap();
+    assert!(root.is_none());
+    assert_eq!(fallback, settings.join("instance-v2-stable-id"));
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn machine_id_survives_a_rename_and_distinguishes_hosts_with_the_same_name() {
+    let a = b"87654321098765432109876543210987\n";
+    let b = b"12345678901234567890123456789012\n";
+    let host = || Some(b"same-name".to_vec());
+    assert_eq!(
+        linux_host_id(Some(a), host),
+        linux_host_id(Some(a), || Some(b"renamed".to_vec()))
+    );
+    assert_ne!(linux_host_id(Some(a), host), linux_host_id(Some(b), host));
+    assert_eq!(linux_host_id(Some(b"bad"), host), linux_host_id(None, host));
+}
+
+#[cfg(target_os = "linux")]
+fn runtime() -> Option<(PathBuf, Directory)> {
+    private_runtime(std::env::var_os("XDG_RUNTIME_DIR")?.into())
+}
+
+#[cfg(target_os = "macos")]
+fn runtime() -> Option<(PathBuf, Directory)> {
+    darwin_temp()
+        .and_then(private_runtime)
+        .or_else(|| private_runtime(std::env::var_os("TMPDIR")?.into()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn location(
+    settings: &Path,
+    runtime: Option<(PathBuf, Directory)>,
+    host: impl FnOnce() -> Option<&'static str>,
+) -> Option<(PathBuf, Option<Directory>)> {
+    if let Some((root, dir)) = runtime {
+        let key = crate::update::sha256_hex(settings.canonicalize().ok()?.as_os_str().as_bytes());
+        return Some((root.join(format!("mdshared-instance-v2-{key}")), Some(dir)));
+    }
+    Some((settings.join(format!("instance-v2-{}", host()?)), None))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn local_location(settings: &Path) -> Option<(PathBuf, Option<Directory>)> {
+    #[cfg(target_os = "linux")]
+    return location(settings, runtime(), host_id);
+    #[cfg(target_os = "macos")]
+    location(settings, runtime(), || None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::single) fn endpoint_path(settings: &Path) -> PathBuf {
+    local_location(settings).map_or_else(|| settings.join("instance-v2"), |(path, _)| path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(in crate::single) fn open_endpoint(settings: &Path, create: bool) -> Option<Directory> {
+    let (path, root) = local_location(settings)?;
+    match root {
+        Some(root) => root.subdir(path.file_name()?, create),
+        None => Directory::open(&path, create),
+    }
 }
 
 pub(super) fn random() -> Option<[u8; 32]> {
@@ -86,10 +257,27 @@ impl Directory {
         {
             return None;
         }
-        let file = open_path(path).ok()?;
+        Self::checked(open_path(path).ok()?)
+    }
+
+    fn checked(file: File) -> Option<Self> {
         let meta = file.metadata().ok()?;
         (meta.is_dir() && owned(&meta) && meta.mode() & 0o777 == 0o700 && no_grants(&file))
             .then_some(Self(file))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn subdir(&self, name: &OsStr, create: bool) -> Option<Self> {
+        if create {
+            let name = name_to_c(name).ok()?;
+            // SAFETY: the base directory is pinned and name is a single C path component.
+            if unsafe { libc::mkdirat(self.0.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+            {
+                return None;
+            }
+        }
+        Self::checked(self.child(name, libc::O_RDONLY | libc::O_DIRECTORY).ok()?)
     }
 
     fn child(&self, name: &OsStr, flags: c_int) -> io::Result<File> {

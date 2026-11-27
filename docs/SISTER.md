@@ -64,7 +64,7 @@ A bad value (`--line 0`, `--place 1,2,3`) is dropped, not guessed at. `Rect::par
 ## The wire format
 
 **Connection authentication.** The listener holds an exclusive lock and publishes a fresh
-record in `instance-v2` beside the settings. `instance-v2/instance.port` holds a two-byte
+`instance.port` record in the private endpoint directory. It holds a two-byte
 big-endian port followed by 32 random key bytes. Lookups verify the private directory and
 the opened file handles; they do not follow file links. A second lock guards publication:
 senders briefly retry discovery while a listener is publishing, rather than using a record
@@ -72,8 +72,11 @@ from a previous launch. Unix checks the effective-user
 owner and requires a 0700 directory with no group/other access to the files. macOS also
 checks the extended ACL on the handles and refuses allow entries even with mode 0600.
 Windows rejects reparse points and requires the user SID and a protected owner-only ACL.
-On Linux the record and both locks have the kernel hostname appended to their names, so
-hosts sharing a settings directory do not contend for or contact each other's loopback listener.
+On Linux, an owner-private `$XDG_RUNTIME_DIR` holds the endpoint directory, keyed by a hash
+of the canonical settings directory. Without that runtime directory the endpoint lives beside
+the settings, scoped by `/etc/machine-id` or, if unavailable, the kernel hostname. macOS uses
+the private per-user temporary directory (or a verified `$TMPDIR`), also keyed by the settings
+directory. Windows still uses `instance-v2` beside the settings.
 Neither end sends the key. The sender
 opens with a random 32-byte challenge `C`; the listener returns its own random 32-byte `S`
 and `HMAC-SHA256(key, 'S' || C || S)`. Only after checking that proof does the sender
@@ -81,7 +84,11 @@ write `HMAC-SHA256(key, 'C' || C || S)` and the message below. No paths or live 
 a reused port. Unauthenticated input is discarded before paths are inspected.
 
 Both peers must support this handshake. `alive` can use the legacy lock on Windows or a bare
-connection to a legacy decimal port on Unix. An owner-only Unix settings directory may contain
+connection to a legacy decimal port on Unix. Windows accepts the current user's legacy files
+or files owned by Administrators when that group is the token's default owner. Other users
+may have read access but not write or control access; SYSTEM and local administrators are
+already privileged. The v2 directory and files still require a protected, user-only ACL.
+An owner-only Unix settings directory may contain
 a legacy port file made group-writable by umask `0002`; it is used only for that bare probe.
 No paths or live text go to a legacy listener;
 `deliver` returns `Older` and `forward` and `send` return false. Restart and registration only
@@ -168,7 +175,9 @@ mdview
    filesystem check. A stalled lookup can hold up later requests; a late result or a full
    queue drops only that message. A send that discovers the public channel is closed releases
    the instance lock before closing the request socket and stopping the listener.
-  If the sender disconnects after queueing, the window still receives the request.
+   If the sender disconnects after queueing, the window still receives the request.
+   `single::forward` splits large file selections at the header limits and waits for each
+   batch to be acknowledged. If a later batch fails, it does not resend earlier batches.
   The 200 KB loopback round trip is measured in a test.
 
 Why older receivers are safe. An old receiver reads the name line and then lines up to the first
@@ -401,9 +410,9 @@ Live text (unsaved changes in the viewer):
 ## Run and not run
 
 For the authenticated transport, document delivery, legacy overlap in both startup orders,
-deferred registration, generation races, queue rejection, delayed file checks, text and
-expanded header limits, and delayed replies were tested on Windows using loopback or anonymous pipes and temporary
-files. Linux and macOS (including the inherited ACL test) were type-checked only.
+deferred registration, generation races, queue rejection, delayed file checks, header limits,
+delayed replies and a 300-file hand-off were tested on Windows. Linux and macOS (including
+host-local storage and the inherited ACL test) were type-checked only.
 No hand-off between real applications was run. The desktop runs below predate authentication.
 
 Run on KDE Plasma 6.8 Wayland (CachyOS), with both apps running: side-by-side placement (the editor

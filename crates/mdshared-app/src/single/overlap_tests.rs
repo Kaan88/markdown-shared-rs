@@ -55,6 +55,23 @@ fn settings_files_in_the_same_directory_contend_for_one_public_listener() {
 }
 
 #[test]
+fn forwarding_three_hundred_files_delivers_them_in_order_once() {
+    let path = scratch("large-selection");
+    let settings = path.join("settings.ini");
+    let files: Vec<_> = (0..300).map(|i| path.join(format!("{i}.md"))).collect();
+    for file in &files {
+        fs::write(file, b"note").unwrap();
+    }
+    let rx = listen(APP, &settings).unwrap();
+    assert!(forward(APP, &settings, &files));
+    for file in files {
+        assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap(), file);
+    }
+    assert!(rx.try_recv().is_err());
+    retire(path, rx);
+}
+
+#[test]
 fn a_stale_legacy_record_beside_the_real_settings_does_not_delay_startup() {
     let path = scratch("stale-legacy-beside-settings");
     let settings = path.join("settings.ini");
@@ -286,7 +303,7 @@ fn a_passing_probe_does_not_keep_a_new_listener_from_registering() {
     assert!(instance_record(&settings).is_some());
     assert!(hold_lock(&dir, |_| panic!("a published listener is not a probe")).is_none());
     drop((listener_lock, dir));
-    fs::remove_dir_all(path).unwrap();
+    remove(path);
 }
 
 #[test]
@@ -316,7 +333,7 @@ fn discovery_waits_for_this_generation_instead_of_returning_the_stale_port() {
     assert!(lock.is_some());
     assert_eq!(record.port, port);
     drop((lock, dir));
-    fs::remove_dir_all(path).unwrap();
+    remove(path);
 }
 
 #[test]
@@ -325,11 +342,11 @@ fn record_and_lock_refuse_a_non_file() {
     let settings = path.join("settings.ini");
     let dir = directory(&settings, true).unwrap();
     fs::create_dir(port_file(&settings)).unwrap();
-    fs::create_dir(private_dir(&settings).join(record::local_name(record::LOCK).as_ref())).unwrap();
+    fs::create_dir(private_dir(&settings).join(record::LOCK)).unwrap();
     assert!(Record::load(&dir).is_none());
     assert!(record::lock(&dir, true).is_none());
     drop(dir);
-    fs::remove_dir_all(path).unwrap();
+    remove(path);
 }
 
 #[cfg(windows)]
@@ -379,9 +396,9 @@ fn private_directory_record_and_lock_do_not_follow_links_or_open_fifos() {
     let settings = path.join("settings.ini");
     let dir = directory(&settings, true).unwrap();
     let port = port_file(&settings);
-    let lock = private_dir(&settings).join(record::local_name(record::LOCK).as_ref());
+    let lock = private_dir(&settings).join(record::LOCK);
     Record::publish(&dir, 12345).unwrap();
-    let alternate = path.join("alternate");
+    let alternate = port.with_extension("alternate");
     fs::rename(&port, &alternate).unwrap();
     symlink(&alternate, &port).unwrap();
     symlink(&alternate, &lock).unwrap();
@@ -399,11 +416,14 @@ fn private_directory_record_and_lock_do_not_follow_links_or_open_fifos() {
     fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(directory(&settings, false).is_none());
     fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
-    let moved = path.join("moved");
+    let moved = private.with_extension("moved");
     fs::rename(&private, &moved).unwrap();
     symlink(&moved, &private).unwrap();
     assert!(directory(&settings, false).is_none());
-    fs::remove_dir_all(path).unwrap();
+    drop(dir);
+    fs::remove_file(private).unwrap();
+    fs::remove_dir_all(moved).unwrap();
+    remove(path);
 }
 
 fn delay(by: Duration) {
@@ -897,7 +917,7 @@ fn a_slow_challenge_then_a_slow_acknowledgement_does_not_lose_delivery() {
     assert_eq!(deliver_request(APP, &settings, &request), Delivery::Taken);
     peer.join().unwrap();
     drop((lock, dir));
-    fs::remove_dir_all(path).unwrap();
+    remove(path);
 }
 
 #[test]

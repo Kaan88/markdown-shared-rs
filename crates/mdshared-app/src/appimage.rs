@@ -108,9 +108,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_update_lock_fits_when_the_stage_uses_a_full_filename() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
         let dir = std::env::temp_dir().join(format!("mdshared-long-stage-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let stem = "a".repeat(255 - ".new".len());
+        let path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated directory pathname.
+        let limit = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_NAME_MAX) };
+        let max = usize::try_from(limit).expect("scratch directory has a finite name limit");
+        let stem = "a".repeat(max.checked_sub(".new".len()).unwrap());
         let image = dir.join(&stem);
         std::fs::File::create_new(dir.join(format!("{stem}.new"))).unwrap();
         let lock = lock_update(&image).unwrap();

@@ -10,6 +10,9 @@ pub(super) fn scratch(name: &str) -> PathBuf {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => panic!("cannot clear {}: {e}", path.display()),
     }
+    #[cfg(windows)]
+    record::create_legacy_fixture_dir(&path).unwrap();
+    #[cfg(not(windows))]
     fs::create_dir(&path).unwrap();
     path
 }
@@ -29,6 +32,15 @@ pub(super) fn retire<T>(path: PathBuf, rx: Receiver<T>) {
 }
 
 pub(super) fn remove(path: PathBuf) {
+    #[cfg(unix)]
+    {
+        let endpoint = private_dir(&path.join("settings.ini"));
+        if !endpoint.starts_with(&path)
+            && let Err(e) = fs::remove_dir_all(&endpoint)
+        {
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{}", endpoint.display());
+        }
+    }
     let end = Instant::now() + READ_DEADLINE;
     loop {
         match fs::remove_dir_all(&path) {
@@ -58,6 +70,35 @@ fn a_loopback_fixture_clears_stale_state_and_releases_its_directory() {
     assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap().doc, request.doc);
     retire(path.clone(), rx);
     assert!(!path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn a_legacy_record_can_grant_other_users_read_access_but_not_write_access() {
+    let path = scratch("legacy-acl-grants");
+    let settings = path.join("settings.ini");
+    let port = path.join("instance.port");
+    let (listener, lock) = legacy_start(&path);
+    let grant = |access| {
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&port)
+            .arg("/grant")
+            .arg(access)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let request = Request::document("legacy", "");
+    grant("*S-1-5-32-545:(R)"); // Builtin Users.
+    assert_eq!(deliver_request(APP, &settings, &request), Delivery::Older);
+    grant("*S-1-5-32-545:(W)");
+    assert_eq!(deliver_request(APP, &settings, &request), Delivery::Nobody);
+    drop((listener, lock));
+    remove(path);
 }
 
 #[cfg(unix)]

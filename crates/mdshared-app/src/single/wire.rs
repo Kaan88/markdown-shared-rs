@@ -6,6 +6,7 @@ use super::record::random;
 use crate::sister::{MAX_TEXT, doc_id};
 use crate::update::Sha256;
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 
 type Block = [u8; 32];
 
@@ -80,6 +81,41 @@ pub(super) fn authenticate(r: &mut impl Read, w: &mut impl Write, key: &Block) -
 const MAX_LINE: usize = 64 * 1024;
 const MAX_HEADER: usize = 1024 * 1024;
 const MAX_FIELDS: usize = 256;
+
+/// Keep the sender's batches within the same line, header and field caps as the reader.
+pub(super) fn send_paths(
+    app: &str,
+    paths: &[PathBuf],
+    mut send: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let valid_line = |line: &str| line.len() < MAX_LINE && !line.contains(['\r', '\n']);
+    if !valid_line(app) {
+        return false;
+    }
+    let mut message = format!("{app}\n");
+    let prefix = message.len();
+    let mut fields = 0;
+    for path in paths {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        let line = absolute.to_string_lossy();
+        if !valid_line(&line) {
+            return false;
+        }
+        if fields == MAX_FIELDS || message.len() + line.len() + 2 > MAX_HEADER {
+            message.push('\n');
+            if !send(message.as_bytes()) {
+                return false;
+            }
+            message.truncate(prefix);
+            fields = 0;
+        }
+        message.push_str(&line);
+        message.push('\n');
+        fields += 1;
+    }
+    message.push('\n');
+    send(message.as_bytes())
+}
 
 /// A complete UTF-8 line; the limit includes the LF. EOF or a limit is never a terminator.
 fn line(r: &mut impl BufRead, limit: usize) -> Option<String> {
@@ -175,6 +211,29 @@ mod tests {
     use super::*;
     use crate::single::record::Record;
     use std::io::{BufReader, Cursor};
+
+    #[test]
+    fn batches_respect_the_byte_cap_and_stop_on_the_first_refusal() {
+        let paths: Vec<_> = (0..80)
+            .map(|i| PathBuf::from(format!("{i}-{}", "x".repeat(32 * 1024))))
+            .collect();
+        let mut lengths = Vec::new();
+        assert!(!send_paths("app", &paths, |message| {
+            assert!(message.len() <= MAX_HEADER);
+            let body = header(&mut Cursor::new(message), "app").unwrap();
+            assert!(bounded_destinations(&body).is_some());
+            assert_eq!(
+                body[0],
+                std::path::absolute(&paths[lengths.iter().sum::<usize>()])
+                    .unwrap_or_else(|_| paths[lengths.iter().sum::<usize>()].clone())
+                    .to_string_lossy()
+            );
+            lengths.push(body.len());
+            lengths.len() == 1
+        }));
+        assert_eq!(lengths.len(), 2);
+        assert!(lengths.iter().sum::<usize>() < paths.len());
+    }
 
     #[test]
     fn the_hmac_matches_a_known_answer_and_binds_both_nonces_and_the_role() {

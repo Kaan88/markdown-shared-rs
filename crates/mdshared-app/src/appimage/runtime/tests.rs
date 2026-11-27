@@ -6,6 +6,29 @@ const DIR_SLOT: i32 = 1001;
 const RUNTIME: &str = "4321";
 const TYPE2: &[u8] = b"\x7fELF\x02\x01\x01\0AI\x02 test runtime";
 
+fn mount_path(path: &Path) -> Vec<u8> {
+    let mut escaped = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b' ' => escaped.extend(b"\\040"),
+            b'\t' => escaped.extend(b"\\011"),
+            b'\n' => escaped.extend(b"\\012"),
+            b'\\' => escaped.extend(b"\\134"),
+            _ => escaped.push(byte),
+        }
+    }
+    escaped
+}
+
+#[test]
+fn a_mount_fixture_can_use_all_four_escaped_path_characters() {
+    let launch = Fixture::new("space tab\tnewline\nbackslash\\", true);
+    assert_eq!(
+        launch.verify(launch.image.as_os_str()),
+        Some(launch.image.clone())
+    );
+}
+
 #[test]
 fn parent_ignores_non_utf8_status_fields_and_accepts_only_an_ascii_pid() {
     let f = Fixture::new("status-bytes", false);
@@ -84,12 +107,14 @@ impl Fixture {
         Self::fdinfo(&proc, "self", EXE_SLOT as u32, 42, "0100000");
         Self::fdinfo(&proc, "self", DIR_SLOT as u32, 42, "0100000");
         let mounts = if mounted {
-            format!(
-                "42 2 0:3 / {} ro,nodev - fuse.squashfuse unnamed.AppImage ro\n",
-                dir.display()
-            )
+            [
+                b"42 2 0:3 / ".as_slice(),
+                &mount_path(&dir),
+                b" ro,nodev - fuse.squashfuse unnamed.AppImage ro\n",
+            ]
+            .concat()
         } else {
-            "42 2 0:3 / / rw - tmpfs tmpfs rw\n".into()
+            b"42 2 0:3 / / rw - tmpfs tmpfs rw\n".to_vec()
         };
         fs::write(proc.join("self/mountinfo"), mounts).unwrap();
         Self {
@@ -189,12 +214,14 @@ fn an_ancestors_pipe_for_another_mount_cannot_select_that_image() {
     let mounts = launch.proc.join("self/mountinfo");
     fs::write(
         &mounts,
-        format!(
-            "42 2 0:3 / {} ro - fuse.squashfuse image-a ro\n\
-             43 2 0:4 / {} ro - fuse.squashfuse image-b ro\n",
-            launch.dir.display(),
-            other.dir.display()
-        ),
+        [
+            b"42 2 0:3 / ".as_slice(),
+            &mount_path(&launch.dir),
+            b" ro - fuse.squashfuse image-a ro\n43 2 0:4 / ",
+            &mount_path(&other.dir),
+            b" ro - fuse.squashfuse image-b ro\n",
+        ]
+        .concat(),
     )
     .unwrap();
     fs::rename(other.proc.join(RUNTIME), launch.proc.join("6543")).unwrap();
@@ -224,19 +251,23 @@ fn an_ancestors_pipe_for_another_mount_cannot_select_that_image() {
 
 #[test]
 fn a_replacement_at_the_mount_label_and_an_executable_on_a_nested_mount_are_refused() {
-    let launch = Fixture::new("replaced-or-nested", true);
+    let launch = Fixture::new("replaced or nested", true);
     let mounts = launch.proc.join("self/mountinfo");
+    let named = launch.root.join("mdtest.AppImage");
     fs::write(
         &mounts,
-        format!(
-            "42 2 0:3 / {0} ro - fuse.squashfuse {1}/mdtest.AppImage ro\n\
-         43 42 0:4 / {0}/nested rw - tmpfs tmpfs rw\n",
-            launch.dir.display(),
-            launch.root.display(),
-        ),
+        [
+            b"42 2 0:3 / ".as_slice(),
+            &mount_path(&launch.dir),
+            b" ro - fuse.squashfuse ",
+            &mount_path(&named),
+            b" ro\n43 42 0:4 / ",
+            &mount_path(&launch.dir.join("nested")),
+            b" rw - tmpfs tmpfs rw\n",
+        ]
+        .concat(),
     )
     .unwrap();
-    let named = launch.root.join("mdtest.AppImage");
     fs::rename(&launch.image, &named).unwrap();
     assert_eq!(launch.verify(named.as_os_str()), Some(named.clone()));
 
