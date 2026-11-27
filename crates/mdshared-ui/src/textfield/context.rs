@@ -16,27 +16,59 @@ pub enum ContextAction {
     SelectAll,
 }
 
-/// Maximum UTF-8 byte length a field will accept from the clipboard, before single-line cleaning.
+/// Maximum UTF-8 byte length for menu Paste, before cleaning.
 pub const MAX_PASTE_BYTES: usize = 64 * 1024;
 
 pub(super) trait Clipboard {
     fn may_have_text(&mut self) -> bool;
-    fn read(&mut self, limit: usize) -> Option<String>;
+    fn read(&mut self, limit: Option<usize>) -> Option<String>;
     fn write(&mut self, text: &str) -> bool;
 }
 
 pub(super) struct SystemClipboard;
 
+#[cfg(test)]
+thread_local! {
+    static PASTE_FIXTURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn paste_fixture(text: &'static str) -> impl Drop {
+    // Exercise callers of the system adapter without reading or writing the desktop clipboard.
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PASTE_FIXTURE.set(self.0);
+        }
+    }
+    Restore(PASTE_FIXTURE.replace(Some(text)))
+}
+
 impl Clipboard for SystemClipboard {
     fn may_have_text(&mut self) -> bool {
+        #[cfg(test)]
+        if PASTE_FIXTURE.get().is_some() {
+            return true;
+        }
         platform::clipboard_may_have_text()
     }
 
-    fn read(&mut self, limit: usize) -> Option<String> {
-        platform::clipboard_text_bounded(limit)
+    fn read(&mut self, limit: Option<usize>) -> Option<String> {
+        #[cfg(test)]
+        if let Some(text) = PASTE_FIXTURE.get() {
+            return limit
+                .is_none_or(|limit| text.len() <= limit)
+                .then(|| text.to_owned());
+        }
+        match limit {
+            Some(limit) => platform::clipboard_text_bounded(limit),
+            None => platform::clipboard_text(),
+        }
     }
 
     fn write(&mut self, text: &str) -> bool {
+        #[cfg(test)]
+        assert!(PASTE_FIXTURE.get().is_none(), "unexpected clipboard write");
         platform::set_clipboard_text(text)
     }
 }
@@ -45,15 +77,15 @@ impl TextField {
     /// The four items for a [`crate::menu::Menu`] or [`crate::submenu::Cascade`]. Call when
     /// opening the menu. Paste is enabled when text is advertised or the platform cannot
     /// cheaply check. The clipboard payload is not read until Paste is chosen.
-    /// A secret field never consults the clipboard; only Select all can be enabled.
+    /// Secret fields allow Paste but never offer Cut or Copy.
     pub fn context_menu(&self) -> Vec<Item<ContextAction>> {
         self.context_menu_with(&mut SystemClipboard)
     }
 
     /// Applies an item chosen from the menu, checking again that it is allowed. Returns true
     /// when the field was edited, a selection was made, or text was copied successfully.
-    /// A failed clipboard write never deletes the selection. Secret fields refuse all three
-    /// clipboard actions. This does not change the existing keyboard editing methods.
+    /// A failed clipboard write never deletes the selection. As with the keyboard shortcuts,
+    /// secret fields accept Paste but refuse Cut and Copy so the secret cannot be exported.
     pub fn apply_context_action(&mut self, action: ContextAction) -> bool {
         self.apply_with(action, &mut SystemClipboard)
     }
@@ -61,7 +93,7 @@ impl TextField {
     fn context_menu_with(&self, clipboard: &mut impl Clipboard) -> Vec<Item<ContextAction>> {
         use ContextAction::*;
         let can_copy = self.selection_for_export().is_some();
-        let can_paste = !self.secret && clipboard.may_have_text();
+        let can_paste = clipboard.may_have_text();
         vec![
             Item::new(Cut, "Cut").enabled(can_copy),
             Item::new(Copy, "Copy").enabled(can_copy),
@@ -82,7 +114,7 @@ impl TextField {
                     .is_some_and(|text| clipboard.write(text))
                     && (action == Copy || self.delete_selection())
             }
-            Paste => self.paste_with(true, false, clipboard),
+            Paste => self.paste_from_menu(clipboard),
             SelectAll if !self.is_empty() => {
                 self.select_all();
                 true
@@ -91,27 +123,23 @@ impl TextField {
         }
     }
 
-    pub(super) fn paste_with(
-        &mut self,
-        allowed: bool,
-        first_line: bool,
-        clipboard: &mut impl Clipboard,
-    ) -> bool {
-        if !allowed || self.secret {
-            return false;
-        }
+    /// The keyboard shortcut takes the first line even from a large clipboard. A line that
+    /// cleans to nothing still replaces a selection. Only secret fields keep Unicode separators.
+    pub(super) fn paste_first_line(&mut self, clipboard: &mut impl Clipboard) -> bool {
+        clipboard.read(None).is_some_and(|text| {
+            let first = text.lines().next().unwrap_or("");
+            self.insert_clean(&super::clean_with(first, !self.is_secret()))
+        })
+    }
+
+    fn paste_from_menu(&mut self, clipboard: &mut impl Clipboard) -> bool {
         let Some(text) = clipboard
-            .read(MAX_PASTE_BYTES)
+            .read(Some(MAX_PASTE_BYTES))
             .filter(|text| text.len() <= MAX_PASTE_BYTES)
         else {
             return false;
         };
-        let text = if first_line {
-            text.lines().next().unwrap_or("")
-        } else {
-            text.as_str()
-        };
-        let clean = super::clean(text);
+        let clean = super::clean(&text);
         !clean.is_empty() && self.insert_clean(&clean)
     }
 }
@@ -136,9 +164,9 @@ mod tests {
             self.text.is_some()
         }
 
-        fn read(&mut self, limit: usize) -> Option<String> {
+        fn read(&mut self, limit: Option<usize>) -> Option<String> {
             self.reads += 1;
-            self.requested_limit = Some(limit);
+            self.requested_limit = limit;
             self.text.clone()
         }
 
@@ -223,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_menu_cannot_read_write_or_edit_through_the_clipboard() {
+    fn a_secret_menu_pastes_without_exporting_the_selection() {
         let mut f = TextField::new();
         let mut clipboard = Fake {
             text: Some("outside".to_owned()),
@@ -232,19 +260,24 @@ mod tests {
         f.set_text("secret");
         f.select_all();
         f.set_secret(true);
-        assert_eq!(enabled(&f, &mut clipboard), [SelectAll]);
-        for action in [Cut, Copy, Paste] {
+        assert_eq!(enabled(&f, &mut clipboard), [Paste, SelectAll]);
+        assert_eq!(clipboard.reads, 0);
+        for action in [Cut, Copy] {
             assert!(!f.apply_with(action, &mut clipboard));
         }
         assert!(f.has_selection());
         assert_eq!(f.selection_for_export(), None);
+        assert!(f.apply_with(Paste, &mut clipboard));
+        assert_eq!(f.text(), "outside");
         assert_eq!(
             (clipboard.probes, clipboard.reads, clipboard.writes),
-            (0, 0, 0)
+            (1, 1, 0)
         );
         // The public system adapters are safe to call in the secret case as well.
-        assert!(!f.context_menu()[2].enabled);
-        assert!(!f.apply_context_action(Paste));
+        let _clipboard = paste_fixture(" again");
+        assert!(f.context_menu()[2].enabled);
+        assert!(f.apply_context_action(Paste));
+        assert_eq!(f.text(), "outside again");
     }
 
     #[test]
@@ -269,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_checks_permission_before_reading_and_both_pastes_clean_unicode_separators() {
+    fn keyboard_checks_permission_and_only_legacy_secret_paste_keeps_unicode_separators() {
         use crate::keys::{KeyName, Mods};
         let mut f = TextField::new();
         let mut clipboard = Fake {
@@ -287,14 +320,18 @@ mod tests {
             f.handle_key_with(&key, mods, None, false, &mut clipboard),
             Some(false)
         );
+        assert_eq!(clipboard.reads, 0);
+        assert_eq!(f.text(), "kept");
         f.set_secret(true);
         assert_eq!(
             f.handle_key_with(&key, mods, None, true, &mut clipboard),
-            Some(false)
+            Some(true)
         );
-        assert_eq!(clipboard.reads, 0);
-        assert_eq!(f.text(), "kept");
+        assert_eq!(clipboard.reads, 1);
+        assert_eq!(f.text(), "a\u{2028}b\u{2029}c");
         f.set_secret(false);
+        f.set_text("kept");
+        f.select_all();
         assert_eq!(
             f.handle_key_with(&key, mods, None, true, &mut clipboard),
             Some(true)
@@ -303,6 +340,102 @@ mod tests {
         f.select_all();
         assert!(f.apply_with(Paste, &mut clipboard));
         assert_eq!(f.text(), "a b c");
-        assert_eq!(clipboard.reads, 2);
+        assert_eq!(clipboard.reads, 3);
+    }
+
+    #[test]
+    fn secret_keyboard_paste_takes_the_first_line_even_with_a_large_tail() {
+        let mut f = TextField::new();
+        f.set_secret(true);
+        f.set_text("old");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some(format!("key\r\n{}", "x".repeat(MAX_PASTE_BYTES))),
+            ..Fake::default()
+        };
+        assert_eq!(ctrl(&mut f, 'v', &mut clipboard), Some(true));
+        assert_eq!(clipboard.requested_limit, None);
+        assert_eq!(f.text(), "key");
+        assert!(!f.has_selection());
+    }
+
+    #[test]
+    fn secret_keyboard_paste_replaces_the_selection_with_a_cleaned_empty_line() {
+        let mut f = TextField::new();
+        f.set_secret(true);
+        f.set_text("old");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some("\x01\x7f\nignored".to_owned()),
+            ..Fake::default()
+        };
+        assert_eq!(ctrl(&mut f, 'v', &mut clipboard), Some(true));
+        assert!(f.is_empty());
+        assert!(!f.has_selection());
+    }
+
+    #[test]
+    fn non_secret_keyboard_paste_takes_the_first_line_even_with_a_large_tail() {
+        let mut f = TextField::new();
+        f.set_text("old");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some(format!("first\r\n{}", "x".repeat(MAX_PASTE_BYTES))),
+            ..Fake::default()
+        };
+        assert!(!f.apply_with(Paste, &mut clipboard));
+        assert_eq!(f.selected_text(), "old");
+        assert_eq!(clipboard.requested_limit, Some(MAX_PASTE_BYTES));
+        assert_eq!(ctrl(&mut f, 'v', &mut clipboard), Some(true));
+        assert_eq!(clipboard.requested_limit, None);
+        assert_eq!(f.text(), "first");
+        assert!(!f.has_selection());
+    }
+
+    #[test]
+    fn non_secret_keyboard_paste_replaces_the_selection_with_a_cleaned_empty_first_line() {
+        use crate::textfield::EditKey;
+
+        let mut f = TextField::new();
+        f.set_text("keep-old");
+        for _ in 0..3 {
+            f.key(EditKey::Left, false, true);
+        }
+        assert_eq!(f.selected_text(), "old");
+        let mut clipboard = Fake {
+            text: Some("\x01\x7f\nignored".to_owned()),
+            ..Fake::default()
+        };
+        assert_eq!(ctrl(&mut f, 'v', &mut clipboard), Some(true));
+        assert_eq!(f.text(), "keep-");
+        assert!(!f.has_selection());
+    }
+
+    #[test]
+    fn secret_keyboard_copy_and_cut_leave_the_clipboard_and_selection_alone() {
+        let mut f = TextField::new();
+        f.set_secret(true);
+        f.set_text("secret");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some("outside".to_owned()),
+            ..Fake::default()
+        };
+        for key in ['c', 'x'] {
+            assert_eq!(ctrl(&mut f, key, &mut clipboard), Some(false));
+            assert_eq!(clipboard.writes, 0);
+            assert_eq!(clipboard.text.as_deref(), Some("outside"));
+            assert_eq!(f.text(), "secret");
+            assert_eq!(f.selected_text(), "secret");
+        }
+    }
+
+    fn ctrl(f: &mut TextField, key: char, clipboard: &mut Fake) -> Option<bool> {
+        use crate::keys::{KeyName, Mods};
+        let mods = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        f.handle_key_with(&KeyName::Char(key), mods, None, true, clipboard)
     }
 }

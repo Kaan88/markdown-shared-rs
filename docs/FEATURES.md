@@ -20,8 +20,8 @@ offer the underlying text cursor or text menu while that popup is open. On a rig
 call `context_menu(Some((x, y)))` to focus the field without disturbing its selection, or
 `context_menu(None)` for the already focused field. The host owns the menu and gives it input
 first. Pass its chosen item to `apply_context_action`; Cut and Paste report `Outcome::Changed`
-when they change the row's value. Secret fields use the field's export guard and refuse all
-clipboard actions. Select all still works.
+when they change the row's value. Secret fields allow Paste and Select all. The field's
+export guard refuses Cut and Copy, even when text is selected.
 
 Try `cargo run -p mdshared-ui --features host --example settings_textfield`. Drag out of the
 Name field, double- or triple-click it and open its edit menu. Try the Secret menu and hover
@@ -59,8 +59,11 @@ Opening the menu never reads the paste payload: Windows and macOS ask for its fo
 Linux's arboard backend lacks that query, so it offers Paste and checks the size after its
 single fetch. Windows limits the UTF-16 scan before decoding and writes with a private
 message-only owner window. macOS checks the native string length before converting it.
-Keyboard paste checks permission and the secret flag before any read; it still takes the
-first line. `selection_for_export` returns nothing for a secret; `text()` and
+Keyboard paste checks clipboard permission before any read and takes only the first line,
+without the menu's size cap. A first line that cleans to nothing still replaces a selection.
+Non-secret fields turn Unicode line and paragraph separators into spaces; secret fields
+keep those separators as written.
+`selection_for_export` returns nothing for a secret; `text()` and
 `selected_text()` are raw owner access. Debug hides secret field and settings row values,
 and hides IME text and settings text values whose types carry no secret flag. `set_preedit`
 discards invalid cursor offsets. The old low-level pointer signatures are unchanged;
@@ -77,6 +80,17 @@ pixel test that fails if two selection bands are merged, and a check that field 
 doesn't shape prefixes. The native Windows clipboard round-trip test is not ignored in
 CI; the requested local test command excludes it under `explorer_tests`. The example was
 not launched, and Linux and macOS were not run.
+
+The secret-keyboard follow-up was checked on Windows with Rust 1.99.1: release Clippy and
+tests with `host,a11y` passed (1,233 unit tests and five doctests passed). Fake clipboard
+tests reproduced both Paste regressions before the fix and cover Ctrl+C and Ctrl+X.
+The four `explorer_tests` cases were skipped; no desktop clipboard or app was opened.
+Linux and macOS were not run.
+
+The non-secret keyboard follow-up passed Windows Rust 1.99.1 formatting, the catalogue
+check, release Clippy and tests, and the additional feature checks. Both fake clipboard
+regressions failed before the fix and passed after it. The existing Unicode and menu
+tests passed unchanged. The real clipboard and other platforms were not run.
 
 ## Vertical-only text hinting (`mdshared_text::text`)
 
@@ -3334,3 +3348,84 @@ integration binary passed 60 runs with 64 test threads. Format, workspace Clippy
 (22 passed) passed. Release workspace tests passed (2,304 passed, four Explorer tests
 excluded to leave the desktop alone). All eight golden hashes were unchanged.
 CI, Linux and macOS were not rerun for this test-only change.
+
+### Task writeback review follow-up
+
+Task writeback now uses the exact source byte behind each rendered task, including in
+files with bare carriage returns. The offset parse starts after recognised front matter;
+an unmatched or duplicate task event does not authorize a write. The loader's lossy UTF-8
+decoding is mapped back to the original file bytes. The read stops at one byte beyond the
+Markdown size limit and rejects the file if that byte exists. A file changed externally
+but still presenting the same sequence of task states cannot be detected by `expected` alone.
+
+On Windows with Rust 1.99.1, format, catalogue, release workspace Clippy, and the
+release core suite passed (215 tests). The wrong-byte, front-matter, lossy UTF-8 and
+bounded-read tests failed before their fixes; the long multibyte note already passed
+with #61. Release workspace tests passed with the network, Explorer, native process
+and engine-dependent checks excluded (2,327 passed). Linux and macOS were not run.
+
+The second review made the display-math guard skip code block events and made writeback
+check the opened handle is a regular file before reading it. On Windows with Rust 1.99.1,
+format, catalogue, release Clippy and tests, and the additional feature checks passed.
+Both code-fence cases failed with CRLF before the fix and passed with CRLF and LF after it.
+The strengthened YAML fixture reproduced a wrong-byte write decision with the old scanner.
+Linux-target Clippy checked the Unix FIFO regression; it was not run. macOS was not run.
+
+The third review moved the display-math guard into the final page parse, including math
+that the parser shows as literal text. The page does not assign opener and closer roles
+to standalone literal `$$` lines, so writeback refuses a task between them rather than
+guessing which lines pair. It also added a pre-open check (at first without following
+symbolic links) in addition to the opened-handle check. A path replaced between the
+first check and `open` can still make `open` block.
+
+On Windows with Rust 1.99.1, formatting, catalogue, release Clippy and tests, and the
+additional feature checks passed. The rejected-math case, stray delimiter case and
+directory case each failed without their fix. Linux-target Clippy checked the Unix
+tests, but Linux and macOS were not run.
+
+The fourth review excludes hidden `<rp>` text from the display-math guard and restores
+writeback through stable symbolic links to regular files. Both regular-file checks remain.
+On Windows with Rust 1.99.1, formatting, catalogue, release Clippy and tests, and the
+additional feature checks passed. The `<rp>` test failed before its fix and passed
+after it. The Unix symlink test was checked by Linux-target Clippy but not run.
+
+The fifth review excludes HTML code (`<code>`, `<tt>`, `<samp>`), keyboard labels and
+ruby annotations from the display-math guard. Footnotes and summaries cannot supply a
+delimiter to the main text. A `<details>` body has its own delimiter tracking whether
+it starts open or closed; ordinary alert text stays in the main text flow. Markdown code,
+`<pre>`, raw HTML, comments, image alt text, duplicate footnotes and `<rp>` were checked
+as separate paths. On Windows with Rust 1.99.1, four regressions failed before the fix
+and passed after it. Formatting, catalogue, release Clippy, tests and the feature checks
+passed. Linux-target Clippy passed; Linux and macOS runtime tests were not run.
+
+The sixth review gave each separate Markdown container its own delimiter run. The guard
+recognises a standalone `$$` after the container's parsed source prefix, including quote
+marks, list markers and indentation, and footnote labels. A footnote's delimiters cannot
+pair with main text. A lazy line can still belong to an enclosing run, and an item
+can complete a region that its list interrupted. The guard tracks prefixes even when
+layout first flattens deep blocks and refuses writeback if its own nesting limit is reached.
+
+On Windows with Rust 1.99.1, both reported cases and the lazy-alert case allowed writes
+before the fix and refused them afterward. The lone footnote delimiter did not block
+main-text tasks. Formatting, catalogue, release Clippy and tests, and the feature checks
+passed. Linux-target Clippy passed; Linux and macOS runtime tests were not run.
+
+The seventh review made a list item inherit both the possible display-math opener
+and whether a task followed it. Closing an item sends its task observation back to
+the parent, but leaves the item's own delimiter in that item. Other container runs
+stay separate. Windows Rust 1.99.1 checks passed, including the reported regression
+and its mirror. The reported case failed without inheritance; the mirror failed
+when the exit merge was disabled. Linux-target Clippy passed; Linux and macOS
+runtime tests were not run.
+
+The eighth review removed the second container and tab-column parser. Writeback now
+refuses the whole document if the final page parse emits literal `$$` in prose.
+Footnotes may keep task markers in the model without a visible entry, and details
+can open in the view. The document-wide rule also preserves the earlier refusal
+whose delimiters and task land in three different parsed blocks. Complete math,
+code and discarded text do not trigger the guard. No existing refusal was changed;
+eight branch-only success fixtures changed or were narrowed to test an exclusion alone.
+
+Both tab fixtures authorized writes before the change and now refuse them. On Windows
+with Rust 1.99.1, formatting, the catalogue, release Clippy and tests, and the feature
+checks passed. Linux-target Clippy passed; Linux and macOS runtime tests were not run.

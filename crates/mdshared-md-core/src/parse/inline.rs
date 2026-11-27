@@ -224,6 +224,9 @@ impl<'a> Builder<'a> {
 
     pub(super) fn push_atom(&mut self, kind: SpanKind) {
         self.flush_run();
+        if let Some(tasks) = &mut self.task_events {
+            tasks.atom();
+        }
         if self.open_alert.is_some() {
             self.alert_content = true;
         }
@@ -327,8 +330,22 @@ impl<'a> Builder<'a> {
             self.escapes.push((at, at + c.len_utf8()));
         }
         self.push_inline_text(t);
+        self.note_task_text(range.start, at);
         if self.src.as_bytes()[range.start] == b'&' && is_named_entity(&self.src[range]) {
             self.entities.push((at, self.doc.text.len()));
+        }
+    }
+
+    /// Sends only emitted prose to the task guard. Code and ruby readings use their
+    /// existing active spans, including spans carried across inline blocks.
+    pub(super) fn note_task_text(&mut self, source: usize, start: usize) {
+        if let Some(tasks) = &mut self.task_events
+            && !self.in_rp
+            && self.open_html[Tag::Code.slot()] == 0
+            && self.open_html[Tag::Kbd.slot()] == 0
+            && (self.open_html[Tag::Rt.slot()] == 0 || self.open_html[Tag::Ruby.slot()] == 0)
+        {
+            tasks.text(source, self.inline_block, start, &self.doc.text[start..]);
         }
     }
 

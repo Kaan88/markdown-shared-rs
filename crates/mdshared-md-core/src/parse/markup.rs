@@ -87,6 +87,7 @@ impl<'a> Builder<'a> {
         self.begin_inline();
         self.flush_run();
         self.note_heading_text(t);
+        let start = self.doc.text.len();
         let mut pending_space = false;
         for c in t.chars() {
             if c.is_ascii_whitespace() {
@@ -102,6 +103,7 @@ impl<'a> Builder<'a> {
         if pending_space {
             self.push_collapsed_space();
         }
+        self.note_task_text(self.event_at, start);
     }
 
     pub(super) fn push_collapsed_space(&mut self) {
