@@ -17,7 +17,7 @@ use crate::overlay::{
 };
 use crate::scroll::draw_scrollbar;
 use crate::segments::{SEGMENT_H, draw_segments, switch_width};
-use crate::textfield::FieldColors;
+use crate::textfield::{FieldArea, FieldColors, FieldHit};
 use crate::theme::Palette;
 use mdshared_app::library::folder_name;
 use mdshared_app::split;
@@ -71,6 +71,8 @@ impl PlanScreen {
         self.win = (w, h);
         self.scale = 1.0 / p.px();
         self.spots.clear();
+        // Set again below while a rename field is drawn.
+        self.field_at = None;
         let rows = self.rows();
         self.scroll = rows.clamp_scroll(self.scroll);
         let prows = self.prows();
@@ -90,6 +92,12 @@ impl PlanScreen {
         if let Some(pop) = self.menu.as_mut() {
             pop.menu.draw_in(p, pal, Rect::new(0.0, 0.0, w, h));
         }
+        // The rename field's edit menu, open only on the `pointer_press` route, goes with the
+        // field; drawn last, over everything.
+        if self.edit.is_none() {
+            self.input.cancel();
+        }
+        self.input.draw_menu(p, pal, Rect::new(0.0, 0.0, w, h));
     }
 
     fn hovered(&self, hit: PHit) -> bool {
@@ -255,7 +263,7 @@ impl PlanScreen {
         let editing = matches!(self.edit.as_ref().map(|e| e.kind), Some(EditKind::Group));
         if editing {
             if let Some(e) = self.edit.as_mut() {
-                draw_field(
+                self.field_at = Some(draw_field(
                     p,
                     pal,
                     e,
@@ -263,7 +271,7 @@ impl PlanScreen {
                     "Name of the new group",
                     caret_on,
                     &mut self.spots,
-                );
+                ));
             }
         } else {
             let lit = self.hovered(PHit::Dest) || self.menu.is_some() && self.pressed.is_none();
@@ -549,9 +557,10 @@ impl PlanScreen {
                 EditKind::Section(_) => "Name of the new section",
                 _ => "Name of the note",
             };
-            draw_field(p, pal, e, r, hint, caret_on, &mut self.spots);
+            let at = draw_field(p, pal, e, r, hint, caret_on, &mut self.spots);
             // The field's spot is what shows of it: a row half out of the list takes no click
             // meant for what is above or below the list (audit 4, W10).
+            self.field_at = Some(FieldArea::new(clipped(r, g.list), at.text()));
             if let Some((PHit::Field, spot)) = self.spots.last_mut() {
                 *spot = clipped(*spot, g.list);
             }
@@ -980,7 +989,8 @@ fn clipped(r: Rect, to: Rect) -> Rect {
     )
 }
 
-/// A text field in a framed box over a row or the group button.
+/// A text field in a framed box over a row or the group button. Returns where it is, for
+/// the rename field's input.
 // The old click-only field route, kept as it was until this widget moves to `FieldInput`
 // (roadmap L15); its callers see no change.
 #[allow(deprecated)]
@@ -992,7 +1002,7 @@ fn draw_field(
     placeholder: &str,
     caret_on: bool,
     spots: &mut Vec<(PHit, Rect)>,
-) {
+) -> FieldArea {
     p.frame(r, 6.0, pal.field, pal.accent);
     let area = Rect::new(r.x + 10.0, r.y, (r.w - 20.0).max(0.0), r.h);
     if let Some(cx) = e.click.take() {
@@ -1016,4 +1026,13 @@ fn draw_field(
         caret_on,
     );
     spots.push((PHit::Field, r));
+    FieldArea::new(
+        r,
+        FieldHit {
+            area,
+            face: Face::Ui,
+            size: 13.5,
+            scale: p.scale,
+        },
+    )
 }

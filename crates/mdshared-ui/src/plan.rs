@@ -15,13 +15,14 @@
 //!
 //! Nothing here exists until a plan is opened, so it is nothing on the launch path.
 
-use crate::gfx::Rect;
+use crate::cursor::Cursor;
+use crate::gfx::{Gfx, Rect};
 use crate::keys::{KeyName, Mods};
 use crate::menu::{Item, Menu};
 use crate::overlay::{DIALOG_FOOTER, DIALOG_PAD, dialog_card};
 use crate::rows::{Nav, Rows};
 use crate::scroll::offset_for_thumb;
-use crate::textfield::TextField;
+use crate::textfield::{EditLabels, FieldArea, FieldInput, FieldOutcome, TextField};
 use mdshared_app::library::{self, folder_name, note_folder};
 use mdshared_app::split::answer::Dropped;
 use mdshared_app::split::{
@@ -30,6 +31,7 @@ use mdshared_app::split::{
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub mod demo;
 mod draw;
@@ -695,6 +697,12 @@ pub struct PlanScreen {
     drag: Option<Drag>,
     /// The row that was selected when the press began: a second click on it renames.
     press_sel: usize,
+    /// The rename field's mouse editing and edit menu, on the
+    /// [`pointer_press`](PlanScreen::pointer_press) route; the old [`press`](PlanScreen::press)
+    /// route never reaches it.
+    input: FieldInput,
+    /// Where the rename field was last drawn, while one is open.
+    field_at: Option<FieldArea>,
     /// The header offers "Ask the AI…" (5.2). Off unless the application turns it on, so the
     /// card of an application with no AI draws as it always did.
     pub ai_offer: bool,
@@ -775,6 +783,8 @@ impl PlanScreen {
             bands_w: -1.0,
             drag: None,
             press_sel: 0,
+            input: FieldInput::new(),
+            field_at: None,
             ai_offer: false,
             ai_cut: None,
             ai_notice: None,
@@ -1357,6 +1367,14 @@ impl PlanScreen {
         Some(PHit::Card)
     }
 
+    /// The pointer moved: a thumb in hand follows it, an open menu lights its rows, and the
+    /// hover follows it.
+    ///
+    /// Deprecated with [`press`](Self::press): [`pointer_motion`](Self::pointer_motion) is
+    /// this with the rename field's drag.
+    #[deprecated(
+        note = "an open rename field takes only a click here (at the next draw): use `pointer_press`, `pointer_motion`, `pointer_release`, `secondary_press` and `key_with_menu`, which give it the drag, the double and triple click, edge scrolling and the edit menu"
+    )]
     pub fn pointer(&mut self, x: f32, y: f32) {
         if let Some(d) = self.drag {
             self.drag_to(d, y);
@@ -1399,6 +1417,18 @@ impl PlanScreen {
         }
     }
 
+    /// A press: an open menu chooses or closes, a press outside an open rename field takes
+    /// the name as it stands, a thumb is grabbed, a track pages, and a control is pressed
+    /// (it acts on the [`release`](Self::release) over it).
+    ///
+    /// Deprecated: a press in an open rename field only places the caret here, at the next
+    /// draw (no drag, no double or triple click, no edge scrolling, no edit menu).
+    /// [`pointer_press`](Self::pointer_press) is this with all of it. The plan's applications
+    /// move when their pin passes this, or allow the warning to keep this behaviour (roadmap
+    /// L15).
+    #[deprecated(
+        note = "an open rename field takes only a click here (at the next draw): use `pointer_press`, `pointer_motion`, `pointer_release`, `secondary_press` and `key_with_menu`, which give it the drag, the double and triple click, edge scrolling and the edit menu"
+    )]
     pub fn press(&mut self, x: f32, y: f32) {
         self.tick += 1;
         if let Some(pop) = self.menu.as_ref() {
@@ -1461,9 +1491,16 @@ impl PlanScreen {
         }
     }
 
+    /// The button went up: the control the press began on acts when the pointer is still on
+    /// it. A drag of the rename field begun on the [`pointer_press`](Self::pointer_press)
+    /// route ends here too (without the last stretch to `(x, y)`:
+    /// [`pointer_release`](Self::pointer_release) has that).
     pub fn release(&mut self, x: f32, y: f32) -> Act {
         self.tick += 1;
         self.drag = None;
+        if self.input.is_dragging() {
+            self.input.cancel();
+        }
         let Some(pressed) = self.pressed.take() else {
             return Act::Nothing;
         };
@@ -1527,14 +1564,185 @@ impl PlanScreen {
     /// scrollbar's thumb is let go with the scroll where the drag left it. The selection, the
     /// plan, an open menu and a rename under way stay as they are. True when there was a press
     /// (the screen's `tick` moves then, so the overlay draws again without its pressed look).
+    /// On the [`pointer_press`](Self::pointer_press) route it also ends a drag in the rename
+    /// field and closes the field's edit menu.
     pub fn cancel(&mut self) -> bool {
         let thumb = self.drag.take().is_some();
         let control = self.pressed.take().is_some();
-        let held = thumb || control;
+        let field = self.input.is_dragging();
+        let menu = self.input.cancel();
+        let held = thumb || control || field || menu;
         if held {
             self.tick += 1;
         }
         held
+    }
+
+    // ---- the pointer route, with all of the rename field's mouse editing --------------------
+    //
+    // `pointer_press`, `secondary_press`, `pointer_motion`, `pointer_release`, `key_with_menu`,
+    // `text_deadline`, `tick_text` and `cursor_at` together: an open rename field (a note's, a
+    // section's, the new group's) gets a field's whole mouse editing (`textfield::FieldInput`),
+    // and the rest of the screen answers as `press`, `pointer`, `release` and `key` do.
+
+    /// Moves `tick` when the rename field's input changed what it draws; true then.
+    fn field_moved(&mut self, o: FieldOutcome) -> bool {
+        let moved = o.redraw();
+        if moved {
+            self.tick += 1;
+        }
+        moved
+    }
+
+    /// A primary (left) press at `at`, on the route that gives an open rename field all of a
+    /// field's mouse editing: a click places the caret where the shaped text puts it (at once,
+    /// not at the next draw), Shift extends the selection, a double click selects a word and a
+    /// triple click everything, a drag selects and scrolls the text past the field's ends
+    /// ([`text_deadline`](Self::text_deadline)), and a press anywhere in the field's frame
+    /// counts. `now` is the event's time and `gfx` the one the screen is drawn with.
+    ///
+    /// With the field's edit menu open, the press goes to the menu (choosing an item, or
+    /// closing the menu when outside it) and no further. Everywhere else it is
+    /// [`press`](Self::press): a press outside the field takes the name as it stands, a row is
+    /// selected, a button is pressed.
+    ///
+    /// Use it with [`pointer_motion`](Self::pointer_motion),
+    /// [`pointer_release`](Self::pointer_release), [`secondary_press`](Self::secondary_press)
+    /// and [`key_with_menu`](Self::key_with_menu) in place of `press`, `pointer`, `release`
+    /// and `key`; wait for [`text_deadline`](Self::text_deadline) and call
+    /// [`tick_text`](Self::tick_text); call [`cancel`](Self::cancel) when the window loses the
+    /// keyboard. [`draw`](Self::draw) draws the edit menu over everything.
+    // The rest of the screen is still `press`'s; its click-only field part never runs from
+    // here, since a press in the field's frame is the input's.
+    #[allow(deprecated)]
+    pub fn pointer_press(&mut self, at: (f32, f32), mods: Mods, now: Instant, gfx: &mut Gfx) {
+        if let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at) {
+            let menu = self.input.menu_open();
+            let o = self.input.press(&mut e.field, gfx, area, at, mods, now);
+            if menu || o.taken() {
+                self.tick += 1;
+                return;
+            }
+        } else {
+            self.input.cancel();
+        }
+        self.press(at.0, at.1);
+    }
+
+    /// A secondary (right) press at `at`: on an open rename field it ends a drag, moves the
+    /// caret to the press when nothing is selected, and opens the field's edit menu there
+    /// (Cut, Copy, Paste, Select all, in the words of [`set_edit_labels`](Self::set_edit_labels)).
+    /// An edit menu open before is closed first, and the press goes no further. True when it
+    /// was taken; false leaves it to the application (a row's menu, say).
+    pub fn secondary_press(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> bool {
+        let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at) else {
+            return false;
+        };
+        let o = self.input.secondary_press(&mut e.field, gfx, area, at, now);
+        if o.taken() {
+            self.tick += 1;
+        }
+        o.taken()
+    }
+
+    /// The pointer moved to `at`, on the [`pointer_press`](Self::pointer_press) route: an open
+    /// edit menu lights its rows, a press held in the rename field extends the selection
+    /// (wherever the pointer is), and otherwise it is [`pointer`](Self::pointer).
+    #[allow(deprecated)]
+    pub fn pointer_motion(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) {
+        if let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at) {
+            let o = self.input.pointer_move(&mut e.field, gfx, area, at, now);
+            if o.taken() {
+                self.field_moved(o);
+                return;
+            }
+        }
+        self.pointer(at.0, at.1);
+    }
+
+    /// The primary button went up at `at`, on the [`pointer_press`](Self::pointer_press)
+    /// route: a press held in the rename field ends there (the run of clicks goes on), an open
+    /// edit menu takes it, and otherwise it is [`release`](Self::release).
+    pub fn pointer_release(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> Act {
+        if let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at) {
+            let o = self.input.release(&mut e.field, gfx, area, at, now);
+            if o.taken() {
+                self.field_moved(o);
+                return Act::Nothing;
+            }
+        }
+        self.release(at.0, at.1)
+    }
+
+    /// A key, on the [`pointer_press`](Self::pointer_press) route: with a rename field open,
+    /// its edit menu takes every key first (Up, Down, Enter, Escape, an access key; Escape
+    /// closes the menu and leaves the rename open), and Shift+F10 or the Menu key
+    /// (`menu_key`) opens the menu at the caret. Every other key is [`key`](Self::key).
+    pub fn key_with_menu(
+        &mut self,
+        name: Option<&KeyName>,
+        menu_key: bool,
+        mods: Mods,
+        typed: Option<&str>,
+        gfx: &mut Gfx,
+    ) -> Act {
+        let shift_f10 =
+            matches!(name, Some(KeyName::F(10))) && mods.shift && !mods.ctrl && !mods.alt;
+        if let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at)
+            && (self.input.menu_open() || shift_f10 || menu_key)
+        {
+            let open = Mods {
+                shift: true,
+                ..Mods::default()
+            };
+            if !self.input.menu_open() {
+                // Shift+F10 or the Menu key: open it at the caret.
+                self.input
+                    .key(&mut e.field, gfx, area, &KeyName::F(10), open, None);
+            } else if let Some(n) = name {
+                self.input.key(&mut e.field, gfx, area, n, mods, typed);
+            }
+            // A key with no name while the menu is open: the menu drops it, as it drops text.
+            self.tick += 1;
+            return Act::Nothing;
+        }
+        self.key(name, menu_key, mods, typed)
+    }
+
+    /// When [`tick_text`](Self::tick_text) is due: the next step of a drag held past the
+    /// rename field's end, or the edit menu's submenu delay. `None` while nothing waits.
+    pub fn text_deadline(&self) -> Option<Instant> {
+        self.input.deadline()
+    }
+
+    /// Does what was due at `now` (see [`text_deadline`](Self::text_deadline)). True when
+    /// something moved (and `tick` with it); early or repeated calls do nothing.
+    pub fn tick_text(&mut self, now: Instant, gfx: &mut Gfx) -> bool {
+        let (Some(e), Some(area)) = (self.edit.as_mut(), self.field_at) else {
+            return false;
+        };
+        let o = self.input.tick(&mut e.field, gfx, area, now);
+        self.field_moved(o)
+    }
+
+    /// The cursor to show at `at` on the [`pointer_press`](Self::pointer_press) route: the
+    /// I-beam over an open rename field and all through its drag, the arrow over an open edit
+    /// menu, and `None` (the application's choice) elsewhere.
+    pub fn cursor_at(&self, at: (f32, f32)) -> Option<Cursor> {
+        let area = self.field_at?;
+        self.edit.as_ref()?;
+        self.input.cursor_at(area, at)
+    }
+
+    /// Words the rename field's edit menu by `labels` from the next time it opens (English
+    /// until then).
+    pub fn set_edit_labels(&mut self, labels: EditLabels) {
+        self.input.set_labels(labels);
+    }
+
+    /// Whether the rename field's edit menu is open.
+    pub fn edit_menu_open(&self) -> bool {
+        self.input.menu_open()
     }
 
     /// "Write the notes": records that it was pressed, and nothing else. The writer is the next
@@ -1866,6 +2074,8 @@ impl PlanScreen {
 }
 
 #[cfg(test)]
+// These test the old `press` and `pointer` route as well as the new one.
+#[allow(deprecated)]
 mod tests {
     use super::demo::{japan, log, many, recipes};
     use super::*;
@@ -2639,6 +2849,171 @@ mod tests {
         let scroll = s.scroll;
         s.pointer(x, y + 300.0);
         assert_eq!(s.scroll, scroll);
+    }
+
+    // ---- the pointer route with the rename field's whole mouse editing ----
+
+    /// A screen with a rename of row 2 open, drawn once with the returned `Gfx` (which places
+    /// the field); `None` on a system with no font for the name.
+    fn renaming() -> Option<(PlanScreen, Gfx)> {
+        let mut s = screen_of(&japan(), Some(2));
+        s.sel = 2;
+        s.start_rename();
+        let mut gfx = Gfx::new();
+        let mut bmp = Bitmap::new(1280, 800);
+        {
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            s.draw(&mut p, &LIGHT, 1280.0, 800.0, true);
+        }
+        let area = s.field_at?;
+        let text = s.edit.as_ref()?.field.text().to_string();
+        let stops = {
+            let mut p = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.caret_stops(Face::Ui, 13.5, &text)
+        };
+        if text.is_empty() || stops.last().is_none_or(|&w| w <= 0.0) {
+            eprintln!("skipped: no advancing glyph for the test text in the system fonts");
+            return None;
+        }
+        assert!(area.frame().w > 0.0);
+        Some((s, gfx))
+    }
+
+    fn field(s: &PlanScreen) -> &TextField {
+        &s.edit.as_ref().expect("a rename").field
+    }
+
+    #[test]
+    fn the_new_route_gives_the_rename_field_its_clicks_drag_and_padding() {
+        let Some((mut s, mut gfx)) = renaming() else {
+            return;
+        };
+        let t0 = Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let area = s.field_at.unwrap();
+        let name = field(&s).text().to_string();
+        let text = area.text().area;
+        // A press in the frame's padding, left of the text: the caret at the start, at once.
+        let pad = (area.frame().x + 3.0, area.frame().cy());
+        assert!(!text.contains(pad.0, pad.1));
+        s.pointer_press(pad, Mods::default(), t0, &mut gfx);
+        assert_eq!(s.pointer_release(pad, t0, &mut gfx), Act::Nothing);
+        assert!(!field(&s).has_selection());
+        // A drag from there to the far end selects the whole name.
+        let end = (text.right() + 40.0, text.cy());
+        s.pointer_press(pad, Mods::default(), t0 + ms(2000), &mut gfx);
+        s.pointer_motion(end, t0 + ms(2010), &mut gfx);
+        assert_eq!(field(&s).selected_text(), name);
+        s.pointer_release(end, t0 + ms(2020), &mut gfx);
+        // Three presses at one place: the caret, a word, everything.
+        let mid = (text.x + 2.0, text.cy());
+        for (k, dt) in [(1, 4000), (2, 4010), (3, 4020)] {
+            s.pointer_press(mid, Mods::default(), t0 + ms(dt), &mut gfx);
+            s.pointer_release(mid, t0 + ms(dt), &mut gfx);
+            if k == 3 {
+                assert_eq!(field(&s).selected_text(), name, "the triple click");
+            }
+        }
+        assert!(s.edit.is_some(), "still renaming");
+        // The old release ends a drag of the new route.
+        s.pointer_press(mid, Mods::default(), t0 + ms(9000), &mut gfx);
+        assert!(s.input.is_dragging());
+        s.release(mid.0, mid.1);
+        assert!(!s.input.is_dragging());
+        // A press outside the field takes the name, as `press` does.
+        s.pointer_press((5.0, 5.0), Mods::default(), t0 + ms(12000), &mut gfx);
+        assert!(s.edit.is_none());
+        assert_eq!(s.plan.note(2).expect("a note").title(), name);
+    }
+
+    #[test]
+    fn a_right_press_in_the_rename_field_opens_its_edit_menu_which_takes_the_keys_first() {
+        let Some((mut s, mut gfx)) = renaming() else {
+            return;
+        };
+        let t = Instant::now();
+        let area = s.field_at.unwrap();
+        let at = (area.text().area.x + 2.0, area.text().area.cy());
+        assert!(s.secondary_press(at, t, &mut gfx));
+        assert!(s.edit_menu_open());
+        assert!(
+            field(&s).has_selection(),
+            "a right press keeps the selection"
+        );
+        // The screen draws it over everything: the frame differs from one without it.
+        let with = render(&mut s, &LIGHT, 1280, 800).pixels;
+        // Escape closes the menu and leaves the rename open.
+        assert_eq!(
+            s.key_with_menu(
+                Some(&KeyName::Escape),
+                false,
+                Mods::default(),
+                None,
+                &mut gfx
+            ),
+            Act::Nothing
+        );
+        assert!(!s.edit_menu_open());
+        assert!(s.edit.is_some());
+        assert_ne!(with, render(&mut s, &LIGHT, 1280, 800).pixels);
+        // The Menu key opens it at the caret; a cancel closes it.
+        s.key_with_menu(None, true, Mods::default(), None, &mut gfx);
+        assert!(s.edit_menu_open());
+        assert!(s.cancel());
+        assert!(!s.edit_menu_open());
+        // Escape with the menu closed is `key`'s: the rename is dropped.
+        s.key_with_menu(
+            Some(&KeyName::Escape),
+            false,
+            Mods::default(),
+            None,
+            &mut gfx,
+        );
+        assert!(s.edit.is_none());
+        // No rename: a right press is the application's.
+        assert!(!s.secondary_press(at, t, &mut gfx));
+        // The menu does not outlive the rename it was for.
+        let Some((mut s, mut gfx)) = renaming() else {
+            return;
+        };
+        s.secondary_press(at, t, &mut gfx);
+        assert!(s.edit_menu_open());
+        s.edit = None;
+        render(&mut s, &LIGHT, 1280, 800);
+        assert!(!s.edit_menu_open());
+    }
+
+    #[test]
+    fn the_new_route_without_a_rename_is_the_old_one_and_takes_nonsense() {
+        let mut s = screen_of(&japan(), Some(2));
+        let mut gfx = Gfx::new();
+        let t = Instant::now();
+        let g = s.geo();
+        let r = s.rows().rect(g.list, 3);
+        let (x, y) = (r.x + 28.0, r.cy());
+        s.pointer_press((x, y), Mods::default(), t, &mut gfx);
+        assert_eq!(s.pointer_release((x, y), t, &mut gfx), Act::Nothing);
+        assert!(
+            !s.plan.note(3).expect("a note").ticked(),
+            "the tick box flipped"
+        );
+        assert_eq!(s.cursor_at((x, y)), None);
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e9, 1e9] {
+            s.pointer_press((v, v), Mods::default(), t, &mut gfx);
+            s.pointer_motion((v, v), t, &mut gfx);
+            s.pointer_release((v, v), t, &mut gfx);
+            s.secondary_press((v, v), t, &mut gfx);
+            s.tick_text(t, &mut gfx);
+            s.cancel();
+        }
+        if let Some((mut s, mut gfx)) = renaming() {
+            for v in [f32::NAN, f32::INFINITY, -1e9] {
+                s.secondary_press((v, v), t, &mut gfx);
+                s.pointer_motion((v, v), t, &mut gfx);
+                s.tick_text(t, &mut gfx);
+                let _ = s.cursor_at((v, v));
+            }
+        }
     }
 
     /// Audit 4, W10: the rename field's spot is what shows of it. With its row half under the
