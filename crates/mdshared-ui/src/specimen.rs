@@ -127,6 +127,8 @@ fn render(name: &str, scale: f32, pal: &Colors, mut f: impl FnMut(&mut Painter))
 
 #[test]
 #[ignore]
+// A row's hover, through the old move; the sheet is the same on either route.
+#[allow(deprecated)]
 fn palette_sheets() {
     let win = Rect::new(0.0, 0.0, W, H);
     for (scale, sfx) in [(1.0, ""), (1.5, "-150")] {

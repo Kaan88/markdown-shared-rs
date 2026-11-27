@@ -12,13 +12,17 @@
 //!
 //! All coordinates are logical px. No callbacks, no threads: every event returns an [`Outcome`].
 
-use crate::gfx::{Face, Painter, Rect, Rgb};
+use crate::cursor::Cursor;
+use crate::gfx::{Face, Gfx, Painter, Rect, Rgb};
 use crate::glyph;
 use crate::keys::{KeyName, Mods};
 use crate::scroll;
-use crate::textfield::{FieldColors, TextField};
+use crate::textfield::{
+    EditLabels, FieldArea, FieldColors, FieldHit, FieldInput, FieldOutcome, TextField,
+};
 use crate::theme::Palette as Colors;
 use mdshared_app::fuzzy;
+use std::time::Instant;
 
 /// The widest the card gets, and the margin it keeps from the window's sides.
 const CARD_W: f32 = 640.0;
@@ -224,6 +228,11 @@ pub struct Palette {
     pressed_row: Option<usize>,
     pressed_message: bool,
     bar_hover: bool,
+    /// The query box's mouse editing and edit menu, on the [`pointer_press`](Palette::pointer_press)
+    /// route; the old [`press`](Palette::press) route never reaches it.
+    input: FieldInput,
+    /// The scale the card was last drawn at: the box's text is hit at it.
+    scale: f32,
 }
 
 impl Default for Palette {
@@ -269,6 +278,8 @@ impl Palette {
             pressed_row: None,
             pressed_message: false,
             bar_hover: false,
+            input: FieldInput::new(),
+            scale: 1.0,
         }
     }
 
@@ -283,6 +294,7 @@ impl Palette {
         self.fresh_query = true;
         self.drag = Drag::None;
         self.pressed_row = None;
+        self.input.cancel();
         self.rebuild();
     }
 
@@ -628,8 +640,13 @@ impl Palette {
             card.inset(-18.0),
             t,
             (0.0, -crate::menu::MENU_DROP),
-            |p| self.draw(p, pal, window, title_h, caret_on),
+            |p| self.draw_card(p, pal, window, title_h, caret_on),
         );
+        // The edit menu is a menu of its own, over the card, not part of its fade; it goes with
+        // the card.
+        if t > 0.0 {
+            self.input.draw_menu(p, pal, window);
+        }
     }
 
     /// Everything [`draw_presence`](Self::draw_presence) touches at any `t`, as last laid out.
@@ -813,8 +830,13 @@ impl Palette {
 
     /// The pointer moved. Over a row it moves the selection there, so the highlight follows the
     /// pointer but not a scroll under it. Returns true when something needs redrawing.
-    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
-    // (roadmap L15); its callers see no change.
+    ///
+    /// Deprecated with [`press`](Self::press): [`pointer_motion`](Self::pointer_motion) is
+    /// this with the query box's whole drag.
+    #[deprecated(
+        note = "the query box takes only a click and a drag here: use `pointer_press`, `pointer_motion`, `pointer_release`, `secondary_press` and `key_with_menu`, which give it the triple click, edge scrolling, presses in its padding and the edit menu"
+    )]
+    // It calls the click-only `TextField::drag` itself, unchanged.
     #[allow(deprecated)]
     pub fn pointer_move(&mut self, x: f32, y: f32) -> bool {
         match self.drag {
@@ -864,8 +886,16 @@ impl Palette {
     /// outside the card closes the palette; in the box it places the caret (a double click selects
     /// a word); on the scrollbar it grabs or jumps; on a row it selects it, and the release over
     /// the same row chooses it.
-    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
-    // (roadmap L15); its callers see no change.
+    ///
+    /// Deprecated: the box takes a click, a drag and a double click here and nothing more
+    /// (a triple click is a word again, no edge scrolling, no edit menu, nothing for a press
+    /// in its padding). [`pointer_press`](Self::pointer_press) is this with all of it. The
+    /// palette's applications move when their pin passes this, or allow the warning to keep
+    /// this behaviour (roadmap L15).
+    #[deprecated(
+        note = "the query box takes only a click and a drag here: use `pointer_press`, `pointer_motion`, `pointer_release`, `secondary_press` and `key_with_menu`, which give it the triple click, edge scrolling, presses in its padding and the edit menu"
+    )]
+    // It calls the click-only `TextField::press` and `select_word_at` itself, unchanged.
     #[allow(deprecated)]
     pub fn press(&mut self, x: f32, y: f32, mods: Mods, clicks: u8) -> Outcome {
         self.drag = Drag::None;
@@ -919,8 +949,14 @@ impl Palette {
     }
 
     /// The button went up: chooses the row the press began on when the pointer is still on it.
+    /// A drag of the query box begun on the [`pointer_press`](Self::pointer_press) route ends
+    /// here too (without the last stretch to `(x, y)`: [`pointer_release`](Self::pointer_release)
+    /// has that).
     pub fn release(&mut self, x: f32, y: f32) -> Outcome {
         self.drag = Drag::None;
+        if self.input.is_dragging() {
+            self.input.cancel();
+        }
         if let Some(i) = self.pressed_row.take()
             && self.entry_at(x, y) == Some(i)
         {
@@ -941,13 +977,204 @@ impl Palette {
     /// nothing, wherever the pointer goes next. For when the window lost the pointer
     /// (`Focus(false)`, or the host's `Event::PressLost`), where a [`release`](Self::release)
     /// would act on what is under the pointer. The selection, the text and the scroll stay as
-    /// they are. Returns true if there was a press.
+    /// they are. On the [`pointer_press`](Self::pointer_press) route it also ends the query
+    /// box's drag and closes its edit menu. Returns true if there was a press or a menu (draw
+    /// again).
     pub fn cancel(&mut self) -> bool {
         let held = self.drag != Drag::None || self.pressed_row.is_some() || self.pressed_message;
+        self.drop_card_press();
+        let dragging = self.input.is_dragging();
+        let menu = self.input.cancel();
+        held || dragging || menu
+    }
+
+    // ---- the pointer route, with all of the query box's mouse editing ------------------------
+    //
+    // `pointer_press`, `secondary_press`, `pointer_motion`, `pointer_release`, `key_with_menu`,
+    // `text_deadline`, `tick_text` and `cursor_at` together: the query box gets a field's whole
+    // mouse editing (`textfield::FieldInput`), and the rest of the card answers as `press`,
+    // `pointer_move` and `release` do.
+
+    /// The query box as it was last drawn: its frame (a press anywhere in it counts, the
+    /// magnifier included) and its text.
+    fn field_input_area(&self) -> FieldArea {
+        FieldArea::new(
+            self.field_box,
+            FieldHit {
+                area: self.field_area,
+                face: Face::Ui,
+                size: 15.0,
+                scale: self.scale,
+            },
+        )
+    }
+
+    /// The palette's answer for what the query box's input did.
+    fn field_answer(&mut self, o: FieldOutcome) -> Outcome {
+        match o {
+            FieldOutcome::Edited => {
+                self.fresh_query = true;
+                self.rebuild();
+                Outcome::QueryChanged
+            }
+            FieldOutcome::Unused | FieldOutcome::Taken => Outcome::None,
+            _ => Outcome::Redraw,
+        }
+    }
+
+    /// Forgets a press of the card's own (a row, the message line, the thumb).
+    fn drop_card_press(&mut self) {
         self.drag = Drag::None;
         self.pressed_row = None;
         self.pressed_message = false;
-        held
+    }
+
+    /// A primary (left) press at `at`, on the route that gives the query box all of a field's
+    /// mouse editing: a click places the caret where the shaped text puts it, Shift extends the
+    /// selection, a double click selects a word and a triple click everything, a drag selects
+    /// and scrolls the text past the box's ends ([`text_deadline`](Self::text_deadline)), and a
+    /// press anywhere in the box's frame counts, its padding and the magnifier included. `now`
+    /// is the event's time and `gfx` the one the card is drawn with. The box counts its own
+    /// clicks, so `clicks` goes to the rest of the card only.
+    ///
+    /// With the box's edit menu open, the press goes to the menu (choosing an item, or closing
+    /// the menu when outside it) and no further. Elsewhere it is [`press`](Self::press): a row,
+    /// the scrollbar, the message line, or outside the card [`Outcome::Closed`].
+    ///
+    /// Use it with [`pointer_motion`](Self::pointer_motion),
+    /// [`pointer_release`](Self::pointer_release), [`secondary_press`](Self::secondary_press)
+    /// and [`key_with_menu`](Self::key_with_menu) in place of `press`, `pointer_move`,
+    /// `release` and `key`; wait for [`text_deadline`](Self::text_deadline) and call
+    /// [`tick_text`](Self::tick_text); call [`cancel`](Self::cancel) when the window loses the
+    /// keyboard. [`draw`](Self::draw) draws the edit menu over the card.
+    // The rest of the card is still `press`'s; the box's part of it never runs from here,
+    // since a press in the box's frame is the input's.
+    #[allow(deprecated)]
+    pub fn pointer_press(
+        &mut self,
+        at: (f32, f32),
+        mods: Mods,
+        clicks: u8,
+        now: Instant,
+        gfx: &mut Gfx,
+    ) -> Outcome {
+        let area = self.field_input_area();
+        let menu = self.input.menu_open();
+        let o = self.input.press(&mut self.field, gfx, area, at, mods, now);
+        if menu || o.taken() {
+            self.drop_card_press();
+            return match self.field_answer(o) {
+                Outcome::None => Outcome::Redraw,
+                done => done,
+            };
+        }
+        self.press(at.0, at.1, mods, clicks)
+    }
+
+    /// A secondary (right) press at `at`: on the query box it ends a drag, moves the caret to
+    /// the press when nothing is selected, and opens the box's edit menu there (Cut, Copy,
+    /// Paste, Select all, in the words of [`set_edit_labels`](Self::set_edit_labels)), which
+    /// [`draw`](Self::draw) draws over the card. An open menu is closed first. Outside the
+    /// card it is [`Outcome::Closed`], as a left press is; elsewhere on the card it ends a
+    /// press of the card's and does nothing else.
+    pub fn secondary_press(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> Outcome {
+        let area = self.field_input_area();
+        let menu = self.input.menu_open();
+        let o = self
+            .input
+            .secondary_press(&mut self.field, gfx, area, at, now);
+        self.drop_card_press();
+        if o.taken() {
+            return Outcome::Redraw;
+        }
+        if !self.card.contains(at.0, at.1) {
+            return Outcome::Closed;
+        }
+        if menu { Outcome::Redraw } else { Outcome::None }
+    }
+
+    /// The pointer moved to `at`, on the [`pointer_press`](Self::pointer_press) route: an open
+    /// edit menu lights its rows, a press held in the query box extends the selection (wherever
+    /// the pointer is), and otherwise it is [`pointer_move`](Self::pointer_move). True when
+    /// something needs drawing again.
+    // The rest of the card is still `pointer_move`'s; the box's drag of the old route is never
+    // under way on this one.
+    #[allow(deprecated)]
+    pub fn pointer_motion(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> bool {
+        let area = self.field_input_area();
+        let o = self.input.pointer_move(&mut self.field, gfx, area, at, now);
+        if o.taken() {
+            return o.redraw();
+        }
+        self.pointer_move(at.0, at.1)
+    }
+
+    /// The primary button went up at `at`, on the [`pointer_press`](Self::pointer_press)
+    /// route: a press held in the query box ends there (the run of clicks goes on), an open
+    /// edit menu takes it, and otherwise it is [`release`](Self::release): the row the press
+    /// began on is chosen when the pointer is still on it.
+    pub fn pointer_release(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> Outcome {
+        let area = self.field_input_area();
+        let o = self.input.release(&mut self.field, gfx, area, at, now);
+        if o.taken() {
+            return self.field_answer(o);
+        }
+        self.release(at.0, at.1)
+    }
+
+    /// A key, on the [`pointer_press`](Self::pointer_press) route: an open edit menu takes
+    /// every key first (Up, Down, Enter, Escape, an access key; Escape closes the menu, not the
+    /// palette), Shift+F10 opens the menu at the caret, and every other key is
+    /// [`key`](Self::key). A chosen Cut or Paste is [`Outcome::QueryChanged`], as typing is.
+    pub fn key_with_menu(
+        &mut self,
+        key: &KeyName,
+        mods: Mods,
+        typed: Option<&str>,
+        gfx: &mut Gfx,
+    ) -> Outcome {
+        let shift_f10 = *key == KeyName::F(10) && mods.shift && !mods.ctrl && !mods.alt;
+        if self.input.menu_open() || shift_f10 {
+            let area = self.field_input_area();
+            let o = self.input.key(&mut self.field, gfx, area, key, mods, typed);
+            return match self.field_answer(o) {
+                Outcome::None => Outcome::Redraw,
+                done => done,
+            };
+        }
+        self.key(key, mods, typed)
+    }
+
+    /// When [`tick_text`](Self::tick_text) is due: the next step of a drag held past the query
+    /// box's end, or the edit menu's submenu delay. `None` while nothing waits, so an idle
+    /// palette asks for no wake-up.
+    pub fn text_deadline(&self) -> Option<Instant> {
+        self.input.deadline()
+    }
+
+    /// Does what was due at `now` (see [`text_deadline`](Self::text_deadline)). True when
+    /// something moved; early or repeated calls do nothing.
+    pub fn tick_text(&mut self, now: Instant, gfx: &mut Gfx) -> bool {
+        let area = self.field_input_area();
+        self.input.tick(&mut self.field, gfx, area, now).redraw()
+    }
+
+    /// The cursor to show at `at` on the [`pointer_press`](Self::pointer_press) route: the
+    /// I-beam over the query box and all through its drag, the arrow over an open edit menu,
+    /// and `None` (the application's choice) elsewhere.
+    pub fn cursor_at(&self, at: (f32, f32)) -> Option<Cursor> {
+        self.input.cursor_at(self.field_input_area(), at)
+    }
+
+    /// Words the query box's edit menu by `labels` from the next time it opens (English until
+    /// then).
+    pub fn set_edit_labels(&mut self, labels: EditLabels) {
+        self.input.set_labels(labels);
+    }
+
+    /// Whether the query box's edit menu is open.
+    pub fn edit_menu_open(&self) -> bool {
+        self.input.menu_open()
     }
 
     /// The wheel: `dy` logical px, positive towards the end of the list. Returns true when the
@@ -973,7 +1200,9 @@ impl Palette {
 
     // ---- drawing -----------------------------------------------------------------------------
 
-    /// Lays the card out in `window` and draws it. `caret_on` is the blink phase.
+    /// Lays the card out in `window` and draws it. `caret_on` is the blink phase. The query
+    /// box's edit menu, open only on the [`pointer_press`](Self::pointer_press) route, is drawn
+    /// last, over the card; with it closed this draws what it always drew.
     pub fn draw(
         &mut self,
         p: &mut Painter,
@@ -982,6 +1211,20 @@ impl Palette {
         title_h: f32,
         caret_on: bool,
     ) {
+        self.draw_card(p, pal, window, title_h, caret_on);
+        self.input.draw_menu(p, pal, window);
+    }
+
+    /// The card alone: everything [`draw`](Self::draw) draws but the edit menu.
+    fn draw_card(
+        &mut self,
+        p: &mut Painter,
+        pal: &Colors,
+        window: Rect,
+        title_h: f32,
+        caret_on: bool,
+    ) {
+        self.scale = p.scale;
         self.layout(window, title_h);
         let card = self.card;
         p.shadow(card, 10.0, pal.dark);
@@ -1233,6 +1476,8 @@ fn draw_label(
 }
 
 #[cfg(test)]
+// These test the old `press` and `pointer_move` route as well as the new one.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::gfx::Gfx;
@@ -1613,6 +1858,188 @@ mod tests {
         p.press(track.cx(), track.bottom() - 4.0, NONE, 1);
         assert!(p.scroll() > mid);
         p.release(0.0, 0.0);
+    }
+
+    // ---- the pointer route with the query box's whole mouse editing ----
+
+    /// A palette with `query` in the box, drawn once (which places it and gives the box its
+    /// text stops), and the `Gfx` it was drawn with; `None` on a system with no font for it.
+    fn routed(query: &str) -> Option<(Palette, Gfx)> {
+        let mut p = palette(entries(6));
+        p.open(query);
+        p.set_entries(entries(6));
+        let mut gfx = Gfx::new();
+        let mut bmp = Bitmap::new(WIN.w as u32, WIN.h as u32);
+        {
+            let mut painter = Painter::new(&mut bmp, &mut gfx, 1.0);
+            p.draw(&mut painter, &crate::theme::LIGHT, WIN, 40.0, true);
+        }
+        if !query.is_empty() && p.stops.last().is_none_or(|&w| w <= 0.0) {
+            eprintln!("skipped: no advancing glyph for the test text in the system fonts");
+            return None;
+        }
+        Some((p, gfx))
+    }
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_new_route_gives_the_box_a_triple_click_and_presses_in_its_padding() {
+        let Some((mut p, mut gfx)) = routed("alpha beta") else {
+            return;
+        };
+        let t0 = Instant::now();
+        let a = p.field_area;
+        let word = (a.x + p.stops[2], a.cy());
+        // One, two, three presses at one place: the caret, the word, everything.
+        assert_eq!(
+            p.pointer_press(word, NONE, 1, t0, &mut gfx),
+            Outcome::Redraw
+        );
+        p.pointer_release(word, t0, &mut gfx);
+        assert!(!p.field.has_selection());
+        p.pointer_press(word, NONE, 2, t0 + ms(10), &mut gfx);
+        p.pointer_release(word, t0 + ms(10), &mut gfx);
+        assert_eq!(p.field.selected_text(), "alpha");
+        p.pointer_press(word, NONE, 3, t0 + ms(20), &mut gfx);
+        p.pointer_release(word, t0 + ms(20), &mut gfx);
+        assert_eq!(
+            p.field.selected_text(),
+            "alpha beta",
+            "the triple click selects all"
+        );
+        // A press on the magnifier, in the box's padding left of the text: the caret at the
+        // start (the old route left that to the text rectangle's own hit).
+        let pad = (p.field_box.x + 6.0, p.field_box.cy());
+        assert!(!p.field_area.contains(pad.0, pad.1));
+        p.pointer_press(pad, NONE, 1, t0 + ms(2000), &mut gfx);
+        p.pointer_release(pad, t0 + ms(2000), &mut gfx);
+        assert_eq!(p.field.caret(), (0, 0));
+        assert!(!p.field.has_selection());
+        // A drag from there selects as it goes, and the release ends it.
+        let end = (a.right() - 2.0, a.cy());
+        p.pointer_press(pad, NONE, 1, t0 + ms(4000), &mut gfx);
+        assert!(p.pointer_motion(end, t0 + ms(4010), &mut gfx));
+        assert_eq!(p.field.selected_text(), "alpha beta");
+        p.pointer_release(end, t0 + ms(4020), &mut gfx);
+        let far = (a.x + 1.0, a.cy() + 200.0);
+        assert!(!p.pointer_motion(far, t0 + ms(4030), &mut gfx) || !p.input.is_dragging());
+        assert!(!p.input.is_dragging(), "the release ended it");
+    }
+
+    #[test]
+    fn the_new_route_leaves_the_rest_of_the_card_as_press_had_it() {
+        let Some((mut p, mut gfx)) = routed("") else {
+            return;
+        };
+        let t = Instant::now();
+        // A row chosen by a press and a release on it.
+        let r = p.row_rect(3);
+        let at = (r.x + 50.0, r.cy());
+        assert_eq!(p.pointer_press(at, NONE, 1, t, &mut gfx), Outcome::Redraw);
+        assert_eq!(p.pointer_release(at, t, &mut gfx), Outcome::Chosen(3));
+        // Hover moves the selection, as `pointer_move` does.
+        let r5 = p.row_rect(5);
+        assert!(p.pointer_motion((r5.x + 30.0, r5.cy()), t, &mut gfx));
+        assert_eq!(p.selected_index(), Some(5));
+        // Outside the card: closed, by either button.
+        assert_eq!(
+            p.pointer_press((5.0, 5.0), NONE, 1, t, &mut gfx),
+            Outcome::Closed
+        );
+        assert_eq!(p.secondary_press((5.0, 5.0), t, &mut gfx), Outcome::Closed);
+        // A right press on a row does nothing.
+        assert_eq!(p.secondary_press(at, t, &mut gfx), Outcome::None);
+        // Keys other than the menu's are `key`'s.
+        assert_eq!(
+            p.key_with_menu(&KeyName::Escape, NONE, None, &mut gfx),
+            Outcome::Closed
+        );
+    }
+
+    #[test]
+    fn a_right_press_in_the_box_opens_the_edit_menu_which_takes_the_keys_first() {
+        let Some((mut p, mut gfx)) = routed("alpha") else {
+            return;
+        };
+        let t = Instant::now();
+        let a = p.field_area;
+        let at = (a.x + p.stops[2], a.cy());
+        assert_eq!(p.secondary_press(at, t, &mut gfx), Outcome::Redraw);
+        assert!(p.edit_menu_open());
+        assert_eq!(p.field.caret(), (2, 2), "a right press moves a lone caret");
+        // The palette draws it: a frame with the menu differs from one without.
+        let shot = |p: &mut Palette, gfx: &mut Gfx| {
+            let mut bmp = Bitmap::new(WIN.w as u32, WIN.h as u32);
+            {
+                let mut painter = Painter::new(&mut bmp, gfx, 1.0);
+                p.draw(&mut painter, &crate::theme::LIGHT, WIN, 40.0, true);
+            }
+            bmp.pixels
+        };
+        let with = shot(&mut p, &mut gfx);
+        // Escape closes the menu, not the palette.
+        assert_eq!(
+            p.key_with_menu(&KeyName::Escape, NONE, None, &mut gfx),
+            Outcome::Redraw
+        );
+        assert!(!p.edit_menu_open());
+        assert_ne!(with, shot(&mut p, &mut gfx));
+        assert_eq!(
+            p.key_with_menu(&KeyName::Escape, NONE, None, &mut gfx),
+            Outcome::Closed
+        );
+        // Shift+F10 opens it at the caret; a press outside it closes it and goes no further.
+        let shift = Mods {
+            shift: true,
+            ..NONE
+        };
+        assert_eq!(
+            p.key_with_menu(&KeyName::F(10), shift, None, &mut gfx),
+            Outcome::Redraw
+        );
+        assert!(p.edit_menu_open());
+        shot(&mut p, &mut gfx);
+        let r = p.row_rect(1);
+        assert_eq!(
+            p.pointer_press((r.x + 50.0, r.cy()), NONE, 1, t, &mut gfx),
+            Outcome::Redraw
+        );
+        assert!(!p.edit_menu_open());
+        assert_eq!(
+            p.release(r.x + 50.0, r.cy()),
+            Outcome::None,
+            "the row was not pressed"
+        );
+        // A cancel closes it too.
+        p.secondary_press(at, t, &mut gfx);
+        assert!(p.cancel());
+        assert!(!p.edit_menu_open());
+    }
+
+    #[test]
+    fn the_old_release_ends_a_drag_of_the_new_route_and_nonsense_does_not_panic() {
+        let Some((mut p, mut gfx)) = routed("alpha beta") else {
+            return;
+        };
+        let t = Instant::now();
+        let a = p.field_area;
+        p.pointer_press((a.x + 1.0, a.cy()), NONE, 1, t, &mut gfx);
+        assert!(p.input.is_dragging());
+        p.release(a.x + 1.0, a.cy());
+        assert!(!p.input.is_dragging());
+        for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e9, 1e9] {
+            p.pointer_press((v, v), NONE, 1, t, &mut gfx);
+            p.secondary_press((v, a.cy()), t, &mut gfx);
+            p.pointer_motion((v, v), t, &mut gfx);
+            p.pointer_release((a.x, v), t, &mut gfx);
+            p.tick_text(t, &mut gfx);
+            let _ = p.cursor_at((v, v));
+            p.cancel();
+        }
+        assert_eq!(p.query(), "alpha beta");
     }
 
     #[test]
