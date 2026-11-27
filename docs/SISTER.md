@@ -74,16 +74,20 @@ checks the extended ACL on the handles and refuses allow entries even with mode 
 Windows rejects reparse points and requires the user SID and a protected owner-only ACL.
 The endpoint lives in `instance-v2` beside the settings, regardless of launch environment.
 On Linux the record and lock names carry a hash of `/etc/machine-id`, falling back to
-`/var/lib/dbus/machine-id` and then the kernel hostname. On macOS they use the host UUID,
-falling back to the hostname. Windows filenames are unchanged.
+`/var/lib/dbus/machine-id` and then the kernel hostname. They also carry the network namespace
+inode when readable, so separate loopback namespaces do not contend. On macOS they use
+`kern.bootsessionuuid`, falling back to the hostname only if the sysctl is missing.
+Windows filenames are unchanged.
 Neither end sends the key. The sender
 opens with a random 32-byte challenge `C`; the listener returns its own random 32-byte `S`
 and `HMAC-SHA256(key, 'S' || C || S)`. Only after checking that proof does the sender
 write `HMAC-SHA256(key, 'C' || C || S)` and the message below. No paths or live text go to
 a reused port. Unauthenticated input is discarded before paths are inspected.
 
-Both peers must support this handshake. `alive` can use the legacy lock on Windows or a bare
-connection to a legacy decimal port on Unix. Windows accepts the current user's legacy files
+Both peers must support this handshake. `alive` can use a private legacy lock on Windows,
+or a bare connection to a legacy decimal port on Unix. On Windows a contended lock readable
+by other unprivileged accounts also needs a successful bare connection, and cannot defer
+publication. Windows accepts the current user's legacy files
 or files owned by Administrators when that group is the token's default owner. Other users
 may have read access but not write or control access; SYSTEM and local administrators are
 already privileged. The v2 directory and files still require a protected, user-only ACL.
@@ -178,8 +182,8 @@ mdview
    the instance lock before closing the request socket and stopping the listener.
    If the sender disconnects after queueing, the window still receives the request.
    `single::forward` sends large file selections as batches on one authenticated connection.
-   The complete selection must fit in 1 MiB and at most 4,096 paths, with at most 256 paths
-   per batch. The receiver buffers until the final marker, discards incomplete or invalid
+   The complete selection must fit in 1 MiB, with at most 256 paths per batch. The receiver
+   buffers just the path bytes until the final marker, discards incomplete or invalid
    selections, and acknowledges only after queueing the whole selection.
   The 200 KB loopback round trip is measured in a test.
 
@@ -414,7 +418,8 @@ Live text (unsaved changes in the viewer):
 
 For the authenticated transport, document delivery, legacy overlap in both startup orders,
 deferred registration, generation races, queue rejection, delayed file checks, header limits,
-delayed replies and a 300-file hand-off were tested on Windows. Linux and macOS (including
+delayed replies, a 300-file hand-off and a selection of 5,000 short paths were tested on
+Windows. Linux and macOS (including
 host-scoped registration and the inherited ACL test) were type-checked only.
 No hand-off between real applications was run. The desktop runs below predate authentication.
 

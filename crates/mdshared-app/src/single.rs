@@ -70,8 +70,13 @@ fn legacy_port(settings: &Path, open: impl FnOnce(&Path) -> Option<File>) -> Opt
 fn legacy_alive(settings: &Path, timeout: Duration) -> bool {
     #[cfg(windows)]
     {
-        let _ = timeout;
-        legacy_predecessor(settings)
+        legacy_port(settings, record::legacy_file).is_some_and(|port| {
+            match record::legacy_lock_privacy(&settings_dir(settings).join("instance.lock")) {
+                Some(true) => true,
+                Some(false) => connect(port, timeout).is_ok(),
+                None => false,
+            }
+        })
     }
     #[cfg(not(windows))]
     {

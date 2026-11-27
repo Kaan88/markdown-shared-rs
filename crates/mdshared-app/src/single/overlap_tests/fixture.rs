@@ -83,6 +83,20 @@ fn a_refused_second_batch_does_not_deliver_the_first_batch() {
     retire(path, rx);
 }
 
+#[test]
+fn forwarding_five_thousand_short_paths_fits_a_single_selection() {
+    let path = scratch("short-selection");
+    let settings = path.join("settings.ini");
+    let rx = listen_unresolved_requests_waking(APP, &settings, || {}).unwrap();
+    let paths: Vec<_> = (0..5_000).map(|i| path.join(i.to_string())).collect();
+    assert!(forward(APP, &settings, &paths));
+    for expected in paths {
+        assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap().path, expected);
+    }
+    assert!(rx.try_recv().is_err());
+    retire(path, rx);
+}
+
 #[cfg(unix)]
 #[test]
 fn forward_preserves_a_carriage_return_inside_a_unix_filename() {
@@ -97,6 +111,9 @@ fn forward_preserves_a_carriage_return_inside_a_unix_filename() {
 }
 
 #[cfg(target_os = "linux")]
+const REGISTRATION_CHILD: &str = "MDSHARED_TEST_REGISTRATION_CHILD";
+
+#[cfg(target_os = "linux")]
 #[test]
 fn discovery_and_contention_ignore_xdg_runtime_dir() {
     let path = scratch("registration-environment");
@@ -109,7 +126,7 @@ fn discovery_and_contention_ignore_xdg_runtime_dir() {
     assert_eq!(port_file(&settings), recorded);
     assert!(recorded.is_file());
     assert!(recorded.starts_with(settings.parent().unwrap()));
-    for with_runtime in [true, false] {
+    let child = || {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -117,6 +134,17 @@ fn discovery_and_contention_ignore_xdg_runtime_dir() {
                 "--exact",
                 "single::overlap_tests::fixture::probe_registration_from_another_environment",
             ])
+            .env_remove(REGISTRATION_CHILD);
+        command
+    };
+    assert!(
+        child().output().unwrap().status.success(),
+        "unflagged helper is inert"
+    );
+    for with_runtime in [true, false] {
+        let mut command = child();
+        command
+            .env(REGISTRATION_CHILD, "1")
             .env("MDSHARED_TEST_SETTINGS", &settings)
             .env("MDSHARED_TEST_PORT", &recorded);
         if with_runtime {
@@ -144,6 +172,9 @@ fn discovery_and_contention_ignore_xdg_runtime_dir() {
 #[test]
 #[ignore = "run in child processes with different environments by the registration test"]
 fn probe_registration_from_another_environment() {
+    if std::env::var_os(REGISTRATION_CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
     let settings = PathBuf::from(std::env::var_os("MDSHARED_TEST_SETTINGS").unwrap());
     let recorded = PathBuf::from(std::env::var_os("MDSHARED_TEST_PORT").unwrap());
     assert_eq!(port_file(&settings), recorded);
@@ -215,6 +246,51 @@ fn a_legacy_record_can_grant_other_users_read_access_but_not_write_access() {
     assert_eq!(deliver_request(APP, &settings, &request), Delivery::Nobody);
     drop((listener, lock));
     remove(path);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_readable_windows_legacy_lock_needs_a_live_port_and_never_defers() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = scratch("legacy-readable-lock");
+    let settings = path.join("settings.ini");
+    let lock_path = path.join("instance.lock");
+    let (listener, lock) = legacy_start(&path);
+    drop(lock);
+    let output = std::process::Command::new("icacls.exe")
+        .arg(&lock_path)
+        .args(["/grant", "*S-1-5-32-545:(R)"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = File::options()
+        .read(true)
+        .share_mode(0)
+        .open(&lock_path)
+        .unwrap();
+
+    let request = Request::document("legacy", "");
+    assert!(!legacy_predecessor(&settings));
+    assert_eq!(deliver_request(APP, &settings, &request), Delivery::Older);
+    listener.set_nonblocking(true).unwrap();
+    let (mut probe, _) = listener.accept().unwrap();
+    probe.set_nonblocking(false).unwrap();
+    probe.set_read_timeout(Some(CONNECT)).unwrap();
+    assert_eq!(probe.read(&mut [0; 1]).unwrap(), 0, "no payload");
+    drop((probe, listener));
+    assert_eq!(deliver_request(APP, &settings, &request), Delivery::Nobody);
+    let rx = listen_requests_waking(APP, &settings, || {}).unwrap();
+    assert!(
+        port_file(&settings).is_file(),
+        "publication was not deferred"
+    );
+    drop(lock);
+    retire(path, rx);
 }
 
 #[cfg(unix)]

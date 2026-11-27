@@ -6,7 +6,7 @@ use super::record::random;
 use crate::sister::{MAX_TEXT, Request, doc_id};
 use crate::update::Sha256;
 use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type Block = [u8; 32];
 
@@ -81,7 +81,6 @@ pub(super) fn authenticate(r: &mut impl Read, w: &mut impl Write, key: &Block) -
 const MAX_LINE: usize = 64 * 1024;
 const MAX_HEADER: usize = 1024 * 1024;
 const MAX_FIELDS: usize = 256;
-const MAX_SELECTION_PATHS: usize = MAX_FIELDS * 16;
 // An older authenticated reader rejects this first line before it can queue any paths.
 const SELECTION: &str = "\0mdshared paths 1";
 
@@ -147,28 +146,30 @@ pub(super) fn read_header(r: &mut impl BufRead, app: &str) -> Option<Header> {
     let mut header = r.take(MAX_HEADER as u64);
     let first = line(&mut header, MAX_LINE)?;
     if first == SELECTION {
-        // The same byte and receive-deadline limits cover the entire connection's
-        // selection. Bound the in-memory request count separately from the bytes.
-        let mut requests = Vec::new();
+        // Stage only path bytes until commit. The connection-wide byte and time
+        // limits already bound the selection, even when it has many short paths.
+        let mut paths = String::new();
         let mut batches = 0;
         loop {
             let next = line(&mut header, MAX_LINE)?;
             if next.is_empty() {
-                return (batches >= 2).then_some(Header::Selection(requests));
+                return (batches >= 2).then(|| {
+                    Header::Selection(paths.split_terminator('\n').map(Request::new).collect())
+                });
             }
             if next != app {
                 return None;
             }
             let batch = fields(&mut header)?;
-            if batch.is_empty() || requests.len() + batch.len() > MAX_SELECTION_PATHS {
+            if batch.is_empty() {
                 return None;
             }
             for path in batch {
-                let path = PathBuf::from(path);
-                if !path.is_absolute() {
+                if !Path::new(&path).is_absolute() {
                     return None;
                 }
-                requests.push(Request::new(path));
+                paths.push_str(&path);
+                paths.push('\n');
             }
             batches += 1;
         }

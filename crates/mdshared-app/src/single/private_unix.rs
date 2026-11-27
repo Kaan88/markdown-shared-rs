@@ -41,29 +41,127 @@ fn system_id() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn system_id() -> Option<String> {
-    let mut id = [0; 16];
-    let timeout = libc::timespec {
-        tv_sec: 1,
-        tv_nsec: 0,
+fn boot_session_id() -> io::Result<Option<String>> {
+    let mut bytes = [0u8; 64];
+    let mut len = bytes.len();
+    // SAFETY: the read-only query writes at most len bytes into the live buffer.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
-    // SAFETY: gethostuuid writes a 16-byte UUID, and timeout lives through the call.
-    (unsafe { libc::gethostuuid(id.as_mut_ptr(), &timeout) } == 0 && id != [0; 16])
-        .then(|| crate::update::sha256_hex(&[b"uuid:", id.as_slice()].concat()))
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let uuid = bytes
+        .get(..len)
+        .and_then(|bytes| bytes.strip_suffix(b"\0"))
+        .filter(|uuid| !uuid.is_empty())
+        .ok_or(io::ErrorKind::InvalidData)?;
+    Ok(Some(crate::update::sha256_hex(&[b"boot:", uuid].concat())))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hostname_id() -> Option<String> {
+    let name = hostname()?;
+    Some(crate::update::sha256_hex(
+        &[b"hostname:", name.as_slice()].concat(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_scope(host: String, net: Option<u64>) -> String {
+    match net {
+        Some(inode) => format!("{host}.{inode}"),
+        None => host,
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn host_id() -> Option<&'static str> {
     use std::sync::LazyLock;
     static ID: LazyLock<Option<String>> = LazyLock::new(|| {
-        system_id().or_else(|| {
-            let name = hostname()?;
-            Some(crate::update::sha256_hex(
-                &[b"hostname:", name.as_slice()].concat(),
-            ))
-        })
+        let host = system_id().or_else(hostname_id)?;
+        // Follow the procfs link to its network namespace, not the link's own inode.
+        let net = std::fs::metadata("/proc/self/ns/net")
+            .ok()
+            .map(|meta| meta.ino());
+        Some(namespace_scope(host, net))
     });
     ID.as_deref()
+}
+
+#[cfg(target_os = "macos")]
+fn cached_macos_id(
+    cache: &std::sync::OnceLock<String>,
+    boot: impl FnOnce() -> io::Result<Option<String>>,
+    hostname: impl FnOnce() -> Option<String>,
+) -> Option<&str> {
+    if let Some(id) = cache.get() {
+        return Some(id);
+    }
+    let id = match boot().ok()? {
+        Some(id) => id,
+        None => hostname()?,
+    };
+    Some(cache.get_or_init(|| id))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn host_id() -> Option<&'static str> {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    cached_macos_id(&ID, boot_session_id, hostname_id)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn the_loopback_namespace_is_part_of_the_host_scope_when_readable() {
+    assert_ne!(
+        namespace_scope("host".into(), Some(1)),
+        namespace_scope("host".into(), Some(2))
+    );
+    assert_eq!(namespace_scope("host".into(), None), "host");
+    if let Ok(meta) = std::fs::metadata("/proc/self/ns/net") {
+        assert!(host_id().unwrap().ends_with(&format!(".{}", meta.ino())));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn a_transient_boot_session_error_does_not_use_or_cache_the_hostname() {
+    let cache = std::sync::OnceLock::new();
+    let no_fallback = || panic!("the sysctl was not missing");
+    assert_eq!(
+        cached_macos_id(
+            &cache,
+            || Err(io::ErrorKind::Interrupted.into()),
+            no_fallback
+        ),
+        None
+    );
+    assert!(cache.get().is_none());
+    assert_eq!(
+        cached_macos_id(&cache, || Ok(Some("boot".into())), no_fallback),
+        Some("boot")
+    );
+    assert_eq!(
+        cached_macos_id(&cache, || panic!("use the cached boot id"), no_fallback),
+        Some("boot")
+    );
+    let missing = std::sync::OnceLock::new();
+    assert_eq!(
+        cached_macos_id(&missing, || Ok(None), || Some("host".into())),
+        Some("host")
+    );
 }
 
 #[cfg(all(test, target_os = "linux"))]

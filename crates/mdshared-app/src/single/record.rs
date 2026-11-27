@@ -19,6 +19,8 @@ pub(super) use os::Directory;
 #[cfg(all(test, windows))]
 pub(super) use os::create_legacy_fixture_dir;
 pub(super) use os::legacy_file;
+#[cfg(windows)]
+pub(super) use os::legacy_lock_privacy;
 pub(super) use os::legacy_locked;
 #[cfg(unix)]
 pub(super) use os::legacy_probe_file;

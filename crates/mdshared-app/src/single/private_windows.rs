@@ -249,20 +249,28 @@ fn plain(file: &File, dir: bool) -> bool {
 
 pub(in crate::single) fn legacy_file(path: &Path) -> Option<File> {
     let file = file_options().read(true).open(path).ok()?;
-    (plain(&file, false) && legacy_acl(&file)).then_some(file)
+    (plain(&file, false) && legacy_privacy(&file).is_some()).then_some(file)
 }
 
 pub(in crate::single) fn legacy_locked(path: &Path) -> bool {
+    legacy_lock_privacy(path) == Some(true)
+}
+
+/// A safely owned and contended legacy lock; true only when other users cannot read it.
+pub(in crate::single) fn legacy_lock_privacy(path: &Path) -> Option<bool> {
     let check = file_options()
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-        .open(path);
-    if !check.is_ok_and(|file| plain(&file, false) && legacy_acl(&file)) {
-        return false;
+        .open(path)
+        .ok()?;
+    if !plain(&check, false) {
+        return None;
     }
+    let private = legacy_privacy(&check)?;
     file_options()
         .read(true)
         .open(path)
         .is_err_and(|e| e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
+        .then_some(private)
 }
 
 fn process_token() -> Option<OwnedHandle> {
@@ -330,28 +338,25 @@ pub(super) fn private(file: &File) -> bool {
 }
 
 fn private_acl(file: &File) -> bool {
-    check_security(file, |security, user, _| security.private(user))
+    check_security(file, |security, user, _| security.private(user)) == Some(true)
 }
 
-fn legacy_acl(file: &File) -> bool {
+fn legacy_privacy(file: &File) -> Option<bool> {
     check_security(file, |security, user, token| {
         security.legacy(user, || {
             with_sid(token, TokenOwner, |_, owner| owner == ADMINISTRATORS) == Some(true)
         })
-    })
+    })?
 }
 
-fn check_security(
+fn check_security<T>(
     file: &File,
-    check: impl FnOnce(Security<'_>, &[u8], &OwnedHandle) -> bool,
-) -> bool {
-    let (Some(desc), Some(token)) = (Descriptor::read(file), process_token()) else {
-        return false;
-    };
-    let Some(security) = Security::parse(desc.bytes()) else {
-        return false;
-    };
-    with_sid(&token, TokenUser, |_, user| check(security, user, &token)) == Some(true)
+    check: impl FnOnce(Security<'_>, &[u8], &OwnedHandle) -> T,
+) -> Option<T> {
+    let desc = Descriptor::read(file)?;
+    let token = process_token()?;
+    let security = Security::parse(desc.bytes())?;
+    with_sid(&token, TokenUser, |_, user| check(security, user, &token))
 }
 
 // Well-known SIDs S-1-5-18 and S-1-5-32-544, in the self-relative descriptor's byte layout.
@@ -435,14 +440,15 @@ impl<'a> Security<'a> {
             && self.all_aces(|ace| ace[0] == 0 && sid_bytes(ace, 8) == Some(user)) == Some(true)
     }
 
-    fn legacy(&self, user: &[u8], admin_default_owner: impl FnOnce() -> bool) -> bool {
+    fn legacy(&self, user: &[u8], admin_default_owner: impl FnOnce() -> bool) -> Option<bool> {
         if self.owner != user && (self.owner != ADMINISTRATORS || !admin_default_owner()) {
-            return false;
+            return None;
         }
         // SYSTEM and local administrators can already take ownership and write any
         // file. Inherited read grants are harmless; reject other write/control grants.
         const READ_ONLY: u32 =
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
+        let mut private = true;
         self.all_aces(|ace| {
             if ace[1] & INHERIT_ONLY_ACE as u8 != 0 || ace[0] == 1 {
                 return true; // Inherit-only entry, or ACCESS_DENIED_ACE_TYPE.
@@ -453,8 +459,13 @@ impl<'a> Security<'a> {
             let (Some(mask), Some(sid)) = (dword(ace, 4), sid_bytes(ace, 8)) else {
                 return false;
             };
-            sid == user || sid == SYSTEM || sid == ADMINISTRATORS || mask & !READ_ONLY == 0
-        }) == Some(true)
+            if sid == user || sid == SYSTEM || sid == ADMINISTRATORS {
+                return true;
+            }
+            private &= mask == 0;
+            mask & !READ_ONLY == 0
+        })?
+        .then_some(private)
     }
 }
 
@@ -501,8 +512,8 @@ mod tests {
             ],
         );
         let inherited = Security::parse(&inherited).unwrap();
-        assert!(inherited.legacy(USER, || true));
-        assert!(!inherited.legacy(USER, || false));
+        assert_eq!(inherited.legacy(USER, || true), Some(false));
+        assert_eq!(inherited.legacy(USER, || false), None);
         assert!(!inherited.private(USER), "never a v2 record");
 
         for (owner, mask) in [
@@ -511,7 +522,12 @@ mod tests {
             (ADMINISTRATORS, WRITE_DAC),
         ] {
             let desc = descriptor(owner, false, &[(USER, FILE_ALL_ACCESS), (USERS, mask)]);
-            assert!(!Security::parse(&desc).unwrap().legacy(USER, || true));
+            assert!(
+                Security::parse(&desc)
+                    .unwrap()
+                    .legacy(USER, || true)
+                    .is_none()
+            );
         }
         let mut null_dacl = descriptor(USER, false, &[]);
         null_dacl[16..20].fill(0);
@@ -534,7 +550,7 @@ mod tests {
             corrupt[acl + 10..acl + 12].copy_from_slice(&size.to_le_bytes());
             let parsed = Security::parse(&corrupt).unwrap();
             assert!(!parsed.private(USER));
-            assert!(!parsed.legacy(USER, || false));
+            assert!(parsed.legacy(USER, || false).is_none());
         }
     }
 }
