@@ -844,6 +844,37 @@ fn a_click_in_the_list_shows_its_page_and_puts_the_keyboard_there() {
 }
 
 #[test]
+fn a_cancelled_press_does_not_act() {
+    let mut t = T::new(sample_pages(), MIN);
+    assert_eq!(t.f.cancel(), Outcome::None, "nothing held");
+    t.page_named("Tabs");
+    let r = t.f.control_rect(RESTORE);
+    assert_eq!(t.f.press(r.cx(), r.cy(), NONE, 1), Outcome::Redraw);
+    assert_eq!(t.f.cancel(), Outcome::Redraw);
+    assert_eq!(t.f.cancel(), Outcome::None, "once");
+    assert_eq!(
+        t.f.release(r.cx(), r.cy()),
+        Outcome::None,
+        "the toggle did not flip"
+    );
+    assert_eq!(t.f.value(RESTORE), Some(Value::Bool(true)));
+    // A segment.
+    t.page_named("Appearance");
+    let s = t.f.segment_rect(THEME, 2);
+    t.f.press(s.cx(), s.cy(), NONE, 1);
+    assert_eq!(t.f.cancel(), Outcome::Redraw);
+    assert_eq!(t.f.release(s.cx(), s.cy()), Outcome::None);
+    assert_eq!(t.f.value(THEME), Some(Value::Choice(0)));
+    // A text box's selection drag ends.
+    t.page_named("AI service");
+    let n = t.f.control_rect(NAME);
+    t.f.press(n.cx(), n.cy(), NONE, 1);
+    assert!(t.f.drag.is_some());
+    assert_eq!(t.f.cancel(), Outcome::Redraw);
+    assert_eq!(t.f.drag, None);
+}
+
+#[test]
 fn controls_answer_clicks_and_disabled_ones_do_not() {
     let mut t = T::new(sample_pages(), MIN);
     t.page_named("Tabs");

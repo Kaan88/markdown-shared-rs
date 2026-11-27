@@ -1734,6 +1734,28 @@ impl Form {
         }
     }
 
+    /// Drops a press under way, for when the window lost the pointer (`Focus(false)`, or the
+    /// host's `Event::PressLost`), where a [`release`](Self::release) would act on what is
+    /// under the pointer: a pressed control (a toggle, a segment, a dropdown, a stepper's
+    /// minus or plus, an action, a button, Close, a category) does not act, an open dropdown's
+    /// pressed item is not chosen (the dropdown stays open), and a text box's selection drag
+    /// ends with the selection kept (either route: [`press`](Self::press) or
+    /// `pointer_press`). Nothing here holds a value, so nothing is changed. `Redraw` when a
+    /// press was dropped (a pressed control is drawn pressed), `None` when nothing was held:
+    /// the same answers as `settings::Form::cancel` gives for these.
+    pub fn cancel(&mut self) -> Outcome {
+        let text = self.text_pointer.held;
+        self.cancel_text_pointer();
+        let drag = self.drag.take().is_some();
+        let control = self.pressed.take().is_some();
+        let item = self.menu_pressed.take().is_some();
+        if text || drag || control || item {
+            Outcome::Redraw
+        } else {
+            Outcome::None
+        }
+    }
+
     /// The wheel: only an open dropdown's menu scrolls; a page never does. Returns true when
     /// something moved.
     pub fn wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {

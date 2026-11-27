@@ -1467,6 +1467,45 @@ impl Form {
         }
     }
 
+    /// Drops a press under way, for when the window lost the pointer (`Focus(false)`, or the
+    /// host's `Event::PressLost`), where a [`release`](Self::release) would act on what is
+    /// under the pointer:
+    ///
+    /// * A pressed control (a toggle, a segment, a dropdown, a stepper's minus or plus, an
+    ///   action button, Close, a category) does not act, and an open dropdown's pressed item is
+    ///   not chosen; the dropdown stays open.
+    /// * A text box's selection drag ends (either route: [`press`](Self::press) or
+    ///   `pointer_press`), the selection kept; so does the scrollbar's, the scroll kept.
+    /// * A value in hand (a slider row's thumb, a draggable number row's value, a colour
+    ///   picker's square or strip) stays where the drag left it and is let go as a release
+    ///   lets it go: [`Outcome::Changed`] when it moved since the last report. The value on
+    ///   the screen is the value the application has. (Escape on a number drag puts the old
+    ///   value back instead; a lost pointer is not the person asking for that.)
+    ///
+    /// Returns `Changed` as above, `Redraw` when another press was dropped (a pressed control
+    /// is drawn pressed), and `None` when nothing was held.
+    pub fn cancel(&mut self) -> Outcome {
+        let text = self.text_pointer.held;
+        self.cancel_text_pointer();
+        let colour = self.colour_cancel();
+        let value = match self.drag {
+            Drag::Slider(i, _, reported) => Some(self.slider_release(i, reported)),
+            Drag::Number(_) => Some(self.drag_number_release()),
+            Drag::Bar(_) | Drag::Text(_) => Some(Outcome::Redraw),
+            Drag::None => None,
+        };
+        self.drag = Drag::None;
+        let control = self.pressed.take().is_some();
+        let item = self.menu_pressed.take().is_some();
+        let pressed = control || item;
+        match (colour, value) {
+            (Some(o @ Outcome::Changed { .. }), _) | (_, Some(o @ Outcome::Changed { .. })) => o,
+            (Some(_), _) | (_, Some(_)) => Outcome::Redraw,
+            _ if text || pressed => Outcome::Redraw,
+            _ => Outcome::None,
+        }
+    }
+
     /// The wheel over `(x, y)`: `dy` logical px, positive towards the end. Scrolls the body (an
     /// open dropdown's menu when the pointer is over it). Returns true when something moved.
     pub fn wheel(&mut self, x: f32, y: f32, dy: f32) -> bool {
@@ -2134,6 +2173,41 @@ mod tests {
         t.f.pointer_move(r.cx(), r.cy());
         assert!(t.f.pressed.is_none());
         assert_eq!(t.f.release(r.cx(), r.cy()), Outcome::None);
+    }
+
+    #[test]
+    fn a_cancelled_press_on_a_control_does_not_act() {
+        let mut t = T::new(rows(), 800.0, 600.0);
+        assert_eq!(t.f.cancel(), Outcome::None, "nothing held");
+        for id in [WRAP, RESET] {
+            let r = t.f.control_rect(t.row(id));
+            assert_eq!(t.f.press(r.cx(), r.cy(), NONE, 1), Outcome::Redraw);
+            assert_eq!(t.f.cancel(), Outcome::Redraw, "{id}");
+            assert_eq!(t.f.cancel(), Outcome::None, "{id}: once");
+            assert_eq!(t.f.release(r.cx(), r.cy()), Outcome::None, "{id}");
+        }
+        assert_eq!(t.f.value(WRAP), Some(Value::Bool(false)));
+        // An open dropdown's item: not chosen, and the menu stays open.
+        let r = t.f.control_rect(t.row(WIDTH));
+        t.click_rect(r);
+        {
+            let mut p = Painter::new(&mut t.bmp, &mut t.gfx, 1.0);
+            t.f.menu.as_mut().unwrap().1.place(&mut p, 800.0, 600.0);
+        }
+        let item = t.f.menu.as_ref().unwrap().1.row_rect(2);
+        t.f.press(item.cx(), item.cy(), NONE, 1);
+        assert_eq!(t.f.cancel(), Outcome::Redraw);
+        assert_eq!(t.f.release(item.cx(), item.cy()), Outcome::None);
+        assert!(t.f.menu.is_some());
+        assert_eq!(t.f.value(WIDTH), Some(Value::Choice(1)));
+        // A text box's selection drag ends; the text and the focus stay.
+        t.f.menu = None;
+        let r = t.f.control_rect(t.row(NAME));
+        t.f.press(r.cx(), r.cy(), NONE, 1);
+        assert!(matches!(t.f.drag, Drag::Text(_)));
+        assert_eq!(t.f.cancel(), Outcome::Redraw);
+        assert_eq!(t.f.drag, Drag::None);
+        assert_eq!(t.f.value(NAME), Some(Value::Text("abc".into())));
     }
 
     #[test]

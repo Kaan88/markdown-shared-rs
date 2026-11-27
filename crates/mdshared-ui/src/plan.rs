@@ -1521,6 +1521,22 @@ impl PlanScreen {
         Act::Nothing
     }
 
+    /// Drops a press under way, for when the window lost the pointer (`Focus(false)`, or the
+    /// host's `Event::PressLost`), where a [`release`](Self::release) would act on what is
+    /// under the pointer: a pressed tick box, row, button or menu item does nothing, and a
+    /// scrollbar's thumb is let go with the scroll where the drag left it. The selection, the
+    /// plan, an open menu and a rename under way stay as they are. True when there was a press
+    /// (the screen's `tick` moves then, so the overlay draws again without its pressed look).
+    pub fn cancel(&mut self) -> bool {
+        let thumb = self.drag.take().is_some();
+        let control = self.pressed.take().is_some();
+        let held = thumb || control;
+        if held {
+            self.tick += 1;
+        }
+        held
+    }
+
     /// "Write the notes": records that it was pressed, and nothing else. The writer is the next
     /// job.
     fn write(&mut self) -> Act {
@@ -2595,6 +2611,34 @@ mod tests {
         s.press(r.cx(), r.cy());
         s.release(r.cx(), r.cy());
         assert_eq!(s.totals.notes, 23);
+    }
+
+    #[test]
+    fn a_cancelled_press_does_nothing() {
+        let mut s = screen_of(&japan(), Some(2));
+        assert!(!s.cancel(), "nothing held");
+        let g = s.geo();
+        let r = s.rows().rect(g.list, 3);
+        let (x, y) = (r.x + 28.0, r.cy());
+        s.press(x, y);
+        let tick = s.tick;
+        assert!(s.cancel());
+        assert!(s.tick > tick, "drawn again");
+        assert!(!s.cancel(), "once");
+        assert_eq!(s.release(x, y), Act::Nothing);
+        assert!(
+            s.plan.note(3).expect("a note").ticked(),
+            "the tick box did not flip"
+        );
+        // A thumb in hand is let go: a move after the cancel scrolls nothing.
+        s.drag = Some(Drag {
+            pane: Pane::List,
+            grab: 0.0,
+        });
+        assert!(s.cancel());
+        let scroll = s.scroll;
+        s.pointer(x, y + 300.0);
+        assert_eq!(s.scroll, scroll);
     }
 
     /// Audit 4, W10: the rename field's spot is what shows of it. With its row half under the

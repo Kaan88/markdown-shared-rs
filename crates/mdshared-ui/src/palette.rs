@@ -936,6 +936,20 @@ impl Palette {
         Outcome::None
     }
 
+    /// Drops a press under way with no change: a drag of the query box's selection or of the
+    /// scrollbar's thumb ends where it is, and a press on a row or on the message line chooses
+    /// nothing, wherever the pointer goes next. For when the window lost the pointer
+    /// (`Focus(false)`, or the host's `Event::PressLost`), where a [`release`](Self::release)
+    /// would act on what is under the pointer. The selection, the text and the scroll stay as
+    /// they are. Returns true if there was a press.
+    pub fn cancel(&mut self) -> bool {
+        let held = self.drag != Drag::None || self.pressed_row.is_some() || self.pressed_message;
+        self.drag = Drag::None;
+        self.pressed_row = None;
+        self.pressed_message = false;
+        held
+    }
+
     /// The wheel: `dy` logical px, positive towards the end of the list. Returns true when the
     /// list moved.
     pub fn wheel(&mut self, dy: f32) -> bool {
@@ -1599,6 +1613,50 @@ mod tests {
         p.press(track.cx(), track.bottom() - 4.0, NONE, 1);
         assert!(p.scroll() > mid);
         p.release(0.0, 0.0);
+    }
+
+    #[test]
+    fn a_cancelled_press_chooses_nothing_and_drags_nothing() {
+        // A row: the release over the same row, which would choose it, chooses nothing.
+        let mut p = palette(entries(6));
+        assert!(!p.cancel(), "nothing held");
+        let r = p.row_rect(3);
+        p.press(r.x + 50.0, r.cy(), NONE, 1);
+        assert!(p.cancel());
+        assert!(!p.cancel(), "once");
+        assert_eq!(p.selected_index(), Some(3), "the selection stays");
+        assert_eq!(p.release(r.x + 50.0, r.cy()), Outcome::None);
+
+        // The thumb: a move after the cancel scrolls nothing.
+        let mut p = palette((0..60).map(|i| Entry::new(i, format!("E{i}"))).collect());
+        let (_, thumb) = p.bar().unwrap();
+        p.press(thumb.cx(), thumb.cy(), NONE, 1);
+        p.pointer_move(thumb.cx(), thumb.cy() + 40.0);
+        let at = p.scroll();
+        assert!(at > 0.0);
+        assert!(p.cancel());
+        p.pointer_move(thumb.cx(), thumb.cy() + 120.0);
+        assert_eq!(p.scroll(), at, "the scroll stays where the drag left it");
+
+        // The query box: the selection drag ends.
+        let b = p.field_rect();
+        p.press(b.cx(), b.cy(), NONE, 1);
+        assert_eq!(p.drag, Drag::Field);
+        assert!(p.cancel());
+        assert_eq!(p.drag, Drag::None);
+
+        // The message line: the release on it, which would submit, submits nothing.
+        let mut p = plain(Vec::new());
+        p.set_message(Some("Go to line 120".into()));
+        let m = p.line_rect(p.lines[0]);
+        p.press(m.x + 20.0, m.cy(), NONE, 1);
+        assert!(p.cancel());
+        assert_eq!(p.release(m.x + 20.0, m.cy()), Outcome::None);
+        assert_eq!(
+            p.key(&KeyName::Enter, NONE, None),
+            Outcome::Submitted,
+            "Enter still does"
+        );
     }
 
     #[test]

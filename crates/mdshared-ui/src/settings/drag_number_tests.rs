@@ -522,3 +522,47 @@ fn the_cursor_is_the_left_right_arrow_over_a_draggable_value_and_through_its_dra
     unlaid.make_draggable(SIZE);
     assert_eq!(unlaid.cursor_at(x, y), None);
 }
+
+#[test]
+fn a_cancel_lets_a_value_in_hand_go_where_the_drag_left_it() {
+    // A number drag moved with `pointer_move`, which does not report: the cancel reports it.
+    let mut f = form(&[SIZE]);
+    assert_eq!(f.cancel(), Outcome::None, "nothing held");
+    let (x, y) = value_at(&f, SIZE);
+    f.press(x, y, NONE, 1);
+    f.pointer_move(x + 8.0, y);
+    assert_eq!(number(&f, SIZE), 16);
+    assert_eq!(f.cancel(), changed(SIZE, 16));
+    assert_eq!(f.cancel(), Outcome::None, "once");
+    assert!(
+        !matches!(f.pointer(x + 40.0, y), Outcome::Changed { .. }),
+        "the drag is over"
+    );
+    assert_eq!(number(&f, SIZE), 16);
+    // Already reported through `pointer`: only a redraw.
+    f.press(x, y, NONE, 1);
+    assert_eq!(f.pointer(x + 4.0, y), changed(SIZE, 17));
+    assert_eq!(f.cancel(), Outcome::Redraw);
+    // Pressed and not moved: nothing changed, a redraw for the pressed look.
+    f.press(x, y, NONE, 1);
+    assert_eq!(f.cancel(), Outcome::Redraw);
+    assert_eq!(number(&f, SIZE), 17);
+
+    // A slider row's thumb: the same.
+    let mut f = Form::new("Settings", rows(14));
+    f.show_as_slider(SIZE);
+    lay(&mut f);
+    let s = f.slider_rect(index_of(&f, SIZE));
+    let start = s.x + 1.0;
+    f.press(start, s.cy(), NONE, 1);
+    let pressed = number(&f, SIZE);
+    f.pointer_move(s.right() - 1.0, s.cy());
+    let dragged = number(&f, SIZE);
+    assert!(dragged > pressed, "{pressed} -> {dragged}");
+    assert_eq!(f.cancel(), changed(SIZE, dragged));
+    assert!(
+        !matches!(f.pointer(start, s.cy()), Outcome::Changed { .. }),
+        "the thumb is let go"
+    );
+    assert_eq!(number(&f, SIZE), dragged);
+}

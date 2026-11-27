@@ -171,6 +171,18 @@ impl Picker {
         self.drag(&layout.picker, x, y) != Outcome::None || redraw
     }
 
+    /// Drops a press under way with no answer, for when the window lost the pointer (where a
+    /// release would act on what is under it): a held part of the square or the strip is let
+    /// go with its colour where the drag left it, as [`release`](Picker::release) does, and a
+    /// pressed Apply or Cancel button neither applies nor cancels. The popup stays open, and
+    /// the colour is not put back (that is [`cancel`](Picker::cancel)). True when there was a
+    /// press. Works with or without the confirmation buttons.
+    pub fn let_go(&mut self) -> bool {
+        let part = self.release();
+        let button = self.button_held.take().is_some();
+        part || button
+    }
+
     /// Ends a drag or activates a button if the press and release were both on that button.
     /// Releasing outside, even after a drag, does not close the popup.
     pub fn release_with_confirmation(
