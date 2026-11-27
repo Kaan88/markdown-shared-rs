@@ -4,8 +4,11 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+pub(crate) mod runtime;
+
 /// The canonical path `value` (the content of `$APPIMAGE`) names, when it is set, names an
-/// existing regular file. This is the one rule for "this is an AppImage".
+/// existing regular file. This is a location hint, not proof of the running image's identity.
 pub fn path_from(value: Option<&OsStr>) -> Option<PathBuf> {
     let value = value.filter(|v| !v.is_empty())?;
     let canonical = std::fs::canonicalize(value).ok()?;
@@ -16,6 +19,7 @@ pub fn path_from(value: Option<&OsStr>) -> Option<PathBuf> {
 }
 
 /// [`path_from`] for this process's `$APPIMAGE`.
+#[cfg(not(windows))]
 pub fn path() -> Option<PathBuf> {
     path_from(std::env::var_os("APPIMAGE").as_deref())
 }
@@ -35,9 +39,85 @@ pub fn folder_is_writable(dir: &Path) -> bool {
     ok
 }
 
+#[cfg(target_os = "linux")]
+fn owned_single_file(info: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid takes no arguments and returns the effective uid of this process.
+    let uid = unsafe { libc::geteuid() };
+    info.is_file() && info.uid() == uid && info.nlink() == 1
+}
+
+/// Lock a verified installation beside its stage, on an owner-only read/write handle.
+/// NFS can require write access for an exclusive lock. Keep the lock file so that
+/// successive installers always lock the same inode.
+#[cfg(target_os = "linux")]
+pub(crate) fn lock_update(image: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut name = image.as_os_str().to_os_string();
+    name.push(".lck");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let lock = match options.create_new(true).open(&name) {
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => options.create_new(false).open(&name),
+        result => result,
+    }?;
+    let info = lock.metadata()?;
+    if !owned_single_file(&info) || info.mode() & 0o077 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "the AppImage update lock is not an owner-private regular file",
+        ));
+    }
+    lock.try_lock().map_err(Error::from)?;
+    Ok(lock)
+}
+
+/// Remove only an abandoned regular stage owned by this account, without following links.
+/// The caller has verified the installation and holds its update lock.
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_stale_stage(path: &Path) -> std::io::Result<()> {
+    use std::fs::{remove_file, symlink_metadata};
+    use std::io::{Error, ErrorKind};
+
+    let info = match symlink_metadata(path) {
+        Ok(info) => info,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !owned_single_file(&info) {
+        return Err(Error::new(
+            ErrorKind::AlreadyExists,
+            "the existing AppImage stage is not a singly linked regular file owned by this account",
+        ));
+    }
+    remove_file(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_update_lock_fits_when_the_stage_uses_a_full_filename() {
+        let dir = std::env::temp_dir().join(format!("mdshared-long-stage-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let stem = "a".repeat(255 - ".new".len());
+        let image = dir.join(&stem);
+        std::fs::File::create_new(dir.join(format!("{stem}.new"))).unwrap();
+        let lock = lock_update(&image).unwrap();
+        assert!(dir.join(format!("{stem}.lck")).is_file());
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn only_an_existing_file_is_an_appimage() {

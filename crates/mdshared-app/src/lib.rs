@@ -14,6 +14,8 @@
 
 #[cfg(all(feature = "full", not(windows)))]
 pub mod appimage;
+#[cfg(all(test, feature = "full", windows))]
+mod appimage;
 #[cfg(feature = "full")]
 pub mod backdrop;
 #[cfg(feature = "full")]

@@ -34,7 +34,7 @@ file shown, and if no window runs, start nothing.
 |---|---|---|---|
 | Open | `sister::open(name, &Request) -> Result<(), String>` | yes | the first hand-off; works whether or not the other window runs |
 | Send | `sister::send(name, &Request) -> bool` | no | live updates (`follow`); false when no window of `name` answers |
-| Alive | `sister::alive(name) -> bool` | no | whether a window of `name` answers: a bare connection, closed at once, that changes nothing in it; up to 300 ms, so off the UI thread |
+| Alive | `sister::alive(name) -> bool` | no | whether a listener is present, including a legacy one; at most a bare connection with no payload, up to 300 ms, so off the UI thread |
 
 `open` finds the application (below), starts it detached (no stdio, no console window on Windows,
 its own process group on Unix) with the arguments of `Request::args(name)`, and returns. The
@@ -63,6 +63,43 @@ A bad value (`--line 0`, `--place 1,2,3`) is dropped, not guessed at. `Rect::par
 
 ## The wire format
 
+**Connection authentication.** The listener holds an exclusive lock and publishes a fresh
+record in `instance-v2` beside the settings. `instance-v2/instance.port` holds a two-byte
+big-endian port followed by 32 random key bytes. Lookups verify the private directory and
+the opened file handles; they do not follow file links. A second lock guards publication:
+senders briefly retry discovery while a listener is publishing, rather than using a record
+from a previous launch. Unix checks the effective-user
+owner and requires a 0700 directory with no group/other access to the files. macOS also
+checks the extended ACL on the handles and refuses allow entries even with mode 0600.
+Windows rejects reparse points and requires the user SID and a protected owner-only ACL.
+On Linux the record and both locks have the kernel hostname appended to their names, so
+hosts sharing a settings directory do not contend for or contact each other's loopback listener.
+Neither end sends the key. The sender
+opens with a random 32-byte challenge `C`; the listener returns its own random 32-byte `S`
+and `HMAC-SHA256(key, 'S' || C || S)`. Only after checking that proof does the sender
+write `HMAC-SHA256(key, 'C' || C || S)` and the message below. No paths or live text go to
+a reused port. Unauthenticated input is discarded before paths are inspected.
+
+Both peers must support this handshake. `alive` can use the legacy lock on Windows or a bare
+connection to a legacy decimal port on Unix. An owner-only Unix settings directory may contain
+a legacy port file made group-writable by umask `0002`; it is used only for that bare probe.
+No paths or live text go to a legacy listener;
+`deliver` returns `Older` and `forward` and `send` return false. Restart and registration only
+wait if the predecessor actually holds the legacy lock. Registration then retries in the
+background for up to ten seconds, then publishes the independent endpoint even if the old
+lock is still held. An
+unlocked legacy port on Unix (including a reused port) is only a liveness hint and never delays
+registration. A later legacy launch cannot overwrite the authenticated record, but unchanged
+legacy binaries can still open a separate window because they do not know the new transport.
+
+The older-build examples below describe **payload** compatibility, not a plaintext retry.
+The name and option lines must end in LF (CRLF is also accepted), with at most 64 KiB per
+line, 256 path/option lines and a 1 MiB header budget. The total path and shared string data
+after expanding the header to one request per destination must also fit 1 MiB. Authentication
+and the complete header share a two-second receiver deadline even if bytes keep arriving.
+The existing 2 MiB text limit applies
+separately.
+
 The single-instance message was: the application's name, one absolute path per line, an empty
 line. The receiver skips a path that is not an existing file and answers `ok`. A request adds
 option lines that begin with `?`, after the paths and before the empty line:
@@ -88,7 +125,12 @@ and raise a plain path at every caret move, does nothing. A non-follow request t
 opens the file and loses the line, which is the right fallback.
 
 Receiver side: `single::listen_requests_waking(app, settings, wake) -> Option<Receiver<Request>>`
-(instead of `listen_waking`, which still gives paths only). Sender side:
+(instead of `listen_waking`, which still gives paths to files only). A worker filters ordinary
+requests to existing files or folders. A document, `?closed`, or `?unplace` doesn't need an
+existing path. An application that wants to check paths itself can opt in to
+`single::listen_unresolved_requests_waking`. The reply confirms queueing, not that the window
+opened a path. Empty or entirely filtered launches still receive a no-op reply. A paths-only
+listener preserves the `ok doc` reply for a fileless document, but queues no path. Sender side:
 `single::forward_request(app, settings, &Request) -> bool`, and `single::forward` as before.
 
 ### Live text
@@ -111,13 +153,23 @@ mdview
 
 - Cap: `MAX_TEXT` = 2 MiB per update. A sender whose document is larger sends no text and leaves the
   viewer on the file (the save-driven preview); a receiver that is announced more reads nothing and
-  does not answer. Text that is not UTF-8, or does not arrive in full within 2 seconds in all,
-  delivers nothing and gets no `ok`. The receiver reads on the listener thread; the window thread
+  does not answer. A message with text must name exactly one destination (a path or a document).
+  Invalid or overflowing lengths, text that is not UTF-8, and text that does not arrive in full
+  within two seconds are all refused without an `ok`. Repeated declarations must agree and
+  each fit the cap. The listener reads the text; the window
   only sees a finished `Request` in its channel.
 - `Request.text` and `Request.live_off` are set only by `send`; no command-line argument carries
   them.
-- Sending: `sister::send` connects with a 300 ms limit and writes within 1.5 s; for 200 KB, one send
-  and receive over loopback is about 0.5 ms (a test measures it).
+- Sending: `sister::send` connects with a 300 ms limit. The sender has two seconds for the
+  challenge, then up to four seconds to upload the proof, header and text. It starts a
+  fresh acknowledgement timer that covers the receiver's remaining header and text
+  windows (two seconds each) and the two-second acknowledgement window, with a small
+   margin. A single worker handles every request in arrival order, even if it needs no
+   filesystem check. A stalled lookup can hold up later requests; a late result or a full
+   queue drops only that message. A send that discovers the public channel is closed releases
+   the instance lock before closing the request socket and stopping the listener.
+  If the sender disconnects after queueing, the window still receives the request.
+  The 200 KB loopback round trip is measured in a test.
 
 Why older receivers are safe. An old receiver reads the name line and then lines up to the first
 empty line; everything after it is never looked at (`take_while` stops, and the answer is written).
@@ -347,6 +399,12 @@ Live text (unsaved changes in the viewer):
 - [ ] `send` false: as above, no live link. A false after a large text may only mean an old viewer.
 
 ## Run and not run
+
+For the authenticated transport, document delivery, legacy overlap in both startup orders,
+deferred registration, generation races, queue rejection, delayed file checks, text and
+expanded header limits, and delayed replies were tested on Windows using loopback or anonymous pipes and temporary
+files. Linux and macOS (including the inherited ACL test) were type-checked only.
+No hand-off between real applications was run. The desktop runs below predate authentication.
 
 Run on KDE Plasma 6.8 Wayland (CachyOS), with both apps running: side-by-side placement (the editor
 and the viewer at the two halves) and a scripted edit shown in the viewer as unsaved text, with the

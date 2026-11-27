@@ -13,7 +13,7 @@ Plasma on Wayland, cargo 1.99, except where sway (headless, in a container) is n
 |---|---|---|
 | Downloads (`mdshared-fetch`) | The system libcurl, loaded at run time with `dlopen` (`libcurl.so.4`, then `libcurl.so`; the `libloading` crate). No link-time dependency: without libcurl every download fails as before (`Error::Unsupported`, seen by callers as `State::Failed`). Same contract as WinHTTP: no redirects followed, no cookies/netrc/auth/`Accept-Encoding`, http and https only, TLS verification on, size cap from `Content-Length` and while reading, overall deadline. | The network tests (local TCP server) run on unix; `live_https_badge` (`--ignored`) fetched an https badge. |
 | File dialogs (`platform`) | Both apps use these for Open files, Open folder and Save as. `pick_files_async`, `pick_folder_async`, `pick_save_async`: the blocking dialog on a helper thread; one at a time (a second request calls `done` at once with the empty result and returns false). The blocking `pick_files`/`pick_folder` stay for Windows. | Unit test of the one-at-a-time rule; `examples/dialog.rs` run: a portal request was open on the bus while it waited. The apps' dialog flows were not run by hand (not re-checked). |
-| Self-update (`mdshared-app`) | Only inside an AppImage: `updater::installed_files` returns the canonical `$APPIMAGE` when it is an existing file in a writable folder, with no engine. A Linux release lists no `engine.*` keys. The staged file gets mode 0755. `.new`/`.old` sit beside the AppImage. A plain Linux binary updates nothing. | Unit tests. |
+| Self-update (`mdshared-app`) | `updater::installed_files` checks the executable's kernel mount ID from `/proc/self/fdinfo` against `/proc/self/mountinfo` and `$APPDIR`. For a mounted image it uses the application's inherited AppDir handle and keepalive pipe to identify the FUSE runtime and its open backing file. For extract-and-run the kernel pins the direct parent's executable, so the parent need not keep a separate file descriptor open. A mount source label or filename prefix proves nothing. | Filesystem staging and recheck tests ran on Windows; Linux proc fixtures were type-checked only. No real AppImage was mounted or updated. |
 | Window identity (`window::identify`) | Wayland app id and X11 `WM_CLASS` from the app name; the X11 window icon from PNG bytes. | Used by both apps. Compiles; the identity as the desktop shows it (taskbar name and icon) was not re-checked. |
 | Desktop entry (`desktop_entry::ensure`) | From an AppImage: writes `applications/<name>.desktop` and the 256 px icon under `$XDG_DATA_HOME` (or `~/.local/share`) when missing or when the recorded `X-AppImage-Path` differs; never touches an entry without the marker; sets no defaults. | Unit tests with a temp data directory; mdedit run with `$APPIMAGE` set and `XDG_DATA_HOME` on a scratch folder wrote the entry and the icon. |
 | Fonts (`mdshared-text`) | `add_fallbacks` (applied by `shared_fonts()`): Windows names first, then Noto/Twemoji/JoyPixels/Symbola, Noto Symbols/Math, DejaVu Sans, and the CJK families, behind the system's fallback for Han, Common, Inherited and Latin. `EMOJI_FAMILIES` for family strings, and `emoji_presentation_runs` / `push_emoji_runs` so that emoji with U+FE0F, keycaps, skin tones and ZWJ sequences draw in colour (see below; both apps call it, the chrome text too; empty on Windows). | `examples/fontprobe.rs` rendered to PNG and looked at. |
@@ -65,6 +65,27 @@ directory only (and mdedit's entry and icon written to a scratch data folder); t
 was not run, and `update-desktop-database` was not checked to take effect in a desktop session.
 The AppImages are built in the apps' repositories (Ubuntu 20.04 container, so glibc 2.31 or later),
 not here.
+
+## AppImage self-update
+
+A renamed image, a FUSE mount with a basename-only source, and an extract-and-run launch can
+update if the running Type 2 runtime exposes enough information in `/proc`. A plain binary that
+inherited the environment, an executable on a nested mount, or an installation path now naming a
+different inode cannot. If a wrapper closes the AppDir handle or keepalive pipe inherited by
+the application, mounted self-update is unavailable. An ancestor can hold pipes for other
+AppImages, so its descriptors are not used as a fallback. Unsupported runtime layouts and
+restricted `/proc` also leave self-update unavailable.
+The folder must be writable. The updater checks identity again after download, immediately
+before swapping, and before cleaning up. It never truncates an existing `.new`; if identity is
+lost after staging, it leaves the staged file alone instead of trying to clean up beside an
+unverified target. An install holds a lock on an owner-private, writable `.lck` beside the
+image while staging and swapping. The lock file stays in place; it is not a lock on the image.
+An interrupted install can replace its leftover `.new` beside the verified image only if it is
+a singly linked regular file owned by the current account. The updater opens the new stage
+exclusively at mode 0600, then changes it to 0755 after writing. `.new` and `.old` sit beside
+the image, with no separate engine.
+Linux was type-checked; the updater, runtime and lock tests were not run on Linux.
+No live AppImage was run or updated, and no NFS mount was tested.
 
 ## Window shadow (`mdshared_ui::shadow`)
 
