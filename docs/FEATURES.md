@@ -3296,6 +3296,15 @@ describes the measured prefix, not a second full layout. Inline math delimiter s
 and the span walks for HTML export and rich copy no longer rescan the same suffix or
 paragraph for each opener or child.
 
+The renderer review follow-up uses sets for inline atom membership and the ordered
+remote-request queue. Draining the queue removes just the emitted requests from its set,
+so a small batch does not scan the table left by a larger one. Scroll bands whose page
+origin cannot be represented exactly fall back to a full repaint.
+On Windows with Rust 1.99.1, format, workspace and preview-server Clippy, and the catalogue
+check passed. With the engine helper built, release tests passed for the engine protocol (8),
+renderer (165, including both golden checks; two ignored) and preview server (22).
+Extra workspace and feature checks, other platforms, and manual visual review were not run.
+
 ### Left open from the Astra review (2026-11-26)
 
 - **10 — Engine supervision:** reap a normally idle-exited helper without waiting for

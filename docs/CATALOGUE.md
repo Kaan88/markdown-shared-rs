@@ -80,7 +80,10 @@ engine shipping and editor previews. The renderer does not run a window loop.
 
 **I want to draw into an exact-size preview pane:** use `DocumentRenderer::view_frame_sized`
 with the pane's device dimensions and pass the logical layout options separately. For a
-clipped whole page, set `Options::max_height` instead.
+clipped whole page, set `Options::max_height` instead. Scroll bands use frame-relative device
+rows even on tall pages, with a full repaint if the band origin would round to a different row.
+Markdown emphasis beyond `mdshared_md_core::limits::MAX_MD_SPAN_DEPTH` keeps its text
+without adding more wrappers.
 
 | Module or crate | For | Start at |
 |---|---|---|

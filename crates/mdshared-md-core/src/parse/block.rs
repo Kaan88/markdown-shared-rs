@@ -5,6 +5,9 @@ use super::*;
 
 impl<'a> Builder<'a> {
     pub(super) fn push_open(&mut self, open: Open) {
+        if open.origin == Origin::Md && matches!(open.node, Node::Span(_)) {
+            self.md_span_depth += 1;
+        }
         if let Origin::Html(tag) = open.origin {
             self.open_html[tag.slot()] += 1;
             self.html_depth += 1;
@@ -14,6 +17,9 @@ impl<'a> Builder<'a> {
 
     pub(super) fn pop_open(&mut self) -> Option<Open> {
         let open = self.stack.pop()?;
+        if open.origin == Origin::Md && matches!(open.node, Node::Span(_)) {
+            self.md_span_depth -= 1;
+        }
         if let Origin::Html(tag) = open.origin {
             self.open_html[tag.slot()] -= 1;
             self.html_depth -= 1;
@@ -445,7 +451,11 @@ impl<'a> Builder<'a> {
     pub(super) fn drop_last_block(&mut self, b: u32) {
         let block = self.doc.blocks[b as usize];
         self.doc.spans.truncate(block.spans.start as usize);
-        self.doc.blocks.truncate(b as usize);
+        for removed in self.doc.blocks.drain(b as usize..) {
+            if let BlockKind::FootnoteDefinition { footnote } = removed.kind {
+                self.doc.footnotes[footnote as usize].block = NONE;
+            }
+        }
         while self.doc.block_attrs.last().is_some_and(|a| a.block >= b) {
             self.doc.block_attrs.pop();
         }
@@ -460,13 +470,12 @@ impl<'a> Builder<'a> {
         }
         // An anchor noted for the dropped container, or for the block that would have followed it,
         // belongs to whatever block takes its place.
-        for a in &mut self.doc.anchors {
-            a.block = a.block.min(b);
-        }
-        // A definition with no text can itself have been what the empty container held.
-        for f in &mut self.doc.footnotes {
-            if f.block != NONE && f.block >= b {
-                f.block = NONE;
+        let n = self.doc.anchors.len();
+        if n > 0 {
+            // A lower cut covers every anchor an earlier higher cut covered too.
+            while self.anchor_cuts.pop_if(|cut| cut.1 >= b).is_some() {}
+            if self.anchor_cuts.last().is_none_or(|cut| cut.0 < n) {
+                self.anchor_cuts.push((n, b));
             }
         }
     }

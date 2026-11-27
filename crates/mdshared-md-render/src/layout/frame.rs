@@ -84,8 +84,9 @@ impl DocumentRenderer {
         let stale = std::mem::take(&mut self.view.stale);
         // Rows an animated image changed, cut to this viewport.
         let repaint = self.view.repaint.take().and_then(|(y0, y1)| {
-            let (a, b) = (y0.max(top).floor(), y1.min(top + rows as f32).ceil());
-            (b > a).then_some((a, b - a))
+            let first = ((y0 - top).floor() as u32).min(rows);
+            let end = ((y1 - top).ceil() as u32).min(rows);
+            (end > first).then(|| (first, end - first))
         });
         let background = options.theme.bg;
         let page = self.page.as_ref().expect("laid out");
@@ -115,7 +116,7 @@ impl DocumentRenderer {
             self.view.span = Some(frame_span(page, top, rows as f32));
             return self.frame.as_ref().expect("frame");
         }
-        let mut band = (top, rows as f32);
+        let mut band = (0, rows);
         let mut shift = 0i32;
         let mut whole = true;
         if same_size {
@@ -126,20 +127,21 @@ impl DocumentRenderer {
                 band = changed;
                 whole = false;
             } else if !stale && repaint.is_none() && dy.unsigned_abs() < rows as u64 {
-                shift_rows(&mut frame.bitmap, dy as i32);
                 // `dy` is old top minus new top: positive when the view scrolled up and the newly
                 // exposed rows are at the top, negative when it scrolled down and they are at the
                 // bottom.
-                band = if dy > 0 {
-                    (top, dy as f32)
-                } else {
-                    (top + rows as f32 + dy as f32, (-dy) as f32)
-                };
+                band = exposed_rows(rows, dy);
                 // Row `r` of the new frame was row `r - dy` of the old one.
                 shift = -(dy as i32);
                 whole = false;
-            } else {
+            }
+            if whole || band_origin(top, band.0).is_none() {
                 frame.bitmap.clear(background);
+                band = (0, rows);
+                shift = 0;
+                whole = true;
+            } else if shift != 0 {
+                shift_rows(&mut frame.bitmap, -shift);
             }
             frame.top = top;
         } else {
@@ -152,34 +154,34 @@ impl DocumentRenderer {
                 band: None,
                 shift: 0,
             });
-            band = (top, rows as f32);
         }
-        let frame_top = top;
+        let (first, count) = band;
+        let band_top = band_origin(top, first).expect("checked band origin");
         // Blocks can reach past the band, so draw the band on its own bitmap and copy it in;
         // otherwise the overlap would be blended twice.
-        collect(page, &self.cache, &self.floats, &mut pager, band.0, band.1);
-        let stats = if band.1 + 0.5 >= rows as f32 && (band.0 - frame_top).abs() < 0.5 {
+        collect(
+            page,
+            &self.cache,
+            &self.floats,
+            &mut pager,
+            band_top,
+            count as f32,
+        );
+        let stats = if band == (0, rows) {
             let frame = self.frame.as_mut().expect("frame");
-            pager.draw(&mut frame.bitmap, frame_top, &mut self.engine)
+            pager.draw(&mut frame.bitmap, top, &mut self.engine)
         } else {
-            let band_rows = (band.1.ceil() as u32).clamp(1, rows);
-            let mut band_bitmap = Bitmap::new(width, band_rows);
+            let mut band_bitmap = Bitmap::new(width, count);
             band_bitmap.clear(background);
-            let stats = pager.draw(&mut band_bitmap, band.0, &mut self.engine);
+            let stats = pager.draw(&mut band_bitmap, band_top, &mut self.engine);
             let frame = self.frame.as_mut().expect("frame");
-            copy_rows(
-                &mut frame.bitmap,
-                &band_bitmap,
-                (band.0 - frame_top) as usize,
-            );
+            copy_rows(&mut frame.bitmap, &band_bitmap, first as usize);
             stats
         };
-        let first = (band.0 - frame_top).round().max(0.0) as u32;
-        let band_rows = (first, band.1.ceil().max(0.0) as u32);
         self.view.span = Some(frame_span(page, top, rows as f32));
         let frame = self.frame.as_mut().expect("frame");
         frame.stats = stats;
-        frame.band = (!whole).then_some(band_rows);
+        frame.band = (!whole).then_some(band);
         frame.shift = shift;
         self.frame.as_ref().expect("frame")
     }
@@ -269,10 +271,28 @@ fn collect(
     }
 }
 
-/// Copies `source` into `target` starting at row `row`.
+/// The band needs an exact page row as its paint origin. Subtract after widening so the
+/// comparison also detects a lost row when the requested offset itself rounds in `f32`.
+fn band_origin(top: f32, first: u32) -> Option<f32> {
+    if first == 0 {
+        return Some(top);
+    }
+    let origin = top + first as f32;
+    (f64::from(origin) - f64::from(top) == f64::from(first)).then_some(origin)
+}
+
+/// Keep bitmap indices relative to the frame: at large page offsets a float cannot
+/// distinguish every row. Only the paint origin needs page coordinates.
+fn exposed_rows(rows: u32, dy: i64) -> (u32, u32) {
+    let count = dy.unsigned_abs().min(u64::from(rows)) as u32;
+    (if dy < 0 { rows - count } else { 0 }, count)
+}
+
+/// Copies the rows of `source` that fit in `target` starting at row `row`.
 fn copy_rows(target: &mut Bitmap, source: &Bitmap, row: usize) {
     let stride = target.width as usize * 4;
-    let rows = source.height as usize;
+    let row = row.min(target.height as usize);
+    let rows = (source.height as usize).min(target.height as usize - row);
     let start = row * stride;
     target.pixels[start..start + rows * stride].copy_from_slice(&source.pixels[..rows * stride]);
 }
@@ -294,4 +314,64 @@ fn shift_rows(bitmap: &mut Bitmap, dy: i32) {
         // The view scrolled down: the content moves up.
         bitmap.pixels.copy_within(shift * stride..rows * stride, 0);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn a_rounded_tall_band_repaints_the_pattern_exactly_like_a_fresh_frame() {
+    use super::super::Gap;
+    use super::paint::Paint;
+
+    let doc = mdshared_md_core::parse("Room for a pattern.\n\nAfter.");
+    let options = Options::light();
+    let mut renderer = DocumentRenderer::new();
+    renderer.layout(&doc, &options);
+    renderer.set_gap(
+        &doc,
+        Some(Gap {
+            first_line: 1,
+            last_line: 1,
+            height: 20_000_000.0,
+        }),
+    );
+    let top = (1 << 24) as f32;
+    let size = (7, 31);
+    renderer.view_frame_sized(&doc, &options, top, size);
+    let span = renderer.page.as_ref().unwrap().spans[0];
+    let cached = renderer.cache.get_mut(&span.block).unwrap();
+    // Pairs of distinct rows are representable in page coordinates here. On a scroll down
+    // four rows, frame row 27 is the second row of a pair, but a rounded band starts at 28.
+    cached.paints.extend((0..18).map(|pair| Paint::Rect {
+        x: 1.0,
+        y: top + (2 * pair) as f32 - (span.y - cached.phase),
+        w: 5.0,
+        h: 2.0,
+        radius: 0.0,
+        color: [pair * 11, 17, 200],
+    }));
+    renderer.view.stale = true;
+    renderer.view_frame_sized(&doc, &options, top, size);
+
+    let scrolled = renderer.view_frame_sized(&doc, &options, top + 4.0, size);
+    assert_eq!(scrolled.top, top + 4.0);
+    let (bitmap, band, shift) = (
+        scrolled.bitmap.pixels.clone(),
+        scrolled.band,
+        scrolled.shift,
+    );
+    renderer.view.stale = true;
+    let fresh = renderer.view_frame_sized(&doc, &options, top + 4.0, size);
+    let stride = size.0 as usize * 4;
+    assert_ne!(
+        fresh.bitmap.pixels[27 * stride..28 * stride],
+        fresh.bitmap.pixels[28 * stride..29 * stride]
+    );
+    for (row, (a, b)) in bitmap
+        .chunks_exact(stride)
+        .zip(fresh.bitmap.pixels.chunks_exact(stride))
+        .enumerate()
+    {
+        assert_eq!(a, b, "frame row {row}");
+    }
+    assert_eq!((band, shift), (None, 0));
 }

@@ -111,7 +111,7 @@ const MATH_PASSES: usize = 4;
 pub(super) fn parse_with_checks(
     mut src: Cow<'_, str>,
     mut restore: bool,
-    rejected: Vec<usize>,
+    mut rejected: Vec<usize>,
     front: Front,
     task_source: Option<TaskSource<'_>>,
     wiki: &mut dyn FnMut(&str, bool) -> WikiAs,
@@ -121,6 +121,9 @@ pub(super) fn parse_with_checks(
     // document takes the literal pass instead.
     let can_hide = memchr::memmem::find(src.as_bytes(), SWAP_PREFIX).is_none();
     if can_hide && !rejected.is_empty() {
+        // An inner marker can be rejected before its empty outer alert closes.
+        rejected.sort_unstable();
+        rejected.dedup();
         src = Cow::Owned(hide_delimiters(&src, &rejected));
         restore = true;
     }
@@ -138,6 +141,21 @@ pub(super) fn parse_with_checks(
         Ok(doc) => doc,
         Err(_) => unreachable!("the literal pass rejects nothing"),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn rejected_alerts_are_hidden_once_in_source_order() {
+    let doc = parse_with_checks(
+        Cow::Borrowed("[!NOTE] [!TIP]"),
+        false,
+        vec![8, 0, 8],
+        Front::default(),
+        None,
+        &mut |_, _| WikiAs::Text,
+    )
+    .doc;
+    assert_eq!(doc.text.trim_end(), "[!NOTE] [!TIP]");
 }
 
 /// With `literal`, a rejected span or alert becomes plain text. Otherwise the first rejected span stops
