@@ -39,6 +39,50 @@ pub(super) fn button(b: MouseButton) -> Option<Button> {
     })
 }
 
+/// The buttons the application was told went down ([`Event::Press`]) and not yet up: what the
+/// host tells it was lost ([`Event::PressLost`]) when the window loses the keyboard with a
+/// button still held. winit 0.30 on Windows sends no release then (`WM_CAPTURECHANGED` only
+/// resets a count), so without it a drag would stay held until the next release, wherever and
+/// whenever that comes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Held(u8);
+
+/// The order the buttons are told in, and their bits.
+const BUTTONS: [Button; 5] = [
+    Button::Left,
+    Button::Right,
+    Button::Middle,
+    Button::Back,
+    Button::Forward,
+];
+
+fn bit(b: Button) -> u8 {
+    1 << BUTTONS.iter().position(|&k| k == b).unwrap_or(0)
+}
+
+impl Held {
+    /// `b` went down (and the application was told).
+    pub(super) fn press(&mut self, b: Button) {
+        self.0 |= bit(b);
+    }
+
+    /// `b` went up. A release of a button not held (one that came after it was lost, or a
+    /// press the application was not told of) changes nothing.
+    pub(super) fn release(&mut self, b: Button) {
+        self.0 &= !bit(b);
+    }
+
+    /// Takes the buttons held, left, right, middle, back, forward in that order, and holds
+    /// none.
+    pub(super) fn take(&mut self) -> Vec<Button> {
+        let held = std::mem::take(&mut self.0);
+        BUTTONS
+            .into_iter()
+            .filter(|&b| held & bit(b) != 0)
+            .collect()
+    }
+}
+
 /// A wheel's movement as [`Event::Wheel`]: notches times [`WHEEL_LINE`], or a touchpad's device
 /// px as logical px; Shift turns a vertical wheel sideways. winit's sign is kept: positive moves
 /// the content right or down (a wheel turned away from the user).

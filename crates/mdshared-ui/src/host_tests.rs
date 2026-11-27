@@ -678,6 +678,51 @@ fn a_late_far_or_other_press_starts_counting_again() {
 }
 
 #[test]
+fn the_buttons_held_are_taken_in_order_and_once() {
+    let mut h = Held::default();
+    assert_eq!(h.take(), Vec::<Button>::new(), "none held");
+    h.press(Button::Forward);
+    h.press(Button::Left);
+    h.press(Button::Middle);
+    h.press(Button::Left);
+    h.release(Button::Middle);
+    h.release(Button::Back); // never pressed: nothing
+    assert_eq!(h.take(), vec![Button::Left, Button::Forward]);
+    assert_eq!(h.take(), Vec::<Button>::new(), "taken once");
+    // A release after the loss (winit's late one) changes nothing.
+    h.release(Button::Left);
+    assert_eq!(h, Held::default());
+    // Against a plain set, on pseudo-random presses and releases of every button.
+    let all = [
+        Button::Left,
+        Button::Right,
+        Button::Middle,
+        Button::Back,
+        Button::Forward,
+    ];
+    let mut rng = Lcg(7);
+    let mut set = std::collections::HashSet::new();
+    for step in 0..2000 {
+        let b = all[rng.below(5) as usize];
+        match rng.below(7) {
+            0 => {
+                let want: Vec<Button> = all.into_iter().filter(|b| set.contains(b)).collect();
+                assert_eq!(h.take(), want, "step {step}");
+                set.clear();
+            }
+            1..=3 => {
+                h.press(b);
+                set.insert(b);
+            }
+            _ => {
+                h.release(b);
+                set.remove(&b);
+            }
+        }
+    }
+}
+
+#[test]
 fn the_click_count_stops_at_three() {
     let t0 = Instant::now();
     let iv = Duration::from_millis(500);

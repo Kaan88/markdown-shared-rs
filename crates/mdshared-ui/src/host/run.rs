@@ -14,7 +14,7 @@ use winit::window::{ResizeDirection, Window, WindowId};
 
 use super::cx::{Cx, Shared};
 use super::frame::{Damage, Deadlines, Visibility, minimized, next_wake, present, wants_frame};
-use super::input::{Clicks, button, clean_scale, click_slop, logical, wheel};
+use super::input::{Clicks, Held, button, clean_scale, click_slop, logical, wheel};
 use super::timers::NamedTimers;
 use super::{App, Button, Config, Event, KeyPress, Proxy, Wake};
 use crate::anim::Animator;
@@ -54,6 +54,9 @@ struct Host<A: App> {
     /// where it is, and no resize cursor is shown for it.
     pointer_seen: bool,
     clicks: Clicks,
+    /// The buttons the application was told went down and not yet up: told lost
+    /// ([`Event::PressLost`]) after a `Focus(false)`.
+    held: Held,
     double_click: Duration,
     /// The double-click rectangle, device px.
     double_click_size: (u32, u32),
@@ -126,6 +129,7 @@ pub fn run<A: App>(config: Config, app: A) -> Result<(), winit::error::EventLoop
         pointer: (0.0, 0.0),
         pointer_seen: false,
         clicks: Clicks::default(),
+        held: Held::default(),
         double_click: platform::double_click_time(),
         double_click_size: platform::double_click_size(),
         snap_sent: None,
@@ -360,6 +364,9 @@ impl<A: App> Host<A> {
             }
             if has != was {
                 self.call(now, |app, cx| app.event(cx, Event::Focus(has)));
+                if !has {
+                    self.tell_lost(now);
+                }
             }
         } else if self.st.focused && !has {
             // The system refused the activation the first frame was drawn for.
@@ -368,6 +375,15 @@ impl<A: App> Host<A> {
                 self.st.damage.all();
             }
             self.call(now, |app, cx| app.event(cx, Event::Focus(false)));
+            self.tell_lost(now);
+        }
+    }
+
+    /// After a `Focus(false)`: an [`Event::PressLost`] for each button still held, which are
+    /// then held no more. Nothing when none is.
+    fn tell_lost(&mut self, now: Instant) {
+        for button in self.held.take() {
+            self.call(now, |app, cx| app.event(cx, Event::PressLost { button }));
         }
     }
 
@@ -770,6 +786,7 @@ impl<A: App> Host<A> {
                         }
                         let slop = click_slop(self.double_click_size, scale);
                         let clicks = self.clicks.press(now, (x, y), b, self.double_click, slop);
+                        self.held.press(b);
                         Event::Press {
                             x,
                             y,
@@ -777,7 +794,10 @@ impl<A: App> Host<A> {
                             clicks,
                         }
                     }
-                    ElementState::Released => Event::Release { x, y, button: b },
+                    ElementState::Released => {
+                        self.held.release(b);
+                        Event::Release { x, y, button: b }
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => wheel(delta, scale, self.st.mods.shift),
@@ -947,7 +967,11 @@ impl<A: App> ApplicationHandler<Wake<A::Message>> for Host<A> {
         let now = Instant::now();
         self.call(now, |app, cx| app.raw(cx, &event));
         if let Some(ev) = self.reduce(now, event) {
+            let lost = ev == Event::Focus(false);
             self.call(now, |app, cx| app.event(cx, ev));
+            if lost {
+                self.tell_lost(now);
+            }
         }
         if self.st.exit {
             // Ended here, not in `about_to_wait`: a close from the system alone (the taskbar's

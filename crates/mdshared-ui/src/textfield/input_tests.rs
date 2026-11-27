@@ -784,7 +784,17 @@ mod host {
             .0,
             FieldOutcome::Unused
         );
+        // And one the host says was lost, which is still the application's to see.
+        r.clock.advance(Duration::from_secs(1));
+        route(&mut r, true, press(a.0, a.1, Button::Left));
+        assert!(r.input.is_dragging());
+        let lost = Event::PressLost {
+            button: Button::Left,
+        };
+        assert_eq!(route(&mut r, true, lost).0, FieldOutcome::Unused);
+        assert!(!r.input.is_dragging());
         // So is one held across a change of scale.
+        r.clock.advance(Duration::from_secs(1));
         route(&mut r, true, press(a.0, a.1, Button::Left));
         route(&mut r, true, Event::Scale(1.5));
         assert!(!r.input.is_dragging());
