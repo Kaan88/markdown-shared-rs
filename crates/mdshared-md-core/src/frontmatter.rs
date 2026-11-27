@@ -10,18 +10,26 @@ const MAX_BYTES: usize = 16 * 1024;
 
 /// If `src` opens with a front matter block, returns the Markdown that replaces it and the number of
 /// source bytes it used. The block is `---` on the first line, any lines, then `---` or `...`.
+/// The closing marker must fit within the first 16 KiB after the opening line. Trailing carriage
+/// returns and a line feed may cross that limit, but bytes past the limit are not counted as used.
 pub fn take(src: &str) -> Option<(String, usize)> {
     let rest = src.strip_prefix("---")?;
     let rest = rest
         .strip_prefix("\r\n")
         .or_else(|| rest.strip_prefix('\n'))?;
-    let head = &rest[..rest.len().min(MAX_BYTES)];
+    let head = &rest[..rest.floor_char_boundary(MAX_BYTES)];
     let mut body_end = None;
     let mut consumed = src.len() - rest.len();
     let mut offset = 0;
     for line in head.split_inclusive('\n') {
         let text = line.trim_end_matches(['\n', '\r']);
         if text == "---" || text == "..." {
+            if !line.ends_with('\n') {
+                let after_limit = rest[head.len()..].trim_start_matches('\r');
+                if !after_limit.is_empty() && !after_limit.starts_with('\n') {
+                    break; // The byte limit cut the line short.
+                }
+            }
             body_end = Some(offset);
             consumed += offset + line.len();
             break;
@@ -130,6 +138,44 @@ mod tests {
         let (md, used) = take(src).unwrap();
         assert!(md.contains("| name | x |"));
         assert_eq!(&src[used..], "body");
+    }
+
+    #[test]
+    fn a_long_unicode_note_keeps_its_body_after_the_front_matter() {
+        let prefix = "title: 文\n---\n";
+        let note = format!(
+            "---\n{prefix}{}📝",
+            "x".repeat(MAX_BYTES - 1 - prefix.len())
+        );
+        let (table, used) = take(&note).unwrap();
+        assert!(table.contains("| title | 文 |"));
+        assert_eq!(used, 4 + prefix.len());
+    }
+
+    #[test]
+    fn only_a_complete_closing_line_counts_at_the_scan_limit() {
+        let note = format!("---\nk: {}\n---", "x".repeat(MAX_BYTES - "k: \n---".len()));
+        assert_eq!(take(&note).unwrap().1, note.len()); // True end of file.
+        assert!(take(&format!("{note}more\n")).is_none());
+
+        let at_limit = Some(note.len());
+        let cases = [
+            ("", "\nbody", at_limit),
+            ("", "\r\nbody", at_limit),
+            ("\r", "\nbody", at_limit),
+            ("", "\r", at_limit),
+            ("", "\r\r", at_limit),
+            ("", "\r\r\nbody", at_limit),
+            ("", "\r\rmore\n", None),
+        ];
+        let used = ["---", "..."].map(|closer| {
+            cases.map(|(inside, outside, _)| {
+                let padding = "x".repeat(MAX_BYTES - "k: \n".len() - closer.len() - inside.len());
+                let src = format!("---\nk: {padding}\n{closer}{inside}{outside}");
+                take(&src).map(|(_, used)| used)
+            })
+        });
+        assert_eq!(used, [cases.map(|(_, _, expected)| expected); 2]);
     }
 
     #[test]

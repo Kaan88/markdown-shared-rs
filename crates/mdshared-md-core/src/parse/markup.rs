@@ -253,7 +253,7 @@ impl<'a> Builder<'a> {
             Tag::Ul => BlockKind::List { start: None },
             Tag::Ol => {
                 let start = html::attr(attrs, "start")
-                    .and_then(|s| s.trim().parse().ok())
+                    .and_then(|s| s.trim().parse::<u32>().ok())
                     .unwrap_or(1);
                 BlockKind::List { start: Some(start) }
             }

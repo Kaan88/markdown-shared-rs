@@ -184,6 +184,7 @@ impl Easy {
 }
 
 /// What the callbacks collect during one transfer.
+#[derive(Default)]
 struct Transfer {
     max_bytes: usize,
     status: u16,
@@ -207,18 +208,49 @@ fn header_value(slot: &mut Option<String>, value: &str, stopped: &mut Option<Err
 }
 
 extern "C" fn on_header(line: *const u8, size: usize, n: usize, user: *mut c_void) -> usize {
-    let len = size.saturating_mul(n);
-    // SAFETY: libcurl passes `len` readable bytes and the pointer given as HEADERDATA, which is
-    // the `Transfer` on the stack of `get`, used by this thread only.
-    let (line, t) = unsafe {
-        (
-            std::slice::from_raw_parts(line, len),
-            &mut *user.cast::<Transfer>(),
-        )
-    };
+    receive(line, size, n, user, parse_header)
+}
+
+extern "C" fn on_body(data: *const u8, size: usize, n: usize, user: *mut c_void) -> usize {
+    receive(data, size, n, user, append_body)
+}
+
+/// Both C callbacks return a short count to libcurl if Rust unwinds.
+fn receive(
+    data: *const u8,
+    size: usize,
+    n: usize,
+    user: *mut c_void,
+    accept: fn(&mut Transfer, &[u8]) -> usize,
+) -> usize {
+    std::panic::catch_unwind(|| {
+        let Some(len) = size.checked_mul(n) else {
+            return 0;
+        };
+        if len == 0 || len > isize::MAX as usize || data.is_null() || user.is_null() {
+            return 0;
+        }
+        // SAFETY: libcurl supplies `len` readable bytes and the userdata installed by `get`,
+        // a live `Transfer` used exclusively by this thread for the duration of the callback.
+        unsafe {
+            accept(
+                &mut *user.cast::<Transfer>(),
+                std::slice::from_raw_parts(data, len),
+            )
+        }
+    })
+    .unwrap_or(0)
+}
+
+fn parse_header(t: &mut Transfer, line: &[u8]) -> usize {
+    let len = line.len();
     let line = String::from_utf8_lossy(line);
     let line = line.trim_end_matches(['\r', '\n']);
-    if line.len() >= 5 && line[..5].eq_ignore_ascii_case("HTTP/") {
+    if line
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"HTTP/"))
+    {
         // A new response (a 100 Continue or a proxy's CONNECT reply comes first): start over.
         t.status = line
             .split(' ')
@@ -249,20 +281,13 @@ extern "C" fn on_header(line: *const u8, size: usize, n: usize, user: *mut c_voi
     if t.stopped.is_some() { 0 } else { len }
 }
 
-extern "C" fn on_body(data: *const u8, size: usize, n: usize, user: *mut c_void) -> usize {
-    let len = size.saturating_mul(n);
-    // SAFETY: as in `on_header`.
-    let (data, t) = unsafe {
-        (
-            std::slice::from_raw_parts(data, len),
-            &mut *user.cast::<Transfer>(),
-        )
-    };
+fn append_body(t: &mut Transfer, data: &[u8]) -> usize {
+    let len = data.len();
     if t.status != 200 {
         t.skipped = true;
         return 0;
     }
-    if t.body.len() + len > t.max_bytes {
+    if len > t.max_bytes.saturating_sub(t.body.len()) {
         t.stopped = Some(Error::TooLarge);
         return 0;
     }
@@ -315,14 +340,7 @@ impl Session {
         let target = CString::new(url.to_string()).map_err(|_| Error::BadResponse)?;
         let mut transfer = Transfer {
             max_bytes,
-            status: 0,
-            etag: None,
-            last_modified: None,
-            location: None,
-            content_length: None,
-            body: Vec::new(),
-            stopped: None,
-            skipped: false,
+            ..Transfer::default()
         };
 
         let mut rc = 0;
@@ -415,5 +433,45 @@ impl Session {
             location: transfer.location,
             body: transfer.body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbitrary_header_bytes_preserve_the_response_and_oversize_values_stop_it() {
+        let mut t = Transfer::default();
+        for line in [
+            b"hTtP/2 200 OK\r\n".as_slice(),
+            b"ETag: note\r\n",
+            b"",
+            "abcdé: x".as_bytes(),
+            b"abc\xff: x",
+            b"abcd\xff: x",
+        ] {
+            assert_eq!(parse_header(&mut t, line), line.len());
+        }
+        let long = vec![0xff; 128 * 1024];
+        assert_eq!(parse_header(&mut t, &long), long.len());
+        assert_eq!(t.status, 200);
+        assert_eq!(t.etag.as_deref(), Some("note"));
+        assert_eq!(t.stopped, None);
+        assert_eq!(
+            parse_header(&mut t, &[&b"Location: "[..], &long].concat()),
+            0
+        );
+        assert_eq!(t.stopped, Some(Error::BadResponse));
+    }
+
+    #[test]
+    fn a_callback_panic_returns_a_short_count() {
+        let mut t = Transfer::default();
+        let byte = 0;
+        assert_eq!(
+            receive(&byte, 1, 1, (&raw mut t).cast(), |_, _| panic!("test")),
+            0
+        );
     }
 }

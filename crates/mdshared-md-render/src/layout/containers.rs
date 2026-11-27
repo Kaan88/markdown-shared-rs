@@ -1,5 +1,6 @@
 //! Blocks that hold other blocks: block quotes and alerts, lists with their markers, and
 //! `<details>` with its drawn chevron.
+//! Roman markers use decimal above 3999, the end of the conventional Roman range.
 
 use super::inline::{Inline, Style};
 use super::pager::{Pager, Txt};
@@ -321,6 +322,9 @@ fn alpha(mut n: u32, lower: bool) -> String {
 }
 
 fn roman(mut n: u32) -> String {
+    if n > 3999 {
+        return n.to_string();
+    }
     const TABLE: &[(u32, &str)] = &[
         (1000, "M"),
         (900, "CM"),
@@ -344,4 +348,30 @@ fn roman(mut n: u32) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_largest_list_start_lays_out_with_short_markers() {
+        assert_eq!(roman(3999), "MMMCMXCIX");
+        assert_eq!(roman(4000), "4000");
+        assert_eq!(alpha(u32::MAX, true), "mwlqkwu");
+        assert_eq!(alpha(u32::MAX, false), "MWLQKWU");
+
+        // Exercise actual shaping with two items, including the saturating increment. Both
+        // Roman styles must draw the same ten digits as decimal, down to the last pixel.
+        let source = r#"<ol type="I" start="4294967295"><li>up</li><li>two</li></ol>"#;
+        assert_eq!(source.len(), 60);
+        let render = |kind: &str| {
+            let doc = mdshared_md_core::parse(&source.replace('I', kind));
+            crate::render(&doc, &crate::Options::light()).bitmap.pixels
+        };
+        let decimal = render("1");
+        for kind in ["I", "i"] {
+            assert!(render(kind) == decimal, "unexpected marker for {kind}");
+        }
+    }
 }
