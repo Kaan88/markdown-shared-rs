@@ -4,10 +4,12 @@ mod block;
 mod inline;
 mod markup;
 mod math;
+mod source_tasks;
 mod text_links;
 
 use block::{is_atx_heading, is_dash_run};
 use math::{github_math, parse_with_checks};
+use source_tasks::{Parsed, TaskEvents, TaskSource};
 use text_links::WikiOpen;
 
 use crate::autolink::{self, Entities, LinkKind, SWAP_PREFIX};
@@ -62,22 +64,42 @@ pub fn parse_wiki(src: &str, wiki: &mut dyn FnMut(&str) -> WikiAs) -> Document {
 /// `Missing` note too: an embed is never drawn as a missing link). An embed left as text is
 /// remembered in `wiki_text` as `!name`.
 pub fn parse_wiki_embeds(src: &str, wiki: &mut dyn FnMut(&str, bool) -> WikiAs) -> Document {
-    let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
+    parse_with_source(src, wiki, false).doc
+}
+
+/// Like parsing the page, but also find the source byte of each checkbox in the decoded text.
+pub(crate) fn source_tasks(src: &str) -> Option<(usize, Vec<crate::tasks::Marker>)> {
+    parse_with_source(src, &mut |_, _| WikiAs::Text, true).tasks
+}
+
+fn parse_with_source(
+    input: &str,
+    wiki: &mut dyn FnMut(&str, bool) -> WikiAs,
+    track_tasks: bool,
+) -> Parsed {
+    let src = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     if src.len() > MAX_DECODED_BYTES {
-        return Document {
-            warnings: vec![Warning::FileTooLarge],
-            ..Document::default()
+        return Parsed {
+            doc: Document {
+                warnings: vec![Warning::FileTooLarge],
+                ..Document::default()
+            },
+            tasks: None,
         };
     }
     // YAML front matter becomes a table (or a yaml block) before anything else sees the source.
     let with_front;
     let mut front = Front::default();
+    let mut task_source = track_tasks.then(|| TaskSource::new(src, input.len() - src.len()));
     let src = match crate::frontmatter::take(src) {
         Some((head, used)) => {
             front = Front {
                 replacement_lines: count_lines(head.as_bytes()),
                 original_lines: count_lines(&src.as_bytes()[..used]),
             };
+            if let Some(source) = &mut task_source {
+                source.skip_front(used, front.replacement_lines);
+            }
             with_front = format!("{head}{}", &src[used..]);
             with_front.as_str()
         }
@@ -103,7 +125,7 @@ pub fn parse_wiki_embeds(src: &str, wiki: &mut dyn FnMut(&str, bool) -> WikiAs) 
     let protected = autolink::protect_url_delimiters(src);
     let restore = matches!(protected, Cow::Owned(_));
     if memchr::memchr(b'$', protected.as_bytes()).is_none() {
-        let mut b = Builder::new(&protected, restore, false, front, &mut *wiki);
+        let mut b = Builder::new(&protected, restore, false, front, task_source, &mut *wiki);
         for (event, range) in Parser::new_ext(&protected, options()).into_offset_iter() {
             b.event(event, range);
         }
@@ -112,9 +134,9 @@ pub fn parse_wiki_embeds(src: &str, wiki: &mut dyn FnMut(&str, bool) -> WikiAs) 
         }
         let rejected = std::mem::take(&mut b.rejected_alerts);
         drop(b);
-        return parse_with_checks(protected, restore, rejected, front, wiki);
+        return parse_with_checks(protected, restore, rejected, front, task_source, wiki);
     }
-    parse_with_checks(protected, restore, Vec::new(), front, wiki)
+    parse_with_checks(protected, restore, Vec::new(), front, task_source, wiki)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -170,6 +192,8 @@ struct Builder<'a> {
     src: &'a str,
     restore: bool,
     front: Front,
+    task_source: Option<TaskSource<'a>>,
+    task_events: Option<TaskEvents>,
     /// Where the event being handled starts in `src`: the place of any block it opens.
     event_at: usize,
     /// The last mark's place in `src`, with its line and the byte in it ([`Builder::mark`]).
@@ -266,6 +290,7 @@ impl<'a> Builder<'a> {
         restore: bool,
         literal_alerts: bool,
         front: Front,
+        task_source: Option<TaskSource<'a>>,
         wiki: &'a mut dyn FnMut(&str, bool) -> WikiAs,
     ) -> Self {
         let mut breaks = memchr::memchr_iter(b'\n', src.as_bytes());
@@ -274,6 +299,8 @@ impl<'a> Builder<'a> {
             src,
             restore,
             front,
+            task_source,
+            task_events: task_source.and_then(|source| source.events(src)),
             event_at: 0,
             mark_src: 0,
             mark_line: 0,
@@ -504,6 +531,9 @@ impl<'a> Builder<'a> {
                 self.begin_inline();
                 self.mark_task_item();
                 self.push_atom(SpanKind::Checkbox { checked });
+                if let Some(tasks) = &mut self.task_events {
+                    tasks.marker(self.doc.spans.len() - 1, range.end, checked);
+                }
             }
         }
     }
@@ -796,7 +826,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn into_document(mut self) -> Document {
+    fn into_document(mut self) -> Parsed {
         self.flush_run();
         while let Some(open) = self.pop_open() {
             self.close(open);
@@ -819,6 +849,10 @@ impl<'a> Builder<'a> {
         doc.anchors.shrink_to_fit();
         doc.footnotes.shrink_to_fit();
         doc.block_attrs.shrink_to_fit();
-        doc
+        let tasks = self
+            .task_source
+            .zip(self.task_events)
+            .and_then(|(source, events)| source.resolve(self.src, &doc, events));
+        Parsed { doc, tasks }
     }
 }

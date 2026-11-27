@@ -49,6 +49,8 @@ mod draw;
 mod line;
 mod pointer;
 
+#[cfg(test)]
+pub(crate) use context::paste_fixture;
 pub use context::{ContextAction, MAX_PASTE_BYTES};
 pub use pointer::{FieldHit, Pointer};
 
@@ -385,8 +387,9 @@ impl TextField {
     /// selection (Shift), deletion, Ctrl+A/C/X/V when `clipboard` is on, and typed text. `typed`
     /// is the text the key event produced. `None` when the key is not an editing key (the caller
     /// treats it as its own: Enter, Escape, Up, Down, Tab, a shortcut); otherwise whether the
-    /// TEXT changed. Paste takes the clipboard's first line, within [`MAX_PASTE_BYTES`], and is
-    /// never read for a secret field or when `clipboard` is false.
+    /// TEXT changed. Paste takes the clipboard's first line without the menu's size limit,
+    /// and a line that cleans to nothing can replace a selection. The clipboard is never read
+    /// when `clipboard` is false. Secret fields refuse Copy and Cut.
     pub fn handle_key(
         &mut self,
         key: &KeyName,
@@ -429,7 +432,7 @@ impl TextField {
                 clipboard && self.apply_with(ContextAction::Cut, source)
             }
             KeyName::Char('v') if mods.ctrl && !mods.alt => {
-                self.paste_with(clipboard, true, source)
+                clipboard && self.paste_first_line(source)
             }
             KeyName::Enter
             | KeyName::Escape
@@ -617,6 +620,11 @@ impl TextField {
 
 /// Drops control characters; newlines and tabs become spaces.
 fn clean(text: &str) -> String {
+    clean_with(text, true)
+}
+
+/// The legacy secret paste leaves Unicode line and paragraph separators as written.
+fn clean_with(text: &str, unicode_breaks: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -625,7 +633,8 @@ fn clean(text: &str) -> String {
                 chars.next_if_eq(&'\n');
                 out.push(' ');
             }
-            '\n' | '\t' | '\u{2028}' | '\u{2029}' => out.push(' '),
+            '\n' | '\t' => out.push(' '),
+            '\u{2028}' | '\u{2029}' if unicode_breaks => out.push(' '),
             c if c.is_control() => {}
             c => out.push(c),
         }

@@ -113,8 +113,9 @@ pub(super) fn parse_with_checks(
     mut restore: bool,
     rejected: Vec<usize>,
     front: Front,
+    task_source: Option<TaskSource<'_>>,
     wiki: &mut dyn FnMut(&str, bool) -> WikiAs,
-) -> Document {
+) -> Parsed {
     // Hiding swaps in characters from U+E003 upward. A document that already uses any character
     // from that private-use block would have its own text rewritten by `restore`, so such a
     // document takes the literal pass instead.
@@ -125,7 +126,7 @@ pub(super) fn parse_with_checks(
     }
     let passes = if can_hide { MATH_PASSES } else { 0 };
     for _ in 0..passes {
-        match build_checked(&src, restore, false, front, wiki) {
+        match build_checked(&src, restore, false, front, task_source, wiki) {
             Ok(doc) => return doc,
             Err(rejected) => {
                 src = Cow::Owned(hide_delimiters(&src, &rejected));
@@ -133,7 +134,7 @@ pub(super) fn parse_with_checks(
             }
         }
     }
-    match build_checked(&src, restore, true, front, wiki) {
+    match build_checked(&src, restore, true, front, task_source, wiki) {
         Ok(doc) => doc,
         Err(_) => unreachable!("the literal pass rejects nothing"),
     }
@@ -146,9 +147,10 @@ fn build_checked(
     restore: bool,
     literal: bool,
     front: Front,
+    task_source: Option<TaskSource<'_>>,
     wiki: &mut dyn FnMut(&str, bool) -> WikiAs,
-) -> Result<Document, Vec<usize>> {
-    let mut b = Builder::new(src, restore, literal, front, wiki);
+) -> Result<Parsed, Vec<usize>> {
+    let mut b = Builder::new(src, restore, literal, front, task_source, wiki);
     let mut gate = MathGate {
         boundary: true,
         inline: 0..src.len(),
