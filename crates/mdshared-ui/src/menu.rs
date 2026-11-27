@@ -45,9 +45,9 @@ impl<T> Item<T> {
         }
     }
     /// The shortcut shown at the item's right, as the table writes it ("Ctrl+S"); printed the
-    /// platform's way (`keys::label`: "⌘S" on a Mac).
+    /// platform's way ([`crate::keys::label_owned`]: "⌘S" on a Mac).
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = crate::keys::label(&hint.into()).to_string();
+        self.hint = crate::keys::label_owned(hint);
         self
     }
     pub fn icon(mut self, icon: &'static str) -> Self {

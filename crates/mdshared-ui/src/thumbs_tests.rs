@@ -82,6 +82,74 @@ fn ready(l: Lookup) -> Arc<Image> {
 }
 
 #[test]
+fn a_thumbnail_refuses_an_oversized_source_from_its_header() {
+    let dir = Dir::new("source-limit");
+    let path = dir.join("large.png");
+    // An 8001 x 5000 RGBA PNG header and an empty data chunk. The header is over the
+    // decoder's 40 MP limit; trying to read the pixels would give Damaged instead.
+    let header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x1f\x41\0\0\x13\x88\x08\x06\0\0\0\xd3\x28\x30\x67\0\0\0\0IDAT\x35\xaf\x06\x1e";
+    std::fs::write(&path, header).unwrap();
+    assert_eq!(
+        make(&path, 64, None, None),
+        Err(Failure::Picture(image::Error::TooLarge {
+            width: 8001,
+            height: 5000
+        }))
+    );
+}
+
+#[test]
+fn thumbnail_pixels_match_the_original_area_average() {
+    let dir = Dir::new("scale-pixels");
+    let path = dir.join("picture.png");
+    for (w, h) in [(937, 613), (157, 281), (1, 901), (731, 1), (19, 7)] {
+        // Uneven dimensions cut through source pixels. Vary all four channels,
+        // including fully transparent regions with colour that must not bleed.
+        let mut bytes = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let a = if x % 19 < 8 {
+                    0
+                } else {
+                    (x * 13 + y * 7) as u8
+                };
+                bytes.extend([x as u8, y as u8, (x ^ y) as u8, a]);
+            }
+        }
+        let source = Image::new(w, h, bytes).unwrap();
+        std::fs::write(&path, image::encode_png(&source)).unwrap();
+        let expected = source.scaled_to_fit(128, 128).unwrap();
+        let thumb = make(&path, 128, None, None).unwrap();
+        assert_eq!(
+            (thumb.width, thumb.height),
+            (expected.width, expected.height)
+        );
+        assert!(
+            thumb.rgba == expected.rgba,
+            "different pixels for {w} x {h}"
+        );
+    }
+}
+
+#[test]
+fn a_24_megapixel_source_makes_a_thumbnail_with_only_the_output_buffer() {
+    let dir = Dir::new("24mp");
+    let path = dir.join("photo.png");
+    write_png(&path, 6000, 4000, [23, 58, 173, 255]);
+    let thumb = make(&path, 1024, None, None).unwrap();
+    assert_eq!((thumb.width, thumb.height), (1024, 683));
+    assert_eq!(thumb.rgba.capacity(), 1024 * 683 * 4);
+    assert!(
+        thumb
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|c| *c == [23, 58, 173, 255])
+    );
+}
+
+#[test]
 fn a_side_falls_in_the_smallest_bucket_that_holds_it() {
     assert_eq!(bucket(0), 64);
     assert_eq!(bucket(64), 64);

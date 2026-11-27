@@ -104,14 +104,9 @@ impl Entry {
         self
     }
     /// The shortcut or the path at the entry's right. A shortcut is printed the platform's way
-    /// (`keys::label`); anything else is kept as it is.
+    /// ([`crate::keys::label_owned`]); anything else is kept as it is.
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
-        let hint = hint.into();
-        self.hint = if crate::keys::MAC {
-            crate::keys::label(&hint).to_string()
-        } else {
-            hint
-        };
+        self.hint = crate::keys::label_owned(hint);
         self
     }
     pub fn icon(mut self, icon: &'static str) -> Self {
