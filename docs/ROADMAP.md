@@ -328,6 +328,9 @@ Claude Switch also asked for CS16–CS18, the font settings below; the owner app
 | TF1 | **Text field: Unicode line and paragraph separators on Ctrl+V.** Since `8da9b3d`, non-secret keyboard Ctrl+V converts them to spaces, where it used to keep them (pinned by a test). The owner decides whether to restore the old behaviour | S | low | `textfield` | open, owner decides |
 | TG1 | **Task-toggle guard and a literal `$$`.** The guard refuses every write in a document that shows a literal `$$`. By design and conservative; narrow it only if it gets in the way | S | low | the task-toggle guard | open |
 | AI1 | **Before release: run the real mdview and mdedit AppImages through the updater checks**, mounted and extract-and-run (the 2026-11-27 run in [LINUX.md](LINUX.md) used a stand-in image) | S | medium | LINUX.md, the apps' AppImages | open |
+| I14 | **Authenticate the "Move them in" undo record.** From the full review. A forged run record makes undo create a file at any path the record names. Stricter consistency checks were tried and rejected in review (each round broke undo of genuine older runs); a real fix needs a record the shared library can't forge, e.g. signed with a secret kept outside it | M | medium | `runs`, `moves` | open, owner decides |
+| SZ1 | **Split files that were already over 1,000 lines on main**: `mdshared-app/src/runs.rs` (about 7,500 lines), and in `mdshared-ui` `settings.rs`, `menu.rs` and `palette.rs`. A pure move with no behaviour change, in its own PR | M | low | those files | open |
+| R1 | **Review fixes not done when toolkit work stopped on 2026-11-27**: important findings I16-I18 (pty, highlight) and I26-I27 (D-Bus calls, notification clicks), and the 64 minor findings, all in the full review of 7da7b22 | L | medium | several crates | open |
 
 ## The owner's numbering
 
