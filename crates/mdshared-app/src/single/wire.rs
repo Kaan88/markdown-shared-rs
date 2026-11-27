@@ -3,9 +3,9 @@
 //! so a listener cannot echo a sender's proof or reuse one from an earlier connection.
 
 use super::record::random;
-use crate::sister::{MAX_TEXT, doc_id};
+use crate::sister::{MAX_TEXT, Request, doc_id};
 use crate::update::Sha256;
-use std::io::{BufRead, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 
 type Block = [u8; 32];
@@ -81,40 +81,50 @@ pub(super) fn authenticate(r: &mut impl Read, w: &mut impl Write, key: &Block) -
 const MAX_LINE: usize = 64 * 1024;
 const MAX_HEADER: usize = 1024 * 1024;
 const MAX_FIELDS: usize = 256;
+const MAX_SELECTION_PATHS: usize = MAX_FIELDS * 16;
+// An older authenticated reader rejects this first line before it can queue any paths.
+const SELECTION: &str = "\0mdshared paths 1";
 
-/// Keep the sender's batches within the same line, header and field caps as the reader.
-pub(super) fn send_paths(
-    app: &str,
-    paths: &[PathBuf],
-    mut send: impl FnMut(&[u8]) -> bool,
-) -> bool {
-    let valid_line = |line: &str| line.len() < MAX_LINE && !line.contains(['\r', '\n']);
-    if !valid_line(app) {
-        return false;
+/// Small selections keep the ordinary header. A large one begins with a selection
+/// marker, then sends ordinary path batches and an empty line to commit the selection.
+pub(super) fn write_paths(app: &str, paths: &[PathBuf], writer: &mut impl Write) -> io::Result<()> {
+    if app.len() >= MAX_LINE || app.ends_with('\r') || app.contains('\n') || app == SELECTION {
+        return Err(io::ErrorKind::InvalidInput.into());
     }
     let mut message = format!("{app}\n");
     let prefix = message.len();
     let mut fields = 0;
+    let mut transaction = false;
     for path in paths {
         let absolute = std::path::absolute(path).unwrap_or_else(|_| path.clone());
         let line = absolute.to_string_lossy();
-        if !valid_line(&line) {
-            return false;
+        // The reader strips one CR directly before LF. Use CRLF when the path
+        // itself ends in CR so that byte is not mistaken for the terminator.
+        let end = if line.ends_with('\r') { "\r\n" } else { "\n" };
+        let len = line.len() + end.len();
+        if len > MAX_LINE || line.contains('\n') {
+            return Err(io::ErrorKind::InvalidInput.into());
         }
-        if fields == MAX_FIELDS || message.len() + line.len() + 2 > MAX_HEADER {
-            message.push('\n');
-            if !send(message.as_bytes()) {
-                return false;
+        if fields == MAX_FIELDS || message.len() + len + 1 > MAX_HEADER {
+            if !transaction {
+                writeln!(writer, "{SELECTION}")?;
+                transaction = true;
             }
+            message.push('\n');
+            writer.write_all(message.as_bytes())?;
             message.truncate(prefix);
             fields = 0;
         }
         message.push_str(&line);
-        message.push('\n');
+        message.push_str(end);
         fields += 1;
     }
     message.push('\n');
-    send(message.as_bytes())
+    writer.write_all(message.as_bytes())?;
+    if transaction {
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// A complete UTF-8 line; the limit includes the LF. EOF or a limit is never a terminator.
@@ -128,14 +138,56 @@ fn line(r: &mut impl BufRead, limit: usize) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-pub(super) fn header(r: &mut impl BufRead, app: &str) -> Option<Vec<String>> {
+pub(super) enum Header {
+    Message(Vec<String>),
+    Selection(Vec<Request>),
+}
+
+pub(super) fn read_header(r: &mut impl BufRead, app: &str) -> Option<Header> {
     let mut header = r.take(MAX_HEADER as u64);
-    if line(&mut header, MAX_LINE)? != app {
-        return None;
+    let first = line(&mut header, MAX_LINE)?;
+    if first == SELECTION {
+        // The same byte and receive-deadline limits cover the entire connection's
+        // selection. Bound the in-memory request count separately from the bytes.
+        let mut requests = Vec::new();
+        let mut batches = 0;
+        loop {
+            let next = line(&mut header, MAX_LINE)?;
+            if next.is_empty() {
+                return (batches >= 2).then_some(Header::Selection(requests));
+            }
+            if next != app {
+                return None;
+            }
+            let batch = fields(&mut header)?;
+            if batch.is_empty() || requests.len() + batch.len() > MAX_SELECTION_PATHS {
+                return None;
+            }
+            for path in batch {
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    return None;
+                }
+                requests.push(Request::new(path));
+            }
+            batches += 1;
+        }
     }
+    (first == app).then(|| fields(&mut header).map(Header::Message))?
+}
+
+#[cfg(test)]
+pub(super) fn header(r: &mut impl BufRead, app: &str) -> Option<Vec<String>> {
+    match read_header(r, app)? {
+        Header::Message(fields) => Some(fields),
+        Header::Selection(_) => None,
+    }
+}
+
+fn fields(r: &mut impl BufRead) -> Option<Vec<String>> {
     let mut body = Vec::new();
     loop {
-        let field = line(&mut header, MAX_LINE)?;
+        let field = line(r, MAX_LINE)?;
         if field.is_empty() {
             return Some(body);
         }
@@ -213,26 +265,16 @@ mod tests {
     use std::io::{BufReader, Cursor};
 
     #[test]
-    fn batches_respect_the_byte_cap_and_stop_on_the_first_refusal() {
-        let paths: Vec<_> = (0..80)
-            .map(|i| PathBuf::from(format!("{i}-{}", "x".repeat(32 * 1024))))
-            .collect();
-        let mut lengths = Vec::new();
-        assert!(!send_paths("app", &paths, |message| {
-            assert!(message.len() <= MAX_HEADER);
-            let body = header(&mut Cursor::new(message), "app").unwrap();
-            assert!(bounded_destinations(&body).is_some());
-            assert_eq!(
-                body[0],
-                std::path::absolute(&paths[lengths.iter().sum::<usize>()])
-                    .unwrap_or_else(|_| paths[lengths.iter().sum::<usize>()].clone())
-                    .to_string_lossy()
-            );
-            lengths.push(body.len());
-            lengths.len() == 1
-        }));
-        assert_eq!(lengths.len(), 2);
-        assert!(lengths.iter().sum::<usize>() < paths.len());
+    fn a_selection_requires_a_commit_after_the_last_batch() {
+        let paths: Vec<_> = (0..300).map(|i| PathBuf::from(i.to_string())).collect();
+        let mut bytes = Vec::new();
+        write_paths("app", &paths, &mut bytes).unwrap();
+        assert!(matches!(
+            read_header(&mut Cursor::new(&bytes), "app"),
+            Some(Header::Selection(requests)) if requests.len() == paths.len()
+        ));
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        assert!(read_header(&mut Cursor::new(&bytes), "app").is_none());
     }
 
     #[test]

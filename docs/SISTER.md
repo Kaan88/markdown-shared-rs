@@ -72,11 +72,10 @@ from a previous launch. Unix checks the effective-user
 owner and requires a 0700 directory with no group/other access to the files. macOS also
 checks the extended ACL on the handles and refuses allow entries even with mode 0600.
 Windows rejects reparse points and requires the user SID and a protected owner-only ACL.
-On Linux, an owner-private `$XDG_RUNTIME_DIR` holds the endpoint directory, keyed by a hash
-of the canonical settings directory. Without that runtime directory the endpoint lives beside
-the settings, scoped by `/etc/machine-id` or, if unavailable, the kernel hostname. macOS uses
-the private per-user temporary directory (or a verified `$TMPDIR`), also keyed by the settings
-directory. Windows still uses `instance-v2` beside the settings.
+The endpoint lives in `instance-v2` beside the settings, regardless of launch environment.
+On Linux the record and lock names carry a hash of `/etc/machine-id`, falling back to
+`/var/lib/dbus/machine-id` and then the kernel hostname. On macOS they use the host UUID,
+falling back to the hostname. Windows filenames are unchanged.
 Neither end sends the key. The sender
 opens with a random 32-byte challenge `C`; the listener returns its own random 32-byte `S`
 and `HMAC-SHA256(key, 'S' || C || S)`. Only after checking that proof does the sender
@@ -92,7 +91,9 @@ An owner-only Unix settings directory may contain
 a legacy port file made group-writable by umask `0002`; it is used only for that bare probe.
 No paths or live text go to a legacy listener;
 `deliver` returns `Older` and `forward` and `send` return false. Restart and registration only
-wait if the predecessor actually holds the legacy lock. Registration then retries in the
+wait if the predecessor actually holds the legacy lock. On Unix both the record and lock
+must be owner-private to delay registration; readable records are only liveness hints.
+Registration then retries in the
 background for up to ten seconds, then publishes the independent endpoint even if the old
 lock is still held. An
 unlocked legacy port on Unix (including a reused port) is only a liveness hint and never delays
@@ -176,8 +177,10 @@ mdview
    queue drops only that message. A send that discovers the public channel is closed releases
    the instance lock before closing the request socket and stopping the listener.
    If the sender disconnects after queueing, the window still receives the request.
-   `single::forward` splits large file selections at the header limits and waits for each
-   batch to be acknowledged. If a later batch fails, it does not resend earlier batches.
+   `single::forward` sends large file selections as batches on one authenticated connection.
+   The complete selection must fit in 1 MiB and at most 4,096 paths, with at most 256 paths
+   per batch. The receiver buffers until the final marker, discards incomplete or invalid
+   selections, and acknowledges only after queueing the whole selection.
   The 200 KB loopback round trip is measured in a test.
 
 Why older receivers are safe. An old receiver reads the name line and then lines up to the first
@@ -412,7 +415,7 @@ Live text (unsaved changes in the viewer):
 For the authenticated transport, document delivery, legacy overlap in both startup orders,
 deferred registration, generation races, queue rejection, delayed file checks, header limits,
 delayed replies and a 300-file hand-off were tested on Windows. Linux and macOS (including
-host-local storage and the inherited ACL test) were type-checked only.
+host-scoped registration and the inherited ACL test) were type-checked only.
 No hand-off between real applications was run. The desktop runs below predate authentication.
 
 Run on KDE Plasma 6.8 Wayland (CachyOS), with both apps running: side-by-side placement (the editor

@@ -342,7 +342,7 @@ fn record_and_lock_refuse_a_non_file() {
     let settings = path.join("settings.ini");
     let dir = directory(&settings, true).unwrap();
     fs::create_dir(port_file(&settings)).unwrap();
-    fs::create_dir(private_dir(&settings).join(record::LOCK)).unwrap();
+    fs::create_dir(private_dir(&settings).join(record::file_name(record::LOCK).as_ref())).unwrap();
     assert!(Record::load(&dir).is_none());
     assert!(record::lock(&dir, true).is_none());
     drop(dir);
@@ -396,7 +396,7 @@ fn private_directory_record_and_lock_do_not_follow_links_or_open_fifos() {
     let settings = path.join("settings.ini");
     let dir = directory(&settings, true).unwrap();
     let port = port_file(&settings);
-    let lock = private_dir(&settings).join(record::LOCK);
+    let lock = private_dir(&settings).join(record::file_name(record::LOCK).as_ref());
     Record::publish(&dir, 12345).unwrap();
     let alternate = port.with_extension("alternate");
     fs::rename(&port, &alternate).unwrap();

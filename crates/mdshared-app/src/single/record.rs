@@ -1,10 +1,10 @@
 //! One fresh key per listener. Publish a complete, private file by rename; never truncate
 //! an existing file (it might be an older build's world-readable port file or a link).
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use std::path::Path;
 
 #[cfg(windows)]
@@ -22,21 +22,27 @@ pub(super) use os::legacy_file;
 pub(super) use os::legacy_locked;
 #[cfg(unix)]
 pub(super) use os::legacy_probe_file;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) use os::{endpoint_path, open_endpoint};
 
 pub(super) const LOCK: &str = "instance.lock";
 pub(super) const PORT: &str = "instance.port";
 const GATE: &str = "publishing.lock";
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn endpoint_path(settings: &Path) -> std::path::PathBuf {
     settings.join("instance-v2")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn open_endpoint(settings: &Path, create: bool) -> Option<Directory> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    os::host_id()?;
     Directory::open(&endpoint_path(settings), create)
+}
+
+pub(super) fn file_name(base: &'static str) -> Cow<'static, str> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(host) = os::host_id() {
+        return Cow::Owned(format!("{base}.{host}"));
+    }
+    Cow::Borrowed(base)
 }
 
 pub(super) fn lock(dir: &Directory, create: bool) -> Option<File> {
@@ -47,8 +53,9 @@ pub(super) fn gate(dir: &Directory, create: bool) -> Option<File> {
     named_lock(dir, GATE, create)
 }
 
-fn named_lock(dir: &Directory, base: &str, create: bool) -> Option<File> {
-    let name = OsStr::new(base);
+fn named_lock(dir: &Directory, base: &'static str, create: bool) -> Option<File> {
+    let name = file_name(base);
+    let name = OsStr::new(name.as_ref());
     let file = match dir.open_lock(name) {
         Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
             dir.create_file(name).or_else(|e| {
@@ -92,7 +99,8 @@ impl Record {
             file.write_all(&port.to_be_bytes()).ok()?;
             file.write_all(&key).ok()?;
             drop(file);
-            dir.rename(tmp, OsStr::new(PORT)).then_some(())?;
+            dir.rename(tmp, OsStr::new(file_name(PORT).as_ref()))
+                .then_some(())?;
             Some(Self { port, key })
         })();
         if result.is_none() {
@@ -102,7 +110,7 @@ impl Record {
     }
 
     pub fn load(dir: &Directory) -> Option<Self> {
-        let mut file = dir.read_file(OsStr::new(PORT)).ok()?;
+        let mut file = dir.read_file(OsStr::new(file_name(PORT).as_ref())).ok()?;
         if !os::private(&file) || file.metadata().ok()?.len() != 34 {
             return None;
         }
@@ -141,7 +149,7 @@ fn an_inherited_macos_read_grant_defeats_mode_0600_and_the_record_is_refused() {
         .mode(0o600)
         .write(true)
         .create_new(true)
-        .open(path.join(PORT))
+        .open(path.join(file_name(PORT).as_ref()))
         .unwrap();
     file.write_all(&[1; 34]).unwrap();
     assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);

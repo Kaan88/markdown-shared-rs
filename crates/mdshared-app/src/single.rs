@@ -48,9 +48,9 @@ fn directory(settings: &Path, create: bool) -> Option<Directory> {
 }
 
 /// Where the authenticated listener records its port, in a directory separate from the
-/// legacy decimal port file. Linux and macOS prefer private, host-local storage.
+/// legacy decimal port file. Linux and macOS scope the filename to the host.
 pub fn port_file(settings: &Path) -> PathBuf {
-    private_dir(settings).join(record::PORT)
+    private_dir(settings).join(record::file_name(record::PORT).as_ref())
 }
 
 fn connect(port: u16, timeout: Duration) -> io::Result<TcpStream> {
@@ -89,10 +89,11 @@ fn wait_for_legacy(settings: &Path, end: Instant) {
     while legacy_predecessor(settings) && retry(end, &mut std::thread::sleep) {}
 }
 
-/// Hands `paths` to a running instance in bounded batches. True when all batches were
-/// acknowledged. If a later batch fails, earlier acknowledged batches are not sent again.
+/// Hands `paths` to a running instance. Large selections are sent in bounded batches,
+/// queued only once the whole selection is received. True on a final acknowledgement.
 pub fn forward(app: &str, settings: &Path, paths: &[PathBuf]) -> bool {
-    wire::send_paths(app, paths, |message| send(settings, message))
+    exchange_writing(settings, |writer| wire::write_paths(app, paths, writer))
+        .is_some_and(|reply| reply == OK)
 }
 
 /// [`forward`] for a file with a place to show: see [`Request::encode`] for the payload.
@@ -191,6 +192,7 @@ pub fn wait_gone(settings: &Path, timeout: Duration) -> bool {
 }
 
 /// Writes `message` to the instance recorded beside `settings` and waits for its `ok`.
+#[cfg(test)]
 fn send(settings: &Path, message: &[u8]) -> bool {
     exchange(settings, message).is_some_and(|reply| reply == OK)
 }
@@ -198,6 +200,13 @@ fn send(settings: &Path, message: &[u8]) -> bool {
 /// Writes `message` to the instance recorded beside `settings` and returns the line it answers,
 /// trimmed; `None` when nothing listens or no answer comes.
 fn exchange(settings: &Path, message: &[u8]) -> Option<String> {
+    exchange_writing(settings, |writer| writer.write_all(message))
+}
+
+fn exchange_writing(
+    settings: &Path,
+    write: impl FnOnce(&mut Timed<'_>) -> io::Result<()>,
+) -> Option<String> {
     let record = wait_for_record(settings, Instant::now() + STARTUP, std::thread::sleep)?;
     let stream = connect(record.port, CONNECT).ok()?;
     stream.set_nodelay(true).ok()?;
@@ -207,7 +216,7 @@ fn exchange(settings: &Path, message: &[u8]) -> Option<String> {
     let proof = wire::challenge(&mut reader, &mut writer, &record.key)?;
     writer.1 = Instant::now() + READ_DEADLINE * 2;
     writer.write_all(&proof).ok()?;
-    writer.write_all(message).ok()?;
+    write(&mut writer).ok()?;
     // The challenge already arrived, so the listener's remaining header, text and reply
     // time fit inside this fresh budget, even if Windows buffered the entire upload.
     reader.get_mut().1 = Instant::now() + READ_DEADLINE * 2 + ACK_DEADLINE + CONNECT;
@@ -415,6 +424,27 @@ fn invalid_listener(error: &io::Error) -> bool {
     }
 }
 
+fn read_requests(reader: &mut BufReader<Timed<'_>>, app: &str) -> Option<Vec<Request>> {
+    let body = match wire::read_header(reader, app)? {
+        wire::Header::Message(body) => body,
+        wire::Header::Selection(requests) => return Some(requests),
+    };
+    let destinations = wire::bounded_destinations(&body)?;
+    let text_len = wire::checked_text_length(&body)?;
+    if text_len.is_some() && destinations != 1 {
+        return None;
+    }
+    let mut requests = Request::parse(body.iter().map(String::as_str));
+    if let Some(n) = text_len {
+        let [request] = requests.as_mut_slice() else {
+            return None;
+        };
+        reader.get_mut().1 = Instant::now() + READ_DEADLINE;
+        request.text = Some(read_text(reader, n)?);
+    }
+    Some(requests)
+}
+
 /// Authenticate, parse, and queue the message without resolving paths. A valid empty
 /// launch is still acknowledged as a no-op. Exit when the receiver can no longer deliver.
 fn receive(
@@ -435,29 +465,9 @@ fn receive(
         if wire::authenticate(&mut reader, &mut writer, &record.key).is_none() {
             continue;
         }
-        let Some(body) = wire::header(&mut reader, app) else {
+        let Some(requests) = read_requests(&mut reader, app) else {
             continue;
         };
-        let Some(destinations) = wire::bounded_destinations(&body) else {
-            continue;
-        };
-        let Some(text_len) = wire::checked_text_length(&body) else {
-            continue;
-        };
-        if text_len.is_some() && destinations != 1 {
-            continue;
-        }
-        let mut requests = Request::parse(body.iter().map(String::as_str));
-        if let Some(n) = text_len {
-            let [request] = requests.as_mut_slice() else {
-                continue;
-            };
-            reader.get_mut().1 = Instant::now() + READ_DEADLINE;
-            let Some(text) = read_text(&mut reader, n) else {
-                continue;
-            };
-            request.text = Some(text);
-        }
         if stop.requested()
             || !dispatch(
                 Pending::new(stream, requests, Instant::now() + ACK_DEADLINE),

@@ -32,15 +32,6 @@ pub(super) fn retire<T>(path: PathBuf, rx: Receiver<T>) {
 }
 
 pub(super) fn remove(path: PathBuf) {
-    #[cfg(unix)]
-    {
-        let endpoint = private_dir(&path.join("settings.ini"));
-        if !endpoint.starts_with(&path)
-            && let Err(e) = fs::remove_dir_all(&endpoint)
-        {
-            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{}", endpoint.display());
-        }
-    }
     let end = Instant::now() + READ_DEADLINE;
     loop {
         match fs::remove_dir_all(&path) {
@@ -70,6 +61,131 @@ fn a_loopback_fixture_clears_stale_state_and_releases_its_directory() {
     assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap().doc, request.doc);
     retire(path.clone(), rx);
     assert!(!path.exists());
+}
+
+#[test]
+fn a_refused_second_batch_does_not_deliver_the_first_batch() {
+    let path = scratch("refused-selection");
+    let settings = path.join("settings.ini");
+    let rx = listen_unresolved_requests_waking(APP, &settings, || {}).unwrap();
+    let mut base = path.clone();
+    for _ in 0..15 {
+        base.push("x".repeat(200));
+    }
+    // The first 256 paths fit under 1 MiB. Reading the second batch crosses the
+    // total selection cap, even though both batches would fit separately.
+    let paths: Vec<_> = (0..400).map(|i| base.join(format!("{i}.md"))).collect();
+    assert!(!forward(APP, &settings, &paths));
+    let next = Request::new(path.join("next.md"));
+    assert_eq!(deliver_request(APP, &settings, &next), Delivery::Taken);
+    assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap(), next);
+    assert!(rx.try_recv().is_err());
+    retire(path, rx);
+}
+
+#[cfg(unix)]
+#[test]
+fn forward_preserves_a_carriage_return_inside_a_unix_filename() {
+    let path = scratch("path-with-carriage-return");
+    let settings = path.join("settings.ini");
+    let file = path.join("still\rhere.md");
+    fs::write(&file, b"note").unwrap();
+    let rx = listen(APP, &settings).unwrap();
+    assert!(forward(APP, &settings, std::slice::from_ref(&file)));
+    assert_eq!(rx.recv_timeout(READ_DEADLINE).unwrap(), file);
+    retire(path, rx);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn discovery_and_contention_ignore_xdg_runtime_dir() {
+    let path = scratch("registration-environment");
+    let settings = path.join("new-directory/settings.ini");
+    let runtime = path.join("runtime");
+    drop(Directory::open(&runtime, true).unwrap());
+    let recorded = port_file(&settings);
+    assert!(!recorded.exists());
+    let rx = listen_requests_waking(APP, &settings, || {}).unwrap();
+    assert_eq!(port_file(&settings), recorded);
+    assert!(recorded.is_file());
+    assert!(recorded.starts_with(settings.parent().unwrap()));
+    for with_runtime in [true, false] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "single::overlap_tests::fixture::probe_registration_from_another_environment",
+            ])
+            .env("MDSHARED_TEST_SETTINGS", &settings)
+            .env("MDSHARED_TEST_PORT", &recorded);
+        if with_runtime {
+            command.env("XDG_RUNTIME_DIR", &runtime);
+        } else {
+            command.env_remove("XDG_RUNTIME_DIR");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+        assert_eq!(
+            rx.recv_timeout(READ_DEADLINE).unwrap().doc.as_deref(),
+            Some("env-probe")
+        );
+    }
+    assert!(fs::read_dir(runtime).unwrap().next().is_none());
+    retire(settings.parent().unwrap().to_path_buf(), rx);
+    remove(path);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run in child processes with different environments by the registration test"]
+fn probe_registration_from_another_environment() {
+    let settings = PathBuf::from(std::env::var_os("MDSHARED_TEST_SETTINGS").unwrap());
+    let recorded = PathBuf::from(std::env::var_os("MDSHARED_TEST_PORT").unwrap());
+    assert_eq!(port_file(&settings), recorded);
+    assert!(alive(&settings));
+    assert!(listen(APP, &settings).is_none());
+    assert_eq!(
+        deliver_request(APP, &settings, &Request::document("env-probe", "")),
+        Delivery::Taken
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_readable_legacy_record_or_lock_is_not_authority_to_delay_publication() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch("legacy-readable-not-private");
+    let settings = path.join("settings.ini");
+    let port = path.join("instance.port");
+    let (listener, lock) = legacy_start(&path);
+    lock.try_lock().unwrap();
+    let mode = fs::Permissions::from_mode;
+    assert!(legacy_predecessor(&settings));
+    fs::set_permissions(&port, mode(0o644)).unwrap();
+    assert!(alive(&settings));
+    assert!(
+        !legacy_predecessor(&settings),
+        "a readable port is only a hint"
+    );
+    fs::set_permissions(&port, mode(0o600)).unwrap();
+    lock.set_permissions(mode(0o644)).unwrap();
+    assert!(alive(&settings));
+    assert!(
+        !legacy_predecessor(&settings),
+        "a readable lock is not authority"
+    );
+    let rx = listen_requests_waking(APP, &settings, || {}).unwrap();
+    assert!(
+        port_file(&settings).is_file(),
+        "publication was not deferred"
+    );
+    drop((listener, lock));
+    retire(path, rx);
 }
 
 #[cfg(windows)]
