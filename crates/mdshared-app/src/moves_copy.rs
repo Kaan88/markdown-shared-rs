@@ -129,23 +129,7 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
             let Some(from_dir) = w.from.parent() else {
                 continue;
             };
-            let places: Vec<(PathBuf, PathBuf)> = out
-                .iter()
-                .enumerate()
-                .filter(|(k, _)| *k != i)
-                .map(|(_, p)| (p.from.clone(), p.target().to_path_buf()))
-                .collect();
-            let pictures = &out[i].pictures;
-            let place = |p: &Path| -> PathBuf {
-                if let Some(c) = pictures.iter().find(|c| same_path(&c.from, p)) {
-                    return c.to.clone();
-                }
-                match places.iter().find(|(f, _)| links::same_file(f, p)) {
-                    Some((_, t)) => t.clone(),
-                    None => p.to_path_buf(),
-                }
-            };
-            let (new, n) = links::rewrite(text, from_dir, &w.dir, &place, &[]);
+            let (new, n) = rewritten(text, from_dir, &w.dir, &out, i);
             out[i].rewrites = n;
             let wants = (n > 0).then_some(new);
             let same = match (&out[i].copy, &wants) {
@@ -180,6 +164,20 @@ pub fn plan(wanted: &[Wanted], inside: &[PathBuf]) -> Vec<Planned> {
         }
     }
     out
+}
+
+fn rewritten(text: &str, from: &Path, to: &Path, plan: &[Planned], i: usize) -> (String, usize) {
+    let place = |p: &Path| {
+        if let Some(c) = plan[i].pictures.iter().find(|c| same_path(&c.from, p)) {
+            return c.to.clone();
+        }
+        plan.iter()
+            .enumerate()
+            .find(|(k, f)| *k != i && links::same_file(&f.from, p))
+            .map_or(p, |(_, f)| f.target())
+            .to_path_buf()
+    };
+    links::rewrite(text, from, to, &place, &[])
 }
 
 /// The most link passes: each pass settles at least one more file of a chain of links, so a
@@ -224,10 +222,12 @@ pub struct Written {
     pub made_outside: Vec<PathBuf>,
 }
 
-/// Writes the copies `plan` gives. A file is read again here, and one that changed since its
-/// name was chosen is still copied as it is now. On the first failure everything this call made
-/// is taken away again (only while it is the bytes it wrote) and the reason is given. `library`
-/// and `home` are the run's reach: a folder made outside them is not the record's.
+/// Writes the copies `plan` gives. Before making any destination, checks that each rewritten
+/// note still rewrites to the planned text. At write time, a rewritten note must still have the
+/// bytes just checked; files copied without rewrites use their current bytes. On failure,
+/// everything this call made is taken away again (only while it is the bytes it wrote) and the
+/// reason is given. `library` and `home` are the run's reach: a folder made outside them is not
+/// the record's.
 pub fn write(plan: &[Planned], library: &Path, home: &Path) -> Result<Written, String> {
     let mut done = Written::default();
     let reach = |p: &Path| crate::runs::inside(library, home, p);
@@ -244,7 +244,28 @@ fn write_all(
     reach: &dyn Fn(&Path) -> bool,
     done: &mut Written,
 ) -> Result<(), String> {
-    for p in plan {
+    let changed = |p: &Path| format!("{} changed; plan the copy again", p.display());
+    let mut checked = vec![None; plan.len()];
+    // Copying a file can make a previously missing link target exist. Check every rewrite
+    // before this batch changes the disk, then check only the source bytes at write time.
+    for (i, p) in plan.iter().enumerate() {
+        let Copy::New { to, text: Some(t) } = &p.copy else {
+            continue;
+        };
+        let original = read_regular(&p.from, DIGEST_MAX_BYTES, false)
+            .ok_or_else(|| format!("{} could not be read", p.from.display()))?;
+        if !std::str::from_utf8(&original).is_ok_and(|now| {
+            original.len() as u64 <= links::TEXT_MAX
+                && p.from
+                    .parent()
+                    .zip(to.parent())
+                    .is_some_and(|(from, dir)| rewritten(now, from, dir, plan, i).0 == *t)
+        }) {
+            return Err(changed(&p.from));
+        }
+        checked[i] = Some(sha_of(&original));
+    }
+    for (p, checked) in plan.iter().zip(checked) {
         match &p.copy {
             Copy::Stays { .. } => continue,
             Copy::There { to } => {
@@ -259,19 +280,20 @@ fn write_all(
             Copy::New { to, text } => {
                 let original = read_regular(&p.from, DIGEST_MAX_BYTES, false)
                     .ok_or_else(|| format!("{} could not be read", p.from.display()))?;
-                let bytes = match text {
-                    Some(t) => t.as_bytes().to_vec(),
-                    None => original.clone(),
-                };
+                let original_sha256 = sha_of(&original);
+                if checked.is_some_and(|d| d != original_sha256) {
+                    return Err(changed(&p.from));
+                }
+                let bytes = text.as_ref().map_or(original.as_slice(), |t| t.as_bytes());
                 make_dirs(to, reach, done)?;
-                create_new(to, &bytes)
+                create_new(to, bytes)
                     .map_err(|e| format!("{} could not be written: {e}", to.display()))?;
                 done.files.push(PictureRec {
                     path: to.clone(),
                     created: true,
-                    sha256: sha_of(&bytes),
+                    sha256: sha_of(bytes),
                     original: Some(p.from.clone()),
-                    original_sha256: sha_of(&original),
+                    original_sha256,
                 });
             }
         }
@@ -346,6 +368,8 @@ pub const RECORD_FULL: &str = "the run's record has no room to keep it for undo:
 /// The most text a move keeps for undo (the originals of rewritten files and of the library's
 /// notes whose links it changes), well inside what a record may hold.
 const KEPT_MAX: usize = 3 * 1024 * 1024;
+
+const EXISTING_COPY: &str = "the copy was there before this run: left where it is";
 
 /// An original "Move them in" takes away once its copy is listed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -471,6 +495,10 @@ pub fn move_plan(
         else {
             continue;
         };
+        if !rec.created {
+            stay(&mut out, &p.from, EXISTING_COPY);
+            continue;
+        }
         if open(&p.from) {
             stay(&mut out, &p.from, UNSAVED);
             continue;
@@ -593,6 +621,8 @@ pub fn move_plan(
                 Some(SHOWN_BY_STAYING)
             } else if index.others_than(o, &going) {
                 Some(OTHERS_USE)
+            } else if !pic.created {
+                Some(EXISTING_COPY)
             } else {
                 None
             };

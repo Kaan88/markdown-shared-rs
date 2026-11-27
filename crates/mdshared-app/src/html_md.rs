@@ -558,19 +558,8 @@ impl Writer {
             space = false;
             if !code {
                 let next = chars.peek().map(|&(_, n)| n);
-                let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
                 let rest = text.get(at + 1..).unwrap_or("");
-                let escape = match c {
-                    '\\' | '*' | '`' | '[' | ']' => true,
-                    // Inside a word (snake_case) it is no emphasis.
-                    '_' => !(word(prev) && word(next)),
-                    '<' => opens_html(next),
-                    '&' => entity_like(rest),
-                    // A lone `~` after a space ("~5 min") can end no strikethrough.
-                    '~' => next == Some('~') || prev.is_some_and(|p| !p.is_whitespace()),
-                    _ => false,
-                };
-                if escape {
+                if escape_inline(c, prev, next, rest) {
                     self.line.push('\\');
                 } else if (c == '<' && next.is_none())
                     || (c == '&'
@@ -954,7 +943,7 @@ impl Writer {
                 };
                 Some(format!("{fence}{pad}{core}{pad}{fence}"))
             }
-            Wrap::Link => link_target(&i.href).map(|href| format!("[{core}]({href})")),
+            Wrap::Link => link_target(&i.href, true).map(|href| format!("[{core}]({href})")),
             Wrap::Plain => None,
         };
         match marked {
@@ -969,6 +958,7 @@ impl Writer {
     }
 
     fn image(&mut self, attrs: &Attrs) {
+        let code = self.inline.iter().any(|i| i.wrap == Wrap::Code);
         let alt = attrs
             .get("alt")
             .unwrap_or("")
@@ -977,7 +967,7 @@ impl Writer {
             .get("src")
             .map(str::trim)
             .filter(|s| !s.starts_with("data:"))
-            .and_then(link_target);
+            .and_then(|src| link_target(src, !code));
         let Some(src) = src else {
             if !alt.trim().is_empty() {
                 self.text(&alt);
@@ -987,10 +977,24 @@ impl Writer {
         if !(self.line.is_empty() || self.line.ends_with([' ', '\n'])) {
             self.line.push(' ');
         }
-        // A backslash in the alt is one in the text: doubled, so one at its end cannot escape
-        // the `]` (audit 4, W8).
-        let alt = escape_entities(&alt.trim().replace('\\', "\\\\"));
-        self.line.push_str(&format!("![{alt}]({src})"));
+        self.line.push_str("![");
+        let alt = alt.trim();
+        let mut prev = None;
+        for (at, c) in alt.char_indices() {
+            let rest = &alt[at + c.len_utf8()..];
+            // Inside code keep the old serialization: only backslashes and entities.
+            let escape = if code {
+                c == '\\' || (c == '&' && entity_like(rest))
+            } else {
+                escape_inline(c, prev, rest.chars().next(), rest)
+            };
+            if escape {
+                self.line.push('\\');
+            }
+            self.line.push(c);
+            prev = Some(c);
+        }
+        self.line.push_str(&format!("]({src})"));
         self.marked = true;
     }
 
@@ -1169,7 +1173,7 @@ fn language(attrs: &Attrs) -> String {
 
 /// A link's target as Markdown can carry it, or `None` for one not worth a link (empty, a
 /// script, a place in the page it was copied from).
-fn link_target(href: &str) -> Option<String> {
+fn link_target(href: &str, escape_backslashes: bool) -> Option<String> {
     // Browsers take tabs and new lines out of a URL ("java\tscript:" is a script), so control
     // characters go before the scheme is looked at.
     let clean: String = href.chars().filter(|c| !c.is_control()).collect();
@@ -1191,6 +1195,7 @@ fn link_target(href: &str) -> Option<String> {
     for (at, c) in href.char_indices() {
         match c {
             ' ' => out.push_str("%20"),
+            '\\' if escape_backslashes => out.push_str("%5C"),
             '(' => out.push_str("%28"),
             ')' => out.push_str("%29"),
             '<' => out.push_str("%3C"),
@@ -1226,16 +1231,19 @@ fn entity_like(after: &str) -> bool {
     i > start && b.get(i) == Some(&b';')
 }
 
-/// Text with every `&` that would read as a character reference escaped.
-fn escape_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for (at, c) in s.char_indices() {
-        if c == '&' && entity_like(s.get(at + 1..).unwrap_or("")) {
-            out.push('\\');
-        }
-        out.push(c);
+/// Whether this character in prose or an image description needs a backslash to stay literal.
+fn escape_inline(c: char, prev: Option<char>, next: Option<char>, rest: &str) -> bool {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    match c {
+        '\\' | '*' | '`' | '[' | ']' => true,
+        // Inside a word (snake_case) it is no emphasis.
+        '_' => !(word(prev) && word(next)),
+        '<' => opens_html(next),
+        '&' => entity_like(rest),
+        // A lone `~` after a space ("~5 min") can end no strikethrough.
+        '~' => next == Some('~') || prev.is_some_and(|p| !p.is_whitespace()),
+        _ => false,
     }
-    out
 }
 
 fn longest_run(s: &str, c: char) -> usize {

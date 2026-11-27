@@ -210,6 +210,69 @@ fn a_markdown_file_takes_the_pictures_below_it_and_its_words_do_not_change() {
 }
 
 #[test]
+fn a_save_after_planning_a_link_rewrite_refuses_the_copy() {
+    let w = World::new("save-before-rewrite");
+    let md = w.outside.join("trip.md");
+    put(&md, b"[plan](plan.txt)\n");
+    put(&w.outside.join("plan.txt"), b"plan\n");
+    let plan = plan(&[w.want(&md)], &w.inside());
+    assert_eq!(plan[0].rewrites, 1);
+    put(&md, b"[plan](plan.txt)\nNew entry.\n");
+    assert!(write(&plan, &w.library, &w.group).is_err());
+    assert!(!plan[0].target().exists());
+    assert_eq!(bytes(&md), b"[plan](plan.txt)\nNew entry.\n");
+}
+
+#[test]
+fn an_earlier_copy_does_not_change_how_a_later_rewrite_is_checked() {
+    let w = World::new("rewrite-batch");
+    let first = w.outside.join("first.txt");
+    let note = w.outside.join("note.md");
+    put(&first, b"first");
+    put(&w.outside.join("other.txt"), b"other");
+    put(
+        &note,
+        b"[missing](../library/Shots/first.txt)\n[other](other.txt)\n",
+    );
+    let plan = plan(&[w.want(&first), w.want(&note)], &w.inside());
+    assert_eq!(plan[1].rewrites, 1);
+    assert!(!plan[0].target().exists());
+    let done = write(&plan, &w.library, &w.group).expect("both copies are written");
+    assert_eq!(
+        text(plan[1].target()),
+        "[missing](../library/Shots/first.txt)\n[other](../../desk/other.txt)\n"
+    );
+    assert_eq!(
+        done.files[1].original_sha256,
+        digest_of(&note).expect("the original is readable")
+    );
+}
+
+#[test]
+fn a_source_changed_during_the_batch_fails_the_digest_check() {
+    let w = World::new("rewrite-mid-write");
+    let first = w.outside.join("first.txt");
+    let note = w.outside.join("note.md");
+    put(&first, b"first");
+    put(&w.outside.join("other.txt"), b"other");
+    put(&note, b"[other](other.txt)\n");
+    let plan = plan(&[w.want(&first), w.want(&note)], &w.inside());
+    assert_eq!(plan[1].rewrites, 1);
+    let mut done = Written::default();
+    let reach = |p: &Path| {
+        if p == w.group {
+            // This spelling would rewrite to the same text, but the original bytes changed.
+            put(&note, b"[other](./other.txt)\n");
+        }
+        true
+    };
+    let result = write_all(&plan, &reach, &mut done);
+    assert_eq!(done.files.len(), 1);
+    assert!(result.is_err());
+    assert!(!plan[1].target().exists());
+}
+
+#[test]
 fn a_link_outside_its_folder_is_rewritten_to_lead_where_it_did() {
     let w = World::new("rewrite");
     let md = w.outside.join("notes").join("trip.md");
@@ -516,6 +579,24 @@ fn a_library_note_outside_the_reach_keeps_the_original() {
     move_out(&mp, &mut crate::runs::Delete);
     assert!(md.exists());
     assert_eq!(text(&note), "# Ref\n\n[Trip](../desk/trip.md)\n");
+}
+
+#[test]
+fn an_existing_copy_is_never_the_basis_for_removing_an_original() {
+    let w = World::new("move-existing-copy");
+    let md = w.outside.join("note.md");
+    let pic = w.outside.join("p.png");
+    put(&md, b"![p](p.png)");
+    put(&pic, b"picture");
+    put(&w.group.join("p.png"), b"picture");
+    let other = w.outside.join("other.txt");
+    put(&other, b"same");
+    put(&w.group.join("other.txt"), b"same");
+    let (_, _, mp) = moved(&w, &[w.want(&md), w.want(&other)]);
+    assert_eq!(mp.removes.len(), 1);
+    assert_eq!(mp.removes[0].path, md);
+    assert_eq!(mp.why_stays(&pic), Some(EXISTING_COPY));
+    assert_eq!(mp.why_stays(&other), Some(EXISTING_COPY));
 }
 
 /// An original changed after it was copied is not taken away: the copy is not what it holds.

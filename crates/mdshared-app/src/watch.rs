@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 /// Shared by the watcher thread and the UI thread.
+#[derive(Default)]
 struct Shared {
     /// The open files' folders and names, compared against each event's paths.
     files: std::sync::Mutex<BTreeSet<PathBuf>>,
@@ -30,6 +31,35 @@ struct Shared {
 }
 
 impl Shared {
+    fn needs_check(&self, event: notify::Result<notify::Event>) -> bool {
+        let Ok(event) = event else { return true };
+        if event.need_rescan() {
+            return true;
+        }
+        if matches!(event.kind, EventKind::Access(_)) {
+            return false;
+        }
+        {
+            let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            if event.paths.iter().any(|path| files.contains(path)) {
+                return true;
+            }
+        }
+        // Anything created, removed or renamed directly inside a listed folder.
+        let listed = self.listed.lock().unwrap_or_else(|e| e.into_inner());
+        !listed.is_empty()
+            && matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Remove(_)
+                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
+            )
+            && event.paths.iter().any(|path| {
+                path.parent()
+                    .is_some_and(|dir| listed.contains(dir) && self.listing_moved(dir))
+            })
+    }
+
     /// Whether the listing of `dir` may have changed: always, except on macOS, where its
     /// modification time must have moved since the last look (see `listed_times`).
     #[cfg(not(target_os = "macos"))]
@@ -75,40 +105,10 @@ impl FileWatcher {
     /// `None` when the OS watcher cannot start (no inotify instances left, for example); the shell
     /// then falls back to a slow poll.
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Option<FileWatcher> {
-        let shared = Arc::new(Shared {
-            files: Default::default(),
-            listed: Default::default(),
-            #[cfg(target_os = "macos")]
-            listed_times: Default::default(),
-            pending: AtomicBool::new(false),
-        });
+        let shared = Arc::new(Shared::default());
         let seen = shared.clone();
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            let Ok(event) = event else {
-                return;
-            };
-            if matches!(event.kind, EventKind::Access(_)) {
-                return;
-            }
-            let ours = {
-                let files = seen.files.lock().unwrap_or_else(|e| e.into_inner());
-                event.paths.iter().any(|path| files.contains(path))
-            } || {
-                // Anything created, removed or renamed directly inside a listed folder.
-                let listed = seen.listed.lock().unwrap_or_else(|e| e.into_inner());
-                !listed.is_empty()
-                    && matches!(
-                        event.kind,
-                        EventKind::Create(_)
-                            | EventKind::Remove(_)
-                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                    )
-                    && event.paths.iter().any(|path| {
-                        path.parent()
-                            .is_some_and(|dir| listed.contains(dir) && seen.listing_moved(dir))
-                    })
-            };
-            if ours && !seen.pending.swap(true, Ordering::AcqRel) {
+        let watcher = notify::recommended_watcher(move |event| {
+            if seen.needs_check(event) && !seen.pending.swap(true, Ordering::AcqRel) {
                 wake();
             }
         })
@@ -186,6 +186,15 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
     use std::time::Duration;
+
+    #[test]
+    fn errors_and_pathless_rescans_request_a_check() {
+        let shared = Shared::default();
+        let event = notify::Event::new(EventKind::Any);
+        assert!(!shared.needs_check(Ok(event.clone())));
+        assert!(shared.needs_check(Ok(event.set_flag(notify::event::Flag::Rescan))));
+        assert!(shared.needs_check(Err(notify::Error::generic("lost events"))));
+    }
 
     /// Lets events from before the watch went away (FSEvents delivers those of the moment before
     /// a stream starts a little later), and clears any wake they made.
