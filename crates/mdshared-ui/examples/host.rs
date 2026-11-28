@@ -169,6 +169,8 @@ impl App for Demo {
         );
     }
 
+    // The old click-only field route; `examples/field_input.rs` shows `FieldInput`.
+    #[allow(deprecated)]
     fn event(&mut self, cx: &mut Cx<'_, Msg>, event: Event) {
         let w = cx.size().0;
         match event {

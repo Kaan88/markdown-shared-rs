@@ -92,6 +92,98 @@ check, release Clippy and tests, and the additional feature checks. Both fake cl
 regressions failed before the fix and passed after it. The existing Unicode and menu
 tests passed unchanged. The real clipboard and other platforms were not run.
 
+## All of one field's input in one model (`mdshared_ui::textfield::FieldInput`, roadmap L14)
+
+**Why.** `TextField`, `Pointer` and `TextField::context_menu` are pieces, and the
+applications that put them together by hand each left a different piece out. A survey of the
+sibling applications on 2026-11-27 found six that route a field's mouse themselves:
+
+- sozluk: a click only; no drag, double click selected everything, no menu.
+- purge: no drag.
+- mdmix: a triple click was a word.
+- mdview: the find box had all but edge scrolling; nothing let go of a drag on a lost focus.
+- mdedit: the bar's boxes had no edge scrolling and only some had the menu; five fields in
+  its own panels (the AI instruction, the task window's three, the notes plan's two, the
+  import card's) take no mouse at all; nothing let go of a drag on a lost focus.
+- mdplay: the playlist rename field had no drag, ignored Shift, ended the rename on a press
+  in its padding and had no triple click.
+- claude-switch: a 474-line `fieldmouse.rs` around `Pointer` that got the fields right
+  (this model is made from it) but missed one field and most drags on a lost focus.
+
+Two gaps were the same everywhere a press could be held:
+
+- **A press in the frame's padding.** `Pointer::press` refuses one outside the text
+  rectangle, so the frame that looks clickable does nothing there.
+- **A lost window focus.** winit 0.30 on Windows sends no button release when the window loses
+  the mouse (`WM_CAPTURECHANGED` only resets a count), so a drag that was under way goes on
+  at the next plain move after coming back.
+
+**What it does.** One `FieldInput` beside each `TextField`, given the field's `FieldArea`
+(the frame the user sees and the text's `FieldHit`) on every call. All of it is opt-in and
+additive; nothing that existed changes.
+
+- **The mouse.** `press`, `pointer_move` and `release` are `Pointer`'s click, drag, double
+  and triple click, Shift+click and edge scrolling. The pointer is made again when the scale
+  changes. A press in the frame outside the text goes to the nearest end of the text. The
+  release extends to where the button went up.
+- **The right-click menu.** `secondary_press` ends a drag, moves a lone caret to the press
+  (a selection is kept, so Copy copies it) and opens the edit menu as a `submenu::Cascade`
+  the input owns. While the menu is open it takes every pointer event, key and committed
+  text. A press outside it closes it and goes no further, as outside a Windows menu.
+  Shift+F10 opens it under the caret. A chosen item is applied, and Cut and Paste come back
+  `FieldOutcome::Edited`, so the application handles them as typing.
+- **The menu's words.** `EditLabels` gives the menu's words: `TextField::context_menu_labelled`,
+  and `FieldInput::labels`. `context_menu()` is `context_menu_labelled(&EditLabels::ENGLISH)`
+  and is tested against a copy of its old code in every state.
+- **Keys and text.** `key`, `text` and `preedit` go to the open menu first, then to
+  `TextField::handle_key`. Enter, Escape, Tab, Up and Down come back `Unused`.
+- **Cancel and the deadline.** `cancel` is for a lost focus, a hidden field or a new scale.
+  `deadline` and `tick` cover both the edge scroll and the menu's delay.
+- **Drawing the menu.** `cursor_at` gives the cursor. `draw_menu` must come last; the menu is
+  placed when it is drawn.
+- **With `host`.** `event(cx, field, gfx, area, focused, &event)` routes every event: it
+  cancels on `Focus(false)` and `Scale`, asks for its own redraws, and sets or cancels its
+  own named timer, never one it did not set. `timer_fired(cx, ..)` takes the timer. The
+  routing and the timer decision are plain functions (`route`, `next_timer`), so they are
+  tested without a window.
+
+`FieldOutcome` is `non_exhaustive`. `Focus` means "give this field the keyboard": the focus
+between fields stays the application's. `TextField::press`, `drag` and `select_word_at`
+are deprecated (the owner's decision, roadmap L20): an application that moves its pin past
+this and builds with `-D warnings` moves its fields to `FieldInput` (or `Pointer`), or allows
+the warning where it means to keep the old behaviour. The toolkit's own callers (the palette,
+the plan screen, the settings forms' old `press` route and colour row; roadmap L15) allow it
+and behave as before. `Pointer`'s doc points at `FieldInput`.
+
+**Left for later** (roadmap rows):
+
+- L15: the palette's, plan's and colour picker's own fields.
+- L16: K4's `FramedField` routing its text hits here.
+- L17: a host event for the lost press.
+- L18: `Cx` lending its `Gfx`; host applications keep a second one today, as the example does.
+- L19: the seltext and settings menus in other words.
+
+Try `cargo run -p mdshared-ui --features host --example field_input` (two fields, the second
+with a Turkish menu).
+
+**What was run.** On Windows with Rust 1.99.1 (CI's): every command of AGENTS.md, the catalogue
+check and the host example's two-second run passed, with 2,779 tests passing and 50 ignored
+across the runs; `field_input` also ran for two seconds and closed. The new tests are:
+
+- 21 tests of `FieldInput`, including nonsense rectangles and positions. One `clamp` on a
+  text rectangle that is not made of numbers panicked before its fix.
+- 3 of the host routing, under the `host::` filter.
+- 2 of the menu's words. The English rows are checked against a copy of the old code in every
+  state of selection, secret and clipboard.
+
+The clipboard was the test fixture's, so the desktop's was not touched. With Rust 1.100 (not
+CI's), three things already on `main` fail: the `needless_range_loop` lint in
+`sections_tests.rs`, and the updater test `a_cargo_build_does_not_update_itself`, since cargo
+1.100 puts test executables under `build/<crate>/<hash>/out/`.
+
+Not seen by a person: nobody has clicked, dragged or opened the menu in the example. Linux
+and macOS were not run.
+
 ## Vertical-only text hinting (`mdshared_text::text`)
 
 On an eligible monochrome glyph cache miss, swash scales the unhinted outline and the fitter

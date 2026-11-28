@@ -159,6 +159,10 @@ name = "textfield"
 required-features = ["host"]
 
 [[example]]
+name = "field_input"
+required-features = ["host"]
+
+[[example]]
 name = "settings_textfield"
 required-features = ["host"]
 

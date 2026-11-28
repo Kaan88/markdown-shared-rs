@@ -367,6 +367,9 @@ impl Form {
 
     /// A press, before the form's own: an open picker consumes it, including outside presses.
     /// A press on a closed colour row's swatch waits for release. `None` leaves it to the form.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub(super) fn colour_press(
         &mut self,
         x: f32,
@@ -455,6 +458,9 @@ impl Form {
     /// The pointer moved with a picker open: a part held follows it (its colour put into the
     /// row, not reported), a selection in the hex field grows. Some(whether to redraw), or
     /// `None` with no picker open.
+    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
+    // (roadmap L15); its callers see no change.
+    #[allow(deprecated)]
     pub(super) fn colour_move(&mut self, x: f32, y: f32) -> Option<bool> {
         let o = self.colours.open.as_mut()?;
         if o.text_drag {

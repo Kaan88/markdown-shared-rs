@@ -1,5 +1,7 @@
 //! The field's clipboard actions. The application owns the popup and passes back its chosen item.
 
+use std::borrow::Cow;
+
 use super::TextField;
 use crate::{menu::Item, platform};
 
@@ -18,6 +20,62 @@ pub enum ContextAction {
 
 /// Maximum UTF-8 byte length for menu Paste, before cleaning.
 pub const MAX_PASTE_BYTES: usize = 64 * 1024;
+
+/// The words of the edit menu, one per [`ContextAction`]: what
+/// [`TextField::context_menu_labelled`] and [`FieldInput`](super::FieldInput) put on its rows.
+/// [`EditLabels::ENGLISH`] (also the [`Default`]) is the words [`TextField::context_menu`] has
+/// always used. The fields are private so that an item added to the menu later (Undo, Delete)
+/// can come with a builder method instead of breaking every application that makes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditLabels {
+    cut: Cow<'static, str>,
+    copy: Cow<'static, str>,
+    paste: Cow<'static, str>,
+    select_all: Cow<'static, str>,
+}
+
+impl EditLabels {
+    /// "Cut", "Copy", "Paste", "Select all".
+    pub const ENGLISH: EditLabels = EditLabels {
+        cut: Cow::Borrowed("Cut"),
+        copy: Cow::Borrowed("Copy"),
+        paste: Cow::Borrowed("Paste"),
+        select_all: Cow::Borrowed("Select all"),
+    };
+
+    /// The four words in the menu's order: Cut, Copy, Paste, Select all. A word may carry an
+    /// access key as `menu::Item` labels do (`"&Kes"`); an empty word is kept as given (the row
+    /// is drawn with no label), since a translation table that lacks one is the caller's to fix.
+    pub fn new(
+        cut: impl Into<Cow<'static, str>>,
+        copy: impl Into<Cow<'static, str>>,
+        paste: impl Into<Cow<'static, str>>,
+        select_all: impl Into<Cow<'static, str>>,
+    ) -> EditLabels {
+        EditLabels {
+            cut: cut.into(),
+            copy: copy.into(),
+            paste: paste.into(),
+            select_all: select_all.into(),
+        }
+    }
+
+    /// The word for `action`.
+    pub fn label(&self, action: ContextAction) -> &str {
+        match action {
+            ContextAction::Cut => &self.cut,
+            ContextAction::Copy => &self.copy,
+            ContextAction::Paste => &self.paste,
+            ContextAction::SelectAll => &self.select_all,
+        }
+    }
+}
+
+impl Default for EditLabels {
+    fn default() -> EditLabels {
+        EditLabels::ENGLISH
+    }
+}
 
 pub(super) trait Clipboard {
     fn may_have_text(&mut self) -> bool;
@@ -82,6 +140,14 @@ impl TextField {
         self.context_menu_with(&mut SystemClipboard)
     }
 
+    /// [`context_menu`](Self::context_menu) with the items worded by `labels`, for an
+    /// application whose interface is not in English. The items, their order and which are
+    /// enabled are the same; only the words differ. `context_menu()` is this with
+    /// [`EditLabels::ENGLISH`].
+    pub fn context_menu_labelled(&self, labels: &EditLabels) -> Vec<Item<ContextAction>> {
+        self.context_menu_labelled_with(labels, &mut SystemClipboard)
+    }
+
     /// Applies an item chosen from the menu, checking again that it is allowed. Returns true
     /// when the field was edited, a selection was made, or text was copied successfully.
     /// A failed clipboard write never deletes the selection. As with the keyboard shortcuts,
@@ -91,14 +157,23 @@ impl TextField {
     }
 
     fn context_menu_with(&self, clipboard: &mut impl Clipboard) -> Vec<Item<ContextAction>> {
+        self.context_menu_labelled_with(&EditLabels::ENGLISH, clipboard)
+    }
+
+    pub(super) fn context_menu_labelled_with(
+        &self,
+        labels: &EditLabels,
+        clipboard: &mut impl Clipboard,
+    ) -> Vec<Item<ContextAction>> {
         use ContextAction::*;
         let can_copy = self.selection_for_export().is_some();
         let can_paste = clipboard.may_have_text();
+        let item = |action| Item::new(action, labels.label(action));
         vec![
-            Item::new(Cut, "Cut").enabled(can_copy),
-            Item::new(Copy, "Copy").enabled(can_copy),
-            Item::new(Paste, "Paste").enabled(can_paste),
-            Item::new(SelectAll, "Select all").enabled(!self.is_empty()),
+            item(Cut).enabled(can_copy),
+            item(Copy).enabled(can_copy),
+            item(Paste).enabled(can_paste),
+            item(SelectAll).enabled(!self.is_empty()),
         ]
     }
 
@@ -219,6 +294,77 @@ mod tests {
             assert!(!f.apply_with(Paste, &mut clipboard));
             assert_eq!(f.selected_text(), "Jane");
         }
+    }
+
+    /// The rows exactly as `context_menu_with` built them before labels could be chosen.
+    fn old_rows(f: &TextField, clipboard: &mut Fake) -> Vec<Item<ContextAction>> {
+        let can_copy = f.selection_for_export().is_some();
+        let can_paste = clipboard.may_have_text();
+        vec![
+            Item::new(Cut, "Cut").enabled(can_copy),
+            Item::new(Copy, "Copy").enabled(can_copy),
+            Item::new(Paste, "Paste").enabled(can_paste),
+            Item::new(SelectAll, "Select all").enabled(!f.is_empty()),
+        ]
+    }
+
+    fn row_parts(rows: Vec<Item<ContextAction>>) -> Vec<(ContextAction, String, bool, bool)> {
+        rows.into_iter()
+            .map(|r| (r.id, r.label, r.enabled, r.separator_before))
+            .collect()
+    }
+
+    #[test]
+    fn english_labels_give_the_rows_the_menu_always_had_in_every_state() {
+        let states: [(&str, bool, bool, Option<&str>); 5] = [
+            ("", false, false, None),
+            ("Jane", false, false, Some("x")),
+            ("Jane", true, false, None),
+            ("Jane", true, false, Some("x")),
+            ("hunter2", true, true, Some("x")),
+        ];
+        for (text, select, secret, clip) in states {
+            let mut f = TextField::new();
+            f.set_text(text);
+            f.set_secret(secret);
+            if select {
+                f.select_all();
+            }
+            let mut clipboard = Fake {
+                text: clip.map(str::to_owned),
+                ..Fake::default()
+            };
+            let old = row_parts(old_rows(&f, &mut clipboard));
+            assert_eq!(row_parts(f.context_menu_with(&mut clipboard)), old);
+            assert_eq!(
+                row_parts(f.context_menu_labelled_with(&EditLabels::ENGLISH, &mut clipboard)),
+                old
+            );
+        }
+    }
+
+    #[test]
+    fn other_labels_change_only_the_words() {
+        let tr = EditLabels::new("Kes", "Kopyala", "Yapıştır", String::from("Tümünü seç"));
+        let mut f = TextField::new();
+        f.set_text("kelime");
+        f.select_all();
+        let mut clipboard = Fake {
+            text: Some("x".into()),
+            ..Fake::default()
+        };
+        let english = row_parts(f.context_menu_with(&mut clipboard));
+        let turkish = row_parts(f.context_menu_labelled_with(&tr, &mut clipboard));
+        let words: Vec<_> = turkish.iter().map(|r| r.1.as_str()).collect();
+        assert_eq!(words, ["Kes", "Kopyala", "Yapıştır", "Tümünü seç"]);
+        for (e, t) in english.iter().zip(&turkish) {
+            assert_eq!((e.0, e.2, e.3), (t.0, t.2, t.3));
+        }
+        assert_eq!(EditLabels::default(), EditLabels::ENGLISH);
+        assert_eq!(tr.label(SelectAll), "Tümünü seç");
+        assert_eq!(EditLabels::ENGLISH.label(Paste), "Paste");
+        // An empty word is kept, not replaced by English.
+        assert_eq!(EditLabels::new("", "", "", "").label(Cut), "");
     }
 
     #[test]

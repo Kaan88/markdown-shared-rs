@@ -24,7 +24,7 @@ pub struct FieldHit {
 }
 
 impl FieldHit {
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         let r = self.area;
         [
             r.x,
@@ -48,7 +48,7 @@ impl FieldHit {
         (self.valid() && self.area.contains(at.0, at.1)).then_some(Cursor::Text)
     }
 
-    fn line(self, shown: &str, gfx: &mut Gfx) -> Line {
+    pub(super) fn line(self, shown: &str, gfx: &mut Gfx) -> Line {
         let layout = gfx.field_layout(self.face, self.size, shown, self.scale, [0; 3]);
         Line::new(&layout, self.scale)
     }
@@ -68,6 +68,10 @@ struct Held {
 /// Mouse input for one [`TextField`]. Route the primary button and pointer moves here and give
 /// the field focus when a press is accepted. Pass other presses and lost focus to [`Self::cancel`].
 /// The caller continues to deliver move and release events after the pointer leaves the field.
+///
+/// An application usually wants [`FieldInput`](super::FieldInput) instead: it holds one of
+/// these, makes it again when the scale changes, counts a press in the field's padding, and
+/// adds the right-click menu, the keys and the timer.
 #[derive(Debug)]
 pub struct Pointer {
     clicks: ClickCounter,
@@ -219,6 +223,12 @@ impl Pointer {
         }
     }
 
+    /// Whether a press is held: between an accepted [`press`](Self::press) and the
+    /// [`release`](Self::release) or [`cancel`](Self::cancel) that ends it.
+    pub(super) fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
+
     /// The next wake-up needed for auto-scroll, if any.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
@@ -284,7 +294,7 @@ impl Pointer {
     }
 }
 
-fn snapped_origin(hit: FieldHit, scroll: f32) -> f32 {
+pub(super) fn snapped_origin(hit: FieldHit, scroll: f32) -> f32 {
     ((hit.area.x - scroll) * hit.scale).round() / hit.scale
 }
 

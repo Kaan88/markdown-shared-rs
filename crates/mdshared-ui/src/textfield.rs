@@ -1,7 +1,10 @@
 //! A single-line text field for the hand-drawn UI. It owns the text, the caret, the selection and
 //! the horizontal scroll; the app feeds it keys, pasted text and mouse positions, and draws it with
-//! a [`Painter`]. [`Pointer`] adds mouse editing; [`TextField::context_menu`] supplies the items
-//! for a popup the application owns. No windowing code lives here.
+//! a [`Painter`]. [`FieldInput`] is all of one field's input for an application: the mouse
+//! (through [`Pointer`]), the right-click menu it opens and draws, the keys, and the one
+//! deadline; start there. [`Pointer`] alone adds mouse editing, and
+//! [`TextField::context_menu`] supplies the items for a popup the application owns, for a
+//! caller that wires those pieces itself. No windowing code lives here.
 //!
 //! # The caret's blink
 //!
@@ -46,12 +49,14 @@ use std::time::Duration;
 mod context;
 mod diagnostic;
 mod draw;
+mod input;
 mod line;
 mod pointer;
 
 #[cfg(test)]
 pub(crate) use context::paste_fixture;
-pub use context::{ContextAction, MAX_PASTE_BYTES};
+pub use context::{ContextAction, EditLabels, MAX_PASTE_BYTES};
+pub use input::{FieldArea, FieldInput, FieldOutcome, INPUT_TIMER};
 pub use pointer::{FieldHit, Pointer};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -475,6 +480,12 @@ impl TextField {
     /// Mouse press at `x` logical px from the left edge of the text area (before scroll; the field
     /// adds its own scroll). `stops` is `Painter::caret_stops` for the current text. `extend` is
     /// Shift.
+    ///
+    /// This is only the caret: no drag, no double or triple click, no edge scrolling, no menu.
+    /// An application wiring a field's mouse should use [`FieldInput`], which does all of it.
+    #[deprecated(
+        note = "only the caret: use `textfield::FieldInput` (or `textfield::Pointer`), which also gives the drag, the double and triple click, edge scrolling and the edit menu"
+    )]
     pub fn press(&mut self, x: f32, stops: &[f32], extend: bool) {
         self.restart = true;
         self.affinity = None;
@@ -485,14 +496,22 @@ impl TextField {
         }
     }
 
-    /// Mouse drag to `x`: extends the selection from the press anchor.
+    /// Mouse drag to `x`: extends the selection from the press anchor. [`FieldInput`] calls the
+    /// shaped equivalent for every move while the button is held; prefer it in an application.
+    #[deprecated(
+        note = "only the caret: use `textfield::FieldInput` (or `textfield::Pointer`), which also gives the drag, the double and triple click, edge scrolling and the edit menu"
+    )]
     pub fn drag(&mut self, x: f32, stops: &[f32]) {
         self.restart = true;
         self.affinity = None;
         self.caret = self.offset_at(x + self.scroll, stops);
     }
 
-    /// Double click: selects the word (or the run of spaces) at `x`.
+    /// Double click: selects the word (or the run of spaces) at `x`. [`FieldInput`] counts the
+    /// clicks itself and does this, and the triple click; prefer it in an application.
+    #[deprecated(
+        note = "only the caret: use `textfield::FieldInput` (or `textfield::Pointer`), which also gives the drag, the double and triple click, edge scrolling and the edit menu"
+    )]
     pub fn select_word_at(&mut self, x: f32, stops: &[f32]) {
         if self.text.is_empty() {
             return;
@@ -643,10 +662,13 @@ fn clean_with(text: &str, unicode_breaks: bool) -> String {
 }
 
 #[cfg(test)]
+// The tests of the deprecated click-only methods themselves.
+#[allow(deprecated)]
 #[path = "textfield_tests.rs"]
 mod blink_tests;
 
 #[cfg(test)]
+#[allow(deprecated)] // These test the click-only methods as well.
 mod tests {
     use super::*;
 
