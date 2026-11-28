@@ -644,8 +644,8 @@ mod hosted {
     impl FieldInput {
         /// Routes one event of a [`crate::host`] window: pointer moves, presses and releases of
         /// every button, the wheel, and (when `focused`, the field having the keyboard) keys,
-        /// committed text and preedits; it cancels on [`Event::Focus`]`(false)` and on
-        /// [`Event::Scale`]. It asks for a redraw itself when the field or its menu changed,
+        /// committed text and preedits; it cancels on [`Event::Focus`]`(false)`, on
+        /// [`Event::PressLost`] and on [`Event::Scale`]. It asks for a redraw itself when the field or its menu changed,
         /// and sets or cancels its timer ([`timer_name`](Self::timer_name)), whose coming the
         /// application passes to [`timer_fired`](Self::timer_fired).
         ///
@@ -740,7 +740,7 @@ mod hosted {
                 },
                 Event::Text(t) if focused || self.menu.is_some() => self.text(field, t),
                 Event::Preedit(p) if focused => self.preedit(field, p.clone()),
-                Event::Focus(false) | Event::Scale(_) => {
+                Event::Focus(false) | Event::PressLost { .. } | Event::Scale(_) => {
                     return (FieldOutcome::Unused, self.cancel());
                 }
                 _ => FieldOutcome::Unused,

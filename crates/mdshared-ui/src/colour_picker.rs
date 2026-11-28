@@ -50,7 +50,7 @@
 use crate::flyout::{self, Flyout};
 use crate::gfx::{Face, Painter, Rect, Rgb};
 use crate::keys::{KeyName, Mods};
-use crate::textfield::{FieldColors, TextField};
+use crate::textfield::{FieldArea, FieldColors, FieldHit, TextField};
 use crate::theme::Palette;
 use mdshared_text::Bitmap;
 
@@ -429,7 +429,8 @@ impl Picker {
         &self.field
     }
 
-    /// The hex field, for a press or a drag in it (the caller has the caret stops).
+    /// The hex field, for a press or a drag in it: give it to a
+    /// [`FieldInput`](crate::textfield::FieldInput) with [`hex_field_area`].
     pub fn field_mut(&mut self) -> &mut TextField {
         &mut self.field
     }
@@ -507,7 +508,9 @@ impl Picker {
     /// A press at `x`, `y` in `layout`. On the square (or a few px round it) or on the strip:
     /// that part takes the keyboard and the pointer, and the marker jumps under the pointer. On
     /// the old swatch: back to the colour it opened with. On the hex field: the field takes the
-    /// keyboard (the caller places the caret). Anywhere else: [`Outcome::None`].
+    /// keyboard (the caller places the caret: a [`FieldInput`](crate::textfield::FieldInput)
+    /// given [`Picker::field_mut`] and [`hex_field_area`] does all of the field's mouse
+    /// editing). Anywhere else: [`Outcome::None`].
     pub fn press(&mut self, layout: &Layout, x: f32, y: f32) -> Outcome {
         self.held = None;
         if !x.is_finite() || !y.is_finite() {
@@ -749,6 +752,26 @@ fn outline(p: &mut Painter, r: Rect, c: Rgb, a: f32) {
     p.fill_a(Rect::new(r.right(), r.y, px, r.h), c, a);
 }
 
+/// Where the hex field of a picker laid out at `layout` is, as [`draw_picker`] draws it at
+/// `scale`: its frame (`layout.hex`; a press anywhere in it counts) and its text, inset 10 px
+/// each side, in the monospace face at 13 px. For a caller that gives the hex field a whole
+/// field's mouse editing (the click, the drag, the double and triple click, the edit menu):
+/// keep a [`FieldInput`](crate::textfield::FieldInput) beside the picker and pass it
+/// [`Picker::field_mut`] with this area, after [`Picker::press`] has given the field the
+/// keyboard. A layout of no size gives an empty area, which the input ignores.
+pub fn hex_field_area(layout: &Layout, scale: f32) -> FieldArea {
+    let hex = layout.hex;
+    FieldArea::new(
+        hex,
+        FieldHit {
+            area: Rect::new(hex.x + 10.0, hex.y, (hex.w - 20.0).max(0.0), hex.h),
+            face: Face::Mono,
+            size: 13.0,
+            scale,
+        },
+    )
+}
+
 /// Copies `bmp` (made for `r`'s size in device pixels) into `r`.
 fn put(p: &mut Painter, r: Rect, bmp: &Bitmap) {
     let (x0, y0, _, _) = p.dev_rect(r);
@@ -856,7 +879,8 @@ pub fn draw_picker(
             selection: pal.selection,
             caret: pal.text,
         };
-        let area = Rect::new(hex.x + 10.0, hex.y, (hex.w - 20.0).max(0.0), hex.h);
+        // The same text rectangle `hex_field_area` gives.
+        let area = hex_field_area(layout, p.scale).text().area;
         picker.field_mut().draw(
             p,
             area,

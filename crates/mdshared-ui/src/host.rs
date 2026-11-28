@@ -207,6 +207,22 @@ pub enum Event {
     Modifiers(Mods),
     /// The window got (`true`) or lost the keyboard.
     Focus(bool),
+    /// The window lost the keyboard with `button` still held since its [`Press`](Event::Press):
+    /// the press is gone, and no [`Release`](Event::Release) is coming for it. Sent right after
+    /// [`Focus(false)`](Event::Focus), once for each button held (left, right, middle, back,
+    /// forward). winit 0.30 on Windows sends no release when Alt+Tab, a dialog or another
+    /// window takes the mouse in the middle of a press, so a widget left holding a drag would
+    /// follow the pointer when it comes back with no button down, or act on the next release.
+    ///
+    /// Answer it with the widget's `cancel` (or `let_go`): [`textfield::FieldInput::cancel`](crate::textfield::FieldInput::cancel),
+    /// [`palette::Palette::cancel`](crate::palette::Palette::cancel),
+    /// [`settings::Form::cancel`](crate::settings::Form::cancel), and the others that hold a
+    /// press. Each drops the press without acting on what is under the pointer, which a
+    /// release would do. A release that does come later anyway is still sent, as winit sends
+    /// it; a widget that has let go ignores it.
+    ///
+    /// An application whose `match` has a `_` arm and ignores it behaves as before.
+    PressLost { button: Button },
     /// The scale changed: a monitor of another density, or the system's setting. The whole
     /// window is redrawn after it.
     Scale(f32),

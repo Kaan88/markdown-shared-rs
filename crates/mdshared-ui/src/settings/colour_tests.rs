@@ -354,6 +354,23 @@ fn picking_on_the_square_puts_the_hex_in_the_rows_form_and_reports_it() {
     assert_eq!(f.value(UPPER), Some(Value::Text("FFEABF".into())));
     assert_eq!(f.release(sq.x + sq.w / 4.0, sq.y), text(UPPER, "FFEABF"));
     assert_eq!(f.colour_open(), Some(UPPER), "still open");
+    // A cancel lets the part go where the drag left it and reports it, as the release does;
+    // the picker stays open and a move after it changes nothing.
+    f.press(sq.x, sq.bottom(), NONE, 1);
+    assert!(f.pointer_move(sq.x + sq.w / 4.0, sq.y));
+    assert_eq!(f.cancel(), text(UPPER, "FFEABF"));
+    assert_eq!(f.cancel(), Outcome::None, "once");
+    assert!(!f.pointer_move(sq.right(), sq.bottom()));
+    assert_eq!(f.value(UPPER), Some(Value::Text("FFEABF".into())));
+    assert_eq!(f.colour_open(), Some(UPPER), "still open");
+    // A press on a closed row's swatch: the release over it opens nothing.
+    let mut f = told();
+    shot(&mut f, &LIGHT);
+    let s = f.swatch_rect(index(&f, ACCENT));
+    assert_eq!(f.press(s.cx(), s.cy(), NONE, 1), Outcome::Redraw);
+    assert_eq!(f.cancel(), Outcome::Redraw);
+    assert_eq!(f.release(s.cx(), s.cy()), Outcome::None);
+    assert_eq!(f.colour_open(), None);
     // The hash form too.
     let (mut f, l) = opened(ACCENT);
     assert_eq!(

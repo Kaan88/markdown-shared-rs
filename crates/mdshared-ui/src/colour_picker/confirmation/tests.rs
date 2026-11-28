@@ -57,6 +57,34 @@ fn apply_and_cancel_act_only_on_release_over_the_same_button() {
 }
 
 #[test]
+fn a_press_let_go_answers_nothing_and_keeps_the_colour() {
+    for r in [open().1.apply, open().1.cancel] {
+        let (mut p, l) = open();
+        assert!(!p.let_go(), "nothing held");
+        p.press_with_confirmation(&l, r.cx(), r.cy());
+        assert!(p.let_go());
+        assert!(!p.let_go(), "once");
+        // The release over the same button, which would answer, answers nothing.
+        assert_eq!(
+            p.release_with_confirmation(&l, r.cx(), r.cy()),
+            Confirmation::Open
+        );
+        assert_eq!(p.rgb(), NEW);
+    }
+    // A part held: let go where the drag left it, and a move after it drags nothing.
+    let (mut p, l) = open();
+    let sq = l.picker.square;
+    p.press_with_confirmation(&l, sq.x + 10.0, sq.y + 10.0);
+    p.pointer_with_confirmation(&l, sq.x + 40.0, sq.y + 30.0);
+    let dragged = p.rgb();
+    assert!(p.held().is_some());
+    assert!(p.let_go());
+    assert_eq!(p.held(), None);
+    p.pointer_with_confirmation(&l, sq.right() - 2.0, sq.bottom() - 2.0);
+    assert_eq!(p.rgb(), dragged);
+}
+
+#[test]
 fn enter_applies_and_escape_restores_the_opening_colour() {
     let (mut p, _) = open();
     assert_eq!(

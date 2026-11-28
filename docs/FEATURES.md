@@ -184,6 +184,61 @@ CI's), three things already on `main` fail: the `needless_range_loop` lint in
 Not seen by a person: nobody has clicked, dragged or opened the menu in the example. Linux
 and macOS were not run.
 
+## A press the window lost, and the toolkit's own fields on `FieldInput` (roadmap L17, L15)
+
+On Windows winit 0.30 sends no button release when Alt+Tab, a dialog or another window takes
+the mouse in the middle of a press (`WM_CAPTURECHANGED` only resets a count). A widget that holds
+a press then follows the pointer when it comes back with no button down, or acts on the next
+release wherever it lands. The applications' fixes faked one with a release far off screen
+(purge, claude-switch, mdhub, mdplay) or could not let go at all (mdview, mdedit), because four
+widgets had only `release(x, y)`, which acts on what is under the pointer.
+
+**`cancel` on the four widgets with none.** `palette::Palette::cancel() -> bool`,
+`settings::Form::cancel() -> Outcome`, `settings::pages::Form::cancel() -> Outcome`,
+`plan::PlanScreen::cancel() -> bool`, and `colour_picker::Picker::let_go() -> bool`
+(`Picker::cancel` already means "put the opening colour back"). Each drops the press: a pressed
+control does not act, a menu's pressed item is not chosen (the menu stays open), a text or
+scrollbar drag ends where it is. A value in hand in a settings form (a slider row's thumb, a
+draggable number, a colour picker's square or strip) stays where the drag left it and is
+reported as a release reports it (`Changed` when it moved since the last report), because the
+screen already shows it and the `pointer` route has already reported it; Escape on a number drag
+still puts the old value back. `settings::frozen`, the test-only frozen copy, gets none.
+
+**`host::Event::PressLost { button }`.** The host remembers which buttons it told the
+application went down (`host::input::Held`) and, right after each `Focus(false)` it sends, sends
+`PressLost` once for each button still held, left to forward. A release that comes later anyway
+is still forwarded as winit sends it. `FieldInput`'s host route cancels on it, as on
+`Focus(false)`. `Event` is `non_exhaustive`: an application that ignores the new variant behaves
+as before, and nothing it received before is sent differently.
+
+**The palette's query box and the plan screen's rename field on `FieldInput`.** Each gets a new
+route beside its old one, on a private `FieldInput`: `pointer_press(at, mods, [clicks,] now,
+gfx)`, `secondary_press(at, now, gfx)` (the edit menu), `pointer_motion`, `pointer_release`,
+`key_with_menu` (an open menu takes the keys first; Shift+F10 opens it at the caret),
+`text_deadline` / `tick_text` (edge scrolling), `cursor_at`, `set_edit_labels`,
+`edit_menu_open`. The field gets the shaped click, Shift+click, the double and triple click, the
+drag with edge scrolling and a press anywhere in its frame; the rest of the card answers as the
+old `press`, `pointer_move` / `pointer` and `release` do. `draw` draws the edit menu last; with
+it closed, which it always is on the old route, it draws what it drew. `cancel` also ends the
+field's drag and closes its menu, and the old `release` ends a drag of the new route, so an
+application that moves `press` but not `release` does not leave a drag held. The old `press`
+and `pointer_move` (palette) and `press` and `pointer` (plan) are deprecated, by the owner's L20
+rule for click-only field routes; `release` and `key` are not, having no field route of their
+own. `plan::Edit`, whose fields are all public, is untouched: the new state is on `PlanScreen`.
+
+**The colour picker's hex field.** `colour_picker::hex_field_area(layout, scale)` is the hex
+field's `FieldArea` as `draw_picker` draws it, for a caller that keeps a `FieldInput` beside the
+picker and passes it `Picker::field_mut`. The picker holds no `FieldInput` itself: it derives
+`Clone`, and it leaves the hex field's mouse to its caller by design. Not moved: the settings
+colour row's hex field, which keeps the old click, drag and double click through `Form::press`
+even on `pointer_press` (roadmap L15).
+
+What was run: on Windows with Rust 1.99.1, the ten commands of AGENTS.md, the catalogue check
+and the host example for two seconds (see the pull request for the counts). Not run: Linux,
+macOS. Not seen by a person: nobody has Alt+Tabbed in the middle of a drag in any application,
+or right-clicked the palette's box or the plan's rename field.
+
+
 ## Vertical-only text hinting (`mdshared_text::text`)
 
 On an eligible monochrome glyph cache miss, swash scales the unhinted outline and the fitter

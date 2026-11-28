@@ -455,6 +455,24 @@ impl Form {
         Some(Outcome::None)
     }
 
+    /// [`Form::cancel`]'s part for the colour rows: a press on a closed row's swatch opens
+    /// nothing, a part of an open picker held is let go where the drag left it (its change
+    /// reported, as a release would), a selection in the hex field stops, and a pressed Apply
+    /// or Cancel answers nothing. `None` when no colour press was under way.
+    pub(super) fn colour_cancel(&mut self) -> Option<Outcome> {
+        let swatch = self.colours.pressed.take().is_some();
+        let Some(o) = &mut self.colours.open else {
+            return swatch.then_some(Outcome::Redraw);
+        };
+        let text = std::mem::take(&mut o.text_drag);
+        let part = o.picker.held().is_some();
+        let button = o.picker.let_go();
+        if part {
+            return Some(self.colour_report());
+        }
+        (swatch || text || button).then_some(Outcome::Redraw)
+    }
+
     /// The pointer moved with a picker open: a part held follows it (its colour put into the
     /// row, not reported), a selection in the hex field grows. Some(whether to redraw), or
     /// `None` with no picker open.

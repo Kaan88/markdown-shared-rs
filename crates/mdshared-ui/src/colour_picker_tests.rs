@@ -548,3 +548,36 @@ fn the_flyout_holds_the_content_and_its_padding() {
     assert_eq!((c.w, c.h), (CONTENT_W, CONTENT_H));
     assert!(f.rect().y >= 38.0, "below the anchor");
 }
+
+#[test]
+fn the_hex_field_area_is_where_the_field_is_drawn_and_a_field_input_edits_it() {
+    let l = layout();
+    let a = hex_field_area(&l, 1.5);
+    assert_eq!(a.frame(), l.hex);
+    let t = a.text();
+    assert_eq!(
+        t.area,
+        Rect::new(l.hex.x + 10.0, l.hex.y, l.hex.w - 20.0, l.hex.h)
+    );
+    assert_eq!((t.face, t.size, t.scale), (Face::Mono, 13.0, 1.5));
+    // A layout of no size: an empty text rectangle, no panic.
+    let none = hex_field_area(&Layout::new(Rect::default()), f32::NAN);
+    assert!(none.text().area.w <= 0.0 || none.frame().w <= 0.0);
+
+    // A FieldInput given the picker's field and this area: a triple click selects the hex.
+    let mut p = Picker::new([0x33, 0x66, 0xcc], HexForm::DEFAULT);
+    let mut gfx = Gfx::new();
+    let a = hex_field_area(&l, 1.0);
+    let at = (a.text().area.x + 4.0, a.text().area.cy());
+    assert_eq!(p.press(&l, at.0, at.1), Outcome::Redraw);
+    assert_eq!(p.focus(), Part::Hex);
+    let mut input = crate::textfield::FieldInput::new()
+        .timing(std::time::Duration::from_millis(500), (2.0, 2.0));
+    let t0 = std::time::Instant::now();
+    for k in 0..3 {
+        let now = t0 + std::time::Duration::from_millis(10 * k);
+        input.press(p.field_mut(), &mut gfx, a, at, Mods::default(), now);
+        input.release(p.field_mut(), &mut gfx, a, at, now);
+    }
+    assert_eq!(p.field().selected_text(), p.hex());
+}
