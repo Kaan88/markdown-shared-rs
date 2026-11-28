@@ -294,12 +294,14 @@ library does not pull in the toolkit, even if its app does.
 
 ### Markdown viewer
 
-[markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) ·
-`https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`.
-All five reusable crates have moved into this toolkit ([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)).
-For new dependencies, use the `mdshared-md-*` packages above and pin them and any other
-toolkit crates to the full toolkit commit that merges `feat/md-renderer`. The table below
-records the old mdview revision and its actual pins until mdview switches over.
+[markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) has no reusable crates of
+its own any more: all five moved into this toolkit as the `mdshared-md-*` packages above
+([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)), and mdview itself, at `e4ae1e2`, uses
+them from toolkit `48eedb8`, one copy of each toolkit crate in its lockfile. For a new
+dependency, use those packages, pinned to the same toolkit commit as your other toolkit crates.
+The table below is the last mdview revision with crates of its own,
+`https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`,
+which Claude Switch still uses.
 
 | Crate | Path | For | Toolkit pin |
 |---|---|---|---|
@@ -327,29 +329,31 @@ be passed to a newer toolkit's `Painter::blit`. `mdshared-ui` brings in `mdshare
 your app does not name it directly. Separate revisions can coexist if you exchange bytes or
 other revision-independent values instead of those types.
 
-For example, [Claude Switch](https://github.com/Kaan88/claude-switch) at `fd1d3ad` uses mdview
-`01f67b2` with its own toolkit pin at `d1cca33`. Its lockfile has both copies of `mdshared-text`;
-it gives `Painter::image` RGBA bytes rather than handing it the renderer's `Bitmap`.
+For example, [Claude Switch](https://github.com/Kaan88/claude-switch) at `deefd9d` uses mdview
+`01f67b2` with its own toolkit pin at `48eedb8`. Its lockfile has two copies each of
+`mdshared-text`, `mdshared-highlight` and `mdshared-app` (`48eb3ce` and `48eedb8`); it gives
+`Painter::image` RGBA bytes rather than handing it the renderer's `Bitmap`.
 
-[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `9898d24` uses mdview `e2b3e31` for
-its preview (toolkit pin `49de4ec`). The editor itself pins `48eb3ce`; its lockfile has two
-copies each of `mdshared-text` and `mdshared-highlight`. Its preview applies wire updates to
-the editor's own bitmap before blitting.
+[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `1f41b95` no longer uses mdview: its
+preview is this toolkit's `mdshared-md-preview` at `48eedb8`, the revision the rest of the
+editor pins, so its lockfile has one copy of each toolkit crate. The exception is deliberate: a
+dev-dependency, `mdshared-app-106` (`mdshared-app` at `49de4ec`), with which the release
+manifest test reads the update manifest as mdedit 1.0.6 does. It is not a pin to move.
 
 ### Other sibling libraries
 
 | Repository (`git`) | Repository `rev` |
 |---|---|
-| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `9898d24d85ed06b46b7a91f5dd1b194224af25b1` |
+| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `1f41b9518d43597cc736394cbca7baf1cb92c0f5` |
 | [mdmix](https://github.com/Kaan88/mdmix) (Rust port on `f/g0-proto`, not `main`) | `adb10855c95a5f2b39c10da05f214827da6f5a29` |
 | [purge](https://github.com/Kaan88/purge) | `7022fde4771ab6762a3f7111fae6e94c83aff0df` |
-| [claude-switch](https://github.com/Kaan88/claude-switch) | `fd1d3ad86119dd866b64d25691f2accb161ef947` |
-| [mdhub](https://github.com/Kaan88/mdhub) | `f0e0c93d3360eaf5f72cc33b1b0aaf099c59576e` |
+| [claude-switch](https://github.com/Kaan88/claude-switch) | `deefd9df0761cf819b73758157608b34b7feac23` |
+| [mdhub](https://github.com/Kaan88/mdhub) | `1dcd99a1ea482d29f33f8536149d9f1f0818cdf1` |
 
 | Repository | Crate | Path | For | Toolkit pin |
 |---|---|---|---|---|
-| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `48eb3ce` (`mdshared-app`) |
-| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `48eb3ce` (`mdshared-highlight`) |
+| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `48eedb8` (`mdshared-app`) |
+| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `48eedb8` (`mdshared-highlight`) |
 | mdedit | `mdedit-outline` | `crates/mdedit-outline` | Find headings, functions and types for an outline | None |
 | mdmix | `g6-proto` | `rust/g6-proto` | Sound BlasterX G6 packet builders and status parsers, without I/O | None |
 | mdmix | `g6-device` | `rust/g6-device` | G6 device access over HID | None |
@@ -359,11 +363,14 @@ the editor's own bitmap before blitting.
 | purge | `purge-client` | `crates/purge-client` | Windows clients for the Purge engine and broker | None |
 | purge | `purge-ui-model` | `crates/purge-ui-model` | Purge-specific view state and requests, without I/O | None |
 | claude-switch | `claude-switch-core` | `crates/core` | Discover Claude Code sessions and accounts without a window | None |
-| mdhub | `hub-core` | `crates/hub-core` | Hub app catalogue, install detection and updates | `b4b2182` (`mdshared-app` and `mdshared-fetch`) |
+| mdhub | `hub-core` | `crates/hub-core` | Hub app catalogue, install detection and updates | `15f0138` (`mdshared-app` and `mdshared-fetch`) |
 
-The app pins are separate: mdmix's `g6-gui` pins `6017fcd` at the Rust port revision above,
-Purge's UI pins `f45a71c`, and Claude Switch's UI pins `d1cca33`. None of those pins is inherited
-by the libraries in the table. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust
-library or toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins
-`95bbf87`, but `ui-rs` builds a static library for the foobar2000 C++ shim, not a Rust library
-for another toolkit app.
+The app pins are separate: mdmix's `g6-gui` pins `48eedb8` (since `27c7d36` on `f/g0-proto`,
+mdmix#9), Purge's UI pins `48eedb8` (since `342b66a`, purge#11), and Claude Switch's UI pins
+`48eedb8` (at `deefd9d`). None of those pins is inherited by the libraries in the table, which those two moves
+did not change. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust library or
+toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins `48eedb8`
+(since `924c1a5`, mdplay#4), in `ui-rs` and `mockup`, but `ui-rs` builds a static library for the
+foobar2000 C++ shim, not a Rust library for another toolkit app. `48eedb8` is before
+`FieldInput` (#68) and `Event::PressLost` (#69); a pin moved past them brings deprecation
+warnings for `TextField::press` and the palette's and plan screen's old `press` routes.
