@@ -361,9 +361,12 @@ the editor's own bitmap before blitting.
 | claude-switch | `claude-switch-core` | `crates/core` | Discover Claude Code sessions and accounts without a window | None |
 | mdhub | `hub-core` | `crates/hub-core` | Hub app catalogue, install detection and updates | `b4b2182` (`mdshared-app` and `mdshared-fetch`) |
 
-The app pins are separate: mdmix's `g6-gui` pins `6017fcd` at the Rust port revision above,
-Purge's UI pins `f45a71c`, and Claude Switch's UI pins `d1cca33`. None of those pins is inherited
-by the libraries in the table. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust
-library or toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins
-`95bbf87`, but `ui-rs` builds a static library for the foobar2000 C++ shim, not a Rust library
-for another toolkit app.
+The app pins are separate: mdmix's `g6-gui` pins `48eedb8` (since `27c7d36` on `f/g0-proto`,
+mdmix#9), Purge's UI pins `48eedb8` (since `342b66a`, purge#11), and Claude Switch's UI pins
+`d1cca33`. None of those pins is inherited by the libraries in the table, which those two moves
+did not change. [Barbican](https://github.com/Kaan88/barbican) has no separate Rust library or
+toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) pins `48eedb8`
+(since `924c1a5`, mdplay#4), in `ui-rs` and `mockup`, but `ui-rs` builds a static library for the
+foobar2000 C++ shim, not a Rust library for another toolkit app. `48eedb8` is before
+`FieldInput` (#68) and `Event::PressLost` (#69); a pin moved past them brings deprecation
+warnings for `TextField::press` and the palette's and plan screen's old `press` routes.
