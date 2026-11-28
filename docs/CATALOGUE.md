@@ -296,8 +296,8 @@ library does not pull in the toolkit, even if its app does.
 
 [markdown-viewer-rs](https://github.com/Kaan88/markdown-viewer-rs) has no reusable crates of
 its own any more: all five moved into this toolkit as the `mdshared-md-*` packages above
-([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)), and mdview itself, at `e4ae1e2`, uses
-them from toolkit `48eedb8`, one copy of each toolkit crate in its lockfile. For a new
+([ROADMAP X13](ROADMAP.md#left-over-from-what-exists)), and mdview itself, at `cf22524` (1.2.2), uses
+them from toolkit `84c0fc8`, one copy of each toolkit crate in its lockfile. For a new
 dependency, use those packages, pinned to the same toolkit commit as your other toolkit crates.
 The table below is the last mdview revision with crates of its own,
 `https://github.com/Kaan88/markdown-viewer-rs` · `rev = "01f67b2aba1a89e0e1ccfba5f423b1b8085a6b99"`,
@@ -334,8 +334,8 @@ For example, [Claude Switch](https://github.com/Kaan88/claude-switch) at `deefd9
 `mdshared-text`, `mdshared-highlight` and `mdshared-app` (`48eb3ce` and `48eedb8`); it gives
 `Painter::image` RGBA bytes rather than handing it the renderer's `Bitmap`.
 
-[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `1f41b95` no longer uses mdview: its
-preview is this toolkit's `mdshared-md-preview` at `48eedb8`, the revision the rest of the
+[mdedit](https://github.com/Kaan88/markdown-editor-rs) at `b02ff89` (1.6.2) no longer uses mdview:
+its preview is this toolkit's `mdshared-md-preview` at `84c0fc8`, the revision the rest of the
 editor pins, so its lockfile has one copy of each toolkit crate. The exception is deliberate: a
 dev-dependency, `mdshared-app-106` (`mdshared-app` at `49de4ec`), with which the release
 manifest test reads the update manifest as mdedit 1.0.6 does. It is not a pin to move.
@@ -344,7 +344,7 @@ manifest test reads the update manifest as mdedit 1.0.6 does. It is not a pin to
 
 | Repository (`git`) | Repository `rev` |
 |---|---|
-| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `1f41b9518d43597cc736394cbca7baf1cb92c0f5` |
+| [markdown-editor-rs](https://github.com/Kaan88/markdown-editor-rs) | `b02ff895f6ab350c72883fd7153f3eec5e793347` |
 | [mdmix](https://github.com/Kaan88/mdmix) (Rust port on `f/g0-proto`, not `main`) | `adb10855c95a5f2b39c10da05f214827da6f5a29` |
 | [purge](https://github.com/Kaan88/purge) | `7022fde4771ab6762a3f7111fae6e94c83aff0df` |
 | [claude-switch](https://github.com/Kaan88/claude-switch) | `deefd9df0761cf819b73758157608b34b7feac23` |
@@ -352,8 +352,8 @@ manifest test reads the update manifest as mdedit 1.0.6 does. It is not a pin to
 
 | Repository | Crate | Path | For | Toolkit pin |
 |---|---|---|---|---|
-| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `48eedb8` (`mdshared-app`) |
-| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `48eedb8` (`mdshared-highlight`) |
+| mdedit | `mdedit-core` | `crates/mdedit-core` | Headless editor: text buffer, editing and search | `84c0fc8` (`mdshared-app`) |
+| mdedit | `mdedit-highlight` | `crates/mdedit-highlight` | Background syntax highlighting over rope snapshots | `84c0fc8` (`mdshared-highlight`) |
 | mdedit | `mdedit-outline` | `crates/mdedit-outline` | Find headings, functions and types for an outline | None |
 | mdmix | `g6-proto` | `rust/g6-proto` | Sound BlasterX G6 packet builders and status parsers, without I/O | None |
 | mdmix | `g6-device` | `rust/g6-device` | G6 device access over HID | None |
@@ -373,4 +373,7 @@ toolkit pin on the `main` surveyed. [mdplay](https://github.com/Kaan88/mdplay) p
 (since `924c1a5`, mdplay#4), in `ui-rs` and `mockup`, but `ui-rs` builds a static library for the
 foobar2000 C++ shim, not a Rust library for another toolkit app. `48eedb8` is before
 `FieldInput` (#68) and `Event::PressLost` (#69); a pin moved past them brings deprecation
-warnings for `TextField::press` and the palette's and plan screen's old `press` routes.
+warnings for `TextField::press` and the palette's and plan screen's old `press` routes. mdedit
+and mdview pin `84c0fc8` and have moved their palettes (and mdedit its plan screen) to the
+pointer routes; they call each widget's `cancel` on `Focus(false)`, and keep Settings on its old
+`press` route, so #71's colour hex field does not reach them.
