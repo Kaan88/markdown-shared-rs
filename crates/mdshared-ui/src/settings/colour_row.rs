@@ -48,10 +48,14 @@ use crate::colour_picker::{
     self, Cache, Confirmation, ConfirmationLayout, ConfirmationLook, Layout, Look, Part, Picker,
     parse_hex,
 };
+use crate::cursor::Cursor;
 use crate::flyout::Flyout;
-use crate::gfx::{Painter, Rect, Rgb, mix};
+use crate::gfx::{Gfx, Painter, Rect, Rgb, mix};
 use crate::keys::{KeyName, Mods};
+use crate::menu::Item;
+use crate::textfield::{ContextAction, FieldArea, Pointer};
 use crate::theme::Palette as Colors;
+use std::time::Instant;
 
 /// The swatch's width, logical px; it is as high as the control.
 pub(super) const SWATCH_W: f32 = 28.0;
@@ -86,6 +90,24 @@ struct Open {
     ring: bool,
     /// A press in the hex field is selecting text.
     text_drag: bool,
+    /// The hex field's clicks counted by the pointer route (`pointer_press`), with the scale
+    /// they were counted at; `None` on the old route. With `text_drag`, that route's drag.
+    hex_pointer: Option<(f32, Pointer)>,
+}
+
+/// What the pointer route (`pointer_press`) brings to a press, for the hex field's shaped text.
+pub(super) struct Shaped<'a> {
+    pub(super) now: Instant,
+    pub(super) gfx: &'a mut Gfx,
+    pub(super) scale: f32,
+}
+
+/// The hex field's pointer for `scale`, made again when the scale changed.
+fn hex_pointer(slot: &mut Option<(f32, Pointer)>, scale: f32) -> &mut Pointer {
+    if !matches!(slot, Some((s, _)) if *s == scale) {
+        *slot = Some((scale, Pointer::system(scale)));
+    }
+    &mut slot.as_mut().unwrap().1
 }
 
 impl Open {
@@ -226,6 +248,7 @@ impl Form {
             reported: text,
             ring,
             text_drag: false,
+            hex_pointer: None,
         });
         self.place_colour();
     }
@@ -367,8 +390,9 @@ impl Form {
 
     /// A press, before the form's own: an open picker consumes it, including outside presses.
     /// A press on a closed colour row's swatch waits for release. `None` leaves it to the form.
-    // The old click-only field route, kept as it was until this widget moves to `FieldInput`
-    // (roadmap L15); its callers see no change.
+    /// In the hex field, `shaped` (the pointer route) places the caret by the shaped text,
+    /// counts the clicks itself and takes a press in the field's padding; without it, the old
+    /// click-only route, kept as it was: its callers see no change.
     #[allow(deprecated)]
     pub(super) fn colour_press(
         &mut self,
@@ -376,39 +400,49 @@ impl Form {
         y: f32,
         mods: Mods,
         clicks: u8,
+        shaped: Option<Shaped<'_>>,
     ) -> Option<Outcome> {
         self.colours.pressed = None;
         if let Some(o) = &mut self.colours.open {
             o.ring = false;
             // A selection whose release was lost does not outlive the press.
             o.text_drag = false;
-            let (answer, hex) = if let Some(confirmation) = o.confirmation() {
+            let (answer, layout) = if let Some(confirmation) = o.confirmation() {
                 let answer = o.picker.press_with_confirmation(&confirmation, x, y);
                 if answer != Confirmation::Open {
                     return Some(self.finish_colour_confirmation(answer));
                 }
-                (colour_picker::Outcome::Redraw, confirmation.picker.hex)
+                (colour_picker::Outcome::Redraw, confirmation.picker)
             } else {
                 if !o.flyout.contains(x, y) {
                     return Some(self.close_colour_picker(false));
                 }
                 let layout = o.layout();
-                (o.picker.press(&layout, x, y), layout.hex)
+                (o.picker.press(&layout, x, y), layout)
             };
+            let hex = layout.hex;
             if hex.w > 0.0
                 && hex.h > 0.0
                 && o.picker.confirmation_focus().is_none()
                 && o.picker.focus() == Part::Hex
                 && hex.contains(x, y)
             {
-                let rel = x - (hex.x + 10.0);
-                let stops = self.colours.cache.hex_stops().to_vec();
-                let field = o.picker.field_mut();
-                if clicks >= 2 {
-                    field.select_word_at(rel, &stops);
+                if let Some(s) = shaped {
+                    let area = colour_picker::hex_field_area(&layout, s.scale);
+                    let into = area.nearest_in_text((x, y));
+                    let pointer = hex_pointer(&mut o.hex_pointer, s.scale);
+                    o.text_drag =
+                        pointer.press(o.picker.field_mut(), s.gfx, area.text(), into, mods, s.now);
                 } else {
-                    field.press(rel, &stops, mods.shift);
-                    o.text_drag = true;
+                    let rel = x - (hex.x + 10.0);
+                    let stops = self.colours.cache.hex_stops().to_vec();
+                    let field = o.picker.field_mut();
+                    if clicks >= 2 {
+                        field.select_word_at(rel, &stops);
+                    } else {
+                        field.press(rel, &stops, mods.shift);
+                        o.text_drag = true;
+                    }
                 }
             }
             return Some(match self.colour_outcome(answer) {
@@ -438,6 +472,10 @@ impl Form {
     pub(super) fn colour_release(&mut self, x: f32, y: f32) -> Option<Outcome> {
         if let Some(o) = &mut self.colours.open {
             o.text_drag = false;
+            if let Some((_, pointer)) = &mut o.hex_pointer {
+                // A pointer-route drag ended by the old release: the clicks still count.
+                pointer.release();
+            }
             if let Some(confirmation) = o.confirmation() {
                 let answer = o.picker.release_with_confirmation(&confirmation, x, y);
                 return Some(self.finish_colour_confirmation(answer));
@@ -465,6 +503,7 @@ impl Form {
             return swatch.then_some(Outcome::Redraw);
         };
         let text = std::mem::take(&mut o.text_drag);
+        o.hex_pointer = None;
         let part = o.picker.held().is_some();
         let button = o.picker.let_go();
         if part {
@@ -514,6 +553,150 @@ impl Form {
             Outcome::Redraw if !moved => Outcome::None,
             o => o,
         })
+    }
+
+    // ---- the hex field on the pointer route ----------------------------------------------
+    //
+    // The shared text editing (`text_edit_methods!`) asks these first, so an open picker's hex
+    // field takes `pointer_press` and the rest as a text row does. Each is `None` when it is
+    // not the hex field's, and the form goes on as before.
+
+    /// The open picker's hex field as last drawn at `scale`.
+    fn hex_area(o: &Open, scale: f32) -> FieldArea {
+        colour_picker::hex_field_area(&o.layout(), scale)
+    }
+
+    /// `pointer_press` with a picker open: the whole press is the picker's (as
+    /// [`press`](Form::press) gives it), the hex field's part by the shaped text.
+    pub(super) fn popup_text_press(
+        &mut self,
+        at: (f32, f32),
+        mods: Mods,
+        clicks: u8,
+        now: Instant,
+        gfx: &mut Gfx,
+        scale: f32,
+    ) -> Option<Outcome> {
+        self.colours.open.as_ref()?;
+        // What `press` does before the picker sees it, but the hex field's clicks still count.
+        self.text_pointer = Default::default();
+        self.drag = Drag::None;
+        self.pressed = None;
+        self.menu_pressed = None;
+        self.focus_visible = false;
+        let shaped = Shaped { now, gfx, scale };
+        self.colour_press(at.0, at.1, mods, clicks, Some(shaped))
+    }
+
+    /// A move during a hex field drag begun by `pointer_press`: the selection follows.
+    pub(super) fn popup_text_motion(
+        &mut self,
+        at: (f32, f32),
+        now: Instant,
+        gfx: &mut Gfx,
+    ) -> Option<Outcome> {
+        let o = self.colours.open.as_mut().filter(|o| o.text_drag)?;
+        let scale = o.hex_pointer.as_ref()?.0;
+        let area = Self::hex_area(o, scale);
+        let (_, pointer) = o.hex_pointer.as_mut()?;
+        let moved = pointer.pointer_move(o.picker.field_mut(), gfx, area.text(), at, now);
+        Some(if moved {
+            Outcome::Redraw
+        } else {
+            Outcome::None
+        })
+    }
+
+    /// The release of such a drag, at its own position.
+    pub(super) fn popup_text_release(
+        &mut self,
+        at: (f32, f32),
+        now: Instant,
+        gfx: &mut Gfx,
+    ) -> Option<Outcome> {
+        let moved = self.popup_text_motion(at, now, gfx)?;
+        if let Some(o) = &mut self.colours.open {
+            o.text_drag = false;
+            if let Some((_, pointer)) = &mut o.hex_pointer {
+                pointer.release();
+            }
+        }
+        Some(moved)
+    }
+
+    /// When such a drag, resting past an end of the field, next scrolls it.
+    pub(super) fn popup_text_deadline(&self) -> Option<Instant> {
+        let o = self.colours.open.as_ref().filter(|o| o.text_drag)?;
+        o.hex_pointer.as_ref()?.1.deadline()
+    }
+
+    /// Scrolls such a drag at its deadline. `Some(whether to redraw)`.
+    pub(super) fn popup_text_tick(&mut self, now: Instant, gfx: &mut Gfx) -> Option<bool> {
+        let o = self.colours.open.as_mut().filter(|o| o.text_drag)?;
+        let scale = o.hex_pointer.as_ref()?.0;
+        let area = Self::hex_area(o, scale);
+        let (_, pointer) = o.hex_pointer.as_mut()?;
+        Some(pointer.tick(o.picker.field_mut(), gfx, area.text(), now))
+    }
+
+    /// `cancel_text_pointer`: the hex field's drag ends, the selection kept, and the next
+    /// click there is a first one.
+    pub(super) fn popup_text_cancel(&mut self) {
+        if let Some(o) = &mut self.colours.open
+            && o.hex_pointer.take().is_some()
+        {
+            o.text_drag = false;
+        }
+    }
+
+    /// Whether a hex field drag begun by `pointer_press` is held.
+    pub(super) fn popup_text_held(&self) -> bool {
+        self.colours
+            .open
+            .as_ref()
+            .is_some_and(|o| o.text_drag && o.hex_pointer.is_some())
+    }
+
+    /// With a picker open: the I-beam over the hex field (its padding too) and anywhere during
+    /// its drag, and no shape elsewhere, as before.
+    pub(super) fn popup_text_cursor(&self, x: f32, y: f32) -> Option<Cursor> {
+        let o = self.colours.open.as_ref()?;
+        (self.popup_text_held() || Self::hex_area(o, 1.0).contains((x, y))).then_some(Cursor::Text)
+    }
+
+    /// The hex field's edit menu: for a press at `at` on the field, or for `None` when the
+    /// field has the keyboard. The field takes the keyboard, caret and selection kept.
+    pub(super) fn popup_text_menu(
+        &mut self,
+        at: Option<(f32, f32)>,
+    ) -> Option<Vec<Item<ContextAction>>> {
+        let o = self.colours.open.as_mut()?;
+        let on_field = match at {
+            Some(at) => Self::hex_area(o, 1.0).contains(at),
+            None => o.picker.focus() == Part::Hex && o.picker.confirmation_focus().is_none(),
+        };
+        if !on_field {
+            return None;
+        }
+        o.ring = false;
+        Some(o.picker.hex_context_menu())
+    }
+
+    /// An item of the hex field's menu, when the field has the keyboard: a colour typed so
+    /// is put into the row and reported as typing it is, or staged in a confirming picker.
+    pub(super) fn popup_text_action(&mut self, action: ContextAction) -> Option<Outcome> {
+        let o = self.colours.open.as_mut()?;
+        if o.picker.focus() != Part::Hex || o.picker.confirmation_focus().is_some() {
+            return None;
+        }
+        let answer = o.picker.apply_hex_action(action);
+        if o.confirms {
+            return Some(match answer {
+                colour_picker::Outcome::None => Outcome::None,
+                _ => Outcome::Redraw,
+            });
+        }
+        Some(self.colour_outcome(answer))
     }
 
     /// The swatch under the pointer, for its hover; true when that changed.

@@ -229,15 +229,58 @@ own. `plan::Edit`, whose fields are all public, is untouched: the new state is o
 **The colour picker's hex field.** `colour_picker::hex_field_area(layout, scale)` is the hex
 field's `FieldArea` as `draw_picker` draws it, for a caller that keeps a `FieldInput` beside the
 picker and passes it `Picker::field_mut`. The picker holds no `FieldInput` itself: it derives
-`Clone`, and it leaves the hex field's mouse to its caller by design. Not moved: the settings
-colour row's hex field, which keeps the old click, drag and double click through `Form::press`
-even on `pointer_press` (roadmap L15).
+`Clone`, and it leaves the hex field's mouse to its caller by design. The settings colour
+row's hex field moved later (see the next section).
 
 What was run: on Windows with Rust 1.99.1, the ten commands of AGENTS.md, the catalogue check
 and the host example for two seconds (see the pull request for the counts). Not run: Linux,
 macOS. Not seen by a person: nobody has Alt+Tabbed in the middle of a drag in any application,
 or right-clicked the palette's box or the plan's rename field.
 
+
+## The settings colour row's hex field on the pointer route (`mdshared_ui::settings`, roadmap L15)
+
+The last of L15's fields. An application on the settings form's opt-in text route
+(`pointer_press` and the rest) got the shaped click, the triple click, edge scrolling and the
+edit menu in every text row, but an open colour picker's hex field still took the old click,
+drag and double click, and no menu: `pointer_press` handed every press to the old `press` while
+a popup was open.
+
+**How.** The text editing both settings forms share (`text_edit_methods!`) asks the form first
+at each step: `popup_text_press`, `_motion`, `_release`, `_deadline`, `_tick`, `_cancel`,
+`_cursor`, `_menu`, `_action`. The paged form has no colour rows and answers `None` to each. The
+main form answers while a picker is open. The whole press goes to the picker as `press` gives it,
+with one difference: on the hex field a `textfield::Pointer`, kept on the open picker and made
+again when the scale changes, places the caret by the shaped text
+(`colour_picker::hex_field_area`). It counts the clicks itself, takes Shift, and puts a press in
+the field's padding at the nearest end of the text (`FieldArea::nearest_in_text`, now
+crate-visible). The drag follows in `pointer_motion` and scrolls at its deadline.
+`pointer_cursor_at` gives the I-beam over the field and during its drag, and nothing elsewhere
+in the picker, as before. `context_menu` on the field, or for `None` while the field has the
+keyboard, returns the field's own menu and gives the field the keyboard, from an Apply or Cancel
+button too. `apply_context_action` goes to the field, and a hex pasted is reported as one typed
+(`Changed` in the row's own form, or staged as `Redraw` in a confirming picker).
+
+**API added:** `colour_picker::Picker::hex_context_menu() -> Vec<Item<ContextAction>>` and
+`Picker::apply_hex_action(action) -> Outcome` (`Colour` when the text is then a new colour), for
+any caller of the picker. Nothing in the settings forms' public API changes. The methods only
+behave differently with a picker open.
+
+**Compatibility.** The old route (`press`, `pointer_move` / `pointer`, `release`) is untouched,
+so an application that never calls `pointer_press` sees no change. An application on the new
+route sees the hex field act as its text rows do. If it ends a drag with the old `release`, or
+moves it with the old `pointer_move`, the drag still ends, or follows by the cached caret stops,
+so no drag is left held. `cancel` and `cancel_text_pointer` end the field's drag too.
+
+What was run: on Windows with Rust 1.99.1, the ten commands of AGENTS.md and the catalogue
+check. Nine new tests (`settings/colour_text_tests.rs`); with the new press hook switched off,
+the triple click, padding-drag and outside-press tests fail. No test touches the system
+clipboard, so Paste and Cut are covered by the field's own tests and only Select all goes
+through the form here. Not run: Linux, macOS (CI runs them). Not seen by a person: nobody has
+right-clicked or triple-clicked a picker's hex field in claude-switch or mdplay, the two
+applications with colour rows. Both pin the toolkit before this change, and claude-switch also
+looks for a text row under the pointer before it asks the form for the menu, so it needs a small
+change of its own to reach this menu.
 
 ## Vertical-only text hinting (`mdshared_text::text`)
 

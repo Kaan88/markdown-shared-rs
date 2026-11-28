@@ -44,6 +44,9 @@ mod text_edit;
 #[path = "settings/colour_tests.rs"]
 mod colour_tests;
 #[cfg(test)]
+#[path = "settings/colour_text_tests.rs"]
+mod colour_text_tests;
+#[cfg(test)]
 #[path = "settings/drag_number_tests.rs"]
 mod drag_number_tests;
 #[cfg(test)]
@@ -1339,7 +1342,7 @@ impl Form {
         self.pressed = None;
         self.menu_pressed = None;
         self.focus_visible = false;
-        if let Some(o) = self.colour_press(x, y, mods, clicks) {
+        if let Some(o) = self.colour_press(x, y, mods, clicks, None) {
             return o;
         }
         if let Some((_, menu)) = &mut self.menu {
@@ -1485,7 +1488,7 @@ impl Form {
     /// Returns `Changed` as above, `Redraw` when another press was dropped (a pressed control
     /// is drawn pressed), and `None` when nothing was held.
     pub fn cancel(&mut self) -> Outcome {
-        let text = self.text_pointer.held;
+        let text = self.text_pointer.held || self.popup_text_held();
         self.cancel_text_pointer();
         let colour = self.colour_cancel();
         let value = match self.drag {

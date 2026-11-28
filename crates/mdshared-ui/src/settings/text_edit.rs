@@ -72,7 +72,9 @@ macro_rules! text_edit_methods {
         /// Routes a primary press after layout. Use instead of `press` for shaped text hits,
         /// Shift+click and multiple clicks. Pass the drawing scale and the event's time; the
         /// form counts text clicks, while `clicks` is forwarded to other controls. End native
-        /// input method composition before forwarding a press in a text field.
+        /// input method composition before forwarding a press in a text field. With a colour
+        /// row's picker open, the press is the picker's, and its hex field takes it as a text
+        /// row does (padding, double and triple click, Shift).
         pub fn pointer_press(
             &mut self,
             at: (f32, f32),
@@ -82,6 +84,9 @@ macro_rules! text_edit_methods {
             gfx: &mut Gfx,
             scale: f32,
         ) -> Outcome {
+            if let Some(o) = self.popup_text_press(at, mods, clicks, now, gfx, scale) {
+                return o;
+            }
             if let Some(i) = self.text_at(at) {
                 let hit = hit(self.text_area(i), scale);
                 if hit.cursor(at).is_some() {
@@ -103,6 +108,9 @@ macro_rules! text_edit_methods {
             now: Instant,
             gfx: &mut Gfx,
         ) -> Outcome {
+            if let Some(o) = self.popup_text_motion(at, now, gfx) {
+                return o;
+            }
             if let Some((i, hit)) = self.active_text_hit() {
                 let (state, field) = self.text_parts(i);
                 if state.pointer().pointer_move(field, gfx, hit, at, now) {
@@ -117,6 +125,9 @@ macro_rules! text_edit_methods {
         /// Ends the drag, using the release position even if no move was delivered there.
         /// Route this instead of `release` when using `pointer_press`.
         pub fn pointer_release(&mut self, at: (f32, f32), now: Instant, gfx: &mut Gfx) -> Outcome {
+            if let Some(o) = self.popup_text_release(at, now, gfx) {
+                return o;
+            }
             if let Some((i, hit)) = self.active_text_hit() {
                 let (state, field) = self.text_parts(i);
                 let changed = state.pointer().pointer_move(field, gfx, hit, at, now);
@@ -135,12 +146,18 @@ macro_rules! text_edit_methods {
         /// The next wake-up for horizontal text selection scrolling, if any. Recheck after
         /// routing input or a tick; an idle form does not need a timer.
         pub fn text_scroll_deadline(&self) -> Option<Instant> {
+            if let Some(at) = self.popup_text_deadline() {
+                return Some(at);
+            }
             self.active_text_hit()?;
             self.text_pointer.active()?.2.deadline()
         }
 
         /// Advances edge scrolling at its deadline. Returns whether to redraw.
         pub fn tick_text_scroll(&mut self, now: Instant, gfx: &mut Gfx) -> bool {
+            if let Some(redraw) = self.popup_text_tick(now, gfx) {
+                return redraw;
+            }
             let Some((i, hit)) = self.active_text_hit() else {
                 self.cancel_if_inactive();
                 return false;
@@ -153,14 +170,16 @@ macro_rules! text_edit_methods {
         /// or when the drawing scale changes. Does not clear the selection.
         pub fn cancel_text_pointer(&mut self) {
             self.text_pointer = Default::default();
+            self.popup_text_cancel();
         }
 
         /// Requests an I-beam over an editable text area or a cursor for another control.
-        /// An open form popup takes input first, so underlying text never requests an I-beam.
-        /// `None` leaves the choice to the host (normally the arrow).
+        /// An open form popup takes input first, so underlying text never requests an I-beam;
+        /// a colour picker's hex field does. `None` leaves the choice to the host (normally
+        /// the arrow).
         pub fn pointer_cursor_at(&self, x: f32, y: f32) -> Option<Cursor> {
             if self.popup_open() {
-                return None;
+                return self.popup_text_cursor(x, y);
             }
             self.text_at((x, y))
                 .map(|_| Cursor::Text)
@@ -169,10 +188,15 @@ macro_rules! text_edit_methods {
 
         /// Builds an edit menu for the enabled field at `at`, or the focused field for `None`.
         /// A successful call focuses that field without moving its caret or selection. While a
-        /// form popup is open, returns `None`. The host draws the menu, routes input to it first
-        /// and dismisses it if the form's focus or rows change.
+        /// form popup is open, returns `None`, except on an open colour picker's hex field (or
+        /// for `None` while it has the keyboard): its menu, and the field takes the keyboard.
+        /// The host draws the menu, routes input to it first and dismisses it if the form's
+        /// focus or rows change.
         pub fn context_menu(&mut self, at: Option<(f32, f32)>) -> Option<Vec<Item<ContextAction>>> {
             self.cancel_text_pointer();
+            if let Some(items) = self.popup_text_menu(at) {
+                return Some(items);
+            }
             if self.popup_open() {
                 return None;
             }
@@ -187,9 +211,14 @@ macro_rules! text_edit_methods {
         /// Applies a menu action to the focused text field, unless a form popup is open.
         /// Reports `Changed` only for a new text value, or `Redraw` if just the selection may
         /// have changed. Copy has no visible effect. Secret fields accept Paste and refuse
-        /// Cut and Copy even if called directly.
+        /// Cut and Copy even if called directly. With a colour picker open, it goes to the
+        /// picker's hex field when that has the keyboard: a colour pasted is reported as one
+        /// typed (staged, as `Redraw`, in a picker with Apply and Cancel).
         pub fn apply_context_action(&mut self, action: ContextAction) -> Outcome {
             self.cancel_text_pointer();
+            if let Some(o) = self.popup_text_action(action) {
+                return o;
+            }
             if self.popup_open() {
                 return Outcome::None;
             }

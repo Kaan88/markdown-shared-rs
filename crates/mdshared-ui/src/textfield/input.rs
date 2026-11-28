@@ -122,7 +122,7 @@ impl FieldArea {
     /// A point of the frame moved into the text rectangle, to the nearest end of the text: a
     /// press in the padding left of the text places the caret at its start, one right of it
     /// at its end. A point already inside is unchanged.
-    fn nearest_in_text(&self, (x, y): (f32, f32)) -> (f32, f32) {
+    pub(crate) fn nearest_in_text(&self, (x, y): (f32, f32)) -> (f32, f32) {
         let r = self.text.area;
         // `clamp` panics on a bound that is not a number; such a rectangle places nothing
         // anyway (the pointer refuses it), so the point goes on as it is.
