@@ -71,4 +71,48 @@ impl Form {
     fn other_cursor(&self, _: f32, _: f32) -> Option<Cursor> {
         None
     }
+
+    // The paged form has no colour rows (see `colour_row`), so no popup holds a text field.
+
+    fn popup_text_press(
+        &mut self,
+        _: (f32, f32),
+        _: Mods,
+        _: u8,
+        _: Instant,
+        _: &mut Gfx,
+        _: f32,
+    ) -> Option<Outcome> {
+        None
+    }
+
+    fn popup_text_motion(&mut self, _: (f32, f32), _: Instant, _: &mut Gfx) -> Option<Outcome> {
+        None
+    }
+
+    fn popup_text_release(&mut self, _: (f32, f32), _: Instant, _: &mut Gfx) -> Option<Outcome> {
+        None
+    }
+
+    fn popup_text_deadline(&self) -> Option<Instant> {
+        None
+    }
+
+    fn popup_text_tick(&mut self, _: Instant, _: &mut Gfx) -> Option<bool> {
+        None
+    }
+
+    fn popup_text_cancel(&mut self) {}
+
+    fn popup_text_cursor(&self, _: f32, _: f32) -> Option<Cursor> {
+        None
+    }
+
+    fn popup_text_menu(&mut self, _: Option<(f32, f32)>) -> Option<Vec<Item<ContextAction>>> {
+        None
+    }
+
+    fn popup_text_action(&mut self, _: ContextAction) -> Option<Outcome> {
+        None
+    }
 }

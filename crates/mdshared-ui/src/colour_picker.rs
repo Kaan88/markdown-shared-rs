@@ -50,7 +50,8 @@
 use crate::flyout::{self, Flyout};
 use crate::gfx::{Face, Painter, Rect, Rgb};
 use crate::keys::{KeyName, Mods};
-use crate::textfield::{FieldArea, FieldColors, FieldHit, TextField};
+use crate::menu::Item;
+use crate::textfield::{ContextAction, FieldArea, FieldColors, FieldHit, TextField};
 use crate::theme::Palette;
 use mdshared_text::Bitmap;
 
@@ -433,6 +434,44 @@ impl Picker {
     /// [`FieldInput`](crate::textfield::FieldInput) with [`hex_field_area`].
     pub fn field_mut(&mut self) -> &mut TextField {
         &mut self.field
+    }
+
+    /// The hex field's edit menu (Cut, Copy, Paste, Select all, from its real selection), for a
+    /// right press on the field: the field takes the keyboard (from an Apply or Cancel button
+    /// too), its caret and selection as they were. Choose an item with
+    /// [`apply_hex_action`](Self::apply_hex_action).
+    pub fn hex_context_menu(&mut self) -> Vec<Item<ContextAction>> {
+        self.focus_hex();
+        self.field.context_menu()
+    }
+
+    /// An item chosen from the hex field's edit menu, the field taking the keyboard. A text
+    /// that is then a colour moves the markers, as typing it does: [`Outcome::Colour`]. Any
+    /// other edit or a new selection is [`Outcome::Redraw`]; Copy, or an item the field
+    /// refuses (Cut with nothing selected), is [`Outcome::None`].
+    pub fn apply_hex_action(&mut self, action: ContextAction) -> Outcome {
+        let focus = self.focus != Part::Hex || self.button_focus.is_some();
+        self.focus_hex();
+        let before = self.field.text().to_owned();
+        if !self.field.apply_context_action(action) || action == ContextAction::Copy {
+            return if focus {
+                Outcome::Redraw
+            } else {
+                Outcome::None
+            };
+        }
+        if self.field.text() == before {
+            return Outcome::Redraw;
+        }
+        match parse_hex(self.field.text()) {
+            Some(rgb) if self.take_rgb(rgb) => Outcome::Colour,
+            _ => Outcome::Redraw,
+        }
+    }
+
+    fn focus_hex(&mut self) {
+        self.set_focus(Part::Hex);
+        self.button_focus = None;
     }
 
     /// Moves the markers to `c` (made sane); true when the colour changed. The field shows the
